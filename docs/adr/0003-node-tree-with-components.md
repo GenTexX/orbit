@@ -1,0 +1,3 @@
+# Scenes are trees of plain Nodes with Components, not typed nodes or pure ECS
+
+A Scene is a tree of plain Nodes (name, transform, children); all capability - sprite, camera, collider, script - is a Component attached to a Node. We deliberately rejected Godot's typed-node model (inheritance hierarchies fight Rust; one-capability-per-node forces filler nodes) despite Godot being the editor inspiration, and rejected pure ECS (no natural "object" for an inspector, steeper scripting mental model) despite it being more Rust-idiomatic. Composition gives the editor one uniform contract: every panel, the serializer, and script reflection all reduce to "enumerate a Node's Components and their fields."

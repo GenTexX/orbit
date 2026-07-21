@@ -1,0 +1,3 @@
+# A Project is a directory of text files; only the shipped game is a single binary
+
+The original plan called for storing everything in a single project file. We split that into two artifacts: the authoring Project is a directory - a manifest (orbit.toml), scenes as human-readable text, scripts as plain source files, loose assets, and a gitignored cache for imported artifacts - while building ships the game as a single binary Game Package for the Runtime. Single-file authoring (custom blob or SQLite) was rejected because it is opaque to git (no diffs or merges), fragile (one corrupted write loses the project), and closed to external tools (no editing scripts in another editor, no grep). Unity's early binary-scene era and its abandonment is the cautionary precedent.

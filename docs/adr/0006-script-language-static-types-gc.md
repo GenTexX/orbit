@@ -1,0 +1,3 @@
+# Scripting language: statically typed with GC references, casual surface
+
+The scripting language is statically typed with local type inference, garbage-collected reference semantics for objects, and value semantics for small structs (Vec2, Color). No ownership, borrowing, or lifetimes - the audience writes casual game scripts, and the layer exists to not be Rust. Dynamic typing was rejected because it boxes everything on WASM, forfeits compile-time errors in our own code editor, and leaves the inspector guessing field types; static types make reflection exact and error squiggles real while staying fast to compile (we skip optimization, not checking).

@@ -1,0 +1,3 @@
+# Language intelligence is an in-process service; LSP is a future adapter
+
+The compiler frontend is structured as a reusable language-service library - error-tolerant parsing and type-checking over in-memory text, queryable for diagnostics, symbols, and completions - which the editor's code editor calls directly in-process. We do not speak LSP between our own editor and our own language: the protocol exists to decouple N editors from M languages, and we are 1x1. Because the service is a clean library, a real LSP server for external editors (Neovim, VS Code) later is a thin adapter. Consequence worth noting: the frontend must be error-tolerant and incremental from the start - a batch-only compiler cannot be retrofitted into a live service.

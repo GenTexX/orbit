@@ -1,0 +1,3 @@
+# Hot reload preserves reflected fields, resets heap and coroutines
+
+When a recompiled script module hot-loads into a running game, each Script component's reflected fields (the same set the inspector shows) are serialized, the new module is instantiated, and fields matching by name and compatible type are reapplied; everything else - heap object graphs, in-flight coroutines - restarts cold. The reflection system built for the inspector does double duty as the migration mechanism. Full heap migration was rejected as a tar pit (layout diffing, identity mapping, failure semantics); cold restart was rejected because it reduces the language's headline hot-reload feature to a restart button.

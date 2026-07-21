@@ -1,0 +1,3 @@
+# Runtime is a library; the editor runs games in-process
+
+The Runtime is a library crate; the shipping game executable is a thin binary wrapper around it. The Editor links the same library and runs the game in-process, rendering into a texture shown in a Viewport panel (Unity's model), rather than spawning a subprocess (Godot's model). Chosen because an embedded viewport was a hard requirement, Wayland forbids cross-process window embedding, and WASM-sandboxed game scripts make the main crash source (game code) trappable in-editor. Accepted risk: an Engine bug can take the editor down with it. A "play in separate window" subprocess mode stays nearly free since the thin runtime binary exists anyway.

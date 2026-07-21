@@ -1,0 +1,3 @@
+# GUI layout uses the taffy crate, not a hand-written algorithm
+
+Although the retained GUI framework is custom and a learning goal in itself, layout is delegated to taffy (the flexbox/grid engine used by Bevy UI and Dioxus) rather than hand-written - layout algorithms are a solved problem and not the part of GUI we want to learn. Widgets store a taffy node ID and style; the widget arena and taffy's layout tree are kept in sync. Accepted cost: layout bugs are debugged through CSS flexbox semantics rather than our own code. Constraint solvers (cassowary-style) were rejected outright: non-local failures and solver cost on large editor trees.

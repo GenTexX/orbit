@@ -1,0 +1,3 @@
+# Scene instancing with value overrides only, no structural overrides
+
+Any Scene can be instanced as a subtree of another Scene, and an instance may override property values on the instanced nodes' components - but may not add or remove nodes or components inside the instance. Scene files therefore store only a source reference plus a flat list of value overrides, and editing a source scene propagates everywhere except overridden values. Structural overrides (Godot's editable children, Unity's prefab variants) are the most bug-prone subsystem in both inspirations - stale diffs, orphaned overrides - and are explicitly deferred, not designed around. No-instancing was rejected because composition is the core workflow of scene-based engines.
