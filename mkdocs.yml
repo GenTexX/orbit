@@ -1,0 +1,24 @@
+# mkdocs config - one site, two audiences: Manual (engine users) and Internals (us).
+site_name: Orbit
+theme:
+  name: material
+
+nav:
+  - Home: index.md
+  - Manual:
+      - manual/index.md
+  - Internals:
+      - internals/index.md
+      - internals/conventions.md
+      - Decisions (ADRs):
+          - adr/0001-wgpu-not-raw-vulkan.md
+          - adr/0002-runtime-as-library-in-process-play.md
+          - adr/0003-node-tree-with-components.md
+          - adr/0004-gui-arena-events-handles.md
+          - adr/0005-taffy-for-gui-layout.md
+          - adr/0006-script-language-static-types-gc.md
+          - adr/0007-script-pipeline-direct-emission-wasmtime-rc.md
+          - adr/0008-hot-reload-preserves-reflected-fields.md
+          - adr/0009-project-is-directory-of-text-files.md
+          - adr/0010-in-process-language-service-lsp-later.md
+          - adr/0011-scene-instancing-value-overrides-only.md
