@@ -1,0 +1,6 @@
+[package]
+name = "aurora-wgpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

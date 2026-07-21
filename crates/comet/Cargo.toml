@@ -1,0 +1,6 @@
+[package]
+name = "comet"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

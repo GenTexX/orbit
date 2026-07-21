@@ -1,0 +1,6 @@
+[package]
+name = "orbit-editor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

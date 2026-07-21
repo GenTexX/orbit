@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/aurora",
+    "crates/aurora-wgpu",
+    "crates/comet",
+    "crates/orbit-renderer",
+    "crates/orbit-engine",
+    "crates/orbit-runtime",
+    "crates/orbit-editor",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"

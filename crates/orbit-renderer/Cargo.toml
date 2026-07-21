@@ -1,0 +1,6 @@
+[package]
+name = "orbit-renderer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
