@@ -8,6 +8,7 @@ members = [
     "crates/orbit-engine",
     "crates/orbit-runtime",
     "crates/orbit-editor",
+    "crates/sandbox",
 ]
 
 [workspace.package]

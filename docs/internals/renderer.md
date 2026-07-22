@@ -12,8 +12,10 @@ World space is **Y-down, origin top-left, one unit = one pixel** ([ADR 0012](../
 
 - **`Gpu`** (internal) - the shared wgpu instance, adapter, device, and queue. A single async setup path serves both cases: *headless* (no surface - used by tests and offscreen render targets) and, later, *windowed* (an adapter chosen compatible with a surface). Public constructors are **synchronous**; the async setup is blocked internally so nothing above the renderer is forced to become async.
 - **`Camera`** - a 2D camera producing the world -> clip view-projection matrix, unit-tested against the corner and pan mappings ADR 0012 promises.
-- **`Renderer`** - builds the sprite pipeline once, then draws batches. Today it renders **offscreen**: `render_to_image` rasterizes a batch of sprites through a camera into an image and reads the pixels back to the CPU. The windowed path (Step 3) reuses the same pipeline.
+- **`Renderer`** - builds the sprite pipeline once, then draws batches. It renders **to a window** (`new` + `render`, which acquires and presents a surface frame; `resize` reconfigures it) and **offscreen** (`render_to_image`, used by tests and later by editor render targets). Both paths share the batch-building and pass-recording code and differ only in target format: the offscreen format is linear for exact read-back, the window uses the surface's own (sRGB) format.
 - **`Sprite` / `Texture` / `Color`** - the public 2D drawing vocabulary. A `Sprite` is a textured quad placed by a 2D affine (position, size, rotation); every sprite in a call shares one `Texture`. Per-sprite data is packed into an instanced vertex buffer and expanded from a unit quad in `sprite.wgsl`. The affine format is deliberately general - it is exactly what the Milestone 3 scene graph will produce for nested, rotated, scaled nodes - so it will not need rewriting then.
+
+The **`sandbox`** binary (`crates/sandbox`) drives the windowed renderer: it owns the winit event loop ([ADR 0002](../adr/0002-runtime-as-library-in-process-play.md)), decodes an embedded PNG into a texture, and draws a few sprites each frame at vsync. The sample PNG is produced reproducibly by `cargo run -p sandbox --example gen_sprite`.
 
 ## How it's tested
 
@@ -21,4 +23,4 @@ The renderer's correctness is pinned by GPU tests that render offscreen and asse
 
 ## Not here yet
 
-The windowed surface/present path (Step 3), the instanced stress test and animation (Step 4), and profiling instrumentation (Step 5) arrive over the rest of Milestone 1. See the [Milestone 1 plan](plans/milestone-1-walking-skeleton.md).
+The instanced stress test and animation (Step 4) and profiling instrumentation (Step 5) arrive over the rest of Milestone 1. Multiple surfaces (for the editor's viewports) and a per-format pipeline cache come with later milestones. See the [Milestone 1 plan](plans/milestone-1-walking-skeleton.md).
