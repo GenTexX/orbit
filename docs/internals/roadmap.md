@@ -7,9 +7,10 @@ This is the milestone spine for Orbit. A **milestone** is a big, demonstrable ca
 ## The spine
 
 ### Milestone 1 - Walking Skeleton
-**Done when:** a window opens, the 2D renderer draws a sprite, and the puffin overlay shows live frame time.
+**Done when:** a window opens, the 2D renderer draws many textured sprites via instanced batching, and per-frame timing streams to an external puffin viewer (no on-screen overlay yet - that waits for Aurora + text). A headless offscreen render is pixel-matched against a committed reference image.
 **Proves:** the whole vertical stack - winit -> wgpu -> `orbit-renderer` -> profiling - and makes "profiling from the beginning" real instead of aspirational.
-**Brings online:** `orbit-renderer` (2D drawing API over wgpu), a sandbox binary, the `tracing` + `puffin` harness.
+**Brings online:** `orbit-renderer` (2D drawing API over wgpu), a sandbox binary, the `profiling` + puffin harness.
+**Plan:** [Milestone 1 - Walking Skeleton](plans/milestone-1-walking-skeleton.md).
 
 ### Milestone 2 - Aurora (usable GUI)
 **Done when:** a mock inspector runs - a docked panel of labeled rows you can click and type into, laid out by taffy, holding 60fps with the profiler open.

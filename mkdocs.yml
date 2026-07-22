@@ -10,6 +10,8 @@ nav:
   - Internals:
       - internals/index.md
       - internals/roadmap.md
+      - Plans:
+          - internals/plans/milestone-1-walking-skeleton.md
       - internals/conventions.md
       - Decisions (ADRs):
           - adr/0001-wgpu-not-raw-vulkan.md
@@ -23,3 +25,4 @@ nav:
           - adr/0009-project-is-directory-of-text-files.md
           - adr/0010-in-process-language-service-lsp-later.md
           - adr/0011-scene-instancing-value-overrides-only.md
+          - adr/0012-2d-coordinate-system.md
