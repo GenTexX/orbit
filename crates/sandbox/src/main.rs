@@ -17,12 +17,25 @@ use winit::{
 const SPRITE_PNG: &[u8] = include_bytes!("../assets/sprite.png");
 
 fn main() -> Result<()> {
+    init_logging();
+    tracing::info!("sandbox starting");
+
     let event_loop = EventLoop::new()?;
     // Redraw continuously - this is a game loop, not an on-demand UI. Vsync
     // (Fifo present mode) paces it to the display's refresh rate.
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop.run_app(&mut App::default())?;
     Ok(())
+}
+
+/// Install a tracing subscriber. Honors the RUST_LOG environment variable;
+/// with none set, shows our own info-level logs plus warnings from the noisy
+/// wgpu and naga internals. This also captures `log` records from wgpu/winit.
+fn init_logging() {
+    use tracing_subscriber::{EnvFilter, fmt};
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,wgpu_core=warn,wgpu_hal=warn,naga=warn"));
+    fmt().with_env_filter(filter).init();
 }
 
 #[derive(Default)]
@@ -47,7 +60,7 @@ impl ApplicationHandler for App {
                 self.state = Some(state);
             }
             Err(err) => {
-                eprintln!("failed to start sandbox: {err:#}");
+                tracing::error!("failed to start sandbox: {err:#}");
                 event_loop.exit();
             }
         }
@@ -62,7 +75,7 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => state.renderer.resize((size.width, size.height)),
             WindowEvent::RedrawRequested => {
                 if let Err(err) = state.draw() {
-                    eprintln!("render error: {err}");
+                    tracing::error!("render error: {err}");
                 }
             }
             _ => {}

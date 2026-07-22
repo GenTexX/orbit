@@ -47,6 +47,10 @@ impl Gpu {
                 ..Default::default()
             })
             .await?;
+
+        let info = adapter.get_info();
+        tracing::info!(adapter = %info.name, backend = ?info.backend, "acquired GPU adapter");
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("photon device"),

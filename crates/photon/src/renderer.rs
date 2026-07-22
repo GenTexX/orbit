@@ -76,6 +76,7 @@ impl Renderer {
             .get_default_config(&renderer.gpu.adapter, width, height)
             .ok_or(RendererError::SurfaceUnsupported)?;
         surface.configure(&renderer.gpu.device, &config);
+        tracing::debug!(format = ?config.format, width, height, "configured window surface");
         let pipeline = Self::build_pipeline(
             &renderer.gpu.device,
             &renderer.pipeline_layout,
