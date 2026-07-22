@@ -10,4 +10,12 @@ pub enum RendererError {
     /// An adapter was found, but a logical device could not be created from it.
     #[error("failed to create a graphics device")]
     RequestDevice(#[from] wgpu::RequestDeviceError),
+
+    /// The GPU could not be polled to completion while reading back an image.
+    #[error("failed to poll the device")]
+    Poll(#[from] wgpu::PollError),
+
+    /// A buffer could not be mapped for reading rendered pixels back to the CPU.
+    #[error("failed to map the readback buffer")]
+    Readback(#[from] wgpu::BufferAsyncError),
 }

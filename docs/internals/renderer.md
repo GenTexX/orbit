@@ -10,9 +10,15 @@ World space is **Y-down, origin top-left, one unit = one pixel** ([ADR 0012](../
 
 ## Current shape
 
-- **`Gpu`** (internal) - the shared wgpu instance, adapter, device, and queue. A single async setup path serves both cases: *headless* (no surface - used by tests and, soon, offscreen render targets) and, later, *windowed* (an adapter chosen compatible with a surface). Public constructors are **synchronous**; the async setup is blocked internally so nothing above the renderer is forced to become async.
-- **`Camera`** - a 2D camera that produces the world -> clip view-projection matrix. Its projection is unit-tested against the corner and pan mappings ADR 0012 promises.
+- **`Gpu`** (internal) - the shared wgpu instance, adapter, device, and queue. A single async setup path serves both cases: *headless* (no surface - used by tests and offscreen render targets) and, later, *windowed* (an adapter chosen compatible with a surface). Public constructors are **synchronous**; the async setup is blocked internally so nothing above the renderer is forced to become async.
+- **`Camera`** - a 2D camera producing the world -> clip view-projection matrix, unit-tested against the corner and pan mappings ADR 0012 promises.
+- **`Renderer`** - builds the sprite pipeline once, then draws batches. Today it renders **offscreen**: `render_to_image` rasterizes a batch of sprites through a camera into an image and reads the pixels back to the CPU. The windowed path (Step 3) reuses the same pipeline.
+- **`Sprite` / `Texture` / `Color`** - the public 2D drawing vocabulary. A `Sprite` is a textured quad placed by a 2D affine (position, size, rotation); every sprite in a call shares one `Texture`. Per-sprite data is packed into an instanced vertex buffer and expanded from a unit quad in `sprite.wgsl`. The affine format is deliberately general - it is exactly what the Milestone 3 scene graph will produce for nested, rotated, scaled nodes - so it will not need rewriting then.
+
+## How it's tested
+
+The renderer's correctness is pinned by GPU tests that render offscreen and assert actual pixel values - e.g. a red sprite placed near the world origin must appear in the **top-left** of the image, proving the Y-down coordinate system through the real pipeline. These assertions check *correctness* (orientation, colour, coverage), not merely frame-to-frame determinism, and need no committed reference image. They require a GPU, so they are `#[ignore]`d until lavapipe runs in CI (Step 6); the deterministic camera-math tests gate every push. A committed golden-image comparison becomes worthwhile later, once there is richer visual output (alpha blending, filtering) worth locking byte-for-byte.
 
 ## Not here yet
 
-The instanced sprite pipeline, the surface/windowed present path, and offscreen render targets arrive over the rest of Milestone 1. See the [Milestone 1 plan](plans/milestone-1-walking-skeleton.md).
+The windowed surface/present path (Step 3), the instanced stress test and animation (Step 4), and profiling instrumentation (Step 5) arrive over the rest of Milestone 1. See the [Milestone 1 plan](plans/milestone-1-walking-skeleton.md).

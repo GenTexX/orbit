@@ -23,7 +23,6 @@ impl Gpu {
     /// Blocks until the device is acquired. wgpu's setup is async internally,
     /// but that never leaks to callers: the renderer's public constructors are
     /// synchronous by design (see the Milestone 1 plan).
-    #[allow(dead_code)]
     pub(crate) fn headless() -> Result<Self, RendererError> {
         pollster::block_on(Self::request(None))
     }
