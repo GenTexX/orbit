@@ -12,5 +12,5 @@ pub use camera::Camera;
 pub use color::Color;
 pub use error::RendererError;
 pub use renderer::Renderer;
-pub use sprite::Sprite;
+pub use sprite::{Sprite, pack_sprite_instances};
 pub use texture::Texture;

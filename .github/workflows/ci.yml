@@ -17,3 +17,19 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # Compile-check the benchmarks so they cannot rot silently.
+      - run: cargo bench --workspace --no-run
+
+  # Runs the GPU render tests (normally #[ignore]d) on Mesa lavapipe, a software
+  # Vulkan implementation, so they gate CI without needing a physical GPU.
+  gpu-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - run: cargo test -p photon -- --include-ignored
+        env:
+          WGPU_BACKEND: vulkan
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json

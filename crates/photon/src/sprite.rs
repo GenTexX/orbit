@@ -85,3 +85,12 @@ impl RawInstance {
         }
     }
 }
+
+/// Pack `sprites` into the renderer's per-instance GPU bytes: the CPU work the
+/// renderer does every frame before uploading the instance buffer (an affine
+/// per sprite, then a copy). Exposed so this hot path can be benchmarked;
+/// normal code just calls [`crate::Renderer::render`].
+pub fn pack_sprite_instances(sprites: &[Sprite]) -> Vec<u8> {
+    let raw: Vec<RawInstance> = sprites.iter().map(|s| s.to_raw()).collect();
+    bytemuck::cast_slice(&raw).to_vec()
+}
