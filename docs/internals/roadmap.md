@@ -6,8 +6,9 @@ This is the milestone spine for Orbit. A **milestone** is a big, demonstrable ca
 
 ## The spine
 
-### Milestone 1 - Walking Skeleton
+### Milestone 1 - Walking Skeleton (done)
 **Done when:** a window opens, the 2D renderer draws many textured sprites via instanced batching, and per-frame timing streams to an external puffin viewer (no on-screen overlay yet - that waits for Aurora + text). A headless offscreen render is pixel-matched against a committed reference image.
+**Result:** delivered as `photon` (instanced sprite renderer, headless pixel-tested), the `sandbox` binary (an animated N-sprite field), opt-in `tracing` logging and puffin profiling, and CI. The offscreen tests assert pixels directly rather than against a committed image (see the plan).
 **Proves:** the whole vertical stack - winit -> wgpu -> `photon` -> profiling - and makes "profiling from the beginning" real instead of aspirational.
 **Brings online:** `photon` (2D drawing API over wgpu), a sandbox binary, the `profiling` + puffin harness.
 **Plan:** [Milestone 1 - Walking Skeleton](plans/milestone-1-walking-skeleton.md).
