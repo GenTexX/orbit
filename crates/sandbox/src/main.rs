@@ -30,7 +30,7 @@ fn main() -> Result<()> {
 
 /// Install a tracing subscriber. Honors the RUST_LOG environment variable;
 /// with none set, shows our own info-level logs plus warnings from the noisy
-/// wgpu and naga internals. This also captures `log` records from wgpu/winit.
+/// wgpu and naga internals. Also captures `log` records from wgpu and winit.
 fn init_logging() {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env()

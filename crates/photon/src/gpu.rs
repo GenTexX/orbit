@@ -15,12 +15,22 @@ pub(crate) struct Gpu {
 }
 
 impl Gpu {
-    /// A default instance with no display handle. `_from_env` still honors
-    /// WGPU_BACKEND and friends for forcing a backend (e.g. Vulkan on CI). The
-    /// windowed path passes a window to `create_surface` separately, which
-    /// carries its own display handle.
+    /// A default instance with no display handle. `_from_env` honors WGPU_*
+    /// variables (e.g. WGPU_BACKEND to force a backend). The windowed path
+    /// passes a window to `create_surface` separately, which carries its own
+    /// display handle.
+    ///
+    /// Vulkan validation layers are left off by default: they are a debugging
+    /// aid, not always-on noise, and wgpu 30 has a benign but very chatty
+    /// validation bug on Linux swapchain acquire (the acquire fence is only
+    /// reset on Windows). Opt in with `WGPU_VALIDATION=1` when chasing a GPU
+    /// problem; that path also surfaces every real validation message.
     pub(crate) fn default_instance() -> wgpu::Instance {
-        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env())
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        if std::env::var_os("WGPU_VALIDATION").is_none() {
+            desc.flags.remove(wgpu::InstanceFlags::VALIDATION);
+        }
+        wgpu::Instance::new(desc)
     }
 
     /// Create a headless GPU context with no surface, suitable for offscreen

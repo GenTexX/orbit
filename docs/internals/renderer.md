@@ -21,6 +21,12 @@ The **`sandbox`** binary (`crates/sandbox`) drives the windowed renderer: it own
 
 The renderer's correctness is pinned by GPU tests that render offscreen and assert actual pixel values - e.g. a red sprite placed near the world origin must appear in the **top-left** of the image, proving the Y-down coordinate system through the real pipeline. These assertions check *correctness* (orientation, colour, coverage), not merely frame-to-frame determinism, and need no committed reference image. They require a GPU, so they are `#[ignore]`d until lavapipe runs in CI (Step 6); the deterministic camera-math tests gate every push. A committed golden-image comparison becomes worthwhile later, once there is richer visual output (alpha blending, filtering) worth locking byte-for-byte.
 
+## Logging and GPU validation
+
+photon emits `tracing` events (e.g. the acquired adapter and backend); binaries install the subscriber. The sandbox does, and also captures `log` records from wgpu and winit, so `RUST_LOG=debug cargo run -p sandbox` surfaces everything.
+
+Vulkan validation layers are **off by default** and opt-in with `WGPU_VALIDATION=1`. They are a debugging aid rather than always-on noise, and wgpu 30.0.0 has a benign but very chatty validation bug on Linux: it only resets the swapchain acquire fence on Windows (`cfg(windows)` in wgpu-hal `vulkan/swapchain/native.rs`), so on Linux it reports `VUID-vkAcquireNextImageKHR-fence-10066` every frame. Rendering is correct regardless - the real acquire-to-render synchronization is via semaphores, not that fence. Turn validation on when developing GPU code; remove this note once the upstream fix ships.
+
 ## Not here yet
 
 The instanced stress test and animation (Step 4) and profiling instrumentation (Step 5) arrive over the rest of Milestone 1. Multiple surfaces (for the editor's viewports) and a per-format pipeline cache come with later milestones. See the [Milestone 1 plan](plans/milestone-1-walking-skeleton.md).
