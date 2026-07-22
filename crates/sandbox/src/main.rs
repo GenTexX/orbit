@@ -1,5 +1,6 @@
 //! sandbox - Milestone 1 dev playground: opens a window and draws sprites via photon.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -80,6 +81,10 @@ struct State {
     /// Frame counter and window start for the once-a-second FPS log.
     frames: u32,
     fps_since: Instant,
+    /// A puffin frame sink for the readable profile dump; present only when
+    /// profiling is on. Paired with `dump_path` from ORBIT_PROFILE_DUMP.
+    frame_view: Option<puffin::GlobalFrameView>,
+    dump_path: Option<PathBuf>,
 }
 
 impl ApplicationHandler for App {
@@ -150,6 +155,21 @@ impl State {
             "rendering sprite field (override with ORBIT_SPRITES)"
         );
 
+        let dump_path = std::env::var_os("ORBIT_PROFILE_DUMP").map(PathBuf::from);
+        let frame_view = puffin::are_scopes_on().then(puffin::GlobalFrameView::default);
+        match (&dump_path, frame_view.is_some()) {
+            (Some(path), true) => {
+                tracing::info!(
+                    "writing a readable profile to {} each second",
+                    path.display()
+                )
+            }
+            (Some(_), false) => tracing::warn!(
+                "ORBIT_PROFILE_DUMP is set but profiling is off; also set ORBIT_PROFILE=1"
+            ),
+            _ => {}
+        }
+
         let now = Instant::now();
         Ok(Self {
             window,
@@ -160,6 +180,8 @@ impl State {
             sprites: Vec::with_capacity(count as usize),
             frames: 0,
             fps_since: now,
+            frame_view,
+            dump_path,
         })
     }
 
@@ -222,8 +244,70 @@ impl State {
                 fps as u32,
                 1000.0 / fps
             );
+            self.dump_profile();
             self.frames = 0;
             self.fps_since = Instant::now();
+        }
+    }
+
+    /// Write the merged per-scope timings of recent frames to `dump_path` as
+    /// readable text. No-op unless both profiling and ORBIT_PROFILE_DUMP are on.
+    fn dump_profile(&self) {
+        let (Some(view), Some(path)) = (&self.frame_view, &self.dump_path) else {
+            return;
+        };
+        let view = view.lock();
+        let frames: Vec<_> = view
+            .latest_frames(120)
+            .filter_map(|f| f.unpacked().ok())
+            .collect();
+        let Some(latest) = frames.last() else {
+            return;
+        };
+
+        let mut out = format!(
+            "orbit profile - {} sprites, merged over {} frames (per-frame averages)\n",
+            self.count,
+            frames.len(),
+        );
+        let scopes = view.scope_collection();
+        for thread in latest.thread_streams.keys() {
+            out.push_str(&format!("\n[thread: {}]\n", thread.name));
+            match puffin::merge_scopes_for_thread(scopes, &frames, thread) {
+                Ok(merged) => {
+                    for scope in &merged {
+                        Self::format_scope(&mut out, scopes, scope, 1);
+                    }
+                }
+                Err(err) => out.push_str(&format!("  merge failed: {err:?}\n")),
+            }
+        }
+
+        if let Err(err) = std::fs::write(path, out) {
+            tracing::error!("failed to write profile dump to {}: {err}", path.display());
+        }
+    }
+
+    /// Format one merged scope and its children as an indented line.
+    fn format_scope(
+        out: &mut String,
+        scopes: &puffin::ScopeCollection,
+        scope: &puffin::MergeScope<'_>,
+        depth: usize,
+    ) {
+        let name = scopes
+            .fetch_by_id(&scope.id)
+            .map(|d| d.scope_name.as_deref().unwrap_or(d.function_name.as_ref()))
+            .unwrap_or("?");
+        let per_frame_ms = scope.duration_per_frame_ns as f64 / 1e6;
+        let max_ms = scope.max_duration_ns as f64 / 1e6;
+        let indent = depth * 2;
+        out.push_str(&format!(
+            "{:indent$}{name}  {per_frame_ms:.3} ms/frame  (max {max_ms:.3} ms, {} calls)\n",
+            "", scope.num_pieces,
+        ));
+        for child in &scope.children {
+            Self::format_scope(out, scopes, child, depth + 1);
         }
     }
 }
