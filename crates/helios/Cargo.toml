@@ -1,5 +1,5 @@
 [package]
-name = "orbit-engine"
+name = "helios"
 version.workspace = true
 edition.workspace = true
 

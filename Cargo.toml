@@ -4,10 +4,10 @@ members = [
     "crates/aurora",
     "crates/aurora-wgpu",
     "crates/comet",
-    "crates/orbit-renderer",
-    "crates/orbit-engine",
-    "crates/orbit-runtime",
-    "crates/orbit-editor",
+    "crates/photon",
+    "crates/helios",
+    "crates/voyager",
+    "crates/atlas",
     "crates/sandbox",
 ]
 

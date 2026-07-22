@@ -7,5 +7,5 @@ edition.workspace = true
 anyhow = "1.0.104"
 glam = "0.33.2"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
-orbit-renderer = { version = "0.1.0", path = "../orbit-renderer" }
+photon = { version = "0.1.0", path = "../photon" }
 winit = "0.30.13"

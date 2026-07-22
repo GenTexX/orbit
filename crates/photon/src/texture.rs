@@ -1,4 +1,4 @@
-//! orbit-renderer texture: an RGBA image living on the GPU, sampled by the sprite pipeline.
+//! photon texture: an RGBA image living on the GPU, sampled by the sprite pipeline.
 
 /// A 2D texture on the GPU. Created from raw RGBA8 bytes; image *decoding*
 /// (PNG, etc.) stays outside the renderer, keeping this crate free of asset

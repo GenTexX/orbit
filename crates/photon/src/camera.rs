@@ -1,4 +1,4 @@
-//! orbit-renderer 2D camera: maps Y-down, top-left, pixel-unit world space (ADR 0012) into clip space.
+//! photon 2D camera: maps Y-down, top-left, pixel-unit world space (ADR 0012) into clip space.
 
 use glam::{Mat4, Vec2, Vec4};
 

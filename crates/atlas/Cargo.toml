@@ -1,5 +1,5 @@
 [package]
-name = "orbit-runtime"
+name = "atlas"
 version.workspace = true
 edition.workspace = true
 

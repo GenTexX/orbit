@@ -1,4 +1,4 @@
-//! orbit-renderer renderer: builds the sprite pipeline and draws batches, both to a window surface and offscreen.
+//! photon renderer: builds the sprite pipeline and draws batches, both to a window surface and offscreen.
 
 use wgpu::util::DeviceExt;
 

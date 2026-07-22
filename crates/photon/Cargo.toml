@@ -1,5 +1,5 @@
 [package]
-name = "orbit-renderer"
+name = "photon"
 version.workspace = true
 edition.workspace = true
 

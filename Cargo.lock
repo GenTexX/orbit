@@ -111,6 +111,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas"
+version = "0.1.0"
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -624,6 +628,10 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
  "foldhash",
 ]
+
+[[package]]
+name = "helios"
+version = "0.1.0"
 
 [[package]]
 name = "hermit-abi"
@@ -1252,29 +1260,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "orbit-editor"
-version = "0.1.0"
-
-[[package]]
-name = "orbit-engine"
-version = "0.1.0"
-
-[[package]]
-name = "orbit-renderer"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "glam",
- "pollster",
- "thiserror 2.0.19",
- "wgpu",
-]
-
-[[package]]
-name = "orbit-runtime"
-version = "0.1.0"
-
-[[package]]
 name = "ordered-float"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1320,6 +1305,17 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "photon"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "pollster",
+ "thiserror 2.0.19",
+ "wgpu",
+]
 
 [[package]]
 name = "pin-project"
@@ -1593,7 +1589,7 @@ dependencies = [
  "anyhow",
  "glam",
  "image",
- "orbit-renderer",
+ "photon",
  "winit",
 ]
 
@@ -1933,6 +1929,10 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "voyager"
+version = "0.1.0"
 
 [[package]]
 name = "walkdir"

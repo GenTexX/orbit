@@ -1,10 +1,10 @@
-//! sandbox - Milestone 1 dev playground: opens a window and draws sprites via orbit-renderer.
+//! sandbox - Milestone 1 dev playground: opens a window and draws sprites via photon.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use glam::Vec2;
-use orbit_renderer::{Camera, Color, Renderer, Sprite, Texture};
+use photon::{Camera, Color, Renderer, Sprite, Texture};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,

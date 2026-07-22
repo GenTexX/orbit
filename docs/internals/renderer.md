@@ -1,6 +1,6 @@
-# Renderer (`orbit-renderer`)
+# Renderer (`photon`)
 
-`orbit-renderer` is Orbit's 2D drawing layer and the **only** crate that touches wgpu types ([ADR 0001](../adr/0001-wgpu-not-raw-vulkan.md)). Everything above it - the engine, the editor's viewport - draws through a 2D API (sprites, shapes, text, render targets) and never sees wgpu. That confinement is what keeps the graphics backend replaceable: swapping it out is a rewrite of this one crate's internals, not a change at every call site.
+`photon` is Orbit's 2D drawing layer and the **only** crate that touches wgpu types ([ADR 0001](../adr/0001-wgpu-not-raw-vulkan.md)). Everything above it - the engine, the editor's viewport - draws through a 2D API (sprites, shapes, text, render targets) and never sees wgpu. That confinement is what keeps the graphics backend replaceable: swapping it out is a rewrite of this one crate's internals, not a change at every call site.
 
 This page grows with the renderer. Today it covers what exists after Milestone 1, Step 1.
 

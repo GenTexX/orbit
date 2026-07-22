@@ -1,6 +1,6 @@
 # Orbit
 
-An educational 2D game engine in Rust: a core engine library, an editor application with a custom retained GUI, and a runtime that plays packaged games. Games are scripted in a custom language compiled to WASM. Sub-projects follow a celestial naming theme: the engine is Orbit, the GUI framework is Aurora, the scripting language is Comet.
+An educational 2D game engine in Rust: a core engine library, an editor application with a custom retained GUI, and a runtime that plays packaged games. Games are scripted in a custom language compiled to WASM. The project as a whole is known publicly as **Orbit**; internally each part carries its own celestial name - Photon (renderer), Helios (engine), Voyager (runtime), Atlas (editor), Aurora (GUI framework), Comet (language). These are working crate names; what the public eventually calls each part is open.
 
 ## Language
 
@@ -11,6 +11,22 @@ _Avoid_: the GUI, orbit-gui
 **Comet**:
 The scripting language: statically typed, garbage-collected, compiled to WASM. Script source files use the .cmt extension.
 _Avoid_: the scripting language (in docs), orbit-script
+
+**Photon**:
+The 2D drawing crate - sprites, shapes, text, render targets - and the only code that touches wgpu.
+_Avoid_: the renderer (as a proper name), orbit-renderer
+
+**Helios**:
+The crate implementing the Engine.
+_Avoid_: orbit-engine
+
+**Voyager**:
+The crate implementing the Runtime.
+_Avoid_: orbit-runtime
+
+**Atlas**:
+The crate implementing the Editor.
+_Avoid_: orbit-editor
 
 **Engine**:
 The core library of reusable game technology - rendering, input, audio, physics, scene management, script host. Has no main function and opens no windows; it is embedded by the Runtime and the Editor.

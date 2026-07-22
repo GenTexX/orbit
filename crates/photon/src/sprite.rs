@@ -1,4 +1,4 @@
-//! orbit-renderer sprite: a textured quad in world space, plus its packed per-instance GPU form.
+//! photon sprite: a textured quad in world space, plus its packed per-instance GPU form.
 
 use crate::color::Color;
 use glam::Vec2;

@@ -1,4 +1,4 @@
-//! orbit-renderer color: an RGBA color used for sprite tints and clear values.
+//! photon color: an RGBA color used for sprite tints and clear values.
 
 /// An RGBA color with components in `0.0..=1.0`.
 #[derive(Debug, Clone, Copy, PartialEq)]

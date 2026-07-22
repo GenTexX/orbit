@@ -1,5 +1,5 @@
 [package]
-name = "orbit-editor"
+name = "voyager"
 version.workspace = true
 edition.workspace = true
 

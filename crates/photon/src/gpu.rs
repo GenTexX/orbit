@@ -1,4 +1,4 @@
-//! orbit-renderer GPU context: owns the wgpu instance, adapter, device, and queue shared by every render path.
+//! photon GPU context: owns the wgpu instance, adapter, device, and queue shared by every render path.
 
 use crate::error::RendererError;
 
@@ -49,7 +49,7 @@ impl Gpu {
             .await?;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("orbit-renderer device"),
+                label: Some("photon device"),
                 ..Default::default()
             })
             .await?;
@@ -73,9 +73,6 @@ mod tests {
         let info = gpu.adapter.get_info();
         // A successfully acquired adapter always reports a device name and backend.
         assert!(!info.name.is_empty(), "adapter reported an empty name");
-        println!(
-            "orbit-renderer using adapter: {} ({:?})",
-            info.name, info.backend
-        );
+        println!("photon using adapter: {} ({:?})", info.name, info.backend);
     }
 }
