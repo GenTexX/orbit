@@ -9,6 +9,7 @@ nav:
       - manual/index.md
   - Internals:
       - internals/index.md
+      - internals/roadmap.md
       - internals/conventions.md
       - Decisions (ADRs):
           - adr/0001-wgpu-not-raw-vulkan.md
