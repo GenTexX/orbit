@@ -1,6 +1,7 @@
 //! sandbox - Milestone 1 dev playground: opens a window and draws sprites via photon.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use glam::Vec2;
@@ -47,6 +48,15 @@ struct State {
     window: Arc<Window>,
     renderer: Renderer,
     texture: Texture,
+    /// How many sprites to draw; override with the ORBIT_SPRITES env var.
+    count: u32,
+    /// Wall-clock start, for time-based animation.
+    start: Instant,
+    /// Reused each frame so the sprite list is not reallocated per frame.
+    sprites: Vec<Sprite>,
+    /// Frame counter and window start for the once-a-second FPS log.
+    frames: u32,
+    fps_since: Instant,
 }
 
 impl ApplicationHandler for App {
@@ -107,33 +117,86 @@ impl State {
         let (w, h) = decoded.dimensions();
         let texture = renderer.create_texture(&decoded.into_raw(), w, h);
 
+        let count = std::env::var("ORBIT_SPRITES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(10_000)
+            .max(1);
+        tracing::info!(
+            count,
+            "rendering sprite field (override with ORBIT_SPRITES)"
+        );
+
+        let now = Instant::now();
         Ok(Self {
             window,
             renderer,
             texture,
+            count,
+            start: now,
+            sprites: Vec::with_capacity(count as usize),
+            frames: 0,
+            fps_since: now,
         })
     }
 
     fn draw(&mut self) -> Result<()> {
         let size = self.window.inner_size();
-        let viewport = Vec2::new(size.width as f32, size.height as f32);
+        let viewport = Vec2::new(size.width.max(1) as f32, size.height.max(1) as f32);
         let camera = Camera::new(Vec2::ZERO, viewport);
+        let time = self.start.elapsed().as_secs_f32();
 
-        // One sprite centered at full size, plus a half-size one in each of the
-        // top-left and bottom-right corners - enough to read position and scale.
-        let tex = Vec2::new(self.texture.width as f32, self.texture.height as f32);
-        let sprites = [
-            Sprite::new(viewport / 2.0 - tex / 2.0, tex),
-            Sprite::new(Vec2::new(20.0, 20.0), tex * 0.5),
-            Sprite::new(viewport - Vec2::splat(20.0) - tex * 0.5, tex * 0.5),
-        ];
-
+        self.build_scene(time, viewport);
         self.renderer.render(
-            Color::new(0.10, 0.10, 0.12, 1.0),
+            Color::new(0.02, 0.02, 0.05, 1.0),
             &camera,
             &self.texture,
-            &sprites,
+            &self.sprites,
         )?;
+        self.report_fps();
         Ok(())
+    }
+
+    /// Rebuild the sprite field for the current time: a grid tiling the
+    /// viewport, each sprite gently wobbling, spinning, and cycling hue. All of
+    /// them draw in a single instanced call.
+    fn build_scene(&mut self, time: f32, viewport: Vec2) {
+        let n = self.count;
+        let aspect = (viewport.x / viewport.y).max(0.01);
+        let cols = ((n as f32 * aspect).sqrt().ceil() as u32).max(1);
+        let rows = n.div_ceil(cols).max(1);
+        let cell = Vec2::new(viewport.x / cols as f32, viewport.y / rows as f32);
+        let size = cell * 0.7;
+
+        self.sprites.clear();
+        for i in 0..n {
+            let grid = Vec2::new((i % cols) as f32, (i / cols) as f32);
+            let center = (grid + 0.5) * cell;
+            let phase = i as f32 * 0.35;
+            let wobble =
+                Vec2::new((time * 1.7 + phase).sin(), (time * 2.1 + phase).cos()) * (cell * 0.18);
+
+            let mut sprite = Sprite::new(center + wobble - size * 0.5, size);
+            sprite.rotation = time * 0.6 + phase;
+            sprite.tint = Color::hsv((i as f32 / n as f32) + time * 0.05, 0.7, 1.0);
+            self.sprites.push(sprite);
+        }
+    }
+
+    /// Log frames-per-second and frame time once a second.
+    fn report_fps(&mut self) {
+        self.frames += 1;
+        let elapsed = self.fps_since.elapsed().as_secs_f32();
+        if elapsed >= 1.0 {
+            let fps = self.frames as f32 / elapsed;
+            tracing::info!(
+                sprites = self.count,
+                "{} fps ({:.2} ms/frame)",
+                fps as u32,
+                1000.0 / fps
+            );
+            self.frames = 0;
+            self.fps_since = Instant::now();
+        }
     }
 }

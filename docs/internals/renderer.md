@@ -15,7 +15,7 @@ World space is **Y-down, origin top-left, one unit = one pixel** ([ADR 0012](../
 - **`Renderer`** - builds the sprite pipeline once, then draws batches. It renders **to a window** (`new` + `render`, which acquires and presents a surface frame; `resize` reconfigures it) and **offscreen** (`render_to_image`, used by tests and later by editor render targets). Both paths share the batch-building and pass-recording code and differ only in target format: the offscreen format is linear for exact read-back, the window uses the surface's own (sRGB) format.
 - **`Sprite` / `Texture` / `Color`** - the public 2D drawing vocabulary. A `Sprite` is a textured quad placed by a 2D affine (position, size, rotation); every sprite in a call shares one `Texture`. Per-sprite data is packed into an instanced vertex buffer and expanded from a unit quad in `sprite.wgsl`. The affine format is deliberately general - it is exactly what the Milestone 3 scene graph will produce for nested, rotated, scaled nodes - so it will not need rewriting then.
 
-The **`sandbox`** binary (`crates/sandbox`) drives the windowed renderer: it owns the winit event loop ([ADR 0002](../adr/0002-runtime-as-library-in-process-play.md)), decodes an embedded PNG into a texture, and draws a few sprites each frame at vsync. The sample PNG is produced reproducibly by `cargo run -p sandbox --example gen_sprite`.
+The **`sandbox`** binary (`crates/sandbox`) drives the windowed renderer: it owns the winit event loop ([ADR 0002](../adr/0002-runtime-as-library-in-process-play.md)), decodes an embedded PNG into a texture, and draws a field of animated sprites - count from the `ORBIT_SPRITES` env var (default 10,000) - in a single instanced draw call, logging FPS once a second. The sample PNG is produced reproducibly by `cargo run -p sandbox --example gen_sprite`. The sprite count is a tunable load: it scales roughly linearly (10k sprites ~2.4 ms/frame, 100k ~19 ms), giving the profiler something real to measure.
 
 ## How it's tested
 
@@ -29,4 +29,4 @@ Vulkan validation layers are **off by default** and opt-in with `WGPU_VALIDATION
 
 ## Not here yet
 
-The instanced stress test and animation (Step 4) and profiling instrumentation (Step 5) arrive over the rest of Milestone 1. Multiple surfaces (for the editor's viewports) and a per-format pipeline cache come with later milestones. See the [Milestone 1 plan](plans/milestone-1-walking-skeleton.md).
+Profiling instrumentation (Step 5) and the criterion bench plus CI wiring (Step 6) arrive over the rest of Milestone 1. Multiple surfaces (for the editor's viewports), a per-format pipeline cache, and a persistent instance buffer (the batch is rebuilt and re-uploaded every frame today) come with later milestones. See the [Milestone 1 plan](plans/milestone-1-walking-skeleton.md).
