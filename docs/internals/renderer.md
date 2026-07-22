@@ -21,12 +21,14 @@ The **`sandbox`** binary (`crates/sandbox`) drives the windowed renderer: it own
 
 The renderer's correctness is pinned by GPU tests that render offscreen and assert actual pixel values - e.g. a red sprite placed near the world origin must appear in the **top-left** of the image, proving the Y-down coordinate system through the real pipeline. These assertions check *correctness* (orientation, colour, coverage), not merely frame-to-frame determinism, and need no committed reference image. They require a GPU, so they are `#[ignore]`d until lavapipe runs in CI (Step 6); the deterministic camera-math tests gate every push. A committed golden-image comparison becomes worthwhile later, once there is richer visual output (alpha blending, filtering) worth locking byte-for-byte.
 
-## Logging and GPU validation
+## Logging, profiling, and validation
 
 photon emits `tracing` events (e.g. the acquired adapter and backend); binaries install the subscriber. The sandbox does, and also captures `log` records from wgpu and winit, so `RUST_LOG=debug cargo run -p sandbox` surfaces everything.
+
+Frame profiling uses the `profiling` facade over the puffin backend, so the same `profiling::scope!` instrumentation can later target Tracy instead. photon scopes the render phases (acquire, prepare_batch, record_pass, submit, present); the sandbox scopes `build_scene` and marks each frame boundary. It is **opt-in**: `ORBIT_PROFILE=1 cargo run -p sandbox` turns puffin on and serves it on `127.0.0.1:8585`; connect the standalone `puffin_viewer --url 127.0.0.1:8585` to see per-phase timing (wgpu's own scopes appear too, since it also uses `profiling`). With `ORBIT_PROFILE` unset, the scopes are cheap no-ops.
 
 Vulkan validation layers are **off by default** and opt-in with `WGPU_VALIDATION=1`. They are a debugging aid rather than always-on noise, and wgpu 30.0.0 has a benign but very chatty validation bug on Linux: it only resets the swapchain acquire fence on Windows (`cfg(windows)` in wgpu-hal `vulkan/swapchain/native.rs`), so on Linux it reports `VUID-vkAcquireNextImageKHR-fence-10066` every frame. Rendering is correct regardless - the real acquire-to-render synchronization is via semaphores, not that fence. Turn validation on when developing GPU code; remove this note once the upstream fix ships.
 
 ## Not here yet
 
-Profiling instrumentation (Step 5) and the criterion bench plus CI wiring (Step 6) arrive over the rest of Milestone 1. Multiple surfaces (for the editor's viewports), a per-format pipeline cache, and a persistent instance buffer (the batch is rebuilt and re-uploaded every frame today) come with later milestones. See the [Milestone 1 plan](plans/milestone-1-walking-skeleton.md).
+The criterion bench and CI wiring (Step 6, the last of Milestone 1) come next. Multiple surfaces (for the editor's viewports), a per-format pipeline cache, and a persistent instance buffer (the batch is rebuilt and re-uploaded every frame today) come with later milestones. See the [Milestone 1 plan](plans/milestone-1-walking-skeleton.md).

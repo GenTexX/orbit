@@ -8,6 +8,9 @@ anyhow = "1.0.104"
 glam = "0.33.2"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 photon = { version = "0.1.0", path = "../photon" }
+profiling = { version = "1.0.18", features = ["profile-with-puffin"] }
+puffin = "0.20.0"
+puffin_http = "0.17.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 winit = "0.30.13"

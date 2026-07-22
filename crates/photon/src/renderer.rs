@@ -233,6 +233,8 @@ impl Renderer {
         texture: &Texture,
         sprites: &[Sprite],
     ) -> Result<(), RendererError> {
+        profiling::scope!("render");
+
         let Some(frame) = self.acquire_frame()? else {
             return Ok(());
         };
@@ -252,14 +254,21 @@ impl Renderer {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         self.record_pass(&mut encoder, &view, pipeline, clear, &batch);
-        self.gpu.queue.submit(Some(encoder.finish()));
-        self.gpu.queue.present(frame);
+        {
+            profiling::scope!("submit");
+            self.gpu.queue.submit(Some(encoder.finish()));
+        }
+        {
+            profiling::scope!("present");
+            self.gpu.queue.present(frame);
+        }
         Ok(())
     }
 
     /// Acquire the next surface frame, reconfiguring on an outdated/lost surface.
     /// Returns `None` for a frame that should be skipped this tick.
     fn acquire_frame(&mut self) -> Result<Option<wgpu::SurfaceTexture>, RendererError> {
+        profiling::scope!("acquire_frame");
         let acquired = {
             let state = self.surface.as_ref().ok_or(RendererError::NoSurface)?;
             state.surface.get_current_texture()
@@ -394,6 +403,7 @@ impl Renderer {
         texture: &Texture,
         sprites: &[Sprite],
     ) -> BatchResources {
+        profiling::scope!("prepare_batch");
         let device = &self.gpu.device;
 
         let camera_uniform = CameraUniform {
@@ -456,6 +466,7 @@ impl Renderer {
         clear: Color,
         batch: &BatchResources,
     ) {
+        profiling::scope!("record_pass");
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("sprite pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {

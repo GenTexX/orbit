@@ -21,6 +21,9 @@ fn main() -> Result<()> {
     init_logging();
     tracing::info!("sandbox starting");
 
+    // Kept alive for the whole run; dropping it would stop the profiler server.
+    let _profiler = init_profiling();
+
     let event_loop = EventLoop::new()?;
     // Redraw continuously - this is a game loop, not an on-demand UI. Vsync
     // (Fifo present mode) paces it to the display's refresh rate.
@@ -37,6 +40,26 @@ fn init_logging() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,wgpu_core=warn,wgpu_hal=warn,naga=warn"));
     fmt().with_env_filter(filter).init();
+}
+
+/// Start the puffin profiler server when ORBIT_PROFILE is set, and return it so
+/// the caller keeps it alive. When unset, profiling stays off and the
+/// `profiling::scope!` calls throughout photon and the sandbox are cheap
+/// no-ops. Connect a viewer with `puffin_viewer --url 127.0.0.1:8585`.
+fn init_profiling() -> Option<puffin_http::Server> {
+    // Off unless ORBIT_PROFILE is set; `?` early-returns None when it is absent.
+    std::env::var_os("ORBIT_PROFILE")?;
+    puffin::set_scopes_on(true);
+    match puffin_http::Server::new("0.0.0.0:8585") {
+        Ok(server) => {
+            tracing::info!("puffin profiler on; connect with: puffin_viewer --url 127.0.0.1:8585");
+            Some(server)
+        }
+        Err(err) => {
+            tracing::error!("failed to start puffin server: {err}");
+            None
+        }
+    }
 }
 
 #[derive(Default)]
@@ -154,6 +177,9 @@ impl State {
             &self.sprites,
         )?;
         self.report_fps();
+
+        // Mark the frame boundary for the profiler (a no-op when profiling off).
+        profiling::finish_frame!();
         Ok(())
     }
 
@@ -161,6 +187,7 @@ impl State {
     /// viewport, each sprite gently wobbling, spinning, and cycling hue. All of
     /// them draw in a single instanced call.
     fn build_scene(&mut self, time: f32, viewport: Vec2) {
+        profiling::scope!("build_scene");
         let n = self.count;
         let aspect = (viewport.x / viewport.y).max(0.01);
         let cols = ((n as f32 * aspect).sqrt().ceil() as u32).max(1);
