@@ -12,6 +12,8 @@ nav:
       - internals/roadmap.md
       - Plans:
           - internals/plans/milestone-1-walking-skeleton.md
+      - Subsystems:
+          - internals/renderer.md
       - internals/conventions.md
       - Decisions (ADRs):
           - adr/0001-wgpu-not-raw-vulkan.md
