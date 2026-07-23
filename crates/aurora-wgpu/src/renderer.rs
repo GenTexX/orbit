@@ -1,29 +1,57 @@
-//! aurora-wgpu renderer: turns an Aurora draw list into batched, clipped colored quads on a surface.
+//! aurora-wgpu renderer: turns an Aurora draw list into batched, clipped, atlas-textured quads on a surface.
 
+use aurora::cosmic_text::FontSystem;
 use aurora::{Color, DrawCommand, DrawList, Rect};
 use glam::Vec2;
 use wgpu::util::DeviceExt;
 
+use crate::atlas::{Atlas, GlyphEntry};
 use crate::error::RenderError;
 
-/// One filled rectangle as uploaded to the GPU; `#[repr(C)]` to match the
-/// vertex attributes and the `Instance` struct in rect.wgsl.
+/// One quad as uploaded to the GPU: a pixel rectangle plus the atlas UV span it
+/// samples. Filled rects sample a white texel; glyphs sample their bitmap.
+/// `#[repr(C)]` to match the vertex attributes and the `Instance` in quad.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct RectInstance {
+struct QuadInstance {
     pos: [f32; 2],
     size: [f32; 2],
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
     color: [f32; 4],
 }
 
-impl RectInstance {
+impl QuadInstance {
     fn layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRS: [wgpu::VertexAttribute; 3] =
-            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
+        const ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+            0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2, 4 => Float32x4];
         wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<RectInstance>() as wgpu::BufferAddress,
+            array_stride: std::mem::size_of::<QuadInstance>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &ATTRS,
+        }
+    }
+
+    /// A solid fill: the whole quad samples the atlas's white texel.
+    fn fill(rect: Rect, color: Color, white_uv: [f32; 2]) -> Self {
+        Self {
+            pos: rect.pos.to_array(),
+            size: rect.size.to_array(),
+            uv_min: white_uv,
+            uv_max: white_uv,
+            color: [color.r, color.g, color.b, color.a],
+        }
+    }
+
+    /// A glyph quad: placed at the pen position offset by the bitmap's bearing,
+    /// sampling the glyph's coverage from the atlas.
+    fn glyph(pen_x: f32, pen_y: f32, entry: &GlyphEntry, color: Color) -> Self {
+        Self {
+            pos: [pen_x + entry.left as f32, pen_y - entry.top as f32],
+            size: [entry.width, entry.height],
+            uv_min: entry.uv_min,
+            uv_max: entry.uv_max,
+            color: [color.r, color.g, color.b, color.a],
         }
     }
 }
@@ -38,6 +66,8 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     screen_buffer: wgpu::Buffer,
     screen_bind_group: wgpu::BindGroup,
+    atlas: Atlas,
+    atlas_bind_group: wgpu::BindGroup,
 }
 
 impl Renderer {
@@ -102,22 +132,67 @@ impl Renderer {
             }],
         });
 
+        // The glyph atlas plus its sampler live in bind group 1. Linear filtering
+        // smooths the coverage; the white texel is constant so fills are unaffected.
+        let atlas = Atlas::new(&device, &queue);
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("atlas sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let atlas_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("atlas bind group layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("atlas bind group"),
+            layout: &atlas_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&atlas.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rect shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("rect.wgsl").into()),
+            label: Some("quad shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("quad.wgsl").into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("rect pipeline layout"),
-            bind_group_layouts: &[Some(&screen_layout)],
+            label: Some("quad pipeline layout"),
+            bind_group_layouts: &[Some(&screen_layout), Some(&atlas_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("rect pipeline"),
+            label: Some("quad pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Some(RectInstance::layout())],
+                buffers: &[Some(QuadInstance::layout())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -148,6 +223,8 @@ impl Renderer {
             pipeline,
             screen_buffer,
             screen_bind_group,
+            atlas,
+            atlas_bind_group,
         })
     }
 
@@ -158,10 +235,17 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Draw `list` over a `clear` background and present. Runs of filled rects
-    /// under the same clip are batched into one instanced draw; a `PushClip` or
-    /// `PopClip` flushes the current batch and updates the scissor.
-    pub fn render(&mut self, list: &DrawList, clear: Color) -> Result<(), RenderError> {
+    /// Draw `list` over a `clear` background and present. Runs of quads (fills and
+    /// glyphs) under the same clip are batched into one instanced draw; a
+    /// `PushClip`/`PopClip` flushes the current batch and updates the scissor.
+    /// `font_system` supplies the glyphs the draw list references, rasterized into
+    /// the atlas on first use.
+    pub fn render(
+        &mut self,
+        list: &DrawList,
+        font_system: &mut FontSystem,
+        clear: Color,
+    ) -> Result<(), RenderError> {
         let (sw, sh) = (self.config.width as f32, self.config.height as f32);
         self.queue.write_buffer(
             &self.screen_buffer,
@@ -186,14 +270,16 @@ impl Renderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         // Translate the command list into an instance buffer plus a set of
-        // (scissor, instance range) draws.
-        let mut instances: Vec<RectInstance> = Vec::new();
+        // (scissor, instance range) draws. Glyphs are rasterized into the atlas
+        // as they are first encountered here (queued before the pass runs).
+        let white_uv = self.atlas.white_uv;
+        let mut instances: Vec<QuadInstance> = Vec::new();
         let mut draws: Vec<(Scissor, std::ops::Range<u32>)> = Vec::new();
         let mut clips: Vec<Rect> = Vec::new();
         let mut batch_start: u32 = 0;
         let mut scissor = Scissor::of(&clips, sw, sh);
 
-        let flush = |instances: &[RectInstance],
+        let flush = |instances: &[QuadInstance],
                      draws: &mut Vec<(Scissor, std::ops::Range<u32>)>,
                      batch_start: &mut u32,
                      scissor: Scissor| {
@@ -207,15 +293,22 @@ impl Renderer {
         };
 
         for cmd in &list.commands {
-            match *cmd {
-                DrawCommand::FillRect { rect, color } => instances.push(RectInstance {
-                    pos: rect.pos.to_array(),
-                    size: rect.size.to_array(),
-                    color: [color.r, color.g, color.b, color.a],
-                }),
+            match cmd {
+                DrawCommand::FillRect { rect, color } => {
+                    instances.push(QuadInstance::fill(*rect, *color, white_uv));
+                }
+                DrawCommand::Text { glyphs, color } => {
+                    for g in glyphs {
+                        if let Some(entry) =
+                            self.atlas.ensure(&self.queue, font_system, g.cache_key)
+                        {
+                            instances.push(QuadInstance::glyph(g.x, g.y, &entry, *color));
+                        }
+                    }
+                }
                 DrawCommand::PushClip { rect } => {
                     flush(&instances, &mut draws, &mut batch_start, scissor);
-                    clips.push(rect);
+                    clips.push(*rect);
                     scissor = Scissor::of(&clips, sw, sh);
                 }
                 DrawCommand::PopClip => {
@@ -230,7 +323,7 @@ impl Renderer {
         let instance_buffer = (!instances.is_empty()).then(|| {
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("rect instances"),
+                    label: Some("quad instances"),
                     contents: bytemuck::cast_slice(&instances),
                     usage: wgpu::BufferUsages::VERTEX,
                 })
@@ -265,6 +358,7 @@ impl Renderer {
             if let Some(buffer) = &instance_buffer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.screen_bind_group, &[]);
+                pass.set_bind_group(1, &self.atlas_bind_group, &[]);
                 pass.set_vertex_buffer(0, buffer.slice(..));
                 for (scissor, range) in &draws {
                     let Scissor::Rect([x, y, w, h]) = scissor else {

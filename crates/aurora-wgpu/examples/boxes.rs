@@ -69,7 +69,11 @@ impl ApplicationHandler for App {
                     .layout(Vec2::new(size.width as f32, size.height as f32))
                     .unwrap();
                 let list = state.ui.draw_list();
-                if let Err(err) = state.renderer.render(&list, Color::rgb(0.08, 0.08, 0.10)) {
+                let clear = Color::rgb(0.08, 0.08, 0.10);
+                if let Err(err) = state
+                    .renderer
+                    .render(&list, state.ui.font_system_mut(), clear)
+                {
                     eprintln!("render error: {err}");
                 }
             }
@@ -90,18 +94,32 @@ fn build_ui() -> Ui {
             .clip()
             .background(Color::rgb(0.15, 0.16, 0.20)),
     );
+    // A heading to show text rendering (M2 step 3).
+    ui.label(
+        root,
+        "Aurora - boxes and text",
+        Style::new().foreground(Color::rgb(0.95, 0.95, 0.98)),
+    );
+
     let colors = [
-        Color::rgb(0.85, 0.30, 0.30),
-        Color::rgb(0.30, 0.75, 0.40),
-        Color::rgb(0.30, 0.55, 0.90),
-        Color::rgb(0.85, 0.75, 0.30),
+        ("crimson", Color::rgb(0.85, 0.30, 0.30)),
+        ("emerald", Color::rgb(0.30, 0.75, 0.40)),
+        ("azure", Color::rgb(0.30, 0.55, 0.90)),
+        ("amber", Color::rgb(0.85, 0.75, 0.30)),
     ];
-    for (i, color) in colors.into_iter().enumerate() {
-        ui.panel(
+    for (i, (name, color)) in colors.into_iter().enumerate() {
+        // Each box is a padded row containing a label, so text sits inside it.
+        let box_id = ui.panel(
             root,
             Style::new()
                 .size(240.0, 40.0 + i as f32 * 16.0)
+                .padding(8.0)
                 .background(color),
+        );
+        ui.label(
+            box_id,
+            name,
+            Style::new().foreground(Color::rgb(0.10, 0.10, 0.12)),
         );
     }
     ui

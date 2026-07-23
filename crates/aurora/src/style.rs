@@ -10,18 +10,31 @@ use crate::color::Color;
 ///
 /// Build it fluently:
 /// `Style::new().column().padding(8.0).gap(4.0).background(Color::rgb(0.1, 0.1, 0.12))`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Style {
     /// The taffy layout style.
     pub layout: taffy::Style,
     /// Background fill. `Color::TRANSPARENT` (the default) draws nothing.
     pub background: Color,
+    /// Text color, for widgets that draw text.
+    pub foreground: Color,
     /// Clip children to this widget's rectangle.
     pub clip: bool,
 }
 
+impl Default for Style {
+    fn default() -> Self {
+        Self {
+            layout: taffy::Style::default(),
+            background: Color::TRANSPARENT,
+            foreground: Color::WHITE,
+            clip: false,
+        }
+    }
+}
+
 impl Style {
-    /// A default style: auto layout, transparent, no clip.
+    /// A default style: auto layout, transparent background, white text, no clip.
     pub fn new() -> Self {
         Self::default()
     }
@@ -89,6 +102,12 @@ impl Style {
     /// Set the background fill color.
     pub fn background(mut self, color: Color) -> Self {
         self.background = color;
+        self
+    }
+
+    /// Set the text (foreground) color.
+    pub fn foreground(mut self, color: Color) -> Self {
+        self.foreground = color;
         self
     }
 

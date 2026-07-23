@@ -37,6 +37,8 @@ pub(crate) struct Widget {
     pub children: Vec<WidgetId>,
     /// Background fill (visual style, not layout). Transparent draws nothing.
     pub background: Color,
+    /// Text color, for widgets that draw text.
+    pub foreground: Color,
     /// Whether children are clipped to this widget's rectangle.
     pub clip: bool,
 }

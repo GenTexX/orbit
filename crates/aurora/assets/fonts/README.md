@@ -1,0 +1,15 @@
+# Bundled fonts
+
+## DejaVu Sans (`DejaVuSans.ttf`)
+
+Aurora bundles DejaVu Sans as its default UI font so text rendering is
+deterministic and does not depend on whatever fonts a host system happens to
+have installed (see ADR 0013).
+
+- Source: the DejaVu Fonts project, https://dejavu-fonts.github.io/
+- License: a permissive, free license derived from the Bitstream Vera Fonts
+  license plus a public-domain grant for the DejaVu changes. It allows
+  redistribution and bundling. Full terms:
+  https://dejavu-fonts.github.io/License.html
+
+The font is unmodified from its upstream release.

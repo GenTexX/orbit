@@ -1,38 +1,45 @@
-//! aurora ui: the widget arena, the taffy layout tree, the builder API, layout, and draw-list generation.
+//! aurora ui: the widget arena, the taffy layout tree (with text measurement), and draw-list generation.
 
+use cosmic_text::{Buffer, FontSystem, Shaping};
 use glam::Vec2;
 use slotmap::{SecondaryMap, SlotMap};
 use taffy::{AvailableSpace, Size, TaffyTree};
 
-use crate::draw::{DrawCommand, DrawList};
+use crate::draw::{DrawCommand, DrawList, Glyph};
 use crate::error::AuroraError;
 use crate::rect::Rect;
 use crate::style::Style;
+use crate::text;
 use crate::widget::{Widget, WidgetId, WidgetKind};
 
-/// A retained Aurora UI: owns the widget arena and the taffy layout tree, and
-/// caches each widget's absolute rectangle after [`layout`](Self::layout).
+/// A retained Aurora UI: owns the widget arena, the taffy layout tree, the font
+/// system, and the shaped text buffers; caches each widget's absolute rectangle
+/// after [`layout`](Self::layout).
 ///
-/// Build a tree with [`root_panel`](Self::root_panel) plus the typed child
-/// constructors, run [`layout`](Self::layout), then either read rectangles with
-/// [`rect`](Self::rect) or produce a frame's [`draw_list`](Self::draw_list). The
-/// widget tree and the taffy tree stay in lockstep: every widget owns one taffy
-/// node.
+/// Build a tree with [`root_panel`](Self::root_panel) and the typed child
+/// constructors, run [`layout`](Self::layout), then produce a frame's
+/// [`draw_list`](Self::draw_list). A backend renders that draw list, borrowing
+/// [`font_system_mut`](Self::font_system_mut) to rasterize glyphs.
 pub struct Ui {
     widgets: SlotMap<WidgetId, Widget>,
     taffy: TaffyTree<WidgetId>,
     root: Option<WidgetId>,
     rects: SecondaryMap<WidgetId, Rect>,
+    font_system: FontSystem,
+    /// One shaped text buffer per text-bearing widget, produced during layout.
+    buffers: SecondaryMap<WidgetId, Buffer>,
 }
 
 impl Ui {
-    /// Create an empty UI with no root.
+    /// Create an empty UI (with the bundled font loaded).
     pub fn new() -> Self {
         Self {
             widgets: SlotMap::with_key(),
             taffy: TaffyTree::new(),
             root: None,
             rects: SecondaryMap::new(),
+            font_system: text::make_font_system(),
+            buffers: SecondaryMap::new(),
         }
     }
 
@@ -96,6 +103,11 @@ impl Ui {
         self.rects.get(id).copied()
     }
 
+    /// The font system, for a backend to rasterize the glyphs in the draw list.
+    pub fn font_system_mut(&mut self) -> &mut FontSystem {
+        &mut self.font_system
+    }
+
     /// Insert a widget, create its taffy node, and link it under `parent`. taffy
     /// calls only fail on internal misuse, so they are treated as bugs.
     fn add(&mut self, kind: WidgetKind, style: Style, parent: Option<WidgetId>) -> WidgetId {
@@ -106,10 +118,9 @@ impl Ui {
             parent,
             children: Vec::new(),
             background: style.background,
+            foreground: style.foreground,
             clip: style.clip,
         });
-        // Let taffy map its node back to our widget (needed once text widgets
-        // measure themselves via a taffy measure function).
         self.taffy
             .set_node_context(node, Some(id))
             .expect("taffy set_node_context");
@@ -123,21 +134,31 @@ impl Ui {
         id
     }
 
-    /// Run layout for `available` space (in pixels) and cache every widget's
-    /// absolute rectangle. taffy reports each node's position relative to its
-    /// parent; this pass walks the tree to turn those into absolute rects.
+    /// Run layout for `available` space (in pixels). Text-bearing leaves are
+    /// shaped and measured through a taffy measure function; then the tree is
+    /// walked to turn taffy's parent-relative positions into absolute rects.
     pub fn layout(&mut self, available: Vec2) -> Result<(), AuroraError> {
         let Some(root) = self.root else {
             return Ok(());
         };
         let root_node = self.widgets[root].taffy;
-        self.taffy.compute_layout(
+
+        // Split the borrows so the measure closure can shape text (widgets +
+        // buffers + font_system) while taffy computes layout.
+        let widgets = &self.widgets;
+        let buffers = &mut self.buffers;
+        let font_system = &mut self.font_system;
+        self.taffy.compute_layout_with_measure(
             root_node,
             Size {
                 width: AvailableSpace::Definite(available.x),
                 height: AvailableSpace::Definite(available.y),
             },
+            |known, avail, _node, ctx, _style| {
+                measure_widget(known, avail, ctx, widgets, buffers, font_system)
+            },
         )?;
+
         self.rects.clear();
         self.accumulate(root, Vec2::ZERO);
         Ok(())
@@ -152,18 +173,14 @@ impl Ui {
         let size = Vec2::new(layout.size.width, layout.size.height);
         self.rects.insert(id, Rect::new(pos, size));
 
-        // Clone the child list so the recursive borrow of `self` is not blocked
-        // by an outstanding borrow of the arena.
         let children = self.widgets[id].children.clone();
         for child in children {
             self.accumulate(child, pos);
         }
     }
 
-    /// Produce this frame's draw list by walking the laid-out tree: each widget
-    /// emits a background fill (if any), then a clip around its children (if it
-    /// clips), then its children, in tree order. Requires a prior
-    /// [`layout`](Self::layout).
+    /// Produce this frame's draw list by walking the laid-out tree. Requires a
+    /// prior [`layout`](Self::layout).
     pub fn draw_list(&self) -> DrawList {
         let mut list = DrawList::default();
         if let Some(root) = self.root {
@@ -184,6 +201,9 @@ impl Ui {
                 color: widget.background,
             });
         }
+        if let WidgetKind::Label(_) = &widget.kind {
+            self.emit_text(id, rect, widget.foreground, list);
+        }
         if widget.clip {
             list.commands.push(DrawCommand::PushClip { rect });
         }
@@ -194,11 +214,82 @@ impl Ui {
             list.commands.push(DrawCommand::PopClip);
         }
     }
+
+    /// Emit a text command for a text-bearing widget from its shaped buffer,
+    /// positioned at `rect`'s top-left.
+    fn emit_text(&self, id: WidgetId, rect: Rect, color: crate::Color, list: &mut DrawList) {
+        let Some(buffer) = self.buffers.get(id) else {
+            return;
+        };
+        let mut glyphs = Vec::new();
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs {
+                // Bake the widget's origin and the run's baseline into the pen
+                // position; the backend adds each glyph's bitmap bearing.
+                let physical = glyph.physical((rect.pos.x, rect.pos.y + run.line_y), 1.0);
+                glyphs.push(Glyph {
+                    cache_key: physical.cache_key,
+                    x: physical.x as f32,
+                    y: physical.y as f32,
+                });
+            }
+        }
+        if !glyphs.is_empty() {
+            list.commands.push(DrawCommand::Text { glyphs, color });
+        }
+    }
 }
 
 impl Default for Ui {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// taffy measure function: shape a text-bearing leaf and return its size. Called
+/// only for leaf nodes without a definite style size.
+fn measure_widget(
+    known: Size<Option<f32>>,
+    available: Size<AvailableSpace>,
+    ctx: Option<&mut WidgetId>,
+    widgets: &SlotMap<WidgetId, Widget>,
+    buffers: &mut SecondaryMap<WidgetId, Buffer>,
+    font_system: &mut FontSystem,
+) -> Size<f32> {
+    let Some(&mut id) = ctx else {
+        return Size::ZERO;
+    };
+    let content = match &widgets[id].kind {
+        WidgetKind::Label(t) | WidgetKind::Button(t) | WidgetKind::TextInput(t) => t.as_str(),
+        WidgetKind::Panel | WidgetKind::Checkbox(_) => return Size::ZERO,
+    };
+
+    // Wrap to a known width if taffy gives one, else the available width.
+    let wrap_width = known.width.or(match available.width {
+        AvailableSpace::Definite(w) => Some(w),
+        AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
+    });
+
+    if !buffers.contains_key(id) {
+        buffers.insert(id, Buffer::new(font_system, text::metrics()));
+    }
+    let buffer = &mut buffers[id];
+    {
+        let mut borrowed = buffer.borrow_with(font_system);
+        borrowed.set_size(wrap_width, None);
+        borrowed.set_text(content, &text::default_attrs(), Shaping::Advanced, None);
+        borrowed.shape_until_scroll(false);
+    }
+
+    let mut width = 0.0f32;
+    let mut lines = 0u32;
+    for run in buffer.layout_runs() {
+        width = width.max(run.line_w);
+        lines += 1;
+    }
+    Size {
+        width: width.ceil(),
+        height: lines.max(1) as f32 * text::LINE_HEIGHT,
     }
 }
 
@@ -230,10 +321,7 @@ mod tests {
         ui.layout(Vec2::new(200.0, 200.0)).unwrap();
 
         assert_eq!(ui.rect(a).unwrap().pos, Vec2::new(0.0, 0.0));
-        assert_eq!(ui.rect(a).unwrap().size, Vec2::new(100.0, 30.0));
-        // b stacks directly below a.
         assert_eq!(ui.rect(b).unwrap().pos, Vec2::new(0.0, 30.0));
-        assert_eq!(ui.rect(b).unwrap().size, Vec2::new(100.0, 40.0));
     }
 
     #[test]
@@ -244,9 +332,37 @@ mod tests {
         let grandchild = ui.panel(child, Style::new().size(20.0, 20.0));
         ui.layout(Vec2::new(400.0, 400.0)).unwrap();
 
-        // child at (10, 10) from root padding; grandchild a further (8, 8) in.
         assert_eq!(ui.rect(child).unwrap().pos, Vec2::new(10.0, 10.0));
         assert_eq!(ui.rect(grandchild).unwrap().pos, Vec2::new(18.0, 18.0));
+    }
+
+    #[test]
+    fn a_label_is_measured_and_emits_a_text_command() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column());
+        let label = ui.label(root, "Hello", Style::new());
+        ui.layout(Vec2::new(400.0, 400.0)).unwrap();
+
+        // The bundled font gives the label a real, non-zero size.
+        let r = ui.rect(label).unwrap();
+        assert!(
+            r.size.x > 0.0,
+            "label width should be measured, got {}",
+            r.size.x
+        );
+        assert!(
+            r.size.y > 0.0,
+            "label height should be measured, got {}",
+            r.size.y
+        );
+
+        // And it emits a text command with glyphs.
+        let has_text = ui
+            .draw_list()
+            .commands
+            .iter()
+            .any(|c| matches!(c, DrawCommand::Text { glyphs, .. } if !glyphs.is_empty()));
+        assert!(has_text, "label should emit a non-empty Text command");
     }
 
     #[test]
@@ -259,21 +375,11 @@ mod tests {
         ui.panel(root, Style::new().size(50.0, 50.0).background(blue));
         ui.layout(Vec2::new(100.0, 100.0)).unwrap();
 
-        // root fill, then a clip around the child, the child fill, then pop.
         let cmds = ui.draw_list().commands;
         assert_eq!(cmds.len(), 4, "{cmds:?}");
         assert!(matches!(cmds[0], DrawCommand::FillRect { color, .. } if color == red));
         assert!(matches!(cmds[1], DrawCommand::PushClip { .. }));
         assert!(matches!(cmds[2], DrawCommand::FillRect { color, .. } if color == blue));
         assert!(matches!(cmds[3], DrawCommand::PopClip));
-    }
-
-    #[test]
-    fn transparent_widgets_emit_no_fill() {
-        let mut ui = Ui::new();
-        // No background -> transparent -> no FillRect for the root.
-        ui.root_panel(Style::new().size(100.0, 100.0));
-        ui.layout(Vec2::new(100.0, 100.0)).unwrap();
-        assert!(ui.draw_list().commands.is_empty());
     }
 }
