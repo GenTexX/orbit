@@ -19,16 +19,15 @@ this list is what "come back and make the editor great" concretely means.
 - **Scrollbar interactions**: dragging the thumb, clicking the track to
   page, and keyboard scrolling (PgUp/PgDn/Home/End) - the wheel-only
   scrolling that shipped covers the common case but not these.
-- **Text selection** in inputs (shift+arrows, mouse sweep), plus
-  **clipboard** (ctrl+c/x/v via winit/arboard) - editing fields without
-  selection gets old fast.
-- **Tab focus traversal** between inputs (and Enter moving to the next row in
-  the inspector, spreadsheet-style).
+- **Enter moves to the next inspector row** (spreadsheet-style), building on
+  the shipped tab traversal.
 - **Popup layer shipped** (right-click context menus ride on it). Still open,
   now unblocked: **dropdown/select widget**, **tooltips** on hover (popup +
   timer), **modal dialogs** (popup + input block behind), and richer context
   menus (submenus, separators, icons, keyboard nav).
-- **Sliders and numeric steppers** (drag a value, click tiny +/- arrows).
+- **Numeric steppers** (tiny +/- arrows on a numeric field to nudge the
+  value) - the slider and the inspector drag-scrub shipped; discrete steppers
+  did not.
 - **Icons.** Everything is text; icons would transform the toolbar, tree rows
   (node type icons, visibility eyes), and file list. Open question on the
   format: a bitmap atlas (same machinery as the glyph atlas, simplest), SVG
@@ -47,9 +46,8 @@ this list is what "come back and make the editor great" concretely means.
   theming-as-data.
 - **Input placeholders**: greyed hint text shown in an empty field (e.g.
   "search...", "name").
-- **Input validation / masking**: a field that rejects disallowed characters
-  as you type (numeric-only, integer, hex color) - the framework-level
-  primitive the inspector's numeric fields build on.
+- **Richer input masks**: numeric masking shipped; integer-only and hex-color
+  masks would round it out (the color picker will want hex).
 - **Anti-aliasing** for the UI: rounded-rect and rotated-line edges are hard
   today (single-sample quads). MSAA on the aurora-wgpu pass, or SDF-based
   shapes, for crisp edges - also helps photon's gizmo overlay lines.
@@ -138,9 +136,6 @@ this list is what "come back and make the editor great" concretely means.
 
 ## Inspector fields
 
-- **Numeric fields**: accept only numbers while typing; for `Vec2`, two
-  inputs labeled `x` and `y` in the engine axis colors (X red, Y green).
-  Drag-to-scrub on the field's label.
 - **Asset fields**: an asset-chooser popup (needs popups), and/or drag a file
   from the explorer onto the field.
 - **Color fields**: a color picker (needs popups); until then at least a
