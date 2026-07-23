@@ -47,6 +47,8 @@ pub enum Key {
     End,
     /// Submit the focused field's current text (e.g. commit an edit).
     Enter,
+    /// Move focus to the next input (or the previous one, with shift held).
+    Tab,
 }
 
 /// What the mouse cursor should look like over the current hover target. The

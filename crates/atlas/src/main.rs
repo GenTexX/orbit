@@ -1104,6 +1104,7 @@ fn translate_key(event: &winit::event::KeyEvent) -> Vec<InputEvent> {
         WinitKey::Named(NamedKey::Home) => Some(Key::Home),
         WinitKey::Named(NamedKey::End) => Some(Key::End),
         WinitKey::Named(NamedKey::Enter) => Some(Key::Enter),
+        WinitKey::Named(NamedKey::Tab) => Some(Key::Tab),
         _ => None,
     };
     if let Some(key) = named {

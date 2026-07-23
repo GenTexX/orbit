@@ -708,6 +708,11 @@ impl Ui {
             self.events.push(Event::Submitted(id));
             return;
         }
+        // Tab steps focus to the next (or previous, with shift) input.
+        if key == Key::Tab {
+            self.focus_step(if self.shift { -1 } else { 1 });
+            return;
+        }
         // Backspace/Delete over a selection remove it as a unit.
         if matches!(key, Key::Backspace | Key::Delete) && self.delete_selection() {
             return;
@@ -746,7 +751,7 @@ impl Ui {
             }
             // Backspace at the start / Delete at the end: nothing to remove.
             Key::Backspace | Key::Delete => self.caret = caret,
-            Key::Enter => unreachable!("handled above"),
+            Key::Enter | Key::Tab => unreachable!("handled above"),
         }
         if edited {
             self.invalidate_text(id);
@@ -795,6 +800,44 @@ impl Ui {
             }
         }
         x
+    }
+
+    /// The focusable inputs in tree (pre-order) order - the tab ring.
+    fn focus_ring(&self) -> Vec<WidgetId> {
+        let mut ring = Vec::new();
+        if let Some(root) = self.root {
+            self.collect_focusable(root, &mut ring);
+        }
+        ring
+    }
+
+    fn collect_focusable(&self, id: WidgetId, ring: &mut Vec<WidgetId>) {
+        if matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
+            ring.push(id);
+        }
+        for &child in &self.widgets[id].children {
+            self.collect_focusable(child, ring);
+        }
+    }
+
+    /// Step focus by `dir` (+1 next, -1 previous) around the tab ring, wrapping
+    /// at the ends. The newly focused field is selected whole (the tab-in
+    /// convention), ready to be overtyped.
+    fn focus_step(&mut self, dir: i32) {
+        let ring = self.focus_ring();
+        if ring.is_empty() {
+            return;
+        }
+        let len = ring.len() as i32;
+        let next = match self.focused.and_then(|f| ring.iter().position(|&w| w == f)) {
+            Some(i) => (i as i32 + dir).rem_euclid(len) as usize,
+            None if dir > 0 => 0,
+            None => (len - 1) as usize,
+        };
+        let id = ring[next];
+        self.focused = Some(id);
+        self.caret = self.text_len(id);
+        self.selection_anchor = Some(0);
     }
 
     /// The byte length of a text input's contents (0 for other kinds).
@@ -1530,6 +1573,35 @@ mod tests {
         ui.handle_input(InputEvent::Text('c'));
         assert_eq!(text_of(&ui, field), "abc");
         assert_eq!(ui.caret, 3);
+    }
+
+    #[test]
+    fn tab_moves_focus_around_the_ring_and_selects_the_field() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(200.0, 200.0));
+        let a = ui.text_input(root, "aaa", Style::new().size(200.0, 24.0));
+        let b = ui.text_input(root, "bbb", Style::new().size(200.0, 24.0));
+        let c = ui.text_input(root, "ccc", Style::new().size(200.0, 24.0));
+        ui.layout(Vec2::new(200.0, 200.0)).unwrap();
+
+        click_at(&mut ui, Vec2::new(10.0, 12.0)); // focus the first
+        assert_eq!(ui.focused(), Some(a));
+
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        assert_eq!(ui.focused(), Some(b));
+        // Tab-in selects the whole field, ready to overtype.
+        assert_eq!(ui.selected_text().as_deref(), Some("bbb"));
+
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        assert_eq!(ui.focused(), Some(c));
+        // Wraps around to the first.
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        assert_eq!(ui.focused(), Some(a));
+
+        // Shift+Tab steps backwards (wrapping to the last).
+        ui.set_shift(true);
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        assert_eq!(ui.focused(), Some(c));
     }
 
     #[test]
