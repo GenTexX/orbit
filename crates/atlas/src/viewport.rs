@@ -31,6 +31,10 @@ const GRAB_RADIUS_PX: f32 = 10.0;
 const ARROW_PX: f32 = 56.0;
 /// How far above the sprite's top edge the rotate handle floats.
 const ROTATE_OFFSET_PX: f32 = 26.0;
+/// Thickness of the full-viewport guide line shown during an axis drag.
+const GUIDE_PX: f32 = 1.5;
+/// The guide line's translucency (drawn in the dragged axis's color).
+const GUIDE_ALPHA: f32 = 0.55;
 
 /// The editor's pan/zoom view of the scene: `pan` is the world coordinate at
 /// the viewport's top-left (photon's own camera anchor), `zoom` is screen
@@ -262,6 +266,53 @@ pub fn gizmo_sprites(gizmo: &Gizmo, zoom: f32) -> Vec<Sprite> {
     ]
 }
 
+/// The full-viewport guide line for an axis-constrained drag, in the dragged
+/// axis's color: a translucent line through the motion (or scale) axis,
+/// spanning the whole visible view - the visual cue for "you are locked to
+/// this axis". `None` for drags with no axis to show.
+pub fn axis_guide_sprite(
+    drag: &Drag,
+    scene: &Scene,
+    camera: &EditorCamera,
+    viewport_px: Vec2,
+) -> Option<Sprite> {
+    let (point, dir, vertical) = match *drag {
+        // The node's current world origin always lies on the motion line.
+        Drag::MoveAxis {
+            node,
+            axis_world,
+            vertical,
+            ..
+        } => (
+            scene.world_transform(node).transform_point2(Vec2::ZERO),
+            axis_world,
+            vertical,
+        ),
+        // A per-axis scale stretches along the axis through its pivot.
+        Drag::ScaleAxis {
+            pivot,
+            axis_world,
+            vertical,
+            ..
+        } => (pivot, axis_world, vertical),
+        _ => return None,
+    };
+
+    // Long enough to cross the whole view from any on-screen point: the
+    // visible world rectangle's diagonal, extended both ways.
+    let len = (viewport_px / camera.zoom).length();
+    let t = GUIDE_PX / camera.zoom;
+    let color = if vertical { AXIS_Y } else { AXIS_X };
+
+    let mut s = Sprite::new(
+        point - dir * len - dir.perp() * (t * 0.5),
+        Vec2::new(len * 2.0, t),
+    );
+    s.rotation = dir.to_angle();
+    s.tint = Color::new(color.r, color.g, color.b, GUIDE_ALPHA);
+    Some(s)
+}
+
 /// An in-progress viewport drag. Each records the transform at press time and
 /// applies its math from that original - a release commits one clean undo step.
 /// With sprites centered on the node origin (ADR 0019), every drag edits
@@ -275,11 +326,13 @@ pub enum Drag {
         grab_world: Vec2,
     },
     /// Moving along one world-space axis direction only (a gizmo arrow).
+    /// `vertical` says which local axis (for the guide line's color).
     MoveAxis {
         node: NodeId,
         original: Transform,
         grab_world: Vec2,
         axis_world: Vec2,
+        vertical: bool,
     },
     /// Rotating about the origin: `grab_angle` is the cursor's angle about
     /// `pivot` (the node's world origin at press time).
@@ -337,6 +390,7 @@ impl Drag {
                 original,
                 grab_world,
                 axis_world,
+                ..
             } => {
                 // Only the component of the cursor delta along the axis moves
                 // the node - the constrained translate of a gizmo arrow.
@@ -551,6 +605,7 @@ mod tests {
             original: scene.node(node).transform,
             grab_world: Vec2::new(20.0, 20.0),
             axis_world: Vec2::X,
+            vertical: false,
         };
         // A diagonal cursor move: only its X component applies.
         let moved = drag.apply(&scene, Vec2::new(50.0, 80.0));
@@ -619,5 +674,38 @@ mod tests {
         let scaled = drag.apply(&scene, center + Vec2::new(40.0, 0.0));
         assert!((scaled.scale - Vec2::new(2.0, 1.0)).length() < EPS);
         assert!((scaled.translation - original.translation).length() < EPS);
+    }
+
+    #[test]
+    fn an_axis_drag_shows_a_full_viewport_guide_line() {
+        let (scene, node) = scene_with_sprite(Vec2::new(100.0, 100.0), Vec2::new(40.0, 20.0));
+        let cam = EditorCamera::default();
+        let viewport_px = Vec2::new(800.0, 600.0);
+
+        let drag = Drag::MoveAxis {
+            node,
+            original: scene.node(node).transform,
+            grab_world: Vec2::new(100.0, 100.0),
+            axis_world: Vec2::X,
+            vertical: false,
+        };
+        let guide =
+            axis_guide_sprite(&drag, &scene, &cam, viewport_px).expect("axis drags have a guide");
+        // Long enough to cross the whole view from the node's origin (the
+        // visible diagonal both ways), thin, and along +X.
+        assert!(guide.size.x >= viewport_px.length() * 2.0 - EPS);
+        assert!((guide.size.y - GUIDE_PX).abs() < EPS);
+        assert!(guide.rotation.abs() < EPS);
+        // The line's long midline passes through the node's world origin.
+        let mid_y = guide.position.y + guide.size.y * 0.5;
+        assert!((mid_y - 100.0).abs() < EPS);
+
+        // A free move has no axis, so no guide.
+        let free = Drag::Move {
+            node,
+            original: scene.node(node).transform,
+            grab_world: Vec2::ZERO,
+        };
+        assert!(axis_guide_sprite(&free, &scene, &cam, viewport_px).is_none());
     }
 }

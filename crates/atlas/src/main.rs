@@ -299,12 +299,14 @@ impl State {
                     original,
                     grab_world: world,
                     axis_world: g.axis_x,
+                    vertical: false,
                 },
                 GizmoHit::MoveY => Drag::MoveAxis {
                     node: sel,
                     original,
                     grab_world: world,
                     axis_world: g.axis_y,
+                    vertical: true,
                 },
                 GizmoHit::Rotate => Drag::Rotate {
                     node: sel,
@@ -481,12 +483,26 @@ impl State {
             &self.project.scene.sprites(),
         );
 
-        // The selection's outline and gizmo handles, drawn over the scene in a
-        // second pass (LoadOp::Load) with the tintable white texture.
+        // Editor overlays, drawn over the scene in a second pass (LoadOp::Load)
+        // with the tintable white texture: the axis guide line first (under),
+        // then the selection's outline and gizmo handles.
+        let mut overlay = Vec::new();
+        if let Some(drag) = &self.drag
+            && let Some(guide) = viewport::axis_guide_sprite(
+                drag,
+                &self.project.scene,
+                &self.camera,
+                Vec2::new(w as f32, h as f32),
+            )
+        {
+            overlay.push(guide);
+        }
         if let Some(sel) = self.selected
             && let Some(g) = viewport::gizmo(&self.project.scene, sel, self.camera.zoom)
         {
-            let overlay = viewport::gizmo_sprites(&g, self.camera.zoom);
+            overlay.extend(viewport::gizmo_sprites(&g, self.camera.zoom));
+        }
+        if !overlay.is_empty() {
             self.engine
                 .overlay_to_target(&self.scene_target, &camera, &self.white, &overlay);
         }
