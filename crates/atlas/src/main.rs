@@ -309,21 +309,18 @@ impl State {
                 GizmoHit::Rotate => Drag::Rotate {
                     node: sel,
                     original,
-                    half: g.half,
                     pivot: g.center,
                     grab_angle: (world - g.center).to_angle(),
                 },
                 GizmoHit::ScaleUniform => Drag::ScaleUniform {
                     node: sel,
                     original,
-                    half: g.half,
                     pivot: g.center,
                     grab_dist: world.distance(g.center),
                 },
                 GizmoHit::ScaleX => Drag::ScaleAxis {
                     node: sel,
                     original,
-                    half: g.half,
                     pivot: g.center,
                     axis_world: g.axis_x,
                     grab_proj: (world - g.center).dot(g.axis_x),
@@ -332,7 +329,6 @@ impl State {
                 GizmoHit::ScaleY => Drag::ScaleAxis {
                     node: sel,
                     original,
-                    half: g.half,
                     pivot: g.center,
                     axis_world: g.axis_y,
                     grab_proj: (world - g.center).dot(g.axis_y),

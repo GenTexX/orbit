@@ -1,12 +1,11 @@
 //! atlas viewport interaction: the editor pan/zoom camera, the selection gizmo
-//! (move arrows, center-pivot rotate, uniform and per-axis scale), and the
-//! pure math each drag applies (M3 step 7). Everything here is headless and
-//! unit-tested; main.rs only routes input into it.
+//! (move arrows, rotate, uniform and per-axis scale), and the pure math each
+//! drag applies (M3 step 7). Everything here is headless and unit-tested;
+//! main.rs only routes input into it.
 //!
-//! The model anchors a node at its top-left (photon rotates a sprite about its
-//! position), but the gizmo deliberately edits about the sprite's CENTER: a
-//! rotation or scale adjusts the translation too, so the center stays fixed -
-//! what users expect from an editor. One drag still commits as one transform.
+//! A sprite is centered on its node's origin (ADR 0019), so every drag edits
+//! exactly one transform property: rotating rotates, scaling scales, and the
+//! translation - the sprite's center - never moves under either.
 
 use glam::Vec2;
 use helios::{Component, NodeId, Scene, Transform};
@@ -90,13 +89,10 @@ impl EditorCamera {
 /// The selected node's gizmo, in world space: the sprite's oriented frame and
 /// every handle's anchor point.
 pub struct Gizmo {
-    /// The world center of the sprite's quad - the pivot rotate and scale
-    /// drags work about.
+    /// The node's origin = the sprite's center (ADR 0019) - the pivot every
+    /// rotate and scale works about, for free.
     pub center: Vec2,
-    /// The sprite's local half-extent (component size / 2, unscaled) - what
-    /// the center-pivot math needs to recompute the translation.
-    pub half: Vec2,
-    /// World top-left corner (the node's translation).
+    /// World top-left corner of the quad (for the outline).
     anchor: Vec2,
     /// The world-space quad size and rotation.
     size: Vec2,
@@ -146,23 +142,25 @@ pub fn gizmo(scene: &Scene, node: NodeId, zoom: f32) -> Option<Gizmo> {
     let affine = scene.world_transform(node);
     let (scale, angle, translation) = affine.to_scale_angle_translation();
     let size = scale * sprite_size;
+    let half = sprite_size * 0.5;
     let axis_x = Vec2::from_angle(angle);
     let axis_y = axis_x.perp();
-    let center = affine.transform_point2(sprite_size * 0.5);
+    // The quad is centered on the node's origin (ADR 0019): local space spans
+    // -half .. +half, and the origin is the natural pivot.
+    let center = translation;
     let arrow = ARROW_PX / zoom;
 
     Some(Gizmo {
         center,
-        half: sprite_size * 0.5,
-        anchor: translation,
+        anchor: affine.transform_point2(-half),
         size,
         angle,
         axis_x,
         axis_y,
         rotate_center: center - axis_y * (size.y * 0.5 + ROTATE_OFFSET_PX / zoom),
-        scale_corner: affine.transform_point2(sprite_size),
-        scale_x: affine.transform_point2(Vec2::new(sprite_size.x, sprite_size.y * 0.5)),
-        scale_y: affine.transform_point2(Vec2::new(sprite_size.x * 0.5, sprite_size.y)),
+        scale_corner: affine.transform_point2(half),
+        scale_x: affine.transform_point2(Vec2::new(half.x, 0.0)),
+        scale_y: affine.transform_point2(Vec2::new(0.0, half.y)),
         arrow_x_end: center + axis_x * arrow,
         arrow_y_end: center + axis_y * arrow,
         grab_radius: GRAB_RADIUS_PX / zoom,
@@ -264,23 +262,10 @@ pub fn gizmo_sprites(gizmo: &Gizmo, zoom: f32) -> Vec<Sprite> {
     ]
 }
 
-/// The sprite-quad center in *parent* space for a local transform: where the
-/// center-pivot drags hold the sprite still.
-fn center_in_parent(t: Transform, half: Vec2) -> Vec2 {
-    t.translation + Vec2::from_angle(t.rotation).rotate(t.scale * half)
-}
-
-/// The translation that puts the sprite-quad center at `center` (parent space)
-/// for the given rotation and scale - the inverse of [`center_in_parent`].
-fn translation_keeping_center(center: Vec2, rotation: f32, scale: Vec2, half: Vec2) -> Vec2 {
-    center - Vec2::from_angle(rotation).rotate(scale * half)
-}
-
 /// An in-progress viewport drag. Each records the transform at press time and
 /// applies its math from that original - a release commits one clean undo step.
-/// Rotation and scale pivot about the sprite's center (the translation moves to
-/// keep the center fixed), because that is what an editor user expects even
-/// though the model anchors at the top-left.
+/// With sprites centered on the node origin (ADR 0019), every drag edits
+/// exactly one property; nothing compensates anything.
 #[derive(Debug, Clone, Copy)]
 pub enum Drag {
     /// Moving the node body freely: `grab_world` is where the press landed.
@@ -296,31 +281,28 @@ pub enum Drag {
         grab_world: Vec2,
         axis_world: Vec2,
     },
-    /// Rotating about the sprite's center: `grab_angle` is the cursor's angle
-    /// about `pivot` (the world center at press time).
+    /// Rotating about the origin: `grab_angle` is the cursor's angle about
+    /// `pivot` (the node's world origin at press time).
     Rotate {
         node: NodeId,
         original: Transform,
-        half: Vec2,
         pivot: Vec2,
         grab_angle: f32,
     },
-    /// Uniformly scaling about the center: `grab_dist` is the cursor's
+    /// Uniformly scaling about the origin: `grab_dist` is the cursor's
     /// distance from the pivot at press time.
     ScaleUniform {
         node: NodeId,
         original: Transform,
-        half: Vec2,
         pivot: Vec2,
         grab_dist: f32,
     },
-    /// Scaling one local axis about the center: the cursor's offset from the
-    /// pivot is projected onto `axis_world`, and the ratio to the press-time
-    /// projection scales that component.
+    /// Scaling one local axis: the cursor's offset from the pivot is projected
+    /// onto `axis_world`, and the ratio to the press-time projection scales
+    /// that component.
     ScaleAxis {
         node: NodeId,
         original: Transform,
-        half: Vec2,
         pivot: Vec2,
         axis_world: Vec2,
         grab_proj: f32,
@@ -363,42 +345,33 @@ impl Drag {
             }
             Drag::Rotate {
                 original,
-                half,
                 pivot,
                 grab_angle,
                 ..
             } => {
                 // The change in the cursor's angle about the pivot is the same
                 // in world and parent-local space (a parent rotation offsets
-                // both by a constant), so it adds directly; the translation
-                // then moves to hold the center still.
-                let rotation = original.rotation + ((world - pivot).to_angle() - grab_angle);
-                let center = center_in_parent(original, half);
+                // both by a constant), so it adds directly. The pivot IS the
+                // translation (ADR 0019): nothing else moves.
                 Transform {
-                    rotation,
-                    translation: translation_keeping_center(center, rotation, original.scale, half),
+                    rotation: original.rotation + ((world - pivot).to_angle() - grab_angle),
                     ..original
                 }
             }
             Drag::ScaleUniform {
                 original,
-                half,
                 pivot,
                 grab_dist,
                 ..
             } => {
                 let k = (world.distance(pivot) / grab_dist.max(1.0e-3)).max(0.05);
-                let scale = original.scale * k;
-                let center = center_in_parent(original, half);
                 Transform {
-                    scale,
-                    translation: translation_keeping_center(center, original.rotation, scale, half),
+                    scale: original.scale * k,
                     ..original
                 }
             }
             Drag::ScaleAxis {
                 original,
-                half,
                 pivot,
                 axis_world,
                 grab_proj,
@@ -413,12 +386,7 @@ impl Drag {
                 } else {
                     scale.x *= k;
                 }
-                let center = center_in_parent(original, half);
-                Transform {
-                    scale,
-                    translation: translation_keeping_center(center, original.rotation, scale, half),
-                    ..original
-                }
+                Transform { scale, ..original }
             }
         }
     }
@@ -463,11 +431,9 @@ mod tests {
         (scene, id)
     }
 
-    /// The world center of `node`'s sprite quad, from its current transform.
-    fn world_center(scene: &Scene, node: NodeId, half: Vec2) -> Vec2 {
-        scene
-            .world_transform(node)
-            .transform_point2(half * 2.0 * 0.5)
+    /// The world center of `node`'s sprite quad - its origin (ADR 0019).
+    fn world_center(scene: &Scene, node: NodeId) -> Vec2 {
+        scene.world_transform(node).transform_point2(Vec2::ZERO)
     }
 
     #[test]
@@ -511,15 +477,17 @@ mod tests {
         let (scene, node) = scene_with_sprite(Vec2::new(100.0, 50.0), Vec2::new(60.0, 40.0));
         let g = gizmo(&scene, node, 1.0).expect("sprite node has a gizmo");
 
-        assert!((g.center - Vec2::new(130.0, 70.0)).length() < EPS);
-        assert!((g.scale_corner - Vec2::new(160.0, 90.0)).length() < EPS);
-        assert!((g.scale_x - Vec2::new(160.0, 70.0)).length() < EPS);
-        assert!((g.scale_y - Vec2::new(130.0, 90.0)).length() < EPS);
+        // The node's origin (100, 50) is the quad's center (ADR 0019); the
+        // quad spans (70, 30) .. (130, 70).
+        assert!((g.center - Vec2::new(100.0, 50.0)).length() < EPS);
+        assert!((g.scale_corner - Vec2::new(130.0, 70.0)).length() < EPS);
+        assert!((g.scale_x - Vec2::new(130.0, 50.0)).length() < EPS);
+        assert!((g.scale_y - Vec2::new(100.0, 70.0)).length() < EPS);
         // Unrotated: the rotate handle floats above the top mid-edge, and the
         // arrows point along +X and +Y from the center.
-        assert!((g.rotate_center - Vec2::new(130.0, 50.0 - 26.0)).length() < EPS);
-        assert!((g.arrow_x_end - Vec2::new(130.0 + 56.0, 70.0)).length() < EPS);
-        assert!((g.arrow_y_end - Vec2::new(130.0, 70.0 + 56.0)).length() < EPS);
+        assert!((g.rotate_center - Vec2::new(100.0, 30.0 - 26.0)).length() < EPS);
+        assert!((g.arrow_x_end - Vec2::new(100.0 + 56.0, 50.0)).length() < EPS);
+        assert!((g.arrow_y_end - Vec2::new(100.0, 50.0 + 56.0)).length() < EPS);
 
         assert_eq!(hit_gizmo(&g, g.rotate_center), Some(GizmoHit::Rotate));
         assert_eq!(hit_gizmo(&g, g.scale_corner), Some(GizmoHit::ScaleUniform));
@@ -590,68 +558,59 @@ mod tests {
     }
 
     #[test]
-    fn rotation_pivots_about_the_sprite_center() {
+    fn rotation_pivots_about_the_origin_and_moves_nothing_else() {
         let (mut scene, node) = scene_with_sprite(Vec2::new(100.0, 100.0), Vec2::new(40.0, 20.0));
-        let half = Vec2::new(20.0, 10.0);
-        let center_before = world_center(&scene, node, half);
+        let center_before = world_center(&scene, node);
         let original = scene.node(node).transform;
 
         let drag = Drag::Rotate {
             node,
             original,
-            half,
             pivot: center_before,
             grab_angle: 0.0,
         };
         // Drag to below the pivot: +90 degrees (Y-down world).
         let rotated = drag.apply(&scene, center_before + Vec2::new(0.0, 50.0));
         assert!((rotated.rotation - std::f32::consts::FRAC_PI_2).abs() < EPS);
+        // The translation is untouched - rotating pivots about the origin,
+        // which IS the sprite's center (ADR 0019).
+        assert!((rotated.translation - original.translation).length() < EPS);
 
-        // Apply it and verify the sprite's center did not move - the whole
-        // point of pivoting about the center rather than the anchor.
         scene.node_mut(node).transform = rotated;
-        let center_after = world_center(&scene, node, half);
-        assert!(
-            (center_before - center_after).length() < EPS,
-            "center moved: {center_before} -> {center_after}"
-        );
+        assert!((world_center(&scene, node) - center_before).length() < EPS);
     }
 
     #[test]
-    fn uniform_scale_pivots_about_the_center() {
+    fn uniform_scale_keeps_the_center_and_translation() {
         let (mut scene, node) = scene_with_sprite(Vec2::new(100.0, 100.0), Vec2::new(40.0, 20.0));
-        let half = Vec2::new(20.0, 10.0);
-        let center_before = world_center(&scene, node, half);
+        let center_before = world_center(&scene, node);
         let original = scene.node(node).transform;
 
         let drag = Drag::ScaleUniform {
             node,
             original,
-            half,
             pivot: center_before,
             grab_dist: 20.0,
         };
         let scaled = drag.apply(&scene, center_before + Vec2::new(50.0, 0.0));
         assert!((scaled.scale - Vec2::splat(2.5)).length() < EPS);
+        assert!((scaled.translation - original.translation).length() < EPS);
 
         scene.node_mut(node).transform = scaled;
-        let center_after = world_center(&scene, node, half);
-        assert!((center_before - center_after).length() < EPS);
+        assert!((world_center(&scene, node) - center_before).length() < EPS);
     }
 
     #[test]
-    fn axis_scale_changes_one_component_and_keeps_the_center() {
-        let (mut scene, node) = scene_with_sprite(Vec2::new(100.0, 100.0), Vec2::new(40.0, 20.0));
-        let half = Vec2::new(20.0, 10.0);
-        let center = world_center(&scene, node, half);
+    fn axis_scale_changes_one_component_only() {
+        let (scene, node) = scene_with_sprite(Vec2::new(100.0, 100.0), Vec2::new(40.0, 20.0));
+        let center = world_center(&scene, node);
         let original = scene.node(node).transform;
 
         // Grab the right-edge handle (20 world units from the center along X)
-        // and drag it out to 40: X doubles, Y untouched.
+        // and drag it out to 40: X doubles, Y and translation untouched.
         let drag = Drag::ScaleAxis {
             node,
             original,
-            half,
             pivot: center,
             axis_world: Vec2::X,
             grab_proj: 20.0,
@@ -659,8 +618,6 @@ mod tests {
         };
         let scaled = drag.apply(&scene, center + Vec2::new(40.0, 0.0));
         assert!((scaled.scale - Vec2::new(2.0, 1.0)).length() < EPS);
-
-        scene.node_mut(node).transform = scaled;
-        assert!((world_center(&scene, node, half) - center).length() < EPS);
+        assert!((scaled.translation - original.translation).length() < EPS);
     }
 }

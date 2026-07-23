@@ -2,6 +2,7 @@
 //! scene-to-sprites (it is a rendering concern, per CONTEXT's Engine); this is
 //! still CPU-only - it produces the list, photon draws it.
 
+use glam::Vec2;
 use photon::{Color, Sprite};
 
 use crate::component::{Component, SpriteComponent};
@@ -39,8 +40,10 @@ impl Scene {
     }
 
     /// Turn a node's Sprite component into a photon `Sprite` placed by the node's
-    /// world transform. The node's origin is the sprite's top-left (photon's
-    /// anchor); the sprite's own `size` is scaled by the world scale.
+    /// world transform. The node's origin is the sprite's CENTER (ADR 0019);
+    /// photon's `Sprite` anchors at its top-left and rotates about it, so the
+    /// corner sits half a rotated, scaled size up-left of the origin - this is
+    /// the one place that offset lives.
     ///
     /// The world affine is decomposed into scale/rotation/translation, which is
     /// exact for translate/rotate/uniform-scale - everything the editor does. A
@@ -50,8 +53,10 @@ impl Scene {
     /// carries a full affine) without changing callers here.
     fn build_sprite(&self, id: NodeId, sprite: &SpriteComponent) -> Sprite {
         let (scale, angle, translation) = self.world_transform(id).to_scale_angle_translation();
+        let size = scale * sprite.size;
+        let position = translation - Vec2::from_angle(angle).rotate(size * 0.5);
         let [r, g, b, a] = sprite.tint;
-        let mut placed = Sprite::new(translation, scale * sprite.size);
+        let mut placed = Sprite::new(position, size);
         placed.rotation = angle;
         placed.tint = Color::new(r, g, b, a);
         placed
@@ -85,7 +90,9 @@ mod tests {
 
         let sprites = scene.sprites();
         assert_eq!(sprites.len(), 1);
-        assert!((sprites[0].position - Vec2::new(100.0, 50.0)).length() < 1e-4);
+        // The node's origin (100, 50) is the sprite's CENTER (ADR 0019), so the
+        // photon quad's top-left sits half the size up-left of it.
+        assert!((sprites[0].position - Vec2::new(84.0, 26.0)).length() < 1e-4);
         assert!((sprites[0].size - Vec2::new(32.0, 48.0)).length() < 1e-4);
         assert_eq!(sprites[0].tint, photon::Color::new(1.0, 0.0, 0.0, 1.0));
     }
@@ -136,9 +143,12 @@ mod tests {
             let i = ((y * w + x) * 4) as usize;
             [image[i], image[i + 1], image[i + 2], image[i + 3]]
         };
-        // Inside the sprite's world rect (x 10..50, y 10..40) is red; outside is
-        // the clear color - the scene reached pixels at the right place.
-        assert_eq!(px(30, 20), [255, 0, 0, 255]);
+        // Centered on (10, 10) with size (40, 30), the quad spans x -10..30,
+        // y -5..25 (ADR 0019): its on-screen part is red, outside is the clear
+        // color - the scene reached pixels at the right place.
+        assert_eq!(px(15, 15), [255, 0, 0, 255]);
+        assert_eq!(px(29, 24), [255, 0, 0, 255]);
+        assert_eq!(px(35, 15), [0, 0, 0, 255]);
         assert_eq!(px(80, 80), [0, 0, 0, 255]);
     }
 }

@@ -40,13 +40,12 @@ in order:
 
 ## Viewport and gizmo
 
-- **Sprite anchor/pivot as a model concept.** The gizmo pivots rotate and
-  scale about the sprite's center by compensating the translation (the model
-  anchors at the top-left, per photon's sprite). The deeper fix - if wanted -
-  is an anchor/pivot field on SpriteComponent (Godot's Sprite2D is centered by
-  default), which would also change what `position` means in the inspector.
-  Decide deliberately, not in passing; the gizmo compensation works fine
-  until then.
+- **Configurable sprite anchor/pivot.** DECIDED (ADR 0019): a sprite is
+  centered on its node's origin - hands-on use showed the compensation
+  approach (center-pivot gizmo over a top-left-anchored model) made position
+  jump confusingly. What remains here: an optional anchor/pivot *field* on
+  SpriteComponent for the cases that genuinely want a corner or custom pivot,
+  with centered as its default.
 - **Snapping** (grid, angle increments with a modifier held) and a scale
   readout while dragging.
 - **Mirror/flip via negative scale** is currently clamped away (per-axis scale

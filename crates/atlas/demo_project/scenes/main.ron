@@ -11,7 +11,7 @@
             (
                 name: "Sprite",
                 transform: (
-                    translation: (60.0, 60.0),
+                    translation: (200.0, 160.0),
                     rotation: 0.0,
                     scale: (1.0, 1.0),
                 ),

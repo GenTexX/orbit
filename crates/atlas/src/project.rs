@@ -25,7 +25,9 @@ pub fn open_or_create(dir: &Path) -> Result<Project> {
     let mut scene = Scene::new("Root");
     let root = scene.root();
     let mut sprite = Node::new("Sprite");
-    sprite.transform = Transform::from_translation(Vec2::new(60.0, 60.0));
+    // The node origin is the sprite's center (ADR 0019); place it so the
+    // 160x160 quad sits fully inside the viewport at the default camera.
+    sprite.transform = Transform::from_translation(Vec2::new(200.0, 160.0));
     sprite.components.push(Component::Sprite(SpriteComponent {
         texture: "assets/sprite.png".to_string(),
         tint: [1.0, 1.0, 1.0, 1.0],
