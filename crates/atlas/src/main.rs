@@ -27,7 +27,10 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use crate::ui::{EditorRows, PanelSizes, build_editor_ui, capture_panel_sizes, parse_value};
+use crate::ui::{
+    ContextMenu, EditorRows, MenuAction, PanelSizes, build_editor_ui, capture_panel_sizes,
+    parse_value,
+};
 use crate::viewport::{Drag, EditorCamera, GizmoHit};
 
 fn main() -> Result<()> {
@@ -119,6 +122,8 @@ struct State {
     last_fps: f32,
     /// The cursor icon currently applied to the window (set only on change).
     applied_cursor: aurora::CursorHint,
+    /// The open right-click context menu, if any (Aurora popup layer).
+    context_menu: Option<ContextMenu>,
 }
 
 impl ApplicationHandler for App {
@@ -156,6 +161,12 @@ impl ApplicationHandler for App {
                 ..
             } => match (button, btn_state) {
                 (MouseButton::Left, ElementState::Pressed) => {
+                    // A press outside an open menu dismisses it (before the
+                    // viewport/gizmo logic, so a click on empty space just
+                    // closes the menu without also deselecting).
+                    if state.close_menu_if_outside() {
+                        return;
+                    }
                     state.ui.handle_input(InputEvent::PointerPressed);
                     state.viewport_press();
                     state.file_press();
@@ -165,6 +176,7 @@ impl ApplicationHandler for App {
                     state.end_drag();
                     state.ui.handle_input(InputEvent::PointerReleased);
                 }
+                (MouseButton::Right, ElementState::Pressed) => state.open_context_menu(),
                 (MouseButton::Middle, ElementState::Pressed) => {
                     state.panning = state.over_viewport();
                 }
@@ -240,6 +252,7 @@ impl State {
             viewport_handle,
             &project_dir,
             panel_sizes,
+            None,
         );
 
         Ok(Self {
@@ -269,6 +282,7 @@ impl State {
             fps_since: std::time::Instant::now(),
             last_fps: 0.0,
             applied_cursor: aurora::CursorHint::Default,
+            context_menu: None,
         })
     }
 
@@ -423,6 +437,97 @@ impl State {
             }
             Err(err) => tracing::error!("pick failed: {err}"),
         }
+    }
+
+    /// Right-click: open a context menu. Over a scene-tree row it offers node
+    /// actions (and selects that node); over the viewport it offers "Add
+    /// Sprite Here" at the cursor. Anywhere else it just closes any open menu.
+    fn open_context_menu(&mut self) {
+        let hit = self.ui.hit_test(self.cursor);
+        if let Some(&(_, node)) =
+            hit.and_then(|id| self.rows.tree_rows.iter().find(|(w, _)| *w == id))
+        {
+            self.selected = Some(node);
+            let items = vec![
+                ("Duplicate".to_string(), MenuAction::DuplicateNode(node)),
+                ("Delete".to_string(), MenuAction::DeleteNode(node)),
+            ];
+            self.context_menu = Some(ContextMenu {
+                anchor: self.cursor,
+                items,
+            });
+            self.dirty = true;
+        } else if hit == self.rows.viewport
+            && let Some(world) = self.cursor_world()
+        {
+            self.context_menu = Some(ContextMenu {
+                anchor: self.cursor,
+                items: vec![(
+                    "Add Sprite Here".to_string(),
+                    MenuAction::AddSpriteAt(world),
+                )],
+            });
+            self.dirty = true;
+        } else {
+            self.close_menu();
+        }
+    }
+
+    /// Close an open menu if the click landed outside it. Returns whether it
+    /// consumed the press (a menu was open and the click was outside it).
+    fn close_menu_if_outside(&mut self) -> bool {
+        let Some(popup) = self.rows.menu_popup else {
+            return false;
+        };
+        let inside = self
+            .ui
+            .hit_test(self.cursor)
+            .is_some_and(|id| self.ui.is_within(id, popup));
+        if !inside {
+            self.close_menu();
+            return true;
+        }
+        false
+    }
+
+    fn close_menu(&mut self) {
+        if self.context_menu.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Perform a context-menu action (a menu item was clicked), then close it.
+    fn run_menu_action(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::DeleteNode(node) => {
+                if node != self.project.scene.root() {
+                    self.history.remove_node(&mut self.project.scene, node);
+                    if self.selected == Some(node) {
+                        self.selected = None;
+                    }
+                }
+            }
+            MenuAction::DuplicateNode(node) => {
+                if let Some(parent) = self.project.scene.parent(node) {
+                    let mut copy = self.project.scene.node(node).clone();
+                    copy.name = format!("{} copy", copy.name);
+                    let new = self.history.add_node(&mut self.project.scene, parent, copy);
+                    self.selected = Some(new);
+                }
+            }
+            MenuAction::AddSpriteAt(world) => {
+                let node = actions::spawn_sprite(
+                    &mut self.project.scene,
+                    &mut self.history,
+                    world,
+                    "assets/sprite.png",
+                    self.texture_size,
+                );
+                self.selected = Some(node);
+            }
+        }
+        self.context_menu = None;
+        self.dirty = true;
     }
 
     /// Finish a viewport drag: rewind to the press-time transform and commit
@@ -641,6 +746,7 @@ impl State {
                 self.viewport_handle,
                 &self.project_dir,
                 self.panel_sizes,
+                self.context_menu.as_ref(),
             );
             self.ui = ui;
             self.rows = rows;
@@ -734,6 +840,16 @@ impl State {
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.save => self.save_project(),
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.load => self.load_project(),
+                AuroraEvent::Clicked(id) if self.rows.menu_items.iter().any(|(w, _)| *w == id) => {
+                    let action = self
+                        .rows
+                        .menu_items
+                        .iter()
+                        .find(|(w, _)| *w == id)
+                        .map(|(_, a)| *a)
+                        .expect("guarded by the match arm");
+                    self.run_menu_action(action);
+                }
                 AuroraEvent::Clicked(id) => {
                     if let Some(&(_, node)) =
                         self.rows.tree_rows.iter().find(|(widget, _)| *widget == id)

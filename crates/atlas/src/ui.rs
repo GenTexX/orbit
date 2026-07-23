@@ -13,6 +13,7 @@ const ROOT_BG: Color = Color::rgb(0.08, 0.08, 0.10);
 const HEADING: Color = Color::rgb(0.96, 0.97, 1.0);
 const SUBHEAD: Color = Color::rgb(0.55, 0.60, 0.72);
 const ROW_SELECTED: Color = Color::rgb(0.20, 0.28, 0.42);
+const MENU_BG: Color = Color::rgb(0.16, 0.17, 0.22);
 
 /// Maps widget handles back to the domain data they represent, so the app can
 /// react to Aurora events without Aurora knowing about `Scene`/`NodeId`.
@@ -47,6 +48,28 @@ pub struct EditorRows {
     pub status_zoom: Option<WidgetId>,
     pub status_selected: Option<WidgetId>,
     pub status_fps: Option<WidgetId>,
+    /// The open context-menu popup (for dismiss-on-click-outside), and its
+    /// clickable item rows mapped to the action each performs.
+    pub menu_popup: Option<WidgetId>,
+    pub menu_items: Vec<(WidgetId, MenuAction)>,
+}
+
+/// An action offered by a right-click context menu (built on Aurora popups).
+#[derive(Debug, Clone, Copy)]
+pub enum MenuAction {
+    /// Delete this node (and, since delete detaches, its subtree with it).
+    DeleteNode(NodeId),
+    /// Add a childless copy of this node beside it.
+    DuplicateNode(NodeId),
+    /// Spawn a new sprite at this world position (viewport menu).
+    AddSpriteAt(Vec2),
+}
+
+/// An open right-click context menu: where it is anchored and what it offers.
+#[derive(Debug, Clone)]
+pub struct ContextMenu {
+    pub anchor: Vec2,
+    pub items: Vec<(String, MenuAction)>,
 }
 
 /// The dock's panel sizes. Splitter drags mutate the live widget tree, so the
@@ -105,6 +128,7 @@ pub fn build_editor_ui(
     viewport_handle: ImageHandle,
     project_dir: &Path,
     sizes: PanelSizes,
+    menu: Option<&ContextMenu>,
 ) -> (Ui, EditorRows) {
     let mut ui = Ui::new();
     let mut rows = EditorRows::default();
@@ -146,6 +170,12 @@ pub fn build_editor_ui(
     ui.set_splitter_target(splitter_3, inspector_panel);
 
     build_status_bar(&mut ui, root, &mut rows);
+
+    // A right-click context menu floats above everything on Aurora's popup
+    // layer, so it is built last and dismissed by the app on a click outside.
+    if let Some(menu) = menu {
+        build_context_menu(&mut ui, menu, &mut rows);
+    }
 
     // Restore the scroll positions captured from the previous shell.
     ui.set_scroll_offset(tree_panel, sizes.tree_scroll);
@@ -196,6 +226,33 @@ fn build_toolbar(ui: &mut Ui, parent: WidgetId, rows: &mut EditorRows) {
     rows.add_sprite = Some(button(ui, "Add Sprite"));
     rows.save = Some(button(ui, "Save"));
     rows.load = Some(button(ui, "Load"));
+}
+
+/// A right-click context menu on Aurora's popup layer: a floating column of
+/// action buttons anchored at the click.
+fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, rows: &mut EditorRows) {
+    let popup = ui.popup(
+        menu.anchor,
+        Style::new()
+            .column()
+            .gap(2.0)
+            .padding(4.0)
+            .background(MENU_BG)
+            .clip(),
+    );
+    for (label, action) in &menu.items {
+        let item = ui.button(
+            popup,
+            label.clone(),
+            Style::new()
+                .width(150.0)
+                .padding(6.0)
+                .background(MENU_BG)
+                .foreground(HEADING),
+        );
+        rows.menu_items.push((item, *action));
+    }
+    rows.menu_popup = Some(popup);
 }
 
 /// The docked scene-tree panel: one clickable row per node, indented by depth.
@@ -453,7 +510,7 @@ mod tests {
         let dir = std::env::temp_dir(); // no project files needed for this test
 
         let sizes = PanelSizes::default();
-        let (mut ui, rows) = build_editor_ui(&scene, None, handle, &dir, sizes);
+        let (mut ui, rows) = build_editor_ui(&scene, None, handle, &dir, sizes, None);
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
         // Drag the tree panel's splitter 50px right, as a user would.
@@ -474,12 +531,49 @@ mod tests {
         // Rebuild the shell (what a tree-row click triggers) with captured sizes.
         let captured = capture_panel_sizes(&ui, &rows, sizes);
         assert_eq!(captured.tree_width, sizes.tree_width + 50.0);
-        let (mut ui2, rows2) = build_editor_ui(&scene, None, handle, &dir, captured);
+        let (mut ui2, rows2) = build_editor_ui(&scene, None, handle, &dir, captured, None);
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
         assert_eq!(
             ui2.rect(rows2.tree_panel.unwrap()).unwrap().size.x,
             sizes.tree_width + 50.0,
             "the dragged width survives the rebuild"
+        );
+    }
+
+    #[test]
+    fn a_context_menu_builds_a_popup_of_action_items() {
+        let (scene, handle) = demo_scene();
+        let dir = std::env::temp_dir();
+        let node = scene.children(scene.root())[0];
+        let menu = ContextMenu {
+            anchor: Vec2::new(300.0, 200.0),
+            items: vec![
+                ("Duplicate".to_string(), MenuAction::DuplicateNode(node)),
+                ("Delete".to_string(), MenuAction::DeleteNode(node)),
+            ],
+        };
+        let (mut ui, rows) = build_editor_ui(
+            &scene,
+            None,
+            handle,
+            &dir,
+            PanelSizes::default(),
+            Some(&menu),
+        );
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+
+        // Two item rows were recorded, and the menu popup sits at the anchor.
+        assert_eq!(rows.menu_items.len(), 2);
+        let popup = rows.menu_popup.unwrap();
+        assert_eq!(ui.rect(popup).unwrap().pos, Vec2::new(300.0, 200.0));
+        // A click on the first item lands on the popup (drawn above the tree),
+        // not on whatever panel is behind it.
+        let item = rows.menu_items[0].0;
+        assert!(ui.is_within(item, popup));
+        let item_rect = ui.rect(item).unwrap();
+        assert_eq!(
+            ui.hit_test(item_rect.pos + item_rect.size * 0.5),
+            Some(item)
         );
     }
 
@@ -496,7 +590,7 @@ mod tests {
         let dir = std::env::temp_dir();
 
         let sizes = PanelSizes::default();
-        let (mut ui, rows) = build_editor_ui(&scene, None, handle, &dir, sizes);
+        let (mut ui, rows) = build_editor_ui(&scene, None, handle, &dir, sizes, None);
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
         // Wheel-scroll the tree panel down.
@@ -510,7 +604,7 @@ mod tests {
         // Rebuild with captured state: the offset carries over.
         let captured = capture_panel_sizes(&ui, &rows, sizes);
         assert_eq!(captured.tree_scroll, 90.0);
-        let (mut ui2, rows2) = build_editor_ui(&scene, None, handle, &dir, captured);
+        let (mut ui2, rows2) = build_editor_ui(&scene, None, handle, &dir, captured, None);
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
         assert_eq!(ui2.scroll_offset(rows2.tree_panel.unwrap()), 90.0);
     }
@@ -524,7 +618,8 @@ mod tests {
         let (scene, handle) = demo_scene();
         let dir = std::env::temp_dir();
 
-        let (mut ui, rows) = build_editor_ui(&scene, None, handle, &dir, PanelSizes::default());
+        let (mut ui, rows) =
+            build_editor_ui(&scene, None, handle, &dir, PanelSizes::default(), None);
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
         let viewport = rows.viewport.unwrap();
         let before = ui.rect(viewport).unwrap().size;

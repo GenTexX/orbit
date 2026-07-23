@@ -49,6 +49,10 @@ pub struct Ui {
     /// Content height per scroll container from the last layout, for clamping
     /// offsets and sizing the scrollbar thumb.
     scroll_content: SecondaryMap<WidgetId, f32>,
+    /// Root-level floating widgets (menus, dropdowns, tooltips): drawn above
+    /// the normal tree and hit-tested before it, in insertion order (last on
+    /// top). See [`popup`](Self::popup).
+    popups: Vec<WidgetId>,
     /// Last known pointer position, or `None` when the pointer is off-surface.
     cursor: Option<Vec2>,
     /// The interactive widget under the pointer (a click bubbles to it).
@@ -78,6 +82,7 @@ impl Ui {
             buffers: SecondaryMap::new(),
             scroll_offsets: SecondaryMap::new(),
             scroll_content: SecondaryMap::new(),
+            popups: Vec::new(),
             cursor: None,
             hovered: None,
             pressed: None,
@@ -140,6 +145,42 @@ impl Ui {
         style: Style,
     ) -> WidgetId {
         self.add(WidgetKind::Image(handle), style, Some(parent))
+    }
+
+    /// Add a floating container anchored at `anchor` (absolute UI-space
+    /// pixels), on top of everything else: a menu, dropdown, or tooltip. It is
+    /// laid out out of flow (taffy `Position::Absolute`), sized to its content
+    /// or its style, drawn after the normal tree, and hit-tested before it. If
+    /// it would spill off the bottom or right edge, layout nudges it back on
+    /// screen. Build its contents as children like any panel.
+    pub fn popup(&mut self, anchor: Vec2, style: Style) -> WidgetId {
+        // A popup parents to the root but is positioned absolutely, so it
+        // ignores the root's flex flow and sits where anchored.
+        let root = self.root.expect("popup requires a root panel");
+        let mut style = style;
+        style.layout.position = taffy::Position::Absolute;
+        style.layout.inset = taffy::Rect {
+            left: length(anchor.x),
+            top: length(anchor.y),
+            right: taffy::style_helpers::auto(),
+            bottom: taffy::style_helpers::auto(),
+        };
+        let id = self.add(WidgetKind::Panel, style, Some(root));
+        self.popups.push(id);
+        id
+    }
+
+    /// Whether `id` is `ancestor` or a descendant of it (walking parent links).
+    /// Apps use this to tell whether a click landed inside an open popup.
+    pub fn is_within(&self, id: WidgetId, ancestor: WidgetId) -> bool {
+        let mut cur = Some(id);
+        while let Some(w) = cur {
+            if w == ancestor {
+                return true;
+            }
+            cur = self.widgets[w].parent;
+        }
+        false
     }
 
     /// Add a draggable divider under `parent` that will resize a target widget
@@ -341,10 +382,36 @@ impl Ui {
         self.rects.clear();
         self.content_origin.clear();
         self.accumulate(root, Vec2::ZERO);
+        // Nudge any popup that overhangs the right or bottom edge back on
+        // screen (a menu opened near a corner would otherwise spill off).
+        for &popup in &self.popups.clone() {
+            if let Some(rect) = self.rect(popup) {
+                let over = (rect.max() - available).max(Vec2::ZERO);
+                let under = rect.pos.min(Vec2::ZERO);
+                let shift = under - over;
+                if shift != Vec2::ZERO {
+                    self.shift_subtree(popup, shift);
+                }
+            }
+        }
         // Layout may have moved widgets under a stationary pointer, so refresh
         // what is hovered from the last known cursor position.
         self.update_hover();
         Ok(())
+    }
+
+    /// Translate a whole subtree's cached rects and text origins by `delta`
+    /// (used to nudge an off-screen popup back into view after layout).
+    fn shift_subtree(&mut self, id: WidgetId, delta: Vec2) {
+        if let Some(rect) = self.rects.get_mut(id) {
+            rect.pos += delta;
+        }
+        if let Some(origin) = self.content_origin.get_mut(id) {
+            *origin += delta;
+        }
+        for child in self.widgets[id].children.clone() {
+            self.shift_subtree(child, delta);
+        }
     }
 
     /// Walk the subtree at `id`, adding each parent's absolute origin to taffy's
@@ -671,6 +738,12 @@ impl Ui {
     /// the drag axis - stealing that sliver from the neighboring panels is
     /// exactly what makes it grabbable.
     pub fn hit_test(&self, point: Vec2) -> Option<WidgetId> {
+        // Popups float above everything; the last one added is topmost.
+        for &popup in self.popups.iter().rev() {
+            if let Some(hit) = self.hit_test_node(popup, point, None) {
+                return Some(hit);
+            }
+        }
         for (id, widget) in &self.widgets {
             if let WidgetKind::Splitter { orientation, .. } = widget.kind
                 && let Some(rect) = self.rect(id)
@@ -759,6 +832,10 @@ impl Ui {
         if let Some(root) = self.root {
             self.emit(root, &mut list);
         }
+        // Popups draw last, so they sit above the whole normal tree.
+        for &popup in &self.popups {
+            self.emit(popup, &mut list);
+        }
         list
     }
 
@@ -785,11 +862,15 @@ impl Ui {
             WidgetKind::Splitter { .. } => self.emit_splitter(id, rect, widget, list),
         }
 
-        // Children, optionally clipped to this widget's rectangle.
+        // Children, optionally clipped to this widget's rectangle. Popup
+        // subtrees are skipped here and drawn on top by `draw_list`.
         if widget.clip {
             list.commands.push(DrawCommand::PushClip { rect });
         }
         for &child in &widget.children {
+            if self.popups.contains(&child) {
+                continue;
+            }
             self.emit(child, list);
         }
         if widget.clip {
@@ -1463,6 +1544,48 @@ mod tests {
         ui.handle_input(InputEvent::PointerReleased);
         ui.layout(Vec2::new(300.0, 100.0)).unwrap();
         assert_eq!(ui.rect(right).unwrap().size.x, 130.0);
+    }
+
+    #[test]
+    fn a_popup_draws_on_top_hit_tests_first_and_clamps_on_screen() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().fill());
+        // A full-window button underneath.
+        let under = ui.button(root, "under", Style::new().fill());
+        // A popup covering part of it.
+        let menu = ui.popup(Vec2::new(100.0, 100.0), Style::new().size(80.0, 60.0));
+        let item = ui.button(menu, "item", Style::new().fill());
+        ui.layout(Vec2::new(400.0, 300.0)).unwrap();
+
+        // A point inside the popup hits the popup's item, not the button below.
+        assert_eq!(ui.hit_test(Vec2::new(120.0, 120.0)), Some(item));
+        // A point outside the popup falls through to the underlying button.
+        assert_eq!(ui.hit_test(Vec2::new(300.0, 250.0)), Some(under));
+
+        // The popup draws after (on top of) the underlying button's fill.
+        let cmds = ui.draw_list().commands;
+        let is_menu_fill = |c: &DrawCommand| {
+            matches!(c, DrawCommand::FillRect { rect, .. }
+                if rect.pos == Vec2::new(100.0, 100.0))
+        };
+        let is_under_fill = |c: &DrawCommand| matches!(c, DrawCommand::FillRect { rect, .. } if rect.size == Vec2::new(400.0, 300.0));
+        let menu_at = cmds.iter().position(is_menu_fill).unwrap();
+        let under_at = cmds.iter().position(is_under_fill).unwrap();
+        assert!(menu_at > under_at, "popup must draw after the tree");
+    }
+
+    #[test]
+    fn a_popup_near_the_edge_is_nudged_back_on_screen() {
+        let mut ui = Ui::new();
+        ui.root_panel(Style::new().fill());
+        // Anchored so an 80x60 popup would spill past the 400x300 window.
+        let menu = ui.popup(Vec2::new(390.0, 290.0), Style::new().size(80.0, 60.0));
+        ui.layout(Vec2::new(400.0, 300.0)).unwrap();
+
+        let rect = ui.rect(menu).unwrap();
+        // Pushed fully inside: right edge at 400, bottom at 300.
+        assert_eq!(rect.max(), Vec2::new(400.0, 300.0));
+        assert!(ui.is_within(menu, menu));
     }
 
     #[test]
