@@ -11,7 +11,7 @@
             (
                 name: "Sprite",
                 transform: (
-                    translation: (200.0, 160.0),
+                    translation: (467.77344, 608.04297),
                     rotation: 0.0,
                     scale: (1.0, 1.0),
                 ),
@@ -22,6 +22,44 @@
                             ("texture", Asset("assets/sprite.png")),
                             ("tint", Color((1.0, 1.0, 1.0, 1.0))),
                             ("size", Vec2((160.0, 160.0))),
+                        ],
+                    ),
+                ],
+                children: [],
+            ),
+            (
+                name: "Sprite 2",
+                transform: (
+                    translation: (533.5481, 518.9896),
+                    rotation: 1.6512694,
+                    scale: (1.2803224, 1.3582629),
+                ),
+                components: [
+                    (
+                        kind: "Sprite",
+                        fields: [
+                            ("texture", Asset("assets/sprite.png")),
+                            ("tint", Color((1.0, 1.0, 1.0, 0.4))),
+                            ("size", Vec2((128.0, 128.0))),
+                        ],
+                    ),
+                ],
+                children: [],
+            ),
+            (
+                name: "Sprite 3",
+                transform: (
+                    translation: (472.5703, 561.1758),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                components: [
+                    (
+                        kind: "Sprite",
+                        fields: [
+                            ("texture", Asset("assets/sprite.png")),
+                            ("tint", Color((1.0, 0.0, 0.0, 0.4))),
+                            ("size", Vec2((128.0, 128.0))),
                         ],
                     ),
                 ],

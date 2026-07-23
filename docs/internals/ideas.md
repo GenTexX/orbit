@@ -10,57 +10,155 @@ milestone's finishing pass. Everything else stays for the next round. When an
 idea ships, delete its entry (git history remembers); when one dies, delete
 it too.
 
-## Gizmo and viewport
+Seeded from hands-on M3 testing and the big brainstorm session at the end of
+M3 (2026-07-23), with an eye on M4-M6 shifting focus away from the editor:
+this list is what "come back and make the editor great" concretely means.
 
-- **Corner scale should be free (non-uniform) by default**, stretching both
-  axes independently; holding a modifier (Shift is the Godot/Figma
-  convention, Ctrl also a candidate - decide when implementing) preserves the
-  aspect ratio. Today the corner handle is uniform-only.
+## Aurora: missing capabilities (framework-level)
+
+- **Scrolling containers.** The number one gap: the scene tree, inspector,
+  and file list all overflow silently today. Needs a scroll offset per
+  container, wheel routing, clip (exists), and a scrollbar widget - and
+  scroll positions must live in editor state across shell rebuilds (the
+  PanelSizes lesson).
+- **Text selection** in inputs (shift+arrows, mouse sweep), plus
+  **clipboard** (ctrl+c/x/v via winit/arboard) - editing fields without
+  selection gets old fast.
+- **Tab focus traversal** between inputs (and Enter moving to the next row in
+  the inspector, spreadsheet-style).
+- **Popup/overlay layer**: widgets drawn above the normal tree with their own
+  hit-testing pass - the foundation dropdowns, context menus, tooltips,
+  dialogs, the asset chooser, and the color picker all stand on. Probably the
+  highest-leverage single Aurora feature.
+- **Dropdown/select widget** (needs popups).
+- **Context menus** on right-click (needs popups; the scene tree and viewport
+  both want them badly).
+- **Tooltips** on hover (needs popups + a hover timer).
+- **Modal dialogs** (confirm-discard-changes, errors) - popups plus an input
+  block behind them.
+- **Sliders and numeric steppers** (drag a value, click tiny +/- arrows).
+- **Icons.** Everything is text; a small bitmap icon atlas (same machinery as
+  the glyph atlas) would transform the toolbar, tree rows (node type icons,
+  visibility eyes), and file list.
+- **Disabled state** for widgets (grayed out, non-interactive) - e.g. Save
+  when nothing changed, Load when no project.
+- **Per-side padding/margin in Style.** The tree indents with a spacer-panel
+  hack today because padding is all-sides-equal.
+- **Theming as data**: one Theme struct (colors, spacing, font sizes) instead
+  of scattered consts, so the editor can restyle Aurora without editing it.
+- **DPI awareness**: font size and metrics are physical-pixel constants; on a
+  hidpi display everything will be tiny. Respect winit's scale factor.
+- **Text ellipsis/truncation** for long labels (file paths, node names).
+- **Cursor hints**: Aurora reports a cursor per hovered widget (resize arrows
+  over splitters, text beam over inputs); the app maps it to winit.
+- **Wider splitter grab area** (hit area larger than the drawn bar - needs a
+  per-widget hit inset).
+- **A real checkmark** in checkboxes (undecided if wanted; the filled square
+  is a legit minimalist look).
+- **First-class drag-and-drop**: Aurora-level drag sources/targets with a
+  drag payload and hover feedback, replacing the app-level press/release
+  routing the file-to-viewport drop uses today.
+
+## Editor: scene editing
+
+- **Add/remove components UI.** Today a node's components are fixed at
+  creation. The inspector needs "Add Component" (a dropdown of kinds) and a
+  remove button per component - REQUIRED once Script (M4) and Camera (M5)
+  components exist, so this one has a deadline of sorts.
+- **Rename a node** (double-click its tree row, or a name field at the top of
+  the inspector - Node.name is already there, just not editable).
+- **Delete** the selected node (Del key + context menu), **duplicate**
+  (ctrl+D), and **copy/paste** across the tree - all through History.
+- **Reparent by dragging** rows in the scene tree (the drag-drop machinery
+  above; History::reparent already exists and refuses cycles).
+- **Multi-select**: ctrl+click in tree and viewport, box-select by dragging
+  over empty viewport space; group move/delete; the inspector shows shared
+  fields.
+- **Sibling order = draw order controls**: move up/down in the tree (z-order
+  today is implicit pre-order), maybe an explicit z-index later.
+- **Node visibility toggle** (eye icon per tree row, drawn state in helios)
+  and **lock** (excluded from picking).
+- **Search/filter box** above the scene tree.
+- **Alt-drag to duplicate** in the viewport (grab a sprite with alt held:
+  duplicates it and moves the copy).
+
+## Editor: viewport
+
+- **Grid + origin axes**: a world-space grid (fading with zoom) and X/Y axis
+  lines through the origin in the axis colors; photon needs line/shape
+  primitives or tinted-quad lines for this.
+- **Zoom indicator + view controls**: current zoom % readout, frame-selected
+  (F), frame-all, reset view (double-click middle?).
+- **Status bar** along the bottom: cursor world position, zoom, selected
+  node, fps - cheap and very "real editor".
+- **Checkerboard or configurable background** behind the scene (communicates
+  transparency; the flat navy reads as part of the scene).
 - **Gizmo modes with a toolbar above the viewport** (Godot-style): select /
-  move / rotate / scale as exclusive modes, so only the active mode's gizmo
-  shows and the viewport declutters. Keyboard shortcuts to switch (Godot uses
-  Q/W/E/S). The all-in-one gizmo remains the fallback until then.
+  move / rotate / scale as exclusive modes with Q/W/E/S-style shortcuts; only
+  the active mode's gizmo shows. The toolbar now exists to host it.
+- **Corner scale free (non-uniform) by default**, modifier (Shift, per
+  Godot/Figma convention) to preserve ratio - inverts today's uniform-only
+  corner handle.
+- **Snapping**: grid snap for moves, angle increments for rotation (modifier
+  held), plus a numeric readout near the cursor while dragging.
+- **Mirror/flip via negative scale** is currently clamped away; allowing a
+  flip needs care in the world-affine decomposition.
 - **Configurable sprite anchor/pivot field** on SpriteComponent, centered by
-  default (ADR 0019 settled the default; the field covers the cases that
-  genuinely want a corner or custom pivot).
-- **Snapping**: grid snap for moves, angle increments for rotation (with a
-  modifier held), plus a numeric readout near the cursor while dragging.
-- **Mirror/flip via negative scale** is currently clamped away (per-axis
-  scale stops at +0.05); allowing a flip needs care in the world-affine
-  decomposition (negative scale flips the decomposed angle).
+  default (ADR 0019 settled the default; the field covers the rest).
 
-## Splitters and docking
+## Editor: shell and workflow
 
-- **Wider grab area.** The splitter bar is 4px; you have to hover it exactly.
-  Give splitters a hit area larger than their visual bar (Aurora hit-testing
-  currently equals the drawn rect - needs a per-widget hit inset/outset).
-- **Resize cursor on hover.** Aurora should expose a cursor hint for the
-  hovered widget (resize-horizontal over a vertical splitter, text-beam over
-  a text input, ...) and the app maps it to the winit window cursor.
+- **Persist editor state across restarts**: panel sizes, camera pan/zoom,
+  selection, window size - a small editor-state file next to the project
+  (gitignored), reusing the PanelSizes capture pattern.
+- **Unsaved-changes indicator** (dot/star in the title bar) and a
+  confirm-on-quit prompt when dirty (needs modals).
+- **New/Open project**: currently hardwired to demo_project. Needs a native
+  file dialog (the rfd crate) or an own popup browser.
+- **Console/log panel**: a dockable panel showing tracing output - doubly
+  useful once Comet scripts print (M4).
+- **Undo-history panel** (the History stack visualized, click to jump) -
+  History already has the data.
+- **Scene tabs / multiple open scenes** (deferred from the M3 plan; needs
+  the docking work).
 - **Full docking** (tabs, drag-to-rearrange, floating panels) remains the
-  stated long-term goal the splitter layout builds toward.
+  long-term shell goal the splitters build toward.
+- **A keyboard shortcut map** (one place defining all bindings, shown in a
+  help popup) before shortcuts sprawl further.
 
 ## Inspector fields
 
 - **Numeric fields**: accept only numbers while typing; for `Vec2`, two
-  inputs in a row labeled `x` and `y` in the engine axis colors (X red,
-  Y green - the same palette the gizmo arrows use). Drag-to-scrub on the
-  field's label to change the value with the mouse.
-- **Rotation in degrees**: stored radians, displayed and edited as degrees.
-- **Asset fields** (e.g. a sprite's texture): an asset-chooser popup, and/or
-  drag a file from the file explorer onto the field.
-- **Color fields**: a color picker.
+  inputs labeled `x` and `y` in the engine axis colors (X red, Y green).
+  Drag-to-scrub on the field's label.
+- **Rotation in degrees** (stored radians, displayed/edited as degrees).
+- **Asset fields**: an asset-chooser popup (needs popups), and/or drag a file
+  from the explorer onto the field.
+- **Color fields**: a color picker (needs popups); until then at least a
+  color swatch preview next to the text.
+- **Commit on focus loss** in addition to Enter (clicking away currently
+  silently keeps the old value - surprising).
 
-## Scene tree
+## Engine (helios / photon)
 
-- Rows are restyled buttons and read as such; they should read as tree rows.
-- **Collapse/expand** for nodes with children. Note: expanded-state is
-  widget-tree state and the shell rebuilds - it must live in editor state and
-  be fed back in, like `PanelSizes` (the M3 step 6 lesson), or it will
-  silently reset.
+- **Texture cache + per-texture batching.** THE silent limitation: every
+  sprite renders with the single loaded demo texture regardless of what its
+  `texture` field says. The editor needs a path-keyed texture cache and
+  photon needs to draw batches grouped by texture. Invisible with one PNG in
+  the project, wrong the moment there are two.
+- **Sprite sheet support**: expose photon's `uv_rect` on SpriteComponent
+  (region of a texture), the base for animation later.
+- **Sprite flip flags** (flip_h/flip_v) as a cheap alternative to negative
+  scale.
+- **photon shape primitives**: lines, rects, circles - for the editor grid,
+  debug drawing, and eventually game use.
+- **World-space text** (photon reusing Aurora's glyph atlas machinery) -
+  node labels in the viewport, debug overlays, in-game text later.
+- **Node visibility flag** in helios (skipped by sprites() when off) -
+  pairs with the tree's eye icon.
 
 ## File explorer
 
-- Currently a listing only. M3 step 8 gives it its first real function
-  (drag a PNG into the viewport to create a sprite); later: click-to-select
-  (wired to the asset-field chooser above), previews, and file operations.
+- Currently a listing plus drag-to-viewport. Later: click-to-select (wired to
+  the asset-field chooser), thumbnails/previews for PNGs, file operations
+  (rename, delete, new folder), and watching the directory for changes.
