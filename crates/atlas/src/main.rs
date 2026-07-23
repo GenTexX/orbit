@@ -131,6 +131,9 @@ struct State {
     /// The active transform tool (select/move/rotate/scale), chosen from the
     /// toolbar; filters which gizmo handles show and are hittable.
     gizmo_mode: GizmoMode,
+    /// The OS clipboard (for text copy/cut/paste), or `None` if it could not
+    /// be opened on this platform.
+    clipboard: Option<arboard::Clipboard>,
 }
 
 impl ApplicationHandler for App {
@@ -191,7 +194,12 @@ impl ApplicationHandler for App {
                 _ => {}
             },
             WindowEvent::MouseWheel { delta, .. } => state.wheel(delta),
-            WindowEvent::ModifiersChanged(m) => state.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                state.modifiers = m.state();
+                // Aurora needs shift to know whether movement keys extend a
+                // text selection.
+                state.ui.set_shift(m.state().shift_key());
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if !state.handle_shortcut(&event) && !state.handle_mode_key(&event) {
                     for ev in translate_key(&event) {
@@ -294,6 +302,9 @@ impl State {
             applied_cursor: aurora::CursorHint::Default,
             context_menu: None,
             gizmo_mode: GizmoMode::default(),
+            clipboard: arboard::Clipboard::new()
+                .inspect_err(|err| tracing::warn!("no clipboard available: {err}"))
+                .ok(),
         })
     }
 
@@ -629,9 +640,10 @@ impl State {
         self.camera.zoom_about(self.cursor - rect.pos, factor);
     }
 
-    /// Keyboard shortcuts: ctrl+s saves; ctrl+z / ctrl+shift+z / ctrl+y undo
-    /// and redo (only when no text field is focused, so typing is never
-    /// hijacked - saving has no such conflict). Returns whether handled.
+    /// Keyboard shortcuts. ctrl+s saves (always). With a text field focused,
+    /// ctrl+a/c/x/v are text clipboard ops (so typing is never hijacked and
+    /// undo does not steal ctrl+z). With no field focused, ctrl+z /
+    /// ctrl+shift+z / ctrl+y undo and redo. Returns whether handled.
     fn handle_shortcut(&mut self, event: &winit::event::KeyEvent) -> bool {
         if !self.modifiers.control_key() {
             return false;
@@ -644,7 +656,7 @@ impl State {
             return true;
         }
         if self.ui.focused().is_some() {
-            return false;
+            return self.clipboard_shortcut(c);
         }
         let changed = if c.eq_ignore_ascii_case("z") {
             if self.modifiers.shift_key() {
@@ -661,6 +673,44 @@ impl State {
             self.dirty = true;
         }
         true
+    }
+
+    /// ctrl+a/c/x/v on the focused text field, backed by the OS clipboard.
+    /// Returns whether the key was a (handled) clipboard shortcut.
+    fn clipboard_shortcut(&mut self, c: &str) -> bool {
+        match c {
+            "a" | "A" => self.ui.select_all(),
+            "c" | "C" => {
+                if let Some(text) = self.ui.selected_text() {
+                    self.set_clipboard(&text);
+                }
+            }
+            "x" | "X" => {
+                if let Some(text) = self.ui.selected_text() {
+                    self.set_clipboard(&text);
+                    self.ui.delete_selection();
+                }
+            }
+            "v" | "V" => {
+                if let Some(text) = self.get_clipboard() {
+                    self.ui.insert_str(&text);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn set_clipboard(&mut self, text: &str) {
+        if let Some(cb) = self.clipboard.as_mut()
+            && let Err(err) = cb.set_text(text.to_string())
+        {
+            tracing::warn!("clipboard write failed: {err}");
+        }
+    }
+
+    fn get_clipboard(&mut self) -> Option<String> {
+        self.clipboard.as_mut()?.get_text().ok()
     }
 
     /// A press over a PNG row in the file explorer arms a file drag; releasing

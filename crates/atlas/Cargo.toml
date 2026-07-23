@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 aether = { version = "0.1.0", path = "../aether" }
 anyhow = "1.0.104"
+arboard = "3.6.1"
 aurora = { version = "0.1.0", path = "../aurora" }
 aurora-wgpu = { version = "0.1.0", path = "../aurora-wgpu" }
 glam = "0.33.2"

@@ -63,6 +63,12 @@ pub struct Ui {
     focused: Option<WidgetId>,
     /// Caret position in the focused input, as a byte offset into its text.
     caret: usize,
+    /// The fixed end of a selection (the caret is the moving end), or `None`
+    /// for no selection. The selected range is `min..max` of the two.
+    selection_anchor: Option<usize>,
+    /// Whether shift is currently held (set by the app), so movement keys
+    /// extend the selection rather than collapse it.
+    shift: bool,
     /// Whether the caret is in its visible blink phase (driven by the app).
     caret_on: bool,
     /// Semantic events accumulated since the last [`drain_events`](Self::drain_events).
@@ -88,6 +94,8 @@ impl Ui {
             pressed: None,
             focused: None,
             caret: 0,
+            selection_anchor: None,
+            shift: false,
             caret_on: true,
             events: Vec::new(),
         }
@@ -279,6 +287,85 @@ impl Ui {
     /// blinking caret drive this from a timer; the default is steady-on.
     pub fn set_caret_on(&mut self, on: bool) {
         self.caret_on = on;
+    }
+
+    /// Tell Aurora whether shift is held (the app tracks OS modifiers). While
+    /// set, movement keys extend the selection instead of collapsing it.
+    pub fn set_shift(&mut self, shift: bool) {
+        self.shift = shift;
+    }
+
+    /// The focused input's selected text, or `None` if nothing is selected
+    /// (for the app to put on the OS clipboard on copy/cut).
+    pub fn selected_text(&self) -> Option<String> {
+        let id = self.focused?;
+        let (lo, hi) = self.selection_bounds(id);
+        if lo == hi {
+            return None;
+        }
+        match &self.widgets[id].kind {
+            WidgetKind::TextInput(s) => Some(s[lo..hi].to_string()),
+            _ => None,
+        }
+    }
+
+    /// Select the whole focused input (ctrl+a, driven by the app).
+    pub fn select_all(&mut self) {
+        if let Some(id) = self.focused {
+            self.selection_anchor = Some(0);
+            self.caret = self.text_len(id);
+        }
+    }
+
+    /// Delete the focused input's selection, if any; returns whether it did.
+    /// The app uses this for cut (after reading [`selected_text`](Self::selected_text)).
+    pub fn delete_selection(&mut self) -> bool {
+        let Some(id) = self.focused else {
+            return false;
+        };
+        let (lo, hi) = self.selection_bounds(id);
+        if lo == hi {
+            return false;
+        }
+        if let WidgetKind::TextInput(s) = &mut self.widgets[id].kind {
+            s.replace_range(lo..hi, "");
+        }
+        self.caret = lo;
+        self.selection_anchor = None;
+        self.invalidate_text(id);
+        true
+    }
+
+    /// Insert `text` into the focused input at the caret, replacing any
+    /// selection (control characters are dropped). The app uses this for paste.
+    pub fn insert_str(&mut self, text: &str) {
+        let Some(id) = self.focused else {
+            return;
+        };
+        if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
+            return;
+        }
+        let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+        let (lo, hi) = self.selection_bounds(id);
+        if let WidgetKind::TextInput(s) = &mut self.widgets[id].kind {
+            s.replace_range(lo..hi, &cleaned);
+        }
+        self.caret = lo + cleaned.len();
+        self.selection_anchor = None;
+        self.invalidate_text(id);
+    }
+
+    /// The selection's byte range in `id`'s text (`caret..caret` if none),
+    /// clamped to the current length.
+    fn selection_bounds(&self, id: WidgetId) -> (usize, usize) {
+        let caret = self.caret.min(self.text_len(id));
+        match self.selection_anchor {
+            Some(a) => {
+                let a = a.min(self.text_len(id));
+                (a.min(caret), a.max(caret))
+            }
+            None => (caret, caret),
+        }
     }
 
     /// A scroll container's current vertical offset (0 = scrolled to the top).
@@ -502,6 +589,14 @@ impl Ui {
                 let delta = self.cursor.map(|c| p - c).unwrap_or(Vec2::ZERO);
                 self.cursor = Some(p);
                 self.drag_splitter(delta);
+                // Dragging within the focused input sweeps a selection: move
+                // the caret (the anchor set on press stays put).
+                if self.pressed == self.focused
+                    && let Some(id) = self.focused
+                    && matches!(self.widgets[id].kind, WidgetKind::TextInput(_))
+                {
+                    self.caret = self.caret_at_x(id, self.cursor);
+                }
                 self.update_hover();
             }
             InputEvent::PointerLeft => {
@@ -539,8 +634,15 @@ impl Ui {
             Some(id) if matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) => {
                 self.focused = Some(id);
                 self.caret = self.caret_at_x(id, self.cursor);
+                // Anchor a selection at the press point; a drag before release
+                // extends it, a plain click leaves anchor == caret (no
+                // selection).
+                self.selection_anchor = Some(self.caret);
             }
-            _ => self.focused = None,
+            _ => {
+                self.focused = None;
+                self.selection_anchor = None;
+            }
         }
         if let Some(old) = previous
             && self.focused != previous
@@ -591,20 +693,9 @@ impl Ui {
         if ch.is_control() {
             return;
         }
-        let Some(id) = self.focused else {
-            return;
-        };
-        let inserted = if let WidgetKind::TextInput(s) = &mut self.widgets[id].kind {
-            let caret = self.caret.min(s.len());
-            s.insert(caret, ch);
-            self.caret = caret + ch.len_utf8();
-            true
-        } else {
-            false
-        };
-        if inserted {
-            self.invalidate_text(id);
-        }
+        // Typing over a selection replaces it; insert_str handles both cases.
+        let mut buf = [0u8; 4];
+        self.insert_str(ch.encode_utf8(&mut buf));
     }
 
     /// Apply a named editing key to the focused input.
@@ -617,11 +708,24 @@ impl Ui {
             self.events.push(Event::Submitted(id));
             return;
         }
+        // Backspace/Delete over a selection remove it as a unit.
+        if matches!(key, Key::Backspace | Key::Delete) && self.delete_selection() {
+            return;
+        }
+        let shift = self.shift;
         let WidgetKind::TextInput(s) = &mut self.widgets[id].kind else {
             return;
         };
         let caret = self.caret.min(s.len());
-        // Movement leaves the text untouched; Backspace/Delete edit it.
+        // A shift+movement extends a selection: anchor the fixed end here if
+        // none yet. A plain movement collapses any selection.
+        if matches!(key, Key::Left | Key::Right | Key::Home | Key::End) {
+            if shift {
+                self.selection_anchor.get_or_insert(caret);
+            } else {
+                self.selection_anchor = None;
+            }
+        }
         let mut edited = false;
         match key {
             Key::Left => self.caret = prev_boundary(s, caret),
@@ -671,13 +775,20 @@ impl Ui {
 
     /// The x offset (within the content box) of the caret, from the shaped text.
     fn caret_x_offset(&self, id: WidgetId) -> f32 {
+        self.x_offset_at(id, self.caret)
+    }
+
+    /// The x offset (within the content box) of byte offset `byte` in `id`'s
+    /// shaped text - the left edge of the glyph starting at or after `byte`,
+    /// or the end of the text.
+    fn x_offset_at(&self, id: WidgetId, byte: usize) -> f32 {
         let Some(buffer) = self.buffers.get(id) else {
             return 0.0;
         };
         let mut x = 0.0;
         for run in buffer.layout_runs() {
             for g in run.glyphs {
-                if g.start >= self.caret {
+                if g.start >= byte {
                     return g.x;
                 }
                 x = g.x + g.w;
@@ -996,8 +1107,24 @@ impl Ui {
                 .push(DrawCommand::FillRect { rect, color: fill });
         }
 
-        // Clip the text and caret so long content stays within the field.
+        // Clip the text, selection, and caret so long content stays in-field.
         list.commands.push(DrawCommand::PushClip { rect });
+        // The selection highlight, behind the text.
+        if focused {
+            let (lo, hi) = self.selection_bounds(id);
+            if lo != hi {
+                let origin = self.content_origin.get(id).copied().unwrap_or(rect.pos);
+                let x0 = origin.x + self.x_offset_at(id, lo);
+                let x1 = origin.x + self.x_offset_at(id, hi);
+                list.commands.push(DrawCommand::FillRect {
+                    rect: Rect::new(
+                        Vec2::new(x0, rect.pos.y + 3.0),
+                        Vec2::new((x1 - x0).max(0.0), (rect.size.y - 6.0).max(0.0)),
+                    ),
+                    color: theme::SELECTION,
+                });
+            }
+        }
         self.emit_text(id, widget.foreground, list);
         if focused && self.caret_on {
             let origin = self.content_origin.get(id).copied().unwrap_or(rect.pos);
@@ -1403,6 +1530,60 @@ mod tests {
         ui.handle_input(InputEvent::Text('c'));
         assert_eq!(text_of(&ui, field), "abc");
         assert_eq!(ui.caret, 3);
+    }
+
+    #[test]
+    fn shift_arrows_extend_a_selection_and_typing_replaces_it() {
+        let (mut ui, field) = ui_with_field("hello");
+        click_at(&mut ui, Vec2::new(180.0, 12.0)); // caret at end (5)
+        assert_eq!(ui.selected_text(), None);
+
+        // Shift+Left twice selects the last two chars ("lo").
+        ui.set_shift(true);
+        ui.handle_input(InputEvent::Key(Key::Left));
+        ui.handle_input(InputEvent::Key(Key::Left));
+        assert_eq!(ui.selected_text().as_deref(), Some("lo"));
+
+        // Typing replaces the selection.
+        ui.set_shift(false);
+        ui.handle_input(InputEvent::Text('p'));
+        assert_eq!(text_of(&ui, field), "help");
+        assert_eq!(ui.selected_text(), None);
+    }
+
+    #[test]
+    fn select_all_then_delete_clears_the_field() {
+        let (mut ui, field) = ui_with_field("abcde");
+        click_at(&mut ui, Vec2::new(20.0, 12.0));
+        ui.select_all();
+        assert_eq!(ui.selected_text().as_deref(), Some("abcde"));
+        ui.handle_input(InputEvent::Key(Key::Backspace));
+        assert_eq!(text_of(&ui, field), "");
+    }
+
+    #[test]
+    fn a_mouse_drag_sweeps_a_selection() {
+        let (mut ui, _field) = ui_with_field("hello");
+        // Press near the start, drag to the right, release: a selection spans
+        // the swept text.
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(2.0, 12.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(180.0, 12.0)));
+        assert_eq!(ui.selected_text().as_deref(), Some("hello"));
+        ui.handle_input(InputEvent::PointerReleased);
+        assert_eq!(ui.selected_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn insert_str_pastes_over_a_selection() {
+        let (mut ui, field) = ui_with_field("hello");
+        click_at(&mut ui, Vec2::new(20.0, 12.0));
+        ui.select_all();
+        ui.insert_str("world");
+        assert_eq!(text_of(&ui, field), "world");
+        // Control characters in pasted text are dropped.
+        ui.insert_str("\n!");
+        assert_eq!(text_of(&ui, field), "world!");
     }
 
     #[test]
