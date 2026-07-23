@@ -115,6 +115,51 @@ pub struct Gizmo {
     pub grab_radius: f32,
 }
 
+/// The active transform tool, chosen from the viewport toolbar. It filters
+/// which gizmo handles are shown and hittable; the sprite body always drags to
+/// move, whatever the mode. `Select` shows the full gizmo (every handle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GizmoMode {
+    #[default]
+    Select,
+    Move,
+    Rotate,
+    Scale,
+}
+
+impl GizmoMode {
+    /// Every mode, in toolbar order.
+    pub const ALL: [GizmoMode; 4] = [
+        GizmoMode::Select,
+        GizmoMode::Move,
+        GizmoMode::Rotate,
+        GizmoMode::Scale,
+    ];
+
+    /// The toolbar caption.
+    pub fn label(self) -> &'static str {
+        match self {
+            GizmoMode::Select => "Select",
+            GizmoMode::Move => "Move",
+            GizmoMode::Rotate => "Rotate",
+            GizmoMode::Scale => "Scale",
+        }
+    }
+
+    /// Whether this mode shows and activates the given handle.
+    fn shows(self, hit: GizmoHit) -> bool {
+        match self {
+            GizmoMode::Select => true,
+            GizmoMode::Move => matches!(hit, GizmoHit::MoveX | GizmoHit::MoveY),
+            GizmoMode::Rotate => matches!(hit, GizmoHit::Rotate),
+            GizmoMode::Scale => matches!(
+                hit,
+                GizmoHit::ScaleCorner | GizmoHit::ScaleX | GizmoHit::ScaleY
+            ),
+        }
+    }
+}
+
 /// Which gizmo handle a press landed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GizmoHit {
@@ -179,10 +224,10 @@ fn segment_distance(p: Vec2, a: Vec2, b: Vec2) -> f32 {
     p.distance(a + ab * t)
 }
 
-/// Which handle (if any) a world-space press lands on. Point handles win over
-/// the arrow shafts, and the shafts over the sprite body (the caller falls
-/// back to picking).
-pub fn hit_gizmo(gizmo: &Gizmo, world: Vec2) -> Option<GizmoHit> {
+/// Which handle (if any) a world-space press lands on, restricted to those the
+/// `mode` shows. Point handles win over the arrow shafts, and the shafts over
+/// the sprite body (the caller falls back to picking).
+pub fn hit_gizmo(gizmo: &Gizmo, world: Vec2, mode: GizmoMode) -> Option<GizmoHit> {
     let r = gizmo.grab_radius;
     let hits = [
         (GizmoHit::Rotate, gizmo.rotate_center),
@@ -193,25 +238,30 @@ pub fn hit_gizmo(gizmo: &Gizmo, world: Vec2) -> Option<GizmoHit> {
         (GizmoHit::MoveY, gizmo.arrow_y_end),
     ];
     for (hit, at) in hits {
-        if world.distance(at) <= r {
+        if mode.shows(hit) && world.distance(at) <= r {
             return Some(hit);
         }
     }
     // The arrow shafts, as segments (a slightly tighter radius than the
     // endpoint squares so they do not swallow clicks near the sprite body).
-    if segment_distance(world, gizmo.center, gizmo.arrow_x_end) <= r * 0.6 {
+    if mode.shows(GizmoHit::MoveX)
+        && segment_distance(world, gizmo.center, gizmo.arrow_x_end) <= r * 0.6
+    {
         return Some(GizmoHit::MoveX);
     }
-    if segment_distance(world, gizmo.center, gizmo.arrow_y_end) <= r * 0.6 {
+    if mode.shows(GizmoHit::MoveY)
+        && segment_distance(world, gizmo.center, gizmo.arrow_y_end) <= r * 0.6
+    {
         return Some(GizmoHit::MoveY);
     }
     None
 }
 
 /// The gizmo's overlay sprites (drawn with a solid-white texture, tinted): the
-/// selection outline, the X/Y move arrows, and the rotate and scale handles,
-/// all sized in screen pixels so they stay constant under zoom.
-pub fn gizmo_sprites(gizmo: &Gizmo, zoom: f32) -> Vec<Sprite> {
+/// selection outline always, plus the handles the `mode` shows (move arrows,
+/// rotate lollipop, scale handles), all sized in screen pixels so they stay
+/// constant under zoom.
+pub fn gizmo_sprites(gizmo: &Gizmo, zoom: f32, mode: GizmoMode) -> Vec<Sprite> {
     let t = OUTLINE_PX / zoom;
     let half = HANDLE_HALF_PX / zoom;
     let (w, h) = (gizmo.size.x, gizmo.size.y);
@@ -233,38 +283,46 @@ pub fn gizmo_sprites(gizmo: &Gizmo, zoom: f32) -> Vec<Sprite> {
     };
 
     let arrow = ARROW_PX / zoom;
-    vec![
-        // The four edges of the (possibly rotated) selection rectangle.
+    // The selection outline is always drawn - the four edges of the (possibly
+    // rotated) selection rectangle.
+    let mut sprites = vec![
         quad(at(Vec2::ZERO), Vec2::new(w, t), OUTLINE),
         quad(at(Vec2::ZERO), Vec2::new(t, h), OUTLINE),
         quad(at(Vec2::new(0.0, h - t)), Vec2::new(w, t), OUTLINE),
         quad(at(Vec2::new(w - t, 0.0)), Vec2::new(t, h), OUTLINE),
-        // The move arrows: a shaft from the center along each local axis, with
-        // an endpoint square. Axis colors: X red, Y green.
-        quad(
+    ];
+    if mode.shows(GizmoHit::MoveX) {
+        // A shaft from the center along local X, with an endpoint square (red).
+        sprites.push(quad(
             gizmo.center - gizmo.axis_y * (t * 0.5),
             Vec2::new(arrow, t),
             AXIS_X,
-        ),
-        handle(gizmo.arrow_x_end, AXIS_X),
-        quad(
+        ));
+        sprites.push(handle(gizmo.arrow_x_end, AXIS_X));
+    }
+    if mode.shows(GizmoHit::MoveY) {
+        sprites.push(quad(
             gizmo.center - gizmo.axis_x * (t * 0.5),
             Vec2::new(t, arrow),
             AXIS_Y,
-        ),
-        handle(gizmo.arrow_y_end, AXIS_Y),
-        // A stem from the top edge up to the rotate handle, then the handles:
-        // rotate (blue), per-axis scale (axis colors), uniform scale (amber).
-        quad(
+        ));
+        sprites.push(handle(gizmo.arrow_y_end, AXIS_Y));
+    }
+    if mode.shows(GizmoHit::Rotate) {
+        // A stem from the top edge up to the rotate handle (blue).
+        sprites.push(quad(
             at(Vec2::new(w * 0.5 - t * 0.5, -ROTATE_OFFSET_PX / zoom)),
             Vec2::new(t, ROTATE_OFFSET_PX / zoom),
             OUTLINE,
-        ),
-        handle(gizmo.rotate_center, ROTATE_HANDLE),
-        handle(gizmo.scale_x, AXIS_X),
-        handle(gizmo.scale_y, AXIS_Y),
-        handle(gizmo.scale_corner, SCALE_HANDLE),
-    ]
+        ));
+        sprites.push(handle(gizmo.rotate_center, ROTATE_HANDLE));
+    }
+    if mode.shows(GizmoHit::ScaleX) {
+        sprites.push(handle(gizmo.scale_x, AXIS_X));
+        sprites.push(handle(gizmo.scale_y, AXIS_Y));
+        sprites.push(handle(gizmo.scale_corner, SCALE_HANDLE));
+    }
+    sprites
 }
 
 /// The full-viewport guide line for an axis-constrained drag, in the dragged
@@ -573,21 +631,68 @@ mod tests {
         assert!((g.arrow_x_end - Vec2::new(100.0 + 56.0, 50.0)).length() < EPS);
         assert!((g.arrow_y_end - Vec2::new(100.0, 50.0 + 56.0)).length() < EPS);
 
-        assert_eq!(hit_gizmo(&g, g.rotate_center), Some(GizmoHit::Rotate));
-        assert_eq!(hit_gizmo(&g, g.scale_corner), Some(GizmoHit::ScaleCorner));
-        assert_eq!(hit_gizmo(&g, g.scale_x), Some(GizmoHit::ScaleX));
-        assert_eq!(hit_gizmo(&g, g.scale_y), Some(GizmoHit::ScaleY));
-        assert_eq!(hit_gizmo(&g, g.arrow_x_end), Some(GizmoHit::MoveX));
-        assert_eq!(hit_gizmo(&g, g.arrow_y_end), Some(GizmoHit::MoveY));
+        assert_eq!(
+            hit_gizmo(&g, g.rotate_center, GizmoMode::Select),
+            Some(GizmoHit::Rotate)
+        );
+        assert_eq!(
+            hit_gizmo(&g, g.scale_corner, GizmoMode::Select),
+            Some(GizmoHit::ScaleCorner)
+        );
+        assert_eq!(
+            hit_gizmo(&g, g.scale_x, GizmoMode::Select),
+            Some(GizmoHit::ScaleX)
+        );
+        assert_eq!(
+            hit_gizmo(&g, g.scale_y, GizmoMode::Select),
+            Some(GizmoHit::ScaleY)
+        );
+        assert_eq!(
+            hit_gizmo(&g, g.arrow_x_end, GizmoMode::Select),
+            Some(GizmoHit::MoveX)
+        );
+        assert_eq!(
+            hit_gizmo(&g, g.arrow_y_end, GizmoMode::Select),
+            Some(GizmoHit::MoveY)
+        );
         // A point along the X arrow shaft (between center and tip) hits too -
         // chosen clear of the right-edge scale handle at +30, which sits on
         // the same ray and rightly wins where they cross (point handles beat
         // shafts).
         assert_eq!(
-            hit_gizmo(&g, g.center + g.axis_x * 45.0),
+            hit_gizmo(&g, g.center + g.axis_x * 45.0, GizmoMode::Select),
             Some(GizmoHit::MoveX)
         );
-        assert_eq!(hit_gizmo(&g, Vec2::new(0.0, 0.0)), None);
+        assert_eq!(hit_gizmo(&g, Vec2::new(0.0, 0.0), GizmoMode::Select), None);
+    }
+
+    #[test]
+    fn a_mode_hides_and_disables_other_handles() {
+        let (scene, node) = scene_with_sprite(Vec2::new(100.0, 50.0), Vec2::new(60.0, 40.0));
+        let g = gizmo(&scene, node, 1.0).unwrap();
+
+        // Rotate mode: the rotate handle is live, the scale corner is not.
+        assert_eq!(
+            hit_gizmo(&g, g.rotate_center, GizmoMode::Rotate),
+            Some(GizmoHit::Rotate)
+        );
+        assert_eq!(hit_gizmo(&g, g.scale_corner, GizmoMode::Rotate), None);
+        assert_eq!(hit_gizmo(&g, g.arrow_x_end, GizmoMode::Rotate), None);
+
+        // Move mode: arrows live, rotate/scale not.
+        assert_eq!(
+            hit_gizmo(&g, g.arrow_x_end, GizmoMode::Move),
+            Some(GizmoHit::MoveX)
+        );
+        assert_eq!(hit_gizmo(&g, g.rotate_center, GizmoMode::Move), None);
+
+        // The overlay only draws the outline plus the active mode's handles:
+        // Rotate mode has fewer sprites than Select (which shows everything).
+        let select = gizmo_sprites(&g, 1.0, GizmoMode::Select).len();
+        let rotate = gizmo_sprites(&g, 1.0, GizmoMode::Rotate).len();
+        assert!(rotate < select, "{rotate} should be fewer than {select}");
+        // The outline (4 edges) is always present.
+        assert!(gizmo_sprites(&g, 1.0, GizmoMode::Move).len() >= 4);
     }
 
     #[test]

@@ -247,6 +247,11 @@ impl Ui {
         self.widgets[id].background = color;
     }
 
+    /// A widget's background color (mostly for tests and introspection).
+    pub fn background(&self, id: WidgetId) -> Color {
+        self.widgets[id].background
+    }
+
     /// Replace a label's text. It is re-shaped and re-measured on the next
     /// [`layout`](Self::layout); a no-op on non-label widgets.
     pub fn set_label(&mut self, id: WidgetId, text: impl Into<String>) {

@@ -33,7 +33,7 @@ use crate::ui::{
     ContextMenu, EditorRows, MenuAction, PanelSizes, build_editor_ui, capture_panel_sizes,
     parse_value,
 };
-use crate::viewport::{Drag, EditorCamera, GizmoHit};
+use crate::viewport::{Drag, EditorCamera, GizmoHit, GizmoMode};
 
 fn main() -> Result<()> {
     init_logging();
@@ -128,6 +128,9 @@ struct State {
     applied_cursor: aurora::CursorHint,
     /// The open right-click context menu, if any (Aurora popup layer).
     context_menu: Option<ContextMenu>,
+    /// The active transform tool (select/move/rotate/scale), chosen from the
+    /// toolbar; filters which gizmo handles show and are hittable.
+    gizmo_mode: GizmoMode,
 }
 
 impl ApplicationHandler for App {
@@ -190,7 +193,7 @@ impl ApplicationHandler for App {
             WindowEvent::MouseWheel { delta, .. } => state.wheel(delta),
             WindowEvent::ModifiersChanged(m) => state.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if !state.handle_shortcut(&event) {
+                if !state.handle_shortcut(&event) && !state.handle_mode_key(&event) {
                     for ev in translate_key(&event) {
                         state.ui.handle_input(ev);
                     }
@@ -259,6 +262,7 @@ impl State {
             &project_dir,
             panel_sizes,
             None,
+            GizmoMode::default(),
         );
 
         Ok(Self {
@@ -289,6 +293,7 @@ impl State {
             last_fps: 0.0,
             applied_cursor: aurora::CursorHint::Default,
             context_menu: None,
+            gizmo_mode: GizmoMode::default(),
         })
     }
 
@@ -353,7 +358,7 @@ impl State {
         // over picking (which only sees sprite pixels).
         if let Some(sel) = self.selected
             && let Some(g) = viewport::gizmo(scene, sel, self.camera.zoom)
-            && let Some(hit) = viewport::hit_gizmo(&g, world)
+            && let Some(hit) = viewport::hit_gizmo(&g, world, self.gizmo_mode)
         {
             let original = scene.node(sel).transform;
             self.drag = Some(match hit {
@@ -450,6 +455,36 @@ impl State {
             }
             Err(err) => tracing::error!("pick failed: {err}"),
         }
+    }
+
+    /// Set the active gizmo mode (from a toolbar click or a shortcut).
+    fn set_gizmo_mode(&mut self, mode: GizmoMode) {
+        if self.gizmo_mode != mode {
+            self.gizmo_mode = mode;
+            self.dirty = true;
+        }
+    }
+
+    /// The gizmo-mode shortcuts Q/W/E/R (select/move/rotate/scale, Godot's
+    /// layout), consumed only when no modifier is held and no text field is
+    /// focused - so typing into a field is never hijacked. Returns whether the
+    /// key was handled.
+    fn handle_mode_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if self.modifiers.control_key() || self.modifiers.alt_key() || self.ui.focused().is_some() {
+            return false;
+        }
+        let WinitKey::Character(c) = &event.logical_key else {
+            return false;
+        };
+        let mode = match c.as_str() {
+            "q" | "Q" => GizmoMode::Select,
+            "w" | "W" => GizmoMode::Move,
+            "e" | "E" => GizmoMode::Rotate,
+            "r" | "R" => GizmoMode::Scale,
+            _ => return false,
+        };
+        self.set_gizmo_mode(mode);
+        true
     }
 
     /// Right-click: open a context menu. Over a scene-tree row it offers node
@@ -772,6 +807,7 @@ impl State {
                 &self.project_dir,
                 self.panel_sizes,
                 self.context_menu.as_ref(),
+                self.gizmo_mode,
             );
             self.ui = ui;
             self.rows = rows;
@@ -837,7 +873,11 @@ impl State {
         if let Some(sel) = self.selected
             && let Some(g) = viewport::gizmo(&self.project.scene, sel, self.camera.zoom)
         {
-            overlay.extend(viewport::gizmo_sprites(&g, self.camera.zoom));
+            overlay.extend(viewport::gizmo_sprites(
+                &g,
+                self.camera.zoom,
+                self.gizmo_mode,
+            ));
         }
         if !overlay.is_empty() {
             self.engine
@@ -868,6 +908,18 @@ impl State {
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.save => self.save_project(),
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.load => self.load_project(),
+                AuroraEvent::Clicked(id)
+                    if self.rows.mode_buttons.iter().any(|(w, _)| *w == id) =>
+                {
+                    let mode = self
+                        .rows
+                        .mode_buttons
+                        .iter()
+                        .find(|(w, _)| *w == id)
+                        .map(|(_, m)| *m)
+                        .expect("guarded by the match arm");
+                    self.set_gizmo_mode(mode);
+                }
                 AuroraEvent::Clicked(id) if self.rows.menu_items.iter().any(|(w, _)| *w == id) => {
                     let action = self
                         .rows

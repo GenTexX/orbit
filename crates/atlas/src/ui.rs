@@ -8,12 +8,15 @@ use aurora::{Color, ImageHandle, Orientation, Style, Ui, WidgetId};
 use glam::Vec2;
 use helios::{NodeId, Scene, Value};
 
+use crate::viewport::GizmoMode;
+
 const PANEL_BG: Color = Color::rgb(0.13, 0.14, 0.18);
 const ROOT_BG: Color = Color::rgb(0.08, 0.08, 0.10);
 const HEADING: Color = Color::rgb(0.96, 0.97, 1.0);
 const SUBHEAD: Color = Color::rgb(0.55, 0.60, 0.72);
 const ROW_SELECTED: Color = Color::rgb(0.20, 0.28, 0.42);
 const MENU_BG: Color = Color::rgb(0.16, 0.17, 0.22);
+const MODE_ACTIVE: Color = Color::rgb(0.24, 0.40, 0.62);
 
 /// Maps widget handles back to the domain data they represent, so the app can
 /// react to Aurora events without Aurora knowing about `Scene`/`NodeId`.
@@ -43,6 +46,8 @@ pub struct EditorRows {
     pub add_sprite: Option<WidgetId>,
     pub save: Option<WidgetId>,
     pub load: Option<WidgetId>,
+    /// The toolbar's gizmo-mode buttons, each mapped to the mode it selects.
+    pub mode_buttons: Vec<(WidgetId, GizmoMode)>,
     /// Status bar readouts, updated in place every frame via `set_label`.
     pub status_cursor: Option<WidgetId>,
     pub status_zoom: Option<WidgetId>,
@@ -129,13 +134,14 @@ pub fn build_editor_ui(
     project_dir: &Path,
     sizes: PanelSizes,
     menu: Option<&ContextMenu>,
+    gizmo_mode: GizmoMode,
 ) -> (Ui, EditorRows) {
     let mut ui = Ui::new();
     let mut rows = EditorRows::default();
 
     // A toolbar strip across the top, then the three-way dock below it.
     let root = ui.root_panel(Style::new().fill().column().background(ROOT_BG));
-    build_toolbar(&mut ui, root, &mut rows);
+    build_toolbar(&mut ui, root, gizmo_mode, &mut rows);
     // `main` clips (Overflow::Hidden): this is what lets the scroll panels
     // inside it stay window-sized instead of ballooning the row to their tall
     // content - see aurora's nested-row scroll test.
@@ -208,9 +214,10 @@ fn build_status_bar(ui: &mut Ui, parent: WidgetId, rows: &mut EditorRows) {
     rows.status_fps = Some(readout(ui, "- fps"));
 }
 
-/// The toolbar: the editor's actions, and later home to the gizmo-mode
-/// switches from the ideatank.
-fn build_toolbar(ui: &mut Ui, parent: WidgetId, rows: &mut EditorRows) {
+/// The toolbar: the editor's actions on the left, the gizmo-mode switches on
+/// the right (the active mode highlighted). A natural home for more tool
+/// switches later.
+fn build_toolbar(ui: &mut Ui, parent: WidgetId, mode: GizmoMode, rows: &mut EditorRows) {
     let bar = ui.panel(
         parent,
         Style::new()
@@ -226,6 +233,21 @@ fn build_toolbar(ui: &mut Ui, parent: WidgetId, rows: &mut EditorRows) {
     rows.add_sprite = Some(button(ui, "Add Sprite"));
     rows.save = Some(button(ui, "Save"));
     rows.load = Some(button(ui, "Load"));
+
+    // A spacer pushes the mode switches to the right edge of the bar.
+    ui.panel(bar, Style::new().grow(1.0));
+    for m in GizmoMode::ALL {
+        let background = if m == mode { MODE_ACTIVE } else { PANEL_BG };
+        let button = ui.button(
+            bar,
+            m.label(),
+            Style::new()
+                .padding(6.0)
+                .background(background)
+                .foreground(HEADING),
+        );
+        rows.mode_buttons.push((button, m));
+    }
 }
 
 /// A right-click context menu on Aurora's popup layer: a floating column of
@@ -510,7 +532,8 @@ mod tests {
         let dir = std::env::temp_dir(); // no project files needed for this test
 
         let sizes = PanelSizes::default();
-        let (mut ui, rows) = build_editor_ui(&scene, None, handle, &dir, sizes, None);
+        let (mut ui, rows) =
+            build_editor_ui(&scene, None, handle, &dir, sizes, None, GizmoMode::Select);
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
         // Drag the tree panel's splitter 50px right, as a user would.
@@ -531,13 +554,54 @@ mod tests {
         // Rebuild the shell (what a tree-row click triggers) with captured sizes.
         let captured = capture_panel_sizes(&ui, &rows, sizes);
         assert_eq!(captured.tree_width, sizes.tree_width + 50.0);
-        let (mut ui2, rows2) = build_editor_ui(&scene, None, handle, &dir, captured, None);
+        let (mut ui2, rows2) = build_editor_ui(
+            &scene,
+            None,
+            handle,
+            &dir,
+            captured,
+            None,
+            GizmoMode::Select,
+        );
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
         assert_eq!(
             ui2.rect(rows2.tree_panel.unwrap()).unwrap().size.x,
             sizes.tree_width + 50.0,
             "the dragged width survives the rebuild"
         );
+    }
+
+    #[test]
+    fn the_toolbar_records_mode_buttons_and_highlights_the_active_one() {
+        let (scene, handle) = demo_scene();
+        let dir = std::env::temp_dir();
+        let (mut ui, rows) = build_editor_ui(
+            &scene,
+            None,
+            handle,
+            &dir,
+            PanelSizes::default(),
+            None,
+            GizmoMode::Rotate,
+        );
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+
+        // One button per mode, in order.
+        let modes: Vec<GizmoMode> = rows.mode_buttons.iter().map(|(_, m)| *m).collect();
+        assert_eq!(modes, GizmoMode::ALL.to_vec());
+        // The active mode's button carries the highlight background; the others
+        // use the plain panel background.
+        for (id, m) in &rows.mode_buttons {
+            let aurora::WidgetKind::Button(_) = ui.kind(*id) else {
+                panic!("mode entries are buttons");
+            };
+            let bg = ui.background(*id);
+            if *m == GizmoMode::Rotate {
+                assert_eq!(bg, MODE_ACTIVE, "the active mode is highlighted");
+            } else {
+                assert_eq!(bg, PANEL_BG, "inactive modes are not");
+            }
+        }
     }
 
     #[test]
@@ -559,6 +623,7 @@ mod tests {
             &dir,
             PanelSizes::default(),
             Some(&menu),
+            GizmoMode::Select,
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -590,7 +655,8 @@ mod tests {
         let dir = std::env::temp_dir();
 
         let sizes = PanelSizes::default();
-        let (mut ui, rows) = build_editor_ui(&scene, None, handle, &dir, sizes, None);
+        let (mut ui, rows) =
+            build_editor_ui(&scene, None, handle, &dir, sizes, None, GizmoMode::Select);
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
         // Wheel-scroll the tree panel down.
@@ -604,7 +670,15 @@ mod tests {
         // Rebuild with captured state: the offset carries over.
         let captured = capture_panel_sizes(&ui, &rows, sizes);
         assert_eq!(captured.tree_scroll, 90.0);
-        let (mut ui2, rows2) = build_editor_ui(&scene, None, handle, &dir, captured, None);
+        let (mut ui2, rows2) = build_editor_ui(
+            &scene,
+            None,
+            handle,
+            &dir,
+            captured,
+            None,
+            GizmoMode::Select,
+        );
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
         assert_eq!(ui2.scroll_offset(rows2.tree_panel.unwrap()), 90.0);
     }
@@ -618,8 +692,15 @@ mod tests {
         let (scene, handle) = demo_scene();
         let dir = std::env::temp_dir();
 
-        let (mut ui, rows) =
-            build_editor_ui(&scene, None, handle, &dir, PanelSizes::default(), None);
+        let (mut ui, rows) = build_editor_ui(
+            &scene,
+            None,
+            handle,
+            &dir,
+            PanelSizes::default(),
+            None,
+            GizmoMode::Select,
+        );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
         let viewport = rows.viewport.unwrap();
         let before = ui.rect(viewport).unwrap().size;
