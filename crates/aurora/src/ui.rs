@@ -146,6 +146,11 @@ impl Ui {
     pub fn set_label(&mut self, id: WidgetId, text: impl Into<String>) {
         if let WidgetKind::Label(s) = &mut self.widgets[id].kind {
             *s = text.into();
+            // taffy caches layout per node; without marking this one dirty it
+            // would serve the old measurement and never re-run the measure
+            // function that re-shapes the text buffer.
+            let node = self.widgets[id].taffy;
+            self.taffy.mark_dirty(node).expect("taffy mark_dirty");
         }
     }
 
@@ -608,6 +613,26 @@ mod tests {
             .iter()
             .any(|c| matches!(c, DrawCommand::Text { glyphs, .. } if !glyphs.is_empty()));
         assert!(has_text, "label should emit a non-empty Text command");
+    }
+
+    #[test]
+    fn set_label_reshapes_on_the_next_layout() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column());
+        let label = ui.label(root, "x", Style::new());
+        ui.layout(Vec2::new(400.0, 400.0)).unwrap();
+        let narrow = ui.rect(label).unwrap().size.x;
+
+        // Change to clearly wider text and lay out again at the SAME size. Without
+        // marking the node dirty, taffy would serve the cached (narrow) measure.
+        ui.set_label(label, "wide wide wide wide");
+        ui.layout(Vec2::new(400.0, 400.0)).unwrap();
+        let wide = ui.rect(label).unwrap().size.x;
+
+        assert!(
+            wide > narrow,
+            "label should re-measure wider: {narrow} -> {wide}"
+        );
     }
 
     #[test]
