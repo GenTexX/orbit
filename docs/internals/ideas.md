@@ -29,9 +29,33 @@ this list is what "come back and make the editor great" concretely means.
   timer), **modal dialogs** (popup + input block behind), and richer context
   menus (submenus, separators, icons, keyboard nav).
 - **Sliders and numeric steppers** (drag a value, click tiny +/- arrows).
-- **Icons.** Everything is text; a small bitmap icon atlas (same machinery as
-  the glyph atlas) would transform the toolbar, tree rows (node type icons,
-  visibility eyes), and file list.
+- **Icons.** Everything is text; icons would transform the toolbar, tree rows
+  (node type icons, visibility eyes), and file list. Open question on the
+  format: a bitmap atlas (same machinery as the glyph atlas, simplest), SVG
+  (crisp at any scale/DPI but needs a rasterizer like resvg), or a small
+  custom "Aurora icon" vector format (a handful of filled/stroked paths we
+  tessellate ourselves - no dependency, tuned to what we need).
+- **Toggle switch** (a sliding on/off control, optionally animated) as a
+  friendlier alternative to the checkbox for booleans.
+- **Tabs widget**: a tab bar plus swappable content panes - the primitive the
+  editor's scene tabs and any tabbed inspector would build on.
+- **Text area**: a multi-line text input (wrapping, vertical scroll, caret
+  navigation across lines) - distinct from today's single-line field, and the
+  foundation the M4 code editor needs.
+- **Multiple font sizes** (and weights): the whole UI is one size today.
+  Headings, body, and small captions want distinct sizes - pairs with
+  theming-as-data.
+- **Input placeholders**: greyed hint text shown in an empty field (e.g.
+  "search...", "name").
+- **Input validation / masking**: a field that rejects disallowed characters
+  as you type (numeric-only, integer, hex color) - the framework-level
+  primitive the inspector's numeric fields build on.
+- **Anti-aliasing** for the UI: rounded-rect and rotated-line edges are hard
+  today (single-sample quads). MSAA on the aurora-wgpu pass, or SDF-based
+  shapes, for crisp edges - also helps photon's gizmo overlay lines.
+- **Node editor**: a pan/zoom canvas of nodes with draggable ports and wires
+  between them - for a future visual scripting / shader / state-machine graph.
+  A big one; needs the popup/canvas and drag-and-drop groundwork.
 - **Disabled state** for widgets (grayed out, non-interactive) - e.g. Save
   when nothing changed, Load when no project.
 - **Per-side padding/margin in Style.** The tree indents with a spacer-panel
@@ -81,6 +105,12 @@ this list is what "come back and make the editor great" concretely means.
   transparency; the flat navy reads as part of the scene).
 - **Snapping**: grid snap for moves, angle increments for rotation (modifier
   held), plus a numeric readout near the cursor while dragging.
+- **Arrowheads on the gizmo axes**: the move handles are plain shafts with a
+  square tip today; proper arrowheads (a triangle at each end) read as a real
+  transform gizmo. Needs a triangle/shape primitive in the overlay.
+- **Rotate gizmo arc feedback**: while rotating, draw a partially filled
+  circle/pie from the start angle to the current one, so the amount of
+  rotation is visible at a glance. Needs an arc/pie primitive.
 - **Mirror/flip via negative scale** is currently clamped away; allowing a
   flip needs care in the world-affine decomposition.
 - **Configurable sprite anchor/pivot field** on SpriteComponent, centered by
