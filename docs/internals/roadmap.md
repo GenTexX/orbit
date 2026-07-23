@@ -24,6 +24,7 @@ This is the milestone spine for Orbit. A **milestone** is a big, demonstrable ca
 **Done when:** the editor looks like an editor - docked scene-tree, inspector, and viewport - and you can place, move, and select sprite nodes, then save and load the Project to disk.
 **Proves:** the Node + Component model, scene serialization round-trips, and Aurora assembled into a real docked application. No scripting yet.
 **Brings online:** `helios` (scene tree, components, serialization, input), `atlas` (shell, viewport, scene-tree and inspector panels, file explorer).
+**Plan:** [Milestone 3 - Scenes & Editor Shell](plans/milestone-3-scenes-editor.md) (ADRs 0016-0018).
 
 ### Milestone 4 - Comet (language runs)
 **Done when:** you write a `.cmt` script, it compiles in milliseconds, runs on wasmtime, and moves a node - and the code editor shows live error squiggles as you type.

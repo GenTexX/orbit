@@ -21,7 +21,7 @@ The scripting language: statically typed, garbage-collected, compiled to WASM. S
 _Avoid_: the scripting language (in docs), orbit-script
 
 **Photon**:
-The 2D drawing crate - sprites, shapes, text, render targets - and the only code that touches wgpu.
+The 2D drawing crate - sprites, shapes, text, render targets - and the engine's renderer. It touches wgpu, as do the GUI's backend (aurora-wgpu) and the editor's shared GPU bootstrap (ADR 0018); wgpu stays out of the engine and model logic.
 _Avoid_: the renderer (as a proper name), orbit-renderer
 
 **Helios**:
