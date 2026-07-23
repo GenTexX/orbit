@@ -24,16 +24,10 @@ this list is what "come back and make the editor great" concretely means.
   selection gets old fast.
 - **Tab focus traversal** between inputs (and Enter moving to the next row in
   the inspector, spreadsheet-style).
-- **Popup/overlay layer**: widgets drawn above the normal tree with their own
-  hit-testing pass - the foundation dropdowns, context menus, tooltips,
-  dialogs, the asset chooser, and the color picker all stand on. Probably the
-  highest-leverage single Aurora feature.
-- **Dropdown/select widget** (needs popups).
-- **Context menus** on right-click (needs popups; the scene tree and viewport
-  both want them badly).
-- **Tooltips** on hover (needs popups + a hover timer).
-- **Modal dialogs** (confirm-discard-changes, errors) - popups plus an input
-  block behind them.
+- **Popup layer shipped** (right-click context menus ride on it). Still open,
+  now unblocked: **dropdown/select widget**, **tooltips** on hover (popup +
+  timer), **modal dialogs** (popup + input block behind), and richer context
+  menus (submenus, separators, icons, keyboard nav).
 - **Sliders and numeric steppers** (drag a value, click tiny +/- arrows).
 - **Icons.** Everything is text; a small bitmap icon atlas (same machinery as
   the glyph atlas) would transform the toolbar, tree rows (node type icons,
@@ -85,9 +79,6 @@ this list is what "come back and make the editor great" concretely means.
   (F), frame-all, reset view (double-click middle?).
 - **Checkerboard or configurable background** behind the scene (communicates
   transparency; the flat navy reads as part of the scene).
-- **Gizmo modes with a toolbar above the viewport** (Godot-style): select /
-  move / rotate / scale as exclusive modes with Q/W/E/S-style shortcuts; only
-  the active mode's gizmo shows. The toolbar now exists to host it.
 - **Snapping**: grid snap for moves, angle increments for rotation (modifier
   held), plus a numeric readout near the cursor while dragging.
 - **Mirror/flip via negative scale** is currently clamped away; allowing a
@@ -127,11 +118,10 @@ this list is what "come back and make the editor great" concretely means.
 
 ## Engine (helios / photon)
 
-- **Texture cache + per-texture batching.** THE silent limitation: every
-  sprite renders with the single loaded demo texture regardless of what its
-  `texture` field says. The editor needs a path-keyed texture cache and
-  photon needs to draw batches grouped by texture. Invisible with one PNG in
-  the project, wrong the moment there are two.
+- **Texture atlas / sort-then-batch.** Per-texture batching shipped
+  (consecutive same-texture runs), but cross-texture painter's order still
+  forces a new draw at every texture change. A texture atlas (one draw) or a
+  z-sort-then-batch pass would cut draw calls for texture-interleaved scenes.
 - **Sprite sheet support**: expose photon's `uv_rect` on SpriteComponent
   (region of a texture), the base for animation later.
 - **Sprite flip flags** (flip_h/flip_v) as a cheap alternative to negative
