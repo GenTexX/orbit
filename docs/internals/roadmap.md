@@ -13,10 +13,12 @@ This is the milestone spine for Orbit. A **milestone** is a big, demonstrable ca
 **Brings online:** `photon` (2D drawing API over wgpu), a sandbox binary, the `profiling` + puffin harness.
 **Plan:** [Milestone 1 - Walking Skeleton](plans/milestone-1-walking-skeleton.md).
 
-### Milestone 2 - Aurora (usable GUI)
+### Milestone 2 - Aurora (usable GUI) (done)
 **Done when:** a mock inspector runs - a docked panel of labeled rows you can click and type into, laid out by taffy, holding 60fps with the profiler open.
 **Proves:** the least-proven design we committed to (arena + events + handles + taffy-sync). This is deliberately early to retire that risk before the editor is built on top of it.
 **Brings online:** `aurora`, `aurora-wgpu`.
+**Plan:** [Milestone 2 - Aurora](plans/milestone-2-aurora.md).
+**Shipped:** retained widget arena over a taffy tree; a high-level draw list rendered by aurora-wgpu through a single atlas-textured quad pipeline; text via cosmic-text (bundled DejaVu Sans) with a glyph atlas; pointer input with clip-aware hit-testing and bubbling events; buttons, checkboxes, and focusable/editable text inputs; the `inspector` demo runs well under the 16.6ms/frame budget with puffin scopes throughout. 20 headless tests.
 
 ### Milestone 3 - Scenes & Editor Shell
 **Done when:** the editor looks like an editor - docked scene-tree, inspector, and viewport - and you can place, move, and select sprite nodes, then save and load the Project to disk.
