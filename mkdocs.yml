@@ -10,9 +10,11 @@ nav:
   - Internals:
       - internals/index.md
       - internals/roadmap.md
+      - internals/ideas.md
       - Plans:
           - internals/plans/milestone-1-walking-skeleton.md
           - internals/plans/milestone-2-aurora.md
+          - internals/plans/milestone-3-scenes-editor.md
       - Subsystems:
           - internals/renderer.md
       - internals/benchmarks.md
@@ -33,3 +35,7 @@ nav:
           - adr/0013-text-via-cosmic-text.md
           - adr/0014-aurora-widget-model.md
           - adr/0015-draw-list-high-level-commands.md
+          - adr/0016-component-representation-and-reflection.md
+          - adr/0017-scenes-serialize-to-ron.md
+          - adr/0018-editor-gpu-integration.md
+          - adr/0019-sprite-centered-on-node-origin.md
