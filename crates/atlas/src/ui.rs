@@ -28,6 +28,10 @@ pub struct EditorRows {
     pub tree_panel: Option<WidgetId>,
     pub inspector_panel: Option<WidgetId>,
     pub files_panel: Option<WidgetId>,
+    /// The viewport image widget; the app sizes the scene render target to
+    /// this widget's laid-out rect each frame, so the scene draws 1:1 instead
+    /// of stretching a window-sized texture into a smaller panel.
+    pub viewport: Option<WidgetId>,
 }
 
 /// The dock's panel sizes. Splitter drags mutate the live widget tree, so the
@@ -86,7 +90,7 @@ pub fn build_editor_ui(
 
     // Center: the viewport on top, a resizable file-explorer strip below.
     let center = ui.panel(root, Style::new().column().grow(1.0));
-    ui.image(center, viewport_handle, Style::new().grow(1.0));
+    let viewport = ui.image(center, viewport_handle, Style::new().grow(1.0));
     let splitter_2 = ui.splitter(
         center,
         Orientation::Horizontal,
@@ -110,6 +114,7 @@ pub fn build_editor_ui(
     rows.tree_panel = Some(tree_panel);
     rows.inspector_panel = Some(inspector_panel);
     rows.files_panel = Some(files_panel);
+    rows.viewport = Some(viewport);
     (ui, rows)
 }
 
@@ -355,6 +360,36 @@ mod tests {
             sizes.tree_width + 50.0,
             "the dragged width survives the rebuild"
         );
+    }
+
+    #[test]
+    fn a_panel_drag_reflows_the_viewport_widget() {
+        // The viewport shares the row with the panels, so growing a panel must
+        // narrow the viewport's rect by the same amount - that rect is what
+        // the app sizes the scene render target to each frame (1:1 pixels, no
+        // stretching), so it has to track panel drags.
+        let (scene, handle) = demo_scene();
+        let dir = std::env::temp_dir();
+
+        let (mut ui, rows) = build_editor_ui(&scene, None, handle, &dir, PanelSizes::default());
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        let viewport = rows.viewport.unwrap();
+        let before = ui.rect(viewport).unwrap().size;
+
+        // Drag the tree splitter 60px right.
+        let bar = Vec2::new(
+            ui.rect(rows.tree_panel.unwrap()).unwrap().max().x + 2.0,
+            100.0,
+        );
+        ui.handle_input(aurora::InputEvent::PointerMoved(bar));
+        ui.handle_input(aurora::InputEvent::PointerPressed);
+        ui.handle_input(aurora::InputEvent::PointerMoved(bar + Vec2::new(60.0, 0.0)));
+        ui.handle_input(aurora::InputEvent::PointerReleased);
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+
+        let after = ui.rect(viewport).unwrap().size;
+        assert_eq!(after.x, before.x - 60.0, "the viewport narrows by the drag");
+        assert_eq!(after.y, before.y, "its height is untouched");
     }
 
     #[test]

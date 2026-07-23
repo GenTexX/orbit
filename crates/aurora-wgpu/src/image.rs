@@ -12,9 +12,8 @@ struct RegisteredImage {
 /// against the shared `texture_layout` (the same layout the glyph atlas uses).
 ///
 /// Milestone 3 only ever registers one image (the scene viewport) and never
-/// removes it; re-registering a recreated texture (e.g. after a resize) mints
-/// a fresh handle rather than updating one in place - update-in-place can be
-/// added if a later milestone needs it.
+/// removes it. A recreated texture (e.g. the viewport resized) keeps its
+/// handle via [`update`](Self::update), so widgets referencing it stay valid.
 pub(crate) struct ImageRegistry {
     images: SlotMap<ImageHandle, RegisteredImage>,
     sampler: wgpu::Sampler,
@@ -34,16 +33,13 @@ impl ImageRegistry {
         }
     }
 
-    /// Register `view` for sampling against `layout` (the shared
-    /// texture+sampler bind group layout), returning the handle Aurora's draw
-    /// list will reference it by.
-    pub fn register(
-        &mut self,
+    fn build_bind_group(
+        &self,
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         view: &wgpu::TextureView,
-    ) -> ImageHandle {
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("image bind group"),
             layout,
             entries: &[
@@ -56,8 +52,40 @@ impl ImageRegistry {
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
             ],
-        });
+        })
+    }
+
+    /// Register `view` for sampling against `layout` (the shared
+    /// texture+sampler bind group layout), returning the handle Aurora's draw
+    /// list will reference it by.
+    pub fn register(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        view: &wgpu::TextureView,
+    ) -> ImageHandle {
+        let bind_group = self.build_bind_group(device, layout, view);
         self.images.insert(RegisteredImage { bind_group })
+    }
+
+    /// Point an existing handle at a new texture view (e.g. the viewport's
+    /// target recreated at a new size), keeping the handle - and every widget
+    /// referencing it - valid. Returns `false` on an unknown handle.
+    pub fn update(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        handle: ImageHandle,
+        view: &wgpu::TextureView,
+    ) -> bool {
+        let bind_group = self.build_bind_group(device, layout, view);
+        match self.images.get_mut(handle) {
+            Some(image) => {
+                image.bind_group = bind_group;
+                true
+            }
+            None => false,
+        }
     }
 
     /// The bind group for a registered image, or `None` for an unknown or

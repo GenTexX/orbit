@@ -323,6 +323,15 @@ impl Renderer {
             .register(&self.gpu.device, &self.texture_layout, view)
     }
 
+    /// Point an already-registered image at a new texture view (e.g. the
+    /// viewport's render target recreated at a new size). The handle - and
+    /// every widget referencing it - stays valid, so no UI rebuild is needed.
+    /// Returns `false` on an unknown handle.
+    pub fn update_image(&mut self, handle: ImageHandle, view: &wgpu::TextureView) -> bool {
+        self.images
+            .update(&self.gpu.device, &self.texture_layout, handle, view)
+    }
+
     /// Reconfigure the surface for a new window size.
     pub fn resize(&mut self, size: (u32, u32)) {
         self.config.width = size.0.max(1);

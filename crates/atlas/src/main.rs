@@ -197,16 +197,10 @@ impl State {
     }
 
     fn resize(&mut self, size: (u32, u32)) {
+        // Only the surface needs reconfiguring here: draw() re-sizes the scene
+        // target to the viewport widget's laid-out rect every frame, which a
+        // window resize changes like any panel drag does.
         self.gui.resize(size);
-        // The scene target and its registered handle are sized to the window,
-        // so both are rebuilt; the shell is rebuilt next draw to reference the
-        // fresh handle (ImageRegistry has no update-in-place - see
-        // aurora-wgpu's image.rs).
-        let (scene_target, viewport_handle) =
-            build_viewport_target(&mut self.gui, &self.engine, size);
-        self.scene_target = scene_target;
-        self.viewport_handle = viewport_handle;
-        self.dirty = true;
     }
 
     fn draw(&mut self) -> Result<()> {
@@ -228,11 +222,33 @@ impl State {
             self.dirty = false;
         }
 
+        // Lay the shell out first: the viewport widget's rect decides how big
+        // the scene renders.
         let size = self.window.inner_size();
-        let viewport = Vec2::new(size.width.max(1) as f32, size.height.max(1) as f32);
-        let clear = PhotonColor::new(0.02, 0.02, 0.05, 1.0);
+        let window = Vec2::new(size.width.max(1) as f32, size.height.max(1) as f32);
+        self.ui.layout(window)?;
 
-        let camera = Camera::new(Vec2::ZERO, viewport);
+        // Match the scene target to the viewport widget's on-screen size, so
+        // sprites draw 1:1 (a panel resize reflows the viewport, it does not
+        // stretch it). The handle stays valid across the swap (update_image),
+        // so no shell rebuild is needed - a splitter drag re-targets live.
+        let viewport = self
+            .rows
+            .viewport
+            .and_then(|id| self.ui.rect(id))
+            .map_or(window, |r| r.size);
+        let (w, h) = (
+            viewport.x.round().max(1.0) as u32,
+            viewport.y.round().max(1.0) as u32,
+        );
+        if (w, h) != (self.scene_target.width, self.scene_target.height) {
+            self.scene_target = self.engine.create_scene_target(w, h);
+            self.gui
+                .update_image(self.viewport_handle, self.scene_target.view());
+        }
+
+        let clear = PhotonColor::new(0.02, 0.02, 0.05, 1.0);
+        let camera = Camera::new(Vec2::ZERO, Vec2::new(w as f32, h as f32));
         self.engine.render_to_target(
             &self.scene_target,
             clear,
@@ -241,7 +257,6 @@ impl State {
             &self.project.scene.sprites(),
         );
 
-        self.ui.layout(viewport)?;
         let list = self.ui.draw_list();
         self.gui.render(
             &list,
