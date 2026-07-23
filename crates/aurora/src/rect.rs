@@ -30,4 +30,13 @@ impl Rect {
             && point.x < self.pos.x + self.size.x
             && point.y < self.pos.y + self.size.y
     }
+
+    /// The overlap of two rectangles. Non-overlapping rectangles yield a
+    /// zero-size rectangle (which [`contains`](Self::contains) nothing), so this
+    /// composes cleanly for clip stacks and clipped hit-testing.
+    pub fn intersect(self, other: Rect) -> Rect {
+        let min = self.pos.max(other.pos);
+        let max = self.max().min(other.max());
+        Rect::new(min, (max - min).max(Vec2::ZERO))
+    }
 }

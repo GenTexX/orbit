@@ -29,6 +29,28 @@ impl Color {
     pub const fn rgb(r: f32, g: f32, b: f32) -> Self {
         Self::rgba(r, g, b, 1.0)
     }
+
+    /// Mix each channel `t` of the way toward white (`t` in `0.0..=1.0`),
+    /// preserving alpha. Used for hover highlights on controls.
+    pub fn lighten(self, t: f32) -> Self {
+        Self::rgba(
+            self.r + (1.0 - self.r) * t,
+            self.g + (1.0 - self.g) * t,
+            self.b + (1.0 - self.b) * t,
+            self.a,
+        )
+    }
+
+    /// Scale each channel toward black by `t` (`t` in `0.0..=1.0`), preserving
+    /// alpha. Used for the pressed state on controls.
+    pub fn darken(self, t: f32) -> Self {
+        Self::rgba(
+            self.r * (1.0 - t),
+            self.g * (1.0 - t),
+            self.b * (1.0 - t),
+            self.a,
+        )
+    }
 }
 
 impl Default for Color {

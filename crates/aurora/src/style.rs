@@ -49,12 +49,15 @@ impl Style {
         self
     }
 
-    /// Fix the widget's size in pixels.
+    /// Fix the widget's size in pixels. Sets the minimum size too, so a fixed
+    /// size is not flex-shrunk when it overflows its container.
     pub fn size(mut self, width: f32, height: f32) -> Self {
-        self.layout.size = Size {
+        let s = Size {
             width: length(width),
             height: length(height),
         };
+        self.layout.size = s;
+        self.layout.min_size = s;
         self
     }
 

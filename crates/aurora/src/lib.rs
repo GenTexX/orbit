@@ -3,15 +3,20 @@
 mod color;
 mod draw;
 mod error;
+mod event;
+mod input;
 mod rect;
 mod style;
 mod text;
+mod theme;
 mod ui;
 mod widget;
 
 pub use color::Color;
 pub use draw::{DrawCommand, DrawList, Glyph};
 pub use error::AuroraError;
+pub use event::Event;
+pub use input::InputEvent;
 pub use rect::Rect;
 pub use style::Style;
 pub use ui::Ui;
@@ -28,6 +33,8 @@ pub use cosmic_text;
 pub mod prelude {
     //! Convenient imports for building a UI: Aurora's core types plus taffy's
     //! style vocabulary.
-    pub use crate::{Color, DrawCommand, DrawList, Rect, Style, Ui, WidgetId, WidgetKind};
+    pub use crate::{
+        Color, DrawCommand, DrawList, Event, InputEvent, Rect, Style, Ui, WidgetId, WidgetKind,
+    };
     pub use taffy::prelude::*;
 }

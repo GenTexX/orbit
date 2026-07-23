@@ -27,6 +27,14 @@ pub enum WidgetKind {
     TextInput(String),
 }
 
+impl WidgetKind {
+    /// Whether this kind responds to pointer input (so hit-testing bubbles a
+    /// click up to it). Text inputs join once focus lands in step 5.
+    pub(crate) fn is_interactive(&self) -> bool {
+        matches!(self, WidgetKind::Button(_) | WidgetKind::Checkbox(_))
+    }
+}
+
 /// A node in the UI tree: its kind, its taffy layout node, and its tree links.
 /// Internal: the outside world holds [`WidgetId`] handles, not `Widget` values.
 #[derive(Debug)]
