@@ -29,6 +29,9 @@ pub enum WidgetKind {
     /// A registered texture (e.g. the engine's viewport), drawn to fill this
     /// widget's rectangle. Backend-resolved, not interactive (ADR 0018).
     Image(ImageHandle),
+    /// A horizontal slider holding its current value within `[min, max]`;
+    /// dragging the track sets the value (emits `Event::SliderChanged`).
+    Slider { value: f32, min: f32, max: f32 },
     /// A draggable divider that resizes `target` along `orientation`'s axis -
     /// the foundation resizable, then fully dockable, panels grow from.
     /// `target` starts unset (see [`Ui::splitter`](crate::Ui::splitter)'s doc)
@@ -66,6 +69,7 @@ impl WidgetKind {
             WidgetKind::Button(_)
                 | WidgetKind::Checkbox(_)
                 | WidgetKind::TextInput(_)
+                | WidgetKind::Slider { .. }
                 | WidgetKind::Splitter { .. }
         )
     }

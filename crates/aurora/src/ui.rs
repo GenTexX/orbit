@@ -158,6 +158,29 @@ impl Ui {
         id
     }
 
+    /// Add a horizontal slider under `parent`, holding `value` clamped to
+    /// `[min, max]`. Dragging the track sets the value and emits
+    /// [`Event::SliderChanged`].
+    pub fn slider(
+        &mut self,
+        parent: WidgetId,
+        value: f32,
+        min: f32,
+        max: f32,
+        style: Style,
+    ) -> WidgetId {
+        let value = value.clamp(min.min(max), min.max(max));
+        self.add(WidgetKind::Slider { value, min, max }, style, Some(parent))
+    }
+
+    /// A slider's current value (0.0 for non-sliders).
+    pub fn slider_value(&self, id: WidgetId) -> f32 {
+        match self.widgets[id].kind {
+            WidgetKind::Slider { value, .. } => value,
+            _ => 0.0,
+        }
+    }
+
     /// Add a widget under `parent` that draws a backend-registered texture
     /// (`handle`) filling its rectangle - e.g. the engine's viewport.
     pub fn image(
@@ -614,6 +637,9 @@ impl Ui {
                 let delta = self.cursor.map(|c| p - c).unwrap_or(Vec2::ZERO);
                 self.cursor = Some(p);
                 self.drag_splitter(delta);
+                if let Some(id) = self.pressed {
+                    self.drag_slider(id);
+                }
                 // Dragging within the focused input sweeps a selection: move
                 // the caret (the anchor set on press stays put).
                 if self.pressed == self.focused
@@ -633,6 +659,10 @@ impl Ui {
                 // is a click.
                 self.pressed = self.hovered;
                 self.focus_from_press();
+                // A press on a slider jumps it to the cursor immediately.
+                if let Some(id) = self.pressed {
+                    self.drag_slider(id);
+                }
             }
             InputEvent::PointerReleased => {
                 // `take` always disarms; activation happens only on a release
@@ -673,6 +703,32 @@ impl Ui {
             && self.focused != previous
         {
             self.events.push(Event::Submitted(old));
+        }
+    }
+
+    /// If `id` is a slider, set its value from the cursor's x within the track
+    /// and emit `SliderChanged` (a no-op for other widgets or an off-surface
+    /// cursor). Called on press and on drag.
+    fn drag_slider(&mut self, id: WidgetId) {
+        let WidgetKind::Slider { value, min, max } = self.widgets[id].kind else {
+            return;
+        };
+        let (Some(cursor), Some(rect)) = (self.cursor, self.rect(id)) else {
+            return;
+        };
+        let t = if rect.size.x > 0.0 {
+            ((cursor.x - rect.pos.x) / rect.size.x).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let new = min + t * (max - min);
+        if new != value {
+            self.widgets[id].kind = WidgetKind::Slider {
+                value: new,
+                min,
+                max,
+            };
+            self.events.push(Event::SliderChanged { id, value: new });
         }
     }
 
@@ -1043,6 +1099,9 @@ impl Ui {
                 rect,
                 handle: *handle,
             }),
+            WidgetKind::Slider { value, min, max } => {
+                self.emit_slider(id, rect, *value, *min, *max, list)
+            }
             WidgetKind::Splitter { .. } => self.emit_splitter(id, rect, widget, list),
         }
 
@@ -1083,6 +1142,55 @@ impl Ui {
                 color: theme::SCROLLBAR_THUMB,
             });
         }
+    }
+
+    /// A slider: a track, a filled portion up to the value, and a thumb over
+    /// it. The thumb hover/press-shades like a button.
+    fn emit_slider(
+        &self,
+        id: WidgetId,
+        rect: Rect,
+        value: f32,
+        min: f32,
+        max: f32,
+        list: &mut DrawList,
+    ) {
+        // A thin track centered vertically.
+        let track_h = 4.0;
+        let track = Rect::new(
+            Vec2::new(rect.pos.x, rect.pos.y + (rect.size.y - track_h) * 0.5),
+            Vec2::new(rect.size.x, track_h),
+        );
+        list.commands.push(DrawCommand::FillRect {
+            rect: track,
+            color: theme::SLIDER_TRACK,
+        });
+        let t = if max > min {
+            ((value - min) / (max - min)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // The filled portion.
+        list.commands.push(DrawCommand::FillRect {
+            rect: Rect::new(track.pos, Vec2::new(track.size.x * t, track_h)),
+            color: theme::SLIDER_FILL,
+        });
+        // The thumb: a small square centered on the value position.
+        let half = rect.size.y * 0.5;
+        let cx = rect.pos.x + track.size.x * t;
+        let base = theme::SLIDER_FILL;
+        let color = match self.interaction(id) {
+            Interaction::Idle => base,
+            Interaction::Hovered => base.lighten(0.10),
+            Interaction::Pressed => base.darken(0.10),
+        };
+        list.commands.push(DrawCommand::FillRect {
+            rect: Rect::new(
+                Vec2::new(cx - half, rect.pos.y),
+                Vec2::new(half * 2.0, rect.size.y),
+            ),
+            color,
+        });
     }
 
     /// Emit a solid background fill, skipping fully transparent ones.
@@ -1311,9 +1419,12 @@ fn measure_widget(
                 height: theme::CHECKBOX_SIZE,
             };
         }
-        // Panels, images, and splitters have no intrinsic content size; they
-        // take their size from style (fixed size, grow, or fill).
-        WidgetKind::Panel | WidgetKind::Image(_) | WidgetKind::Splitter { .. } => {
+        // Panels, images, sliders, and splitters have no intrinsic content
+        // size; they take their size from style (fixed size, grow, or fill).
+        WidgetKind::Panel
+        | WidgetKind::Image(_)
+        | WidgetKind::Slider { .. }
+        | WidgetKind::Splitter { .. } => {
             return Size::ZERO;
         }
     };
@@ -1619,6 +1730,30 @@ mod tests {
         ui.handle_input(InputEvent::Text('c'));
         assert_eq!(text_of(&ui, field), "abc");
         assert_eq!(ui.caret, 3);
+    }
+
+    #[test]
+    fn dragging_a_slider_sets_its_value_and_emits() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 40.0));
+        let s = ui.slider(root, 0.0, 0.0, 100.0, Style::new().size(100.0, 20.0));
+        ui.layout(Vec2::new(200.0, 40.0)).unwrap();
+
+        // The slider spans x 0..100; a press at x=25 sets the value to 25.
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(25.0, 10.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        assert!((ui.slider_value(s) - 25.0).abs() < 1e-3);
+        assert_eq!(
+            ui.drain_events(),
+            vec![Event::SliderChanged { id: s, value: 25.0 }]
+        );
+
+        // Dragging updates it; past the end clamps to the max.
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(90.0, 10.0)));
+        assert!((ui.slider_value(s) - 90.0).abs() < 1e-3);
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(500.0, 10.0)));
+        assert!((ui.slider_value(s) - 100.0).abs() < 1e-3);
+        ui.handle_input(InputEvent::PointerReleased);
     }
 
     #[test]

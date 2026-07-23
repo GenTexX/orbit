@@ -43,6 +43,8 @@ struct Ids {
     clicks_label: WidgetId,
     checkbox: WidgetId,
     accent: WidgetId,
+    slider: WidgetId,
+    slider_label: WidgetId,
 }
 
 impl ApplicationHandler for App {
@@ -147,6 +149,11 @@ fn react(state: &mut State) {
                 };
                 state.ui.set_background(state.ids.accent, color);
             }
+            Event::SliderChanged { id, value } if id == state.ids.slider => {
+                state
+                    .ui
+                    .set_label(state.ids.slider_label, format!("{value:.0}"));
+            }
             _ => {}
         }
     }
@@ -217,6 +224,11 @@ fn build_ui() -> (Ui, Ids) {
         Style::new().size(220.0, 28.0).padding(6.0),
     );
 
+    // A slider with a live value readout.
+    let slider_row = ui.panel(root, Style::new().row().gap(8.0).align_center());
+    let slider = ui.slider(slider_row, 50.0, 0.0, 100.0, Style::new().size(220.0, 24.0));
+    let slider_label = ui.label(slider_row, "50", Style::new().padding(6.0));
+
     // The box the checkbox reveals (transparent until toggled on).
     let accent = ui.panel(root, Style::new().size(220.0, 44.0));
 
@@ -227,6 +239,8 @@ fn build_ui() -> (Ui, Ids) {
             clicks_label,
             checkbox,
             accent,
+            slider,
+            slider_label,
         },
     )
 }

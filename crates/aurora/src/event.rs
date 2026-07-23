@@ -16,4 +16,6 @@ pub enum Event {
     /// current text via `Ui::kind(id)`; the field itself is unchanged, so a
     /// rejected submission just leaves the user's typing in place.
     Submitted(WidgetId),
+    /// A slider was dragged to a new value (already stored in the widget).
+    SliderChanged { id: WidgetId, value: f32 },
 }
