@@ -902,20 +902,27 @@ impl Ui {
     }
 
     /// Step focus by `dir` (+1 next, -1 previous) around the tab ring, wrapping
-    /// at the ends. The newly focused field is selected whole (the tab-in
-    /// convention), ready to be overtyped.
+    /// at the ends. The field being left is submitted first (so its edit
+    /// commits, exactly as clicking away does), and the newly focused field is
+    /// selected whole (the tab-in convention), ready to be overtyped.
     fn focus_step(&mut self, dir: i32) {
         let ring = self.focus_ring();
         if ring.is_empty() {
             return;
         }
         let len = ring.len() as i32;
-        let next = match self.focused.and_then(|f| ring.iter().position(|&w| w == f)) {
+        let previous = self.focused;
+        let next = match previous.and_then(|f| ring.iter().position(|&w| w == f)) {
             Some(i) => (i as i32 + dir).rem_euclid(len) as usize,
             None if dir > 0 => 0,
             None => (len - 1) as usize,
         };
         let id = ring[next];
+        if let Some(old) = previous
+            && old != id
+        {
+            self.events.push(Event::Submitted(old));
+        }
         self.focused = Some(id);
         self.caret = self.text_len(id);
         self.selection_anchor = Some(0);
@@ -990,6 +997,20 @@ impl Ui {
                 && inflate_splitter(rect, orientation).contains(point)
             {
                 return Some(id);
+            }
+            // A slider's thumb overhangs each end by half its height; extend
+            // the grab area so the overhanging part stays clickable.
+            if let WidgetKind::Slider { .. } = widget.kind
+                && let Some(rect) = self.rect(id)
+            {
+                let half = rect.size.y * 0.5;
+                let grab = Rect::new(
+                    rect.pos - Vec2::new(half, 0.0),
+                    rect.size + Vec2::new(half * 2.0, 0.0),
+                );
+                if grab.contains(point) {
+                    return Some(id);
+                }
             }
         }
         let root = self.root?;
@@ -1757,6 +1778,22 @@ mod tests {
     }
 
     #[test]
+    fn a_sliders_overhanging_thumb_is_still_clickable() {
+        // The thumb overhangs each end by half the slider height; that region
+        // is outside the widget's rect but must still hit the slider (the
+        // annoyance Philip reported).
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 40.0));
+        let s = ui.slider(root, 100.0, 0.0, 100.0, Style::new().size(100.0, 20.0));
+        ui.layout(Vec2::new(200.0, 40.0)).unwrap();
+
+        // 5px past the right edge (within the 10px overhang) still hits it.
+        assert_eq!(ui.hit_test(Vec2::new(105.0, 10.0)), Some(s));
+        // Well past the overhang, it does not.
+        assert_ne!(ui.hit_test(Vec2::new(130.0, 10.0)), Some(s));
+    }
+
+    #[test]
     fn a_numeric_input_rejects_non_numeric_edits() {
         let mut ui = Ui::new();
         let root = ui.root_panel(Style::new().size(200.0, 60.0));
@@ -1788,9 +1825,12 @@ mod tests {
 
         click_at(&mut ui, Vec2::new(10.0, 12.0)); // focus the first
         assert_eq!(ui.focused(), Some(a));
+        ui.drain_events();
 
         ui.handle_input(InputEvent::Key(Key::Tab));
         assert_eq!(ui.focused(), Some(b));
+        // Leaving `a` submits it (so its edit commits, like clicking away).
+        assert_eq!(ui.drain_events(), vec![Event::Submitted(a)]);
         // Tab-in selects the whole field, ready to overtype.
         assert_eq!(ui.selected_text().as_deref(), Some("bbb"));
 

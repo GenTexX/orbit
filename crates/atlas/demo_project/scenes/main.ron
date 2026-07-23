@@ -30,9 +30,9 @@
             (
                 name: "Sprite 2",
                 transform: (
-                    translation: (543.3397, 547.96436),
-                    rotation: 1.6512694,
-                    scale: (1.2803224, 1.3582629),
+                    translation: (500.0, 500.0),
+                    rotation: 1.5707964,
+                    scale: (1.0, 1.0),
                 ),
                 components: [
                     (

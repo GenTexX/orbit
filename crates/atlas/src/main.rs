@@ -1115,8 +1115,11 @@ impl State {
         let current = field_vec2(&self.project.scene, field);
         let updated = with_axis(current, axis, parsed);
         if updated != current {
+            // No shell rebuild: the field already shows the typed value and the
+            // viewport re-renders from the scene each frame. Rebuilding here
+            // would drop focus - which breaks tabbing between fields, since Tab
+            // commits the field it leaves.
             self.commit_field_vec2(field, updated);
-            self.dirty = true;
         }
     }
 
@@ -1161,9 +1164,9 @@ impl State {
         if let Some(new) = new
             && new != t
         {
+            // No rebuild - see commit_vec_input's note on keeping focus.
             self.history
                 .set_transform(&mut self.project.scene, node, new);
-            self.dirty = true;
         }
     }
 
@@ -1190,16 +1193,15 @@ impl State {
         else {
             return;
         };
-        // A value that fails to parse leaves the field's prior value in place
-        // (parse_value returns None; the text the user typed stays visible
-        // until they fix it or select elsewhere, since we only rebuild the
-        // shell - and so re-render the field from the scene - on success).
+        // Unparseable text is left in place (parse_value returns None); the
+        // user's typing stays visible until they fix it or the shell rebuilds
+        // for another reason (a selection change or undo re-reads the field).
         if let Some(new) = parse_value(&text, &old)
             && new != old
         {
+            // No rebuild - see commit_vec_input's note on keeping focus.
             self.history
                 .set_field(&mut self.project.scene, node, component, field, new);
-            self.dirty = true;
         }
     }
 }
