@@ -38,6 +38,21 @@ in order:
   be fed back in, like `PanelSizes` (see the M3 step 6 lesson), or it will
   silently reset.
 
+## Viewport and gizmo
+
+- **Sprite anchor/pivot as a model concept.** The gizmo pivots rotate and
+  scale about the sprite's center by compensating the translation (the model
+  anchors at the top-left, per photon's sprite). The deeper fix - if wanted -
+  is an anchor/pivot field on SpriteComponent (Godot's Sprite2D is centered by
+  default), which would also change what `position` means in the inspector.
+  Decide deliberately, not in passing; the gizmo compensation works fine
+  until then.
+- **Snapping** (grid, angle increments with a modifier held) and a scale
+  readout while dragging.
+- **Mirror/flip via negative scale** is currently clamped away (per-axis scale
+  stops at +0.05); allowing a flip needs care in the world-affine
+  decomposition (negative scale flips the decomposed angle).
+
 ## File explorer
 
 - Currently a listing only. M3 step 8 gives it its first real function

@@ -290,29 +290,56 @@ impl State {
         // over picking (which only sees sprite pixels).
         if let Some(sel) = self.selected
             && let Some(g) = viewport::gizmo(scene, sel, self.camera.zoom)
+            && let Some(hit) = viewport::hit_gizmo(&g, world)
         {
             let original = scene.node(sel).transform;
-            match viewport::hit_gizmo(&g, world) {
-                Some(GizmoHit::Rotate) => {
-                    self.drag = Some(Drag::Rotate {
-                        node: sel,
-                        original,
-                        anchor: g.anchor,
-                        grab_angle: (world - g.anchor).to_angle(),
-                    });
-                    return;
-                }
-                Some(GizmoHit::Scale) => {
-                    self.drag = Some(Drag::Scale {
-                        node: sel,
-                        original,
-                        anchor: g.anchor,
-                        grab_dist: world.distance(g.anchor),
-                    });
-                    return;
-                }
-                None => {}
-            }
+            self.drag = Some(match hit {
+                GizmoHit::MoveX => Drag::MoveAxis {
+                    node: sel,
+                    original,
+                    grab_world: world,
+                    axis_world: g.axis_x,
+                },
+                GizmoHit::MoveY => Drag::MoveAxis {
+                    node: sel,
+                    original,
+                    grab_world: world,
+                    axis_world: g.axis_y,
+                },
+                GizmoHit::Rotate => Drag::Rotate {
+                    node: sel,
+                    original,
+                    half: g.half,
+                    pivot: g.center,
+                    grab_angle: (world - g.center).to_angle(),
+                },
+                GizmoHit::ScaleUniform => Drag::ScaleUniform {
+                    node: sel,
+                    original,
+                    half: g.half,
+                    pivot: g.center,
+                    grab_dist: world.distance(g.center),
+                },
+                GizmoHit::ScaleX => Drag::ScaleAxis {
+                    node: sel,
+                    original,
+                    half: g.half,
+                    pivot: g.center,
+                    axis_world: g.axis_x,
+                    grab_proj: (world - g.center).dot(g.axis_x),
+                    vertical: false,
+                },
+                GizmoHit::ScaleY => Drag::ScaleAxis {
+                    node: sel,
+                    original,
+                    half: g.half,
+                    pivot: g.center,
+                    axis_world: g.axis_y,
+                    grab_proj: (world - g.center).dot(g.axis_y),
+                    vertical: true,
+                },
+            });
+            return;
         }
 
         let entries = scene.sprite_entries();
