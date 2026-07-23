@@ -12,6 +12,7 @@ nav:
       - internals/roadmap.md
       - Plans:
           - internals/plans/milestone-1-walking-skeleton.md
+          - internals/plans/milestone-2-aurora.md
       - Subsystems:
           - internals/renderer.md
       - internals/benchmarks.md
@@ -29,3 +30,6 @@ nav:
           - adr/0010-in-process-language-service-lsp-later.md
           - adr/0011-scene-instancing-value-overrides-only.md
           - adr/0012-2d-coordinate-system.md
+          - adr/0013-text-via-cosmic-text.md
+          - adr/0014-aurora-widget-model.md
+          - adr/0015-draw-list-high-level-commands.md

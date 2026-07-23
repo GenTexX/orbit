@@ -8,6 +8,14 @@ An educational 2D game engine in Rust: a core engine library, an editor applicat
 The custom retained GUI framework the Editor is built with. Engine-independent and reusable outside Orbit; consumes input, produces draw lists.
 _Avoid_: the GUI, orbit-gui
 
+**Widget**:
+A node in Aurora's UI tree - panel, label, button, checkbox, or text input - stored in the widget arena, laid out by taffy, and referenced by a typed handle.
+_Avoid_: control, element
+
+**Draw list**:
+The per-frame list of high-level drawing commands (filled rects, text runs, clips) Aurora produces and aurora-wgpu renders. Aurora's boundary with the GPU.
+_Avoid_: render list, command buffer
+
 **Comet**:
 The scripting language: statically typed, garbage-collected, compiled to WASM. Script source files use the .cmt extension.
 _Avoid_: the scripting language (in docs), orbit-script
