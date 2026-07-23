@@ -3,13 +3,9 @@
 /// Errors from creating or driving the aurora-wgpu renderer.
 #[derive(Debug, thiserror::Error)]
 pub enum RenderError {
-    /// No graphics adapter could satisfy the requested options.
-    #[error("failed to acquire a graphics adapter")]
-    RequestAdapter(#[from] wgpu::RequestAdapterError),
-
-    /// An adapter was found, but a logical device could not be created.
-    #[error("failed to create a graphics device")]
-    RequestDevice(#[from] wgpu::RequestDeviceError),
+    /// The GPU context (adapter or device) could not be acquired.
+    #[error(transparent)]
+    Gpu(#[from] aether::GpuError),
 
     /// A window surface could not be created from the given target.
     #[error("failed to create a window surface")]

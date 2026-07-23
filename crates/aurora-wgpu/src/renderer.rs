@@ -1,16 +1,22 @@
-//! aurora-wgpu renderer: turns an Aurora draw list into batched, clipped, atlas-textured quads on a surface.
+//! aurora-wgpu renderer: turns an Aurora draw list into batched, clipped quads
+//! (atlas-textured for rects/glyphs, image-textured for registered pictures)
+//! on a surface.
 
+use aether::Gpu;
 use aurora::cosmic_text::FontSystem;
-use aurora::{Color, DrawCommand, DrawList, Rect};
+use aurora::{Color, DrawCommand, DrawList, ImageHandle, Rect};
 use glam::Vec2;
 use wgpu::util::DeviceExt;
 
 use crate::atlas::{Atlas, GlyphEntry};
 use crate::error::RenderError;
+use crate::image::ImageRegistry;
 
-/// One quad as uploaded to the GPU: a pixel rectangle plus the atlas UV span it
-/// samples. Filled rects sample a white texel; glyphs sample their bitmap.
-/// `#[repr(C)]` to match the vertex attributes and the `Instance` in quad.wgsl.
+/// One quad as uploaded to the GPU: a pixel rectangle plus the UV span it
+/// samples. Shared by both pipelines - the atlas pipeline (fills sample a
+/// white texel, glyphs sample coverage) and the image pipeline (a registered
+/// texture, sampled directly). `#[repr(C)]` to match the vertex attributes and
+/// the `Instance` struct in quad.wgsl / image.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct QuadInstance {
@@ -54,55 +60,96 @@ impl QuadInstance {
             color: [color.r, color.g, color.b, color.a],
         }
     }
+
+    /// A registered image filling `rect`, untinted (opaque white).
+    fn image(rect: Rect) -> Self {
+        Self {
+            pos: rect.pos.to_array(),
+            size: rect.size.to_array(),
+            uv_min: [0.0, 0.0],
+            uv_max: [1.0, 1.0],
+            color: [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+}
+
+/// One draw in the command list's order: either a run of atlas-pipeline quads
+/// (fills and glyphs, which can batch together) or a single image-pipeline
+/// draw (each references its own texture, so it cannot batch with others).
+/// Recorded in list order so overlapping draws composite correctly regardless
+/// of which pipeline they use.
+enum Op {
+    Quads {
+        rect: [u32; 4],
+        range: std::ops::Range<u32>,
+    },
+    Image {
+        rect: [u32; 4],
+        handle: ImageHandle,
+        instance: u32,
+    },
 }
 
 /// Renders Aurora draw lists to a window surface. Windowing-agnostic: it takes a
 /// `raw-window-handle` target plus a size, exactly like photon's renderer.
+/// Created self-contained with [`new`](Self::new), or sharing a GPU context
+/// with another renderer via [`from_gpu`](Self::from_gpu) (ADR 0018).
 pub struct Renderer {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    gpu: Gpu,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    image_pipeline: wgpu::RenderPipeline,
     screen_buffer: wgpu::Buffer,
     screen_bind_group: wgpu::BindGroup,
+    /// The texture+sampler bind group layout shared by the atlas bind group,
+    /// every registered image's bind group, and both pipelines' group 1.
+    texture_layout: wgpu::BindGroupLayout,
     atlas: Atlas,
     atlas_bind_group: wgpu::BindGroup,
+    images: ImageRegistry,
 }
 
 impl Renderer {
-    /// Create a renderer that presents to `target` (e.g. an `Arc<Window>`) at the
-    /// given pixel `size`. Blocks on GPU acquisition; wgpu's async setup never
-    /// leaks to callers.
+    /// Create a self-contained renderer that presents to `target` (e.g. an
+    /// `Arc<Window>`) at the given pixel `size`: acquires its own GPU context.
+    /// Blocks on GPU acquisition; wgpu's async setup never leaks to callers.
     pub fn new(
         target: impl Into<wgpu::SurfaceTarget<'static>>,
         size: (u32, u32),
     ) -> Result<Self, RenderError> {
-        // Validation layers are a debugging aid, off by default; opt in with
-        // WGPU_VALIDATION=1 (see photon's gpu.rs for the same rationale).
-        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
-        if std::env::var_os("WGPU_VALIDATION").is_none() {
-            desc.flags.remove(wgpu::InstanceFlags::VALIDATION);
-        }
-        let instance = wgpu::Instance::new(desc);
+        let instance = Gpu::default_instance();
         let surface = instance.create_surface(target)?;
+        let gpu = pollster::block_on(Gpu::request(instance, Some(&surface)))?;
+        Self::build(gpu, surface, size)
+    }
 
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("aurora-wgpu device"),
-                ..Default::default()
-            }))?;
+    /// Create a renderer on an externally supplied GPU context and an
+    /// already-created surface (ADR 0018: the editor's GUI backend renders on
+    /// the same device as the scene). `gpu`'s adapter must be compatible with
+    /// `surface` (e.g. acquired via `Gpu::request(instance, Some(&surface))`).
+    pub fn from_gpu(
+        gpu: Gpu,
+        surface: wgpu::Surface<'static>,
+        size: (u32, u32),
+    ) -> Result<Self, RenderError> {
+        Self::build(gpu, surface, size)
+    }
+
+    /// Build the renderer on an already-acquired `gpu` and `surface`: surface
+    /// configuration, the atlas, the image registry, and both pipelines.
+    fn build(
+        gpu: Gpu,
+        surface: wgpu::Surface<'static>,
+        size: (u32, u32),
+    ) -> Result<Self, RenderError> {
+        let device = &gpu.device;
 
         let (width, height) = (size.0.max(1), size.1.max(1));
         let config = surface
-            .get_default_config(&adapter, width, height)
+            .get_default_config(&gpu.adapter, width, height)
             .ok_or(RenderError::SurfaceUnsupported)?;
-        surface.configure(&device, &config);
+        surface.configure(device, &config);
 
         let screen_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("screen bind group layout"),
@@ -132,17 +179,12 @@ impl Renderer {
             }],
         });
 
-        // The glyph atlas plus its sampler live in bind group 1. Linear filtering
-        // smooths the coverage; the white texel is constant so fills are unaffected.
-        let atlas = Atlas::new(&device, &queue);
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("atlas sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let atlas_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("atlas bind group layout"),
+        // One texture+sampler layout, shared by the glyph atlas, every
+        // registered image, and both pipelines' group 1 - the shape (a
+        // filterable float texture plus a filtering sampler) is identical
+        // whether the texture holds glyph coverage or an RGBA picture.
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("texture bind group layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -162,9 +204,17 @@ impl Renderer {
                 },
             ],
         });
+
+        let atlas = Atlas::new(device, &gpu.queue);
+        let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("atlas sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("atlas bind group"),
-            layout: &atlas_layout,
+            layout: &texture_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -172,34 +222,81 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
+                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
                 },
             ],
         });
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("aurora pipeline layout"),
+            bind_group_layouts: &[Some(&screen_layout), Some(&texture_layout)],
+            immediate_size: 0,
+        });
+
+        let quad_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("quad shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("quad.wgsl").into()),
         });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("quad pipeline layout"),
-            bind_group_layouts: &[Some(&screen_layout), Some(&atlas_layout)],
-            immediate_size: 0,
+        let pipeline = Self::build_pipeline(
+            device,
+            &pipeline_layout,
+            &quad_shader,
+            "quad pipeline",
+            config.format,
+        );
+
+        let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("image shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("image.wgsl").into()),
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("quad pipeline"),
-            layout: Some(&pipeline_layout),
+        let image_pipeline = Self::build_pipeline(
+            device,
+            &pipeline_layout,
+            &image_shader,
+            "image pipeline",
+            config.format,
+        );
+
+        let images = ImageRegistry::new(device);
+
+        Ok(Self {
+            gpu,
+            surface,
+            config,
+            pipeline,
+            image_pipeline,
+            screen_buffer,
+            screen_bind_group,
+            texture_layout,
+            atlas,
+            atlas_bind_group,
+            images,
+        })
+    }
+
+    /// Build a quad-instanced render pipeline for `shader`, targeting `format`.
+    /// The atlas and image pipelines differ only in shader and label.
+    fn build_pipeline(
+        device: &wgpu::Device,
+        layout: &wgpu::PipelineLayout,
+        shader: &wgpu::ShaderModule,
+        label: &str,
+        format: wgpu::TextureFormat,
+    ) -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("vs_main"),
                 buffers: &[Some(QuadInstance::layout())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -213,33 +310,33 @@ impl Renderer {
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
-        });
-
-        Ok(Self {
-            device,
-            queue,
-            surface,
-            config,
-            pipeline,
-            screen_buffer,
-            screen_bind_group,
-            atlas,
-            atlas_bind_group,
         })
+    }
+
+    /// Register a texture (e.g. photon's scene target view) for sampling by
+    /// `DrawCommand::Image`, returning the handle to give a `Ui::image` widget
+    /// (ADR 0018). The registered bind group is built against this renderer's
+    /// device, so `view` must come from a texture created on the same device -
+    /// true by construction when both were built from the same shared `Gpu`.
+    pub fn register_image(&mut self, view: &wgpu::TextureView) -> ImageHandle {
+        self.images
+            .register(&self.gpu.device, &self.texture_layout, view)
     }
 
     /// Reconfigure the surface for a new window size.
     pub fn resize(&mut self, size: (u32, u32)) {
         self.config.width = size.0.max(1);
         self.config.height = size.1.max(1);
-        self.surface.configure(&self.device, &self.config);
+        self.surface.configure(&self.gpu.device, &self.config);
     }
 
-    /// Draw `list` over a `clear` background and present. Runs of quads (fills and
-    /// glyphs) under the same clip are batched into one instanced draw; a
-    /// `PushClip`/`PopClip` flushes the current batch and updates the scissor.
-    /// `font_system` supplies the glyphs the draw list references, rasterized into
-    /// the atlas on first use.
+    /// Draw `list` over a `clear` background and present. Runs of atlas-pipeline
+    /// quads (fills and glyphs) under the same clip are batched into one
+    /// instanced draw; each `Image` command is its own draw against its
+    /// registered texture. A `PushClip`/`PopClip` flushes the current quad batch
+    /// and updates the scissor; ops are recorded in draw-list order, so mixed
+    /// quads and images still composite correctly. `font_system` supplies the
+    /// glyphs the draw list references, rasterized into the atlas on first use.
     pub fn render(
         &mut self,
         list: &DrawList,
@@ -248,17 +345,13 @@ impl Renderer {
     ) -> Result<(), RenderError> {
         profiling::scope!("render");
         let (sw, sh) = (self.config.width as f32, self.config.height as f32);
-        self.queue.write_buffer(
-            &self.screen_buffer,
-            0,
-            bytemuck::cast_slice(&screen_projection(sw, sh)),
-        );
+        self.queue_write_screen(sw, sh);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
+                self.surface.configure(&self.gpu.device, &self.config);
                 return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -270,70 +363,18 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Translate the command list into an instance buffer plus a set of
-        // (scissor, instance range) draws. Glyphs are rasterized into the atlas
-        // as they are first encountered here (queued before the pass runs).
-        let white_uv = self.atlas.white_uv;
-        let mut instances: Vec<QuadInstance> = Vec::new();
-        let mut draws: Vec<(Scissor, std::ops::Range<u32>)> = Vec::new();
-        let mut clips: Vec<Rect> = Vec::new();
-        let mut batch_start: u32 = 0;
-        let mut scissor = Scissor::of(&clips, sw, sh);
-
-        let flush = |instances: &[QuadInstance],
-                     draws: &mut Vec<(Scissor, std::ops::Range<u32>)>,
-                     batch_start: &mut u32,
-                     scissor: Scissor| {
-            let end = instances.len() as u32;
-            if end > *batch_start {
-                if let Scissor::Rect(r) = scissor {
-                    draws.push((Scissor::Rect(r), *batch_start..end));
-                }
-                *batch_start = end;
-            }
+        let (instances, image_instances, ops) = {
+            profiling::scope!("build_instances");
+            self.build_ops(list, font_system, sw, sh)
         };
 
-        {
-            profiling::scope!("build_instances");
-            for cmd in &list.commands {
-                match cmd {
-                    DrawCommand::FillRect { rect, color } => {
-                        instances.push(QuadInstance::fill(*rect, *color, white_uv));
-                    }
-                    DrawCommand::Text { glyphs, color } => {
-                        for g in glyphs {
-                            if let Some(entry) =
-                                self.atlas.ensure(&self.queue, font_system, g.cache_key)
-                            {
-                                instances.push(QuadInstance::glyph(g.x, g.y, &entry, *color));
-                            }
-                        }
-                    }
-                    DrawCommand::PushClip { rect } => {
-                        flush(&instances, &mut draws, &mut batch_start, scissor);
-                        clips.push(*rect);
-                        scissor = Scissor::of(&clips, sw, sh);
-                    }
-                    DrawCommand::PopClip => {
-                        flush(&instances, &mut draws, &mut batch_start, scissor);
-                        clips.pop();
-                        scissor = Scissor::of(&clips, sw, sh);
-                    }
-                }
-            }
-            flush(&instances, &mut draws, &mut batch_start, scissor);
-        }
-
-        let instance_buffer = (!instances.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("quad instances"),
-                    contents: bytemuck::cast_slice(&instances),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-        });
+        let instance_buffer =
+            (!instances.is_empty()).then(|| self.upload_instances("quad instances", &instances));
+        let image_instance_buffer = (!image_instances.is_empty())
+            .then(|| self.upload_instances("image instances", &image_instances));
 
         let mut encoder = self
+            .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
@@ -360,29 +401,145 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            if let Some(buffer) = &instance_buffer {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.screen_bind_group, &[]);
-                pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-                pass.set_vertex_buffer(0, buffer.slice(..));
-                for (scissor, range) in &draws {
-                    let Scissor::Rect([x, y, w, h]) = scissor else {
-                        continue;
-                    };
-                    pass.set_scissor_rect(*x, *y, *w, *h);
-                    pass.draw(0..6, range.clone());
+            for op in &ops {
+                match op {
+                    Op::Quads { rect, range } => {
+                        let Some(buffer) = &instance_buffer else {
+                            continue;
+                        };
+                        pass.set_pipeline(&self.pipeline);
+                        pass.set_bind_group(0, &self.screen_bind_group, &[]);
+                        pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.set_scissor_rect(rect[0], rect[1], rect[2], rect[3]);
+                        pass.draw(0..6, range.clone());
+                    }
+                    Op::Image {
+                        rect,
+                        handle,
+                        instance,
+                    } => {
+                        let (Some(buffer), Some(bind_group)) =
+                            (&image_instance_buffer, self.images.bind_group(*handle))
+                        else {
+                            continue;
+                        };
+                        pass.set_pipeline(&self.image_pipeline);
+                        pass.set_bind_group(0, &self.screen_bind_group, &[]);
+                        pass.set_bind_group(1, bind_group, &[]);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.set_scissor_rect(rect[0], rect[1], rect[2], rect[3]);
+                        pass.draw(0..6, *instance..*instance + 1);
+                    }
                 }
             }
         }
         {
             profiling::scope!("submit");
-            self.queue.submit(Some(encoder.finish()));
+            self.gpu.queue.submit(Some(encoder.finish()));
         }
         {
             profiling::scope!("present");
-            self.queue.present(frame);
+            self.gpu.queue.present(frame);
         }
         Ok(())
+    }
+
+    fn queue_write_screen(&self, sw: f32, sh: f32) {
+        self.gpu.queue.write_buffer(
+            &self.screen_buffer,
+            0,
+            bytemuck::cast_slice(&screen_projection(sw, sh)),
+        );
+    }
+
+    fn upload_instances(&self, label: &str, instances: &[QuadInstance]) -> wgpu::Buffer {
+        self.gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+    }
+
+    /// Translate the command list into the atlas-pipeline instances, the
+    /// image-pipeline instances, and the ordered list of draws over both.
+    /// Glyphs are rasterized into the atlas as they are first encountered here
+    /// (queued before the pass runs).
+    fn build_ops(
+        &mut self,
+        list: &DrawList,
+        font_system: &mut FontSystem,
+        sw: f32,
+        sh: f32,
+    ) -> (Vec<QuadInstance>, Vec<QuadInstance>, Vec<Op>) {
+        let white_uv = self.atlas.white_uv;
+        let mut instances: Vec<QuadInstance> = Vec::new();
+        let mut image_instances: Vec<QuadInstance> = Vec::new();
+        let mut ops: Vec<Op> = Vec::new();
+        let mut clips: Vec<Rect> = Vec::new();
+        let mut batch_start: u32 = 0;
+        let mut scissor = Scissor::of(&clips, sw, sh);
+
+        let flush = |instances: &[QuadInstance],
+                     ops: &mut Vec<Op>,
+                     batch_start: &mut u32,
+                     scissor: Scissor| {
+            let end = instances.len() as u32;
+            if end > *batch_start {
+                if let Scissor::Rect(rect) = scissor {
+                    ops.push(Op::Quads {
+                        rect,
+                        range: *batch_start..end,
+                    });
+                }
+                *batch_start = end;
+            }
+        };
+
+        for cmd in &list.commands {
+            match cmd {
+                DrawCommand::FillRect { rect, color } => {
+                    instances.push(QuadInstance::fill(*rect, *color, white_uv));
+                }
+                DrawCommand::Text { glyphs, color } => {
+                    for g in glyphs {
+                        if let Some(entry) =
+                            self.atlas.ensure(&self.gpu.queue, font_system, g.cache_key)
+                        {
+                            instances.push(QuadInstance::glyph(g.x, g.y, &entry, *color));
+                        }
+                    }
+                }
+                DrawCommand::Image { rect, handle } => {
+                    // Flush pending atlas quads first so this image draws in
+                    // its correct position in the paint order, not after them.
+                    flush(&instances, &mut ops, &mut batch_start, scissor);
+                    if let Scissor::Rect(r) = scissor {
+                        image_instances.push(QuadInstance::image(*rect));
+                        ops.push(Op::Image {
+                            rect: r,
+                            handle: *handle,
+                            instance: (image_instances.len() - 1) as u32,
+                        });
+                    }
+                }
+                DrawCommand::PushClip { rect } => {
+                    flush(&instances, &mut ops, &mut batch_start, scissor);
+                    clips.push(*rect);
+                    scissor = Scissor::of(&clips, sw, sh);
+                }
+                DrawCommand::PopClip => {
+                    flush(&instances, &mut ops, &mut batch_start, scissor);
+                    clips.pop();
+                    scissor = Scissor::of(&clips, sw, sh);
+                }
+            }
+        }
+        flush(&instances, &mut ops, &mut batch_start, scissor);
+
+        (instances, image_instances, ops)
     }
 }
 

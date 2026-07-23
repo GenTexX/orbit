@@ -123,6 +123,17 @@ impl Ui {
         self.add(WidgetKind::TextInput(text.into()), style, Some(parent))
     }
 
+    /// Add a widget under `parent` that draws a backend-registered texture
+    /// (`handle`) filling its rectangle - e.g. the engine's viewport.
+    pub fn image(
+        &mut self,
+        parent: WidgetId,
+        handle: crate::draw::ImageHandle,
+        style: Style,
+    ) -> WidgetId {
+        self.add(WidgetKind::Image(handle), style, Some(parent))
+    }
+
     /// The kind (and per-widget data) of a widget.
     pub fn kind(&self, id: WidgetId) -> &WidgetKind {
         &self.widgets[id].kind
@@ -544,6 +555,10 @@ impl Ui {
             WidgetKind::Button(_) => self.emit_button(id, rect, widget, list),
             WidgetKind::Checkbox(checked) => self.emit_checkbox(id, rect, *checked, list),
             WidgetKind::TextInput(_) => self.emit_text_input(id, rect, widget, list),
+            WidgetKind::Image(handle) => list.commands.push(DrawCommand::Image {
+                rect,
+                handle: *handle,
+            }),
         }
 
         // Children, optionally clipped to this widget's rectangle.
@@ -715,7 +730,9 @@ fn measure_widget(
                 height: theme::CHECKBOX_SIZE,
             };
         }
-        WidgetKind::Panel => return Size::ZERO,
+        // Panels and images have no intrinsic content size; they take their
+        // size from style (fixed size, grow, or fill), like a Panel.
+        WidgetKind::Panel | WidgetKind::Image(_) => return Size::ZERO,
     };
 
     // Wrap to a known width if taffy gives one, else the available width.
@@ -754,6 +771,7 @@ mod tests {
     use crate::draw::DrawCommand;
     use crate::event::Event;
     use crate::input::{InputEvent, Key};
+    use crate::rect::Rect;
     use crate::style::Style;
     use crate::widget::WidgetKind;
     use glam::Vec2;
@@ -1079,5 +1097,32 @@ mod tests {
         click_at(&mut ui, Vec2::new(120.0, 12.0));
         assert_eq!(ui.focused(), None);
         assert_eq!(ui.drain_events(), vec![Event::Clicked(button)]);
+    }
+
+    #[test]
+    fn an_image_widget_fills_its_rect_and_emits_its_handle() {
+        // A backend mints ImageHandle values via its own registry; a bare
+        // SlotMap stands in for that here since Ui never constructs one itself.
+        let mut registry: slotmap::SlotMap<crate::draw::ImageHandle, ()> =
+            slotmap::SlotMap::with_key();
+        let handle = registry.insert(());
+
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 100.0));
+        let viewport = ui.image(root, handle, Style::new().size(200.0, 100.0));
+        ui.layout(Vec2::new(200.0, 100.0)).unwrap();
+
+        assert_eq!(
+            ui.rect(viewport),
+            Some(Rect::new(Vec2::ZERO, Vec2::new(200.0, 100.0)))
+        );
+        let cmds = ui.draw_list().commands;
+        assert_eq!(
+            cmds,
+            vec![DrawCommand::Image {
+                rect: ui.rect(viewport).unwrap(),
+                handle,
+            }]
+        );
     }
 }

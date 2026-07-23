@@ -3,13 +3,9 @@
 /// Errors produced while creating or driving the renderer.
 #[derive(Debug, thiserror::Error)]
 pub enum RendererError {
-    /// No graphics adapter could satisfy the requested options.
-    #[error("failed to acquire a graphics adapter")]
-    RequestAdapter(#[from] wgpu::RequestAdapterError),
-
-    /// An adapter was found, but a logical device could not be created from it.
-    #[error("failed to create a graphics device")]
-    RequestDevice(#[from] wgpu::RequestDeviceError),
+    /// The GPU context (adapter or device) could not be acquired.
+    #[error(transparent)]
+    Gpu(#[from] aether::GpuError),
 
     /// The GPU could not be polled to completion while reading back an image.
     #[error("failed to poll the device")]

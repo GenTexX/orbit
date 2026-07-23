@@ -1,0 +1,10 @@
+[package]
+name = "aether"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pollster = "1.0.1"
+thiserror = "2.0.19"
+tracing = "0.1.44"
+wgpu = "30.0.0"

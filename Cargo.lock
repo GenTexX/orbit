@@ -25,6 +25,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aether"
+version = "0.1.0"
+dependencies = [
+ "pollster",
+ "thiserror 2.0.19",
+ "tracing",
+ "wgpu",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -143,6 +153,19 @@ dependencies = [
 [[package]]
 name = "atlas"
 version = "0.1.0"
+dependencies = [
+ "aether",
+ "anyhow",
+ "aurora",
+ "aurora-wgpu",
+ "glam",
+ "helios",
+ "photon",
+ "pollster",
+ "tracing",
+ "tracing-subscriber",
+ "winit",
+]
 
 [[package]]
 name = "atomic-waker"
@@ -166,6 +189,7 @@ dependencies = [
 name = "aurora-wgpu"
 version = "0.1.0"
 dependencies = [
+ "aether",
  "aurora",
  "bytemuck",
  "cosmic-text",
@@ -174,6 +198,7 @@ dependencies = [
  "profiling",
  "puffin",
  "puffin_http",
+ "slotmap",
  "thiserror 2.0.19",
  "wgpu",
  "winit",
@@ -1694,6 +1719,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 name = "photon"
 version = "0.1.0"
 dependencies = [
+ "aether",
  "bytemuck",
  "criterion",
  "glam",

@@ -1,12 +1,13 @@
 //! photon renderer: builds the sprite pipeline and draws batches, both to a window surface and offscreen.
 
+use aether::Gpu;
 use wgpu::util::DeviceExt;
 
 use crate::{
     camera::Camera,
     color::Color,
     error::RendererError,
-    gpu::Gpu,
+    scene_target::SceneTarget,
     sprite::{RawInstance, Sprite},
     texture::Texture,
 };
@@ -95,6 +96,14 @@ impl Renderer {
     /// tests. Blocks on GPU acquisition.
     pub fn headless() -> Result<Self, RendererError> {
         Ok(Self::build_core(Gpu::headless()?))
+    }
+
+    /// Create a renderer on an externally supplied GPU context, for sharing one
+    /// device with another renderer (ADR 0018: the editor's GUI backend renders
+    /// on the same device as the scene). Never fails: `gpu` was already
+    /// acquired, and building the pipeline is infallible.
+    pub fn from_gpu(gpu: Gpu) -> Self {
+        Self::build_core(gpu)
     }
 
     /// Build the format-agnostic core (layouts, sampler, shader, and the
@@ -395,6 +404,48 @@ impl Renderer {
         Ok(pixels)
     }
 
+    /// Create a sampleable render target sized `(width, height)` for the
+    /// editor's viewport (ADR 0018). Uses the same linear `OFFSCREEN_FORMAT` as
+    /// [`render_to_image`](Self::render_to_image), so the existing offscreen
+    /// pipeline renders into it unchanged.
+    pub fn create_scene_target(&self, width: u32, height: u32) -> SceneTarget {
+        SceneTarget::new(&self.gpu.device, OFFSCREEN_FORMAT, width, height)
+    }
+
+    /// Render `sprites` through `camera` into `target`, over a `clear`
+    /// background. Unlike [`render_to_image`](Self::render_to_image), the
+    /// result stays on the GPU for a compositor to sample - no readback, so
+    /// this cannot fail the way a CPU round-trip can.
+    ///
+    /// Color space: `target`'s texels are linear light, not display-encoded
+    /// (`Texture::from_rgba` sRGB-decodes sprite art on sample, and
+    /// `OFFSCREEN_FORMAT` applies no encode on write - see its doc comment).
+    /// A compositor should sample it as-is and let its own sRGB-formatted
+    /// surface apply the display encode on write, which is the standard
+    /// linear-light compositing pipeline, not a shortcut.
+    pub fn render_to_target(
+        &self,
+        target: &SceneTarget,
+        clear: Color,
+        camera: &Camera,
+        texture: &Texture,
+        sprites: &[Sprite],
+    ) {
+        let batch = self.prepare_batch(camera, texture, sprites);
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        self.record_pass(
+            &mut encoder,
+            target.view(),
+            &self.offscreen_pipeline,
+            clear,
+            &batch,
+        );
+        self.gpu.queue.submit(Some(encoder.finish()));
+    }
+
     /// Build the per-batch GPU resources (camera uniform, bind groups, instance
     /// buffer) shared by the window and offscreen paths.
     fn prepare_batch(
@@ -502,6 +553,53 @@ mod tests {
     fn pixel(image: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * width + x) * 4) as usize;
         [image[i], image[i + 1], image[i + 2], image[i + 3]]
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; run locally with --ignored"]
+    fn from_gpu_renders_the_same_as_a_self_owned_renderer() {
+        // Two renderers sharing one aether::Gpu (ADR 0018's shared-device path)
+        // render identically to a self-owned headless renderer.
+        let gpu = Gpu::headless().expect("gpu context");
+        let shared = Renderer::from_gpu(gpu);
+        let white = shared.create_texture(&[255, 255, 255, 255], 1, 1);
+        let (w, h) = (64u32, 64u32);
+        let camera = Camera::new(Vec2::ZERO, Vec2::new(w as f32, h as f32));
+        let sprite = Sprite::new(Vec2::new(10.0, 10.0), Vec2::new(20.0, 20.0));
+
+        let image = shared
+            .render_to_image(
+                (w, h),
+                Color::new(0.0, 0.0, 0.0, 1.0),
+                &camera,
+                &white,
+                &[sprite],
+            )
+            .expect("render");
+        assert_eq!(pixel(&image, w, 15, 15), [255, 255, 255, 255]);
+        assert_eq!(pixel(&image, w, 60, 60), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; run locally with --ignored"]
+    fn render_to_target_draws_into_a_sampleable_texture() {
+        let renderer = Renderer::headless().expect("headless renderer");
+        let white = renderer.create_texture(&[255, 255, 255, 255], 1, 1);
+        let camera = Camera::new(Vec2::ZERO, Vec2::new(64.0, 64.0));
+        let sprite = Sprite::new(Vec2::new(10.0, 10.0), Vec2::new(20.0, 20.0));
+
+        let target = renderer.create_scene_target(64, 64);
+        assert_eq!((target.width, target.height), (64, 64));
+        // No readback API exists (by design - a compositor samples target.view()
+        // directly); this just proves the call records and submits without
+        // panicking, on the same offscreen pipeline render_to_image uses.
+        renderer.render_to_target(
+            &target,
+            Color::new(0.0, 0.0, 0.0, 1.0),
+            &camera,
+            &white,
+            &[sprite],
+        );
     }
 
     #[test]

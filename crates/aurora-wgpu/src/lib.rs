@@ -2,6 +2,7 @@
 
 mod atlas;
 mod error;
+mod image;
 mod renderer;
 
 pub use error::RenderError;

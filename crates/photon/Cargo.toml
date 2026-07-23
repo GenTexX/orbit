@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+aether = { version = "0.1.0", path = "../aether" }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 glam = "0.33.2"
 pollster = "1.0.1"

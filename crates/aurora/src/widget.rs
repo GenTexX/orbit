@@ -4,6 +4,7 @@ use slotmap::new_key_type;
 use taffy::NodeId;
 
 use crate::color::Color;
+use crate::draw::ImageHandle;
 
 new_key_type! {
     /// A typed handle to a widget in the [`Ui`](crate::Ui) arena. Cheap to copy;
@@ -25,6 +26,9 @@ pub enum WidgetKind {
     Checkbox(bool),
     /// A single-line editable text field, holding its current text.
     TextInput(String),
+    /// A registered texture (e.g. the engine's viewport), drawn to fill this
+    /// widget's rectangle. Backend-resolved, not interactive (ADR 0018).
+    Image(ImageHandle),
 }
 
 impl WidgetKind {

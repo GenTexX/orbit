@@ -1,9 +1,18 @@
 //! aurora draw list: the high-level commands Aurora emits for a backend to render (ADR 0015).
 
 use cosmic_text::CacheKey;
+use slotmap::new_key_type;
 
 use crate::color::Color;
 use crate::rect::Rect;
+
+new_key_type! {
+    /// An opaque reference to a texture a backend has registered (ADR 0018),
+    /// e.g. the engine's rendered scene. Aurora carries only this handle in a
+    /// draw command; it never names the underlying GPU texture type, so a
+    /// backend can swap without this crate changing.
+    pub struct ImageHandle;
+}
 
 /// A single positioned glyph. `cache_key` identifies the glyph (font, id, size,
 /// subpixel offset) for a backend to rasterize and cache; `x`/`y` are its pen
@@ -25,6 +34,9 @@ pub enum DrawCommand {
     FillRect { rect: Rect, color: Color },
     /// Draw a run of glyphs in one color (a shaped line of text).
     Text { glyphs: Vec<Glyph>, color: Color },
+    /// Draw a registered texture stretched to fill a rectangle (e.g. the
+    /// engine's viewport). `handle` is resolved by the backend, not Aurora.
+    Image { rect: Rect, handle: ImageHandle },
     /// Push a clip rectangle. Following draws are clipped to the intersection of
     /// all active clips until the matching `PopClip`.
     PushClip { rect: Rect },
