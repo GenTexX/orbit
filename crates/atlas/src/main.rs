@@ -4,6 +4,7 @@
 //! scene-tree, viewport, inspector, and file explorer, with selection shared
 //! across panels and inspector edits committed through the undo history.
 
+mod actions;
 mod project;
 mod ui;
 mod viewport;
@@ -33,6 +34,9 @@ fn main() -> Result<()> {
     init_logging();
     tracing::info!("atlas starting");
 
+    // Kept alive for the whole run; dropping it would stop the profiler server.
+    let _profiler = init_profiling();
+
     let event_loop = EventLoop::new()?;
     // A live viewport redraws continuously, like the sandbox's game loop.
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -45,6 +49,25 @@ fn init_logging() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,wgpu_core=warn,wgpu_hal=warn,naga=warn"));
     fmt().with_env_filter(filter).init();
+}
+
+/// Start the puffin profiler server when ORBIT_PROFILE is set (the same
+/// opt-in as the sandbox and the aurora-wgpu examples). Off otherwise, so
+/// every `profiling::scope!` across the editor, aurora, and photon stays a
+/// cheap no-op. Connect a viewer with `puffin_viewer --url 127.0.0.1:8585`.
+fn init_profiling() -> Option<puffin_http::Server> {
+    std::env::var_os("ORBIT_PROFILE")?;
+    puffin::set_scopes_on(true);
+    match puffin_http::Server::new("0.0.0.0:8585") {
+        Ok(server) => {
+            tracing::info!("puffin profiler on; connect with: puffin_viewer --url 127.0.0.1:8585");
+            Some(server)
+        }
+        Err(err) => {
+            tracing::error!("failed to start puffin server: {err}");
+            None
+        }
+    }
 }
 
 #[derive(Default)]
@@ -84,6 +107,14 @@ struct State {
     cursor: Vec2,
     /// The current keyboard modifiers (for the undo/redo shortcuts).
     modifiers: ModifiersState,
+    /// A PNG being dragged from the file explorer; dropped over the viewport
+    /// it spawns a sprite there, dropped anywhere else it just cancels.
+    file_drag: Option<String>,
+    /// The demo texture's natural pixel size (spawned sprites default to it).
+    texture_size: Vec2,
+    /// Frame counting for the once-a-second fps log.
+    frames: u32,
+    fps_since: std::time::Instant,
 }
 
 impl ApplicationHandler for App {
@@ -123,8 +154,10 @@ impl ApplicationHandler for App {
                 (MouseButton::Left, ElementState::Pressed) => {
                     state.ui.handle_input(InputEvent::PointerPressed);
                     state.viewport_press();
+                    state.file_press();
                 }
                 (MouseButton::Left, ElementState::Released) => {
+                    state.file_drop();
                     state.end_drag();
                     state.ui.handle_input(InputEvent::PointerReleased);
                 }
@@ -226,6 +259,10 @@ impl State {
             panning: false,
             cursor: Vec2::ZERO,
             modifiers: ModifiersState::default(),
+            file_drag: None,
+            texture_size: Vec2::new(w as f32, h as f32),
+            frames: 0,
+            fps_since: std::time::Instant::now(),
         })
     }
 
@@ -402,16 +439,23 @@ impl State {
         self.camera.zoom_about(self.cursor - rect.pos, factor);
     }
 
-    /// Undo/redo shortcuts (ctrl+z, ctrl+shift+z, ctrl+y). Consumed only when
-    /// no text field is focused, so typing is never hijacked. Returns whether
-    /// the key was handled.
+    /// Keyboard shortcuts: ctrl+s saves; ctrl+z / ctrl+shift+z / ctrl+y undo
+    /// and redo (only when no text field is focused, so typing is never
+    /// hijacked - saving has no such conflict). Returns whether handled.
     fn handle_shortcut(&mut self, event: &winit::event::KeyEvent) -> bool {
-        if !self.modifiers.control_key() || self.ui.focused().is_some() {
+        if !self.modifiers.control_key() {
             return false;
         }
         let WinitKey::Character(c) = &event.logical_key else {
             return false;
         };
+        if c.eq_ignore_ascii_case("s") {
+            self.save_project();
+            return true;
+        }
+        if self.ui.focused().is_some() {
+            return false;
+        }
         let changed = if c.eq_ignore_ascii_case("z") {
             if self.modifiers.shift_key() {
                 self.history.redo(&mut self.project.scene)
@@ -429,7 +473,95 @@ impl State {
         true
     }
 
+    /// A press over a PNG row in the file explorer arms a file drag; releasing
+    /// over the viewport drops it as a new sprite ([`file_drop`](Self::file_drop)).
+    fn file_press(&mut self) {
+        let hit = self.ui.hit_test(self.cursor);
+        self.file_drag = self
+            .rows
+            .file_rows
+            .iter()
+            .find(|(widget, _)| Some(*widget) == hit)
+            .map(|(_, path)| path.clone());
+    }
+
+    /// Complete (or cancel) a file drag: dropped over the viewport, spawn a
+    /// sprite showing that texture at the drop point; anywhere else, cancel.
+    fn file_drop(&mut self) {
+        let Some(path) = self.file_drag.take() else {
+            return;
+        };
+        if self.ui.hit_test(self.cursor) != self.rows.viewport {
+            return;
+        }
+        let Some(world) = self.cursor_world() else {
+            return;
+        };
+        let node = actions::spawn_sprite(
+            &mut self.project.scene,
+            &mut self.history,
+            world,
+            &path,
+            self.texture_size,
+        );
+        self.selected = Some(node);
+        self.dirty = true;
+    }
+
+    /// The toolbar's Add Sprite: spawn at the center of the current view.
+    fn add_sprite_action(&mut self) {
+        let Some(rect) = self.viewport_rect() else {
+            return;
+        };
+        let world = self.camera.screen_to_world(rect.size * 0.5);
+        let node = actions::spawn_sprite(
+            &mut self.project.scene,
+            &mut self.history,
+            world,
+            "assets/sprite.png",
+            self.texture_size,
+        );
+        self.selected = Some(node);
+        self.dirty = true;
+    }
+
+    fn save_project(&mut self) {
+        match self.project.save(&self.project_dir) {
+            Ok(()) => tracing::info!("project saved to {}", self.project_dir.display()),
+            Err(err) => tracing::error!("save failed: {err}"),
+        }
+    }
+
+    /// Reload the project from disk, discarding unsaved edits. The history is
+    /// cleared too: its edits hold NodeIds from the old scene's arena, which
+    /// mean nothing (or worse, the wrong node) in the freshly loaded one.
+    fn load_project(&mut self) {
+        match Project::load(&self.project_dir) {
+            Ok(project) => {
+                self.project = project;
+                self.history = History::new();
+                self.selected = None;
+                self.dirty = true;
+                tracing::info!("project loaded from {}", self.project_dir.display());
+            }
+            Err(err) => tracing::error!("load failed: {err}"),
+        }
+    }
+
+    /// Log the frame rate once a second (the M3 "usable editor" health check).
+    fn report_fps(&mut self) {
+        self.frames += 1;
+        let elapsed = self.fps_since.elapsed().as_secs_f32();
+        if elapsed >= 1.0 {
+            let fps = self.frames as f32 / elapsed;
+            tracing::debug!("{} fps ({:.2} ms/frame)", fps as u32, 1000.0 / fps);
+            self.frames = 0;
+            self.fps_since = std::time::Instant::now();
+        }
+    }
+
     fn draw(&mut self) -> Result<()> {
+        profiling::scope!("editor_frame");
         self.react();
         if self.dirty {
             // Splitter drags live only in the widget tree; read the panels'
@@ -473,6 +605,7 @@ impl State {
                 .update_image(self.viewport_handle, self.scene_target.view());
         }
 
+        profiling::scope!("scene_render");
         let clear = PhotonColor::new(0.02, 0.02, 0.05, 1.0);
         let camera = self.camera.camera(Vec2::new(w as f32, h as f32));
         self.engine.render_to_target(
@@ -513,14 +646,24 @@ impl State {
             self.ui.font_system_mut(),
             aurora::Color::rgb(0.08, 0.08, 0.10),
         )?;
+
+        self.report_fps();
+        // Mark the frame boundary for the profiler (a no-op when profiling off).
+        profiling::finish_frame!();
         Ok(())
     }
 
     /// Drain this frame's Aurora events: a tree-row click selects its node, a
-    /// submitted field commits its text through the undo history.
+    /// toolbar click runs its action, a submitted field commits its text
+    /// through the undo history.
     fn react(&mut self) {
         for event in self.ui.drain_events() {
             match event {
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.add_sprite => {
+                    self.add_sprite_action();
+                }
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.save => self.save_project(),
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.load => self.load_project(),
                 AuroraEvent::Clicked(id) => {
                     if let Some(&(_, node)) =
                         self.rows.tree_rows.iter().find(|(widget, _)| *widget == id)

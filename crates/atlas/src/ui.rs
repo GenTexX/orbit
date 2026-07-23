@@ -35,6 +35,13 @@ pub struct EditorRows {
     /// this widget's laid-out rect each frame, so the scene draws 1:1 instead
     /// of stretching a window-sized texture into a smaller panel.
     pub viewport: Option<WidgetId>,
+    /// PNG rows in the file explorer, draggable into the viewport to spawn a
+    /// sprite: `(row widget, project-relative path)`.
+    pub file_rows: Vec<(WidgetId, String)>,
+    /// The toolbar actions.
+    pub add_sprite: Option<WidgetId>,
+    pub save: Option<WidgetId>,
+    pub load: Option<WidgetId>,
 }
 
 /// The dock's panel sizes. Splitter drags mutate the live widget tree, so the
@@ -85,14 +92,17 @@ pub fn build_editor_ui(
     let mut ui = Ui::new();
     let mut rows = EditorRows::default();
 
-    let root = ui.root_panel(Style::new().fill().row().background(ROOT_BG));
+    // A toolbar strip across the top, then the three-way dock below it.
+    let root = ui.root_panel(Style::new().fill().column().background(ROOT_BG));
+    build_toolbar(&mut ui, root, &mut rows);
+    let main = ui.panel(root, Style::new().row().grow(1.0));
 
-    let tree_panel = build_scene_tree(&mut ui, root, scene, selected, sizes.tree_width, &mut rows);
-    let splitter_1 = ui.splitter(root, Orientation::Vertical, 1.0, Style::new().width(4.0));
+    let tree_panel = build_scene_tree(&mut ui, main, scene, selected, sizes.tree_width, &mut rows);
+    let splitter_1 = ui.splitter(main, Orientation::Vertical, 1.0, Style::new().width(4.0));
     ui.set_splitter_target(splitter_1, tree_panel);
 
     // Center: the viewport on top, a resizable file-explorer strip below.
-    let center = ui.panel(root, Style::new().column().grow(1.0));
+    let center = ui.panel(main, Style::new().column().grow(1.0));
     let viewport = ui.image(center, viewport_handle, Style::new().grow(1.0));
     let splitter_2 = ui.splitter(
         center,
@@ -100,13 +110,14 @@ pub fn build_editor_ui(
         -1.0,
         Style::new().height(4.0),
     );
-    let files_panel = build_file_explorer(&mut ui, center, project_dir, sizes.files_height);
+    let files_panel =
+        build_file_explorer(&mut ui, center, project_dir, sizes.files_height, &mut rows);
     ui.set_splitter_target(splitter_2, files_panel);
 
-    let splitter_3 = ui.splitter(root, Orientation::Vertical, -1.0, Style::new().width(4.0));
+    let splitter_3 = ui.splitter(main, Orientation::Vertical, -1.0, Style::new().width(4.0));
     let inspector_panel = build_inspector(
         &mut ui,
-        root,
+        main,
         scene,
         selected,
         sizes.inspector_width,
@@ -119,6 +130,26 @@ pub fn build_editor_ui(
     rows.files_panel = Some(files_panel);
     rows.viewport = Some(viewport);
     (ui, rows)
+}
+
+/// The toolbar: the editor's actions, and later home to the gizmo-mode
+/// switches from the ideatank.
+fn build_toolbar(ui: &mut Ui, parent: WidgetId, rows: &mut EditorRows) {
+    let bar = ui.panel(
+        parent,
+        Style::new()
+            .row()
+            .gap(6.0)
+            .padding(6.0)
+            .align_center()
+            .background(PANEL_BG),
+    );
+    let button = |ui: &mut Ui, caption: &str| {
+        ui.button(bar, caption, Style::new().padding(6.0).foreground(HEADING))
+    };
+    rows.add_sprite = Some(button(ui, "Add Sprite"));
+    rows.save = Some(button(ui, "Save"));
+    rows.load = Some(button(ui, "Load"));
 }
 
 /// The docked scene-tree panel: one clickable row per node, indented by depth.
@@ -251,7 +282,13 @@ fn add_value_row(ui: &mut Ui, panel: WidgetId, label: &str, value: &Value) -> Wi
 }
 
 /// The docked file explorer: the project's PNG and scene files.
-fn build_file_explorer(ui: &mut Ui, parent: WidgetId, project_dir: &Path, height: f32) -> WidgetId {
+fn build_file_explorer(
+    ui: &mut Ui,
+    parent: WidgetId,
+    project_dir: &Path,
+    height: f32,
+    rows: &mut EditorRows,
+) -> WidgetId {
     let panel = ui.panel(
         parent,
         Style::new()
@@ -263,7 +300,19 @@ fn build_file_explorer(ui: &mut Ui, parent: WidgetId, project_dir: &Path, height
     );
     ui.label(panel, "Files", Style::new().foreground(HEADING));
     for name in list_project_files(project_dir) {
-        ui.label(panel, name, Style::new().foreground(SUBHEAD));
+        if name.ends_with(".png") {
+            // A PNG row is a button so it reads as grabbable; press it and
+            // drag into the viewport to spawn a sprite there (main.rs routes
+            // the press-drag-release; a plain click does nothing yet).
+            let row = ui.button(
+                panel,
+                name.clone(),
+                Style::new().padding(2.0).foreground(HEADING),
+            );
+            rows.file_rows.push((row, name));
+        } else {
+            ui.label(panel, name, Style::new().foreground(SUBHEAD));
+        }
     }
     panel
 }
