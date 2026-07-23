@@ -156,6 +156,7 @@ version = "0.1.0"
 dependencies = [
  "cosmic-text",
  "glam",
+ "profiling",
  "slotmap",
  "taffy",
  "thiserror 2.0.19",
@@ -170,6 +171,9 @@ dependencies = [
  "cosmic-text",
  "glam",
  "pollster",
+ "profiling",
+ "puffin",
+ "puffin_http",
  "thiserror 2.0.19",
  "wgpu",
  "winit",

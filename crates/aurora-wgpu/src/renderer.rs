@@ -246,6 +246,7 @@ impl Renderer {
         font_system: &mut FontSystem,
         clear: Color,
     ) -> Result<(), RenderError> {
+        profiling::scope!("render");
         let (sw, sh) = (self.config.width as f32, self.config.height as f32);
         self.queue.write_buffer(
             &self.screen_buffer,
@@ -292,33 +293,36 @@ impl Renderer {
             }
         };
 
-        for cmd in &list.commands {
-            match cmd {
-                DrawCommand::FillRect { rect, color } => {
-                    instances.push(QuadInstance::fill(*rect, *color, white_uv));
-                }
-                DrawCommand::Text { glyphs, color } => {
-                    for g in glyphs {
-                        if let Some(entry) =
-                            self.atlas.ensure(&self.queue, font_system, g.cache_key)
-                        {
-                            instances.push(QuadInstance::glyph(g.x, g.y, &entry, *color));
+        {
+            profiling::scope!("build_instances");
+            for cmd in &list.commands {
+                match cmd {
+                    DrawCommand::FillRect { rect, color } => {
+                        instances.push(QuadInstance::fill(*rect, *color, white_uv));
+                    }
+                    DrawCommand::Text { glyphs, color } => {
+                        for g in glyphs {
+                            if let Some(entry) =
+                                self.atlas.ensure(&self.queue, font_system, g.cache_key)
+                            {
+                                instances.push(QuadInstance::glyph(g.x, g.y, &entry, *color));
+                            }
                         }
                     }
-                }
-                DrawCommand::PushClip { rect } => {
-                    flush(&instances, &mut draws, &mut batch_start, scissor);
-                    clips.push(*rect);
-                    scissor = Scissor::of(&clips, sw, sh);
-                }
-                DrawCommand::PopClip => {
-                    flush(&instances, &mut draws, &mut batch_start, scissor);
-                    clips.pop();
-                    scissor = Scissor::of(&clips, sw, sh);
+                    DrawCommand::PushClip { rect } => {
+                        flush(&instances, &mut draws, &mut batch_start, scissor);
+                        clips.push(*rect);
+                        scissor = Scissor::of(&clips, sw, sh);
+                    }
+                    DrawCommand::PopClip => {
+                        flush(&instances, &mut draws, &mut batch_start, scissor);
+                        clips.pop();
+                        scissor = Scissor::of(&clips, sw, sh);
+                    }
                 }
             }
+            flush(&instances, &mut draws, &mut batch_start, scissor);
         }
-        flush(&instances, &mut draws, &mut batch_start, scissor);
 
         let instance_buffer = (!instances.is_empty()).then(|| {
             self.device
@@ -333,6 +337,7 @@ impl Renderer {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
+            profiling::scope!("record_pass");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("aurora pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -369,8 +374,14 @@ impl Renderer {
                 }
             }
         }
-        self.queue.submit(Some(encoder.finish()));
-        self.queue.present(frame);
+        {
+            profiling::scope!("submit");
+            self.queue.submit(Some(encoder.finish()));
+        }
+        {
+            profiling::scope!("present");
+            self.queue.present(frame);
+        }
         Ok(())
     }
 }

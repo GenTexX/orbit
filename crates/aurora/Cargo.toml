@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 cosmic-text = "0.19.0"
 glam = "0.33.2"
+profiling = "1.0.18"
 slotmap = "1.1.1"
 taffy = "0.12.2"
 thiserror = "2.0.19"

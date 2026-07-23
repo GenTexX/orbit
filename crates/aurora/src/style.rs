@@ -1,7 +1,7 @@
 //! aurora style: layout (delegated to taffy) plus Aurora's own visual style, with a fluent builder.
 
 use taffy::prelude::{length, percent};
-use taffy::{Display, FlexDirection, Rect as TaffyRect, Size};
+use taffy::{AlignItems, Display, FlexDirection, Rect as TaffyRect, Size};
 
 use crate::color::Color;
 
@@ -61,6 +61,21 @@ impl Style {
         self
     }
 
+    /// Fix the width in pixels, leaving the height to layout (e.g. stretched to
+    /// the parent's cross axis). Pins the minimum width too, so it is not shrunk.
+    pub fn width(mut self, width: f32) -> Self {
+        self.layout.size.width = length(width);
+        self.layout.min_size.width = length(width);
+        self
+    }
+
+    /// Fix the height in pixels, leaving the width to layout.
+    pub fn height(mut self, height: f32) -> Self {
+        self.layout.size.height = length(height);
+        self.layout.min_size.height = length(height);
+        self
+    }
+
     /// Uniform padding on all four sides, in pixels.
     pub fn padding(mut self, pad: f32) -> Self {
         self.layout.padding = TaffyRect {
@@ -99,6 +114,13 @@ impl Style {
     /// axis this widget claims.
     pub fn grow(mut self, factor: f32) -> Self {
         self.layout.flex_grow = factor;
+        self
+    }
+
+    /// Center children along the cross axis (e.g. vertically center a row's
+    /// items). Handy for label-plus-control rows.
+    pub fn align_center(mut self) -> Self {
+        self.layout.align_items = Some(AlignItems::CENTER);
         self
     }
 

@@ -53,6 +53,8 @@ pub struct Ui {
     focused: Option<WidgetId>,
     /// Caret position in the focused input, as a byte offset into its text.
     caret: usize,
+    /// Whether the caret is in its visible blink phase (driven by the app).
+    caret_on: bool,
     /// Semantic events accumulated since the last [`drain_events`](Self::drain_events).
     events: Vec<Event>,
 }
@@ -73,6 +75,7 @@ impl Ui {
             pressed: None,
             focused: None,
             caret: 0,
+            caret_on: true,
             events: Vec::new(),
         }
     }
@@ -156,6 +159,26 @@ impl Ui {
         }
     }
 
+    /// Replace a text input's contents (e.g. an editor populating a field). It
+    /// is re-shaped on the next [`layout`](Self::layout); the caret is clamped
+    /// if this field is focused. A no-op on non-input widgets.
+    pub fn set_text_input(&mut self, id: WidgetId, text: impl Into<String>) {
+        if let WidgetKind::TextInput(s) = &mut self.widgets[id].kind {
+            *s = text.into();
+            let len = s.len();
+            if self.focused == Some(id) {
+                self.caret = self.caret.min(len);
+            }
+            self.invalidate_text(id);
+        }
+    }
+
+    /// Set whether the caret is in its visible blink phase. Apps that want a
+    /// blinking caret drive this from a timer; the default is steady-on.
+    pub fn set_caret_on(&mut self, on: bool) {
+        self.caret_on = on;
+    }
+
     /// Mark a text widget's layout node dirty after its text changed. taffy
     /// caches layout per node; without this it serves the old measurement and
     /// never re-runs the measure function that re-shapes the text buffer.
@@ -194,6 +217,7 @@ impl Ui {
     /// shaped and measured through a taffy measure function; then the tree is
     /// walked to turn taffy's parent-relative positions into absolute rects.
     pub fn layout(&mut self, available: Vec2) -> Result<(), AuroraError> {
+        profiling::scope!("layout");
         let Some(root) = self.root else {
             return Ok(());
         };
@@ -496,6 +520,7 @@ impl Ui {
     /// Produce this frame's draw list by walking the laid-out tree. Requires a
     /// prior [`layout`](Self::layout).
     pub fn draw_list(&self) -> DrawList {
+        profiling::scope!("draw_list");
         let mut list = DrawList::default();
         if let Some(root) = self.root {
             self.emit(root, &mut list);
@@ -610,7 +635,7 @@ impl Ui {
         // Clip the text and caret so long content stays within the field.
         list.commands.push(DrawCommand::PushClip { rect });
         self.emit_text(id, widget.foreground, list);
-        if focused {
+        if focused && self.caret_on {
             let origin = self.content_origin.get(id).copied().unwrap_or(rect.pos);
             let x = origin.x + self.caret_x_offset(id);
             let caret = Rect::new(
@@ -769,6 +794,34 @@ mod tests {
 
         assert_eq!(ui.rect(a).unwrap().pos, Vec2::new(0.0, 0.0));
         assert_eq!(ui.rect(b).unwrap().pos, Vec2::new(0.0, 30.0));
+    }
+
+    #[test]
+    fn width_fixes_one_axis_and_leaves_the_other_to_stretch() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().row().size(400.0, 300.0));
+        let side = ui.panel(root, Style::new().width(100.0));
+        ui.layout(Vec2::new(400.0, 300.0)).unwrap();
+
+        let r = ui.rect(side).unwrap();
+        assert_eq!(r.size.x, 100.0, "width is fixed");
+        assert_eq!(r.size.y, 300.0, "auto height stretches to the row");
+    }
+
+    #[test]
+    fn a_fixed_panel_and_a_growing_sibling_dock_side_by_side() {
+        // The inspector layout: a fixed-width side panel next to a viewport that
+        // fills the rest, both full height.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().row().size(400.0, 300.0));
+        let side = ui.panel(root, Style::new().width(100.0));
+        let main = ui.panel(root, Style::new().grow(1.0));
+        ui.layout(Vec2::new(400.0, 300.0)).unwrap();
+
+        assert_eq!(ui.rect(side).unwrap().size, Vec2::new(100.0, 300.0));
+        let m = ui.rect(main).unwrap();
+        assert_eq!(m.pos, Vec2::new(100.0, 0.0));
+        assert_eq!(m.size, Vec2::new(300.0, 300.0));
     }
 
     #[test]

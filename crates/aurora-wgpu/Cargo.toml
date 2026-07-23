@@ -9,8 +9,15 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 cosmic-text = "0.19.0"
 glam = "0.33.2"
 pollster = "1.0.1"
+profiling = "1.0.18"
 thiserror = "2.0.19"
 wgpu = "30.0.0"
 
 [dev-dependencies]
+# The examples are the profiling front end: they select the puffin backend (which
+# routes every `profiling::scope!` in aurora and aurora-wgpu to puffin) and run
+# the puffin server. Building the library alone keeps profiling a no-op.
+profiling = { version = "1.0.18", features = ["profile-with-puffin"] }
+puffin = "0.20.0"
+puffin_http = "0.17.0"
 winit = "0.30.13"
