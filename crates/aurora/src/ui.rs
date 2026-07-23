@@ -9,7 +9,7 @@ use crate::color::Color;
 use crate::draw::{DrawCommand, DrawList, Glyph};
 use crate::error::AuroraError;
 use crate::event::Event;
-use crate::input::InputEvent;
+use crate::input::{InputEvent, Key};
 use crate::rect::Rect;
 use crate::style::Style;
 use crate::widget::{Widget, WidgetId, WidgetKind};
@@ -49,6 +49,10 @@ pub struct Ui {
     hovered: Option<WidgetId>,
     /// The interactive widget a press landed on, armed until release.
     pressed: Option<WidgetId>,
+    /// The focused text input, which receives keyboard input.
+    focused: Option<WidgetId>,
+    /// Caret position in the focused input, as a byte offset into its text.
+    caret: usize,
     /// Semantic events accumulated since the last [`drain_events`](Self::drain_events).
     events: Vec<Event>,
 }
@@ -67,6 +71,8 @@ impl Ui {
             cursor: None,
             hovered: None,
             pressed: None,
+            focused: None,
+            caret: 0,
             events: Vec::new(),
         }
     }
@@ -146,12 +152,16 @@ impl Ui {
     pub fn set_label(&mut self, id: WidgetId, text: impl Into<String>) {
         if let WidgetKind::Label(s) = &mut self.widgets[id].kind {
             *s = text.into();
-            // taffy caches layout per node; without marking this one dirty it
-            // would serve the old measurement and never re-run the measure
-            // function that re-shapes the text buffer.
-            let node = self.widgets[id].taffy;
-            self.taffy.mark_dirty(node).expect("taffy mark_dirty");
+            self.invalidate_text(id);
         }
+    }
+
+    /// Mark a text widget's layout node dirty after its text changed. taffy
+    /// caches layout per node; without this it serves the old measurement and
+    /// never re-runs the measure function that re-shapes the text buffer.
+    fn invalidate_text(&mut self, id: WidgetId) {
+        let node = self.widgets[id].taffy;
+        self.taffy.mark_dirty(node).expect("taffy mark_dirty");
     }
 
     /// Insert a widget, create its taffy node, and link it under `parent`. taffy
@@ -253,6 +263,7 @@ impl Ui {
                 // Arm the widget under the pointer; a release over the same one
                 // is a click.
                 self.pressed = self.hovered;
+                self.focus_from_press();
             }
             InputEvent::PointerReleased => {
                 // `take` always disarms; activation happens only on a release
@@ -263,6 +274,127 @@ impl Ui {
                     self.activate(id);
                 }
             }
+            InputEvent::Text(ch) => self.insert_char(ch),
+            InputEvent::Key(key) => self.edit_key(key),
+        }
+    }
+
+    /// On a press: focus the text input under the pointer (placing the caret at
+    /// the click), or clear focus when the press lands anywhere else.
+    fn focus_from_press(&mut self) {
+        match self.hovered {
+            Some(id) if matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) => {
+                self.focused = Some(id);
+                self.caret = self.caret_at_x(id, self.cursor);
+            }
+            _ => self.focused = None,
+        }
+    }
+
+    /// The focused text input, if any.
+    pub fn focused(&self) -> Option<WidgetId> {
+        self.focused
+    }
+
+    /// Insert a typed character at the caret in the focused input.
+    fn insert_char(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        let Some(id) = self.focused else {
+            return;
+        };
+        let inserted = if let WidgetKind::TextInput(s) = &mut self.widgets[id].kind {
+            let caret = self.caret.min(s.len());
+            s.insert(caret, ch);
+            self.caret = caret + ch.len_utf8();
+            true
+        } else {
+            false
+        };
+        if inserted {
+            self.invalidate_text(id);
+        }
+    }
+
+    /// Apply a named editing key to the focused input.
+    fn edit_key(&mut self, key: Key) {
+        let Some(id) = self.focused else {
+            return;
+        };
+        let WidgetKind::TextInput(s) = &mut self.widgets[id].kind else {
+            return;
+        };
+        let caret = self.caret.min(s.len());
+        // Movement leaves the text untouched; Backspace/Delete edit it.
+        let mut edited = false;
+        match key {
+            Key::Left => self.caret = prev_boundary(s, caret),
+            Key::Right => self.caret = next_boundary(s, caret),
+            Key::Home => self.caret = 0,
+            Key::End => self.caret = s.len(),
+            Key::Backspace if caret > 0 => {
+                let prev = prev_boundary(s, caret);
+                s.replace_range(prev..caret, "");
+                self.caret = prev;
+                edited = true;
+            }
+            Key::Delete if caret < s.len() => {
+                let next = next_boundary(s, caret);
+                s.replace_range(caret..next, "");
+                self.caret = caret;
+                edited = true;
+            }
+            // Backspace at the start / Delete at the end: nothing to remove.
+            Key::Backspace | Key::Delete => self.caret = caret,
+        }
+        if edited {
+            self.invalidate_text(id);
+        }
+    }
+
+    /// The caret byte offset nearest to a cursor position (for click-to-place).
+    /// Falls back to the end of the text when off-field or not yet shaped.
+    fn caret_at_x(&self, id: WidgetId, cursor: Option<Vec2>) -> usize {
+        let text_len = self.text_len(id);
+        let (Some(cursor), Some(buffer)) = (cursor, self.buffers.get(id)) else {
+            return text_len;
+        };
+        let origin = self.content_origin.get(id).copied().unwrap_or(Vec2::ZERO);
+        let local_x = cursor.x - origin.x;
+        for run in buffer.layout_runs() {
+            for g in run.glyphs {
+                // Snap to whichever side of the glyph's midpoint the click is on.
+                if local_x < g.x + g.w * 0.5 {
+                    return g.start;
+                }
+            }
+        }
+        text_len
+    }
+
+    /// The x offset (within the content box) of the caret, from the shaped text.
+    fn caret_x_offset(&self, id: WidgetId) -> f32 {
+        let Some(buffer) = self.buffers.get(id) else {
+            return 0.0;
+        };
+        let mut x = 0.0;
+        for run in buffer.layout_runs() {
+            for g in run.glyphs {
+                if g.start >= self.caret {
+                    return g.x;
+                }
+                x = g.x + g.w;
+            }
+        }
+        x
+    }
+
+    /// The byte length of a text input's contents (0 for other kinds).
+    fn text_len(&self, id: WidgetId) -> usize {
+        match &self.widgets[id].kind {
+            WidgetKind::TextInput(s) => s.len(),
+            _ => 0,
         }
     }
 
@@ -380,14 +512,13 @@ impl Ui {
         // The widget's own visuals, by kind.
         match &widget.kind {
             WidgetKind::Panel => self.fill_background(rect, widget.background, list),
-            WidgetKind::Label(_) | WidgetKind::TextInput(_) => {
-                // A text input renders like a label for now; focus, caret, and
-                // field styling arrive in step 5.
+            WidgetKind::Label(_) => {
                 self.fill_background(rect, widget.background, list);
                 self.emit_text(id, widget.foreground, list);
             }
             WidgetKind::Button(_) => self.emit_button(id, rect, widget, list),
             WidgetKind::Checkbox(checked) => self.emit_checkbox(id, rect, *checked, list),
+            WidgetKind::TextInput(_) => self.emit_text_input(id, rect, widget, list),
         }
 
         // Children, optionally clipped to this widget's rectangle.
@@ -447,6 +578,53 @@ impl Ui {
         }
     }
 
+    /// A text input: a field fill (with an accent frame when focused), its text
+    /// clipped to the field, and a caret when focused.
+    fn emit_text_input(&self, id: WidgetId, rect: Rect, widget: &Widget, list: &mut DrawList) {
+        let focused = self.focused == Some(id);
+        let fill = if widget.background.a > 0.0 {
+            widget.background
+        } else {
+            theme::FIELD
+        };
+        if focused {
+            // An accent frame: an outer accent rect with the fill inset inside it.
+            let border = 1.5;
+            list.commands.push(DrawCommand::FillRect {
+                rect,
+                color: theme::FOCUS,
+            });
+            let inner = Rect::new(
+                rect.pos + Vec2::splat(border),
+                (rect.size - Vec2::splat(2.0 * border)).max(Vec2::ZERO),
+            );
+            list.commands.push(DrawCommand::FillRect {
+                rect: inner,
+                color: fill,
+            });
+        } else {
+            list.commands
+                .push(DrawCommand::FillRect { rect, color: fill });
+        }
+
+        // Clip the text and caret so long content stays within the field.
+        list.commands.push(DrawCommand::PushClip { rect });
+        self.emit_text(id, widget.foreground, list);
+        if focused {
+            let origin = self.content_origin.get(id).copied().unwrap_or(rect.pos);
+            let x = origin.x + self.caret_x_offset(id);
+            let caret = Rect::new(
+                Vec2::new(x, rect.pos.y + 3.0),
+                Vec2::new(1.5, (rect.size.y - 6.0).max(0.0)),
+            );
+            list.commands.push(DrawCommand::FillRect {
+                rect: caret,
+                color: theme::CARET,
+            });
+        }
+        list.commands.push(DrawCommand::PopClip);
+    }
+
     /// Emit a text command for a text-bearing widget from its shaped buffer,
     /// positioned at the widget's content-box origin.
     fn emit_text(&self, id: WidgetId, color: Color, list: &mut DrawList) {
@@ -477,6 +655,17 @@ impl Default for Ui {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The byte offset of the character boundary just before `i` (or 0). Keeps the
+/// caret on `char` boundaries so `String` edits never split a UTF-8 sequence.
+fn prev_boundary(s: &str, i: usize) -> usize {
+    s[..i].chars().next_back().map_or(0, |c| i - c.len_utf8())
+}
+
+/// The byte offset of the character boundary just after `i` (or `i` at the end).
+fn next_boundary(s: &str, i: usize) -> usize {
+    s[i..].chars().next().map_or(i, |c| i + c.len_utf8())
 }
 
 /// taffy measure function: shape a text-bearing leaf and return its size. Called
@@ -539,7 +728,7 @@ mod tests {
     use crate::color::Color;
     use crate::draw::DrawCommand;
     use crate::event::Event;
-    use crate::input::InputEvent;
+    use crate::input::{InputEvent, Key};
     use crate::style::Style;
     use crate::widget::WidgetKind;
     use glam::Vec2;
@@ -549,6 +738,14 @@ mod tests {
         ui.handle_input(InputEvent::PointerMoved(p));
         ui.handle_input(InputEvent::PointerPressed);
         ui.handle_input(InputEvent::PointerReleased);
+    }
+
+    /// The contents of a text input (panics on other kinds).
+    fn text_of(ui: &Ui, id: crate::WidgetId) -> &str {
+        match ui.kind(id) {
+            WidgetKind::TextInput(s) => s,
+            other => panic!("not a text input: {other:?}"),
+        }
     }
 
     #[test]
@@ -741,5 +938,93 @@ mod tests {
         assert_eq!(ui.hit_test(Vec2::new(260.0, 10.0)), None);
         // ...while the visible part still hits the button.
         assert_eq!(ui.hit_test(Vec2::new(150.0, 10.0)), Some(button));
+    }
+
+    /// A field whose contents can be edited, focused by a click.
+    fn ui_with_field(text: &str) -> (Ui, crate::WidgetId) {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(300.0, 100.0));
+        let field = ui.text_input(root, text, Style::new().size(200.0, 24.0));
+        ui.layout(Vec2::new(300.0, 100.0)).unwrap();
+        (ui, field)
+    }
+
+    #[test]
+    fn clicking_a_text_input_focuses_it() {
+        let (mut ui, field) = ui_with_field("hi");
+        assert_eq!(ui.focused(), None);
+        click_at(&mut ui, Vec2::new(20.0, 12.0));
+        assert_eq!(ui.focused(), Some(field));
+    }
+
+    #[test]
+    fn typing_into_a_focused_input_inserts_at_the_caret() {
+        let (mut ui, field) = ui_with_field("ab");
+        click_at(&mut ui, Vec2::new(180.0, 12.0)); // click past the text: caret at end
+
+        ui.handle_input(InputEvent::Text('c'));
+        assert_eq!(text_of(&ui, field), "abc");
+        assert_eq!(ui.caret, 3);
+    }
+
+    #[test]
+    fn typing_is_ignored_without_focus() {
+        let (mut ui, field) = ui_with_field("ab");
+        ui.handle_input(InputEvent::Text('z'));
+        assert_eq!(text_of(&ui, field), "ab");
+    }
+
+    #[test]
+    fn backspace_deletes_before_the_caret_delete_after() {
+        let (mut ui, field) = ui_with_field("abc");
+        click_at(&mut ui, Vec2::new(180.0, 12.0)); // caret at end (3)
+
+        ui.handle_input(InputEvent::Key(Key::Backspace));
+        assert_eq!(text_of(&ui, field), "ab");
+        assert_eq!(ui.caret, 2);
+
+        ui.handle_input(InputEvent::Key(Key::Home));
+        ui.handle_input(InputEvent::Key(Key::Delete));
+        assert_eq!(text_of(&ui, field), "b");
+        assert_eq!(ui.caret, 0);
+    }
+
+    #[test]
+    fn home_then_typing_inserts_at_the_start() {
+        let (mut ui, field) = ui_with_field("bc");
+        click_at(&mut ui, Vec2::new(180.0, 12.0)); // caret at end
+
+        ui.handle_input(InputEvent::Key(Key::Home));
+        ui.handle_input(InputEvent::Text('a'));
+        assert_eq!(text_of(&ui, field), "abc");
+        assert_eq!(ui.caret, 1);
+    }
+
+    #[test]
+    fn click_position_places_the_caret() {
+        let (mut ui, _field) = ui_with_field("abcdef");
+        // Far right of the text: caret at the end.
+        click_at(&mut ui, Vec2::new(199.0, 12.0));
+        assert_eq!(ui.caret, "abcdef".len());
+        // Far left: caret at the start.
+        click_at(&mut ui, Vec2::new(0.5, 12.0));
+        assert_eq!(ui.caret, 0);
+    }
+
+    #[test]
+    fn clicking_a_button_clears_field_focus() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().row().gap(10.0).size(300.0, 100.0));
+        let field = ui.text_input(root, "hi", Style::new().size(100.0, 24.0));
+        let button = ui.button(root, "B", Style::new().size(40.0, 24.0));
+        ui.layout(Vec2::new(300.0, 100.0)).unwrap();
+
+        click_at(&mut ui, Vec2::new(20.0, 12.0)); // focus the field
+        assert_eq!(ui.focused(), Some(field));
+
+        // The button sits at x = 100 (field) + 10 (gap) = 110.
+        click_at(&mut ui, Vec2::new(120.0, 12.0));
+        assert_eq!(ui.focused(), None);
+        assert_eq!(ui.drain_events(), vec![Event::Clicked(button)]);
     }
 }

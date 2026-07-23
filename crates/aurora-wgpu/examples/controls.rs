@@ -1,16 +1,19 @@
-//! controls - an interactive aurora-wgpu demo: a button and a checkbox wired to
-//! real pointer input. Click the button to bump a counter; toggle the checkbox
-//! to show an accent box. Run with: `cargo run -p aurora-wgpu --example controls`.
+//! controls - an interactive aurora-wgpu demo: a button, a checkbox, and an
+//! editable text field wired to real pointer and keyboard input. Click the
+//! button to bump a counter; toggle the checkbox to show an accent box; click
+//! the field and type (Backspace/Delete/arrows/Home/End work).
+//! Run with: `cargo run -p aurora-wgpu --example controls`.
 
 use std::sync::Arc;
 
-use aurora::{Color, Event, InputEvent, Style, Ui, WidgetId};
+use aurora::{Color, Event, InputEvent, Key, Style, Ui, WidgetId};
 use aurora_wgpu::Renderer;
 use glam::Vec2;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{Key as WinitKey, NamedKey},
     window::{Window, WindowId},
 };
 
@@ -98,6 +101,13 @@ impl ApplicationHandler for App {
                 state.ui.handle_input(ev);
                 state.window.request_redraw();
             }
+            // Translate winit key presses into Aurora text/key events.
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                for ev in translate_key(&event) {
+                    state.ui.handle_input(ev);
+                }
+                state.window.request_redraw();
+            }
             WindowEvent::RedrawRequested => {
                 react(state);
                 let size = state.window.inner_size();
@@ -142,6 +152,30 @@ fn react(state: &mut State) {
     }
 }
 
+/// Map a winit key press to Aurora input: a named editing key, or the typed
+/// text as a run of character events.
+fn translate_key(event: &winit::event::KeyEvent) -> Vec<InputEvent> {
+    let named = match &event.logical_key {
+        WinitKey::Named(NamedKey::Backspace) => Some(Key::Backspace),
+        WinitKey::Named(NamedKey::Delete) => Some(Key::Delete),
+        WinitKey::Named(NamedKey::ArrowLeft) => Some(Key::Left),
+        WinitKey::Named(NamedKey::ArrowRight) => Some(Key::Right),
+        WinitKey::Named(NamedKey::Home) => Some(Key::Home),
+        WinitKey::Named(NamedKey::End) => Some(Key::End),
+        _ => None,
+    };
+    if let Some(key) = named {
+        return vec![InputEvent::Key(key)];
+    }
+    event
+        .text
+        .iter()
+        .flat_map(|t| t.chars())
+        .filter(|c| !c.is_control())
+        .map(InputEvent::Text)
+        .collect()
+}
+
 /// Build the control panel and return the handles the app reacts to.
 fn build_ui() -> (Ui, Ids) {
     let mut ui = Ui::new();
@@ -173,6 +207,15 @@ fn build_ui() -> (Ui, Ids) {
     let check_row = ui.panel(root, Style::new().row().gap(8.0).padding(4.0));
     let checkbox = ui.checkbox(check_row, false, Style::new());
     ui.label(check_row, "Show accent box", Style::new().padding(2.0));
+
+    // An editable text field next to its caption. Click it and type.
+    let field_row = ui.panel(root, Style::new().row().gap(8.0));
+    ui.label(field_row, "Name:", Style::new().padding(6.0));
+    ui.text_input(
+        field_row,
+        "player one",
+        Style::new().size(220.0, 28.0).padding(6.0),
+    );
 
     // The box the checkbox reveals (transparent until toggled on).
     let accent = ui.panel(root, Style::new().size(220.0, 44.0));

@@ -14,3 +14,10 @@ pub(crate) const CHECKBOX_BOX: Color = Color::rgb(0.20, 0.21, 0.26);
 pub(crate) const CHECKBOX_MARK: Color = Color::rgb(0.40, 0.70, 1.0);
 /// The intrinsic side length of a checkbox, in pixels.
 pub(crate) const CHECKBOX_SIZE: f32 = 18.0;
+
+/// Text-input field fill.
+pub(crate) const FIELD: Color = Color::rgb(0.10, 0.11, 0.14);
+/// The accent frame drawn around a focused field.
+pub(crate) const FOCUS: Color = Color::rgb(0.30, 0.55, 0.90);
+/// The text caret color.
+pub(crate) const CARET: Color = Color::rgb(0.90, 0.92, 0.96);

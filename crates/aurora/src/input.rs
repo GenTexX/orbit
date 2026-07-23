@@ -1,11 +1,13 @@
-//! aurora input: pointer input in Aurora's own vocabulary, so the framework
-//! stays windowing-agnostic. A backend (or app) translates winit - or any -
-//! events into these and feeds them to [`Ui::handle_input`](crate::Ui::handle_input).
+//! aurora input: pointer and keyboard input in Aurora's own vocabulary, so the
+//! framework stays windowing-agnostic. A backend (or app) translates winit - or
+//! any - events into these and feeds them to
+//! [`Ui::handle_input`](crate::Ui::handle_input).
 
 use glam::Vec2;
 
-/// A single pointer input event. Aurora tracks only the primary button for now
-/// (all Milestone 2 needs); button state is implicit, at the last moved position.
+/// A single input event. Aurora tracks only the primary pointer button; button
+/// state is implicit, at the last moved position. Keyboard events act on the
+/// focused widget (a text input).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputEvent {
     /// The pointer moved to `position`, in physical pixels (UI space, the same
@@ -17,4 +19,26 @@ pub enum InputEvent {
     PointerPressed,
     /// The primary pointer button came up.
     PointerReleased,
+    /// A character was typed. The backend should filter out control characters;
+    /// the UI ignores them defensively too.
+    Text(char),
+    /// A named editing key was pressed.
+    Key(Key),
+}
+
+/// A named key that drives text editing (as opposed to a typed character).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    /// Delete the character before the caret.
+    Backspace,
+    /// Delete the character after the caret.
+    Delete,
+    /// Move the caret one character left.
+    Left,
+    /// Move the caret one character right.
+    Right,
+    /// Move the caret to the start of the text.
+    Home,
+    /// Move the caret to the end of the text.
+    End,
 }

@@ -29,9 +29,12 @@ pub enum WidgetKind {
 
 impl WidgetKind {
     /// Whether this kind responds to pointer input (so hit-testing bubbles a
-    /// click up to it). Text inputs join once focus lands in step 5.
+    /// click up to it): buttons and checkboxes activate, text inputs take focus.
     pub(crate) fn is_interactive(&self) -> bool {
-        matches!(self, WidgetKind::Button(_) | WidgetKind::Checkbox(_))
+        matches!(
+            self,
+            WidgetKind::Button(_) | WidgetKind::Checkbox(_) | WidgetKind::TextInput(_)
+        )
     }
 }
 
