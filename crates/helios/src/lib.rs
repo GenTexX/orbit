@@ -12,6 +12,7 @@ mod component;
 mod error;
 mod project;
 mod reflect;
+mod render;
 mod scene;
 mod serialize;
 mod transform;

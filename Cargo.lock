@@ -932,6 +932,7 @@ name = "helios"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "photon",
  "ron",
  "serde",
  "slotmap",
