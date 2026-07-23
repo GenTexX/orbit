@@ -87,4 +87,7 @@ pub(crate) struct Widget {
     pub clip: bool,
     /// Whether this widget scrolls its overflowing content vertically.
     pub scroll: bool,
+    /// Whether this text input accepts only numeric text (a leading `-`,
+    /// digits, and a single `.`) - other keystrokes and pastes are rejected.
+    pub numeric: bool,
 }

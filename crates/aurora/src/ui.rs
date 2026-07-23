@@ -144,6 +144,20 @@ impl Ui {
         self.add(WidgetKind::TextInput(text.into()), style, Some(parent))
     }
 
+    /// Add a text input that accepts only numeric text (a leading `-`, digits,
+    /// and a single `.`). Keystrokes and pastes that would break that are
+    /// rejected - the primitive the inspector's numeric fields build on.
+    pub fn numeric_input(
+        &mut self,
+        parent: WidgetId,
+        text: impl Into<String>,
+        style: Style,
+    ) -> WidgetId {
+        let id = self.add(WidgetKind::TextInput(text.into()), style, Some(parent));
+        self.widgets[id].numeric = true;
+        id
+    }
+
     /// Add a widget under `parent` that draws a backend-registered texture
     /// (`handle`) filling its rectangle - e.g. the engine's viewport.
     pub fn image(
@@ -347,6 +361,16 @@ impl Ui {
         }
         let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
         let (lo, hi) = self.selection_bounds(id);
+        // A numeric field rejects an edit that would make its text non-numeric.
+        if self.widgets[id].numeric
+            && let WidgetKind::TextInput(s) = &self.widgets[id].kind
+        {
+            let mut candidate = s.clone();
+            candidate.replace_range(lo..hi, &cleaned);
+            if !is_numeric_text(&candidate) {
+                return;
+            }
+        }
         if let WidgetKind::TextInput(s) = &mut self.widgets[id].kind {
             s.replace_range(lo..hi, &cleaned);
         }
@@ -431,6 +455,7 @@ impl Ui {
             foreground: style.foreground,
             clip: style.clip || style.scroll,
             scroll: style.scroll,
+            numeric: false,
         });
         self.taffy
             .set_node_context(node, Some(id))
@@ -1232,6 +1257,27 @@ fn inflate_splitter(rect: Rect, orientation: Orientation) -> Rect {
     }
 }
 
+/// Whether `s` is valid as-you-type numeric text: an optional leading `-`,
+/// digits, and at most one `.`. Intermediate states like ``, `-`, `1.`, `.5`
+/// are allowed so a value can be typed; a full parse happens on commit.
+fn is_numeric_text(s: &str) -> bool {
+    let body = s.strip_prefix('-').unwrap_or(s);
+    let mut dots = 0;
+    for c in body.chars() {
+        match c {
+            '.' => {
+                dots += 1;
+                if dots > 1 {
+                    return false;
+                }
+            }
+            _ if c.is_ascii_digit() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// The byte offset of the character boundary just before `i` (or 0). Keeps the
 /// caret on `char` boundaries so `String` edits never split a UTF-8 sequence.
 fn prev_boundary(s: &str, i: usize) -> usize {
@@ -1573,6 +1619,27 @@ mod tests {
         ui.handle_input(InputEvent::Text('c'));
         assert_eq!(text_of(&ui, field), "abc");
         assert_eq!(ui.caret, 3);
+    }
+
+    #[test]
+    fn a_numeric_input_rejects_non_numeric_edits() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 60.0));
+        let field = ui.numeric_input(root, "", Style::new().size(180.0, 24.0));
+        ui.layout(Vec2::new(200.0, 60.0)).unwrap();
+        click_at(&mut ui, Vec2::new(10.0, 12.0));
+
+        for ch in "-12.5".chars() {
+            ui.handle_input(InputEvent::Text(ch));
+        }
+        assert_eq!(text_of(&ui, field), "-12.5");
+        // A letter and a second dot are both rejected.
+        ui.handle_input(InputEvent::Text('a'));
+        ui.handle_input(InputEvent::Text('.'));
+        assert_eq!(text_of(&ui, field), "-12.5");
+        // Pasting a non-numeric string is rejected wholesale.
+        ui.insert_str("abc");
+        assert_eq!(text_of(&ui, field), "-12.5");
     }
 
     #[test]

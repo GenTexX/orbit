@@ -17,6 +17,77 @@ const SUBHEAD: Color = Color::rgb(0.55, 0.60, 0.72);
 const ROW_SELECTED: Color = Color::rgb(0.20, 0.28, 0.42);
 const MENU_BG: Color = Color::rgb(0.16, 0.17, 0.22);
 const MODE_ACTIVE: Color = Color::rgb(0.24, 0.40, 0.62);
+/// The engine axis palette (matches the viewport gizmo): X red, Y green. Used
+/// for the inspector's Vec2 x/y labels so a field's axes read consistently.
+const AXIS_X_BG: Color = Color::rgb(0.90, 0.32, 0.32);
+const AXIS_Y_BG: Color = Color::rgb(0.35, 0.70, 0.38);
+
+/// One axis of a 2D value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    X,
+    Y,
+}
+
+/// A reference to a `Vec2`-valued field the inspector edits, resolved against
+/// the scene to read or write it (for both typed commits and label drag-scrub).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FieldRef {
+    /// The node's transform translation.
+    Position(NodeId),
+    /// The node's transform scale.
+    Scale(NodeId),
+    /// A `Vec2` field of one of the node's components.
+    Component {
+        node: NodeId,
+        index: usize,
+        field: &'static str,
+    },
+}
+
+/// This value's `axis` component.
+pub fn axis_of(v: Vec2, axis: Axis) -> f32 {
+    match axis {
+        Axis::X => v.x,
+        Axis::Y => v.y,
+    }
+}
+
+/// `v` with its `axis` component replaced by `val`.
+pub fn with_axis(v: Vec2, axis: Axis, val: f32) -> Vec2 {
+    match axis {
+        Axis::X => Vec2::new(val, v.y),
+        Axis::Y => Vec2::new(v.x, val),
+    }
+}
+
+/// The current value of a `Vec2` field.
+pub fn field_vec2(scene: &Scene, r: FieldRef) -> Vec2 {
+    match r {
+        FieldRef::Position(n) => scene.node(n).transform.translation,
+        FieldRef::Scale(n) => scene.node(n).transform.scale,
+        FieldRef::Component { node, index, field } => {
+            match scene.node(node).components[index].as_reflect().get(field) {
+                Some(Value::Vec2(v)) => v,
+                _ => Vec2::ZERO,
+            }
+        }
+    }
+}
+
+/// Write a `Vec2` field directly (no undo step) - used for live drag-scrub;
+/// the caller commits the final value through the history on release.
+pub fn set_field_vec2(scene: &mut Scene, r: FieldRef, v: Vec2) {
+    match r {
+        FieldRef::Position(n) => scene.node_mut(n).transform.translation = v,
+        FieldRef::Scale(n) => scene.node_mut(n).transform.scale = v,
+        FieldRef::Component { node, index, field } => {
+            scene.node_mut(node).components[index]
+                .as_reflect_mut()
+                .set(field, Value::Vec2(v));
+        }
+    }
+}
 
 /// Maps widget handles back to the domain data they represent, so the app can
 /// react to Aurora events without Aurora knowing about `Scene`/`NodeId`.
@@ -48,6 +119,12 @@ pub struct EditorRows {
     pub load: Option<WidgetId>,
     /// The toolbar's gizmo-mode buttons, each mapped to the mode it selects.
     pub mode_buttons: Vec<(WidgetId, GizmoMode)>,
+    /// Numeric inputs for the x/y components of a Vec2 field: submitting one
+    /// commits that component of `(FieldRef, Axis)`.
+    pub vec_inputs: Vec<(WidgetId, FieldRef, Axis)>,
+    /// The colored x/y axis labels: pressing and dragging one scrubs that
+    /// component of `(FieldRef, Axis)`.
+    pub scrub_labels: Vec<(WidgetId, FieldRef, Axis)>,
     /// Status bar readouts, updated in place every frame via `set_label`.
     pub status_cursor: Option<WidgetId>,
     pub status_zoom: Option<WidgetId>,
@@ -373,16 +450,24 @@ fn build_inspector(
     // rows double as a live readout while dragging.
     ui.label(panel, "Transform", Style::new().foreground(SUBHEAD));
     let t = scene.node(node).transform;
-    let transform_fields = [
-        ("position", Value::Vec2(t.translation)),
-        // Stored radians, edited as degrees (the commit path converts back).
-        ("rotation", Value::F32(t.rotation.to_degrees())),
-        ("scale", Value::Vec2(t.scale)),
-    ];
-    for (field, value) in transform_fields {
-        let input = add_value_row(ui, panel, field, &value);
-        rows.transform_rows.push((input, node, field));
-    }
+    add_vec2_field(
+        ui,
+        panel,
+        "position",
+        t.translation,
+        FieldRef::Position(node),
+        rows,
+    );
+    // Rotation is a single scalar, edited in degrees (stored radians).
+    let input = add_value_row(
+        ui,
+        panel,
+        "rotation",
+        &Value::F32(t.rotation.to_degrees()),
+        true,
+    );
+    rows.transform_rows.push((input, node, "rotation"));
+    add_vec2_field(ui, panel, "scale", t.scale, FieldRef::Scale(node), rows);
 
     for (i, component) in scene.node(node).components.iter().enumerate() {
         let reflect = component.as_reflect();
@@ -391,22 +476,75 @@ fn build_inspector(
             let Some(value) = reflect.get(field) else {
                 continue;
             };
-            let input = add_value_row(ui, panel, field, &value);
-            rows.field_rows.push((input, node, i, field));
+            // A Vec2 field gets the two-axis treatment; everything else a plain
+            // (numeric where it makes sense) row.
+            if let Value::Vec2(v) = value {
+                let r = FieldRef::Component {
+                    node,
+                    index: i,
+                    field,
+                };
+                add_vec2_field(ui, panel, field, v, r, rows);
+            } else {
+                let numeric = matches!(value, Value::F32(_));
+                let input = add_value_row(ui, panel, field, &value, numeric);
+                rows.field_rows.push((input, node, i, field));
+            }
         }
     }
     panel
 }
 
-/// One labeled, editable inspector row; returns the text input's id.
-fn add_value_row(ui: &mut Ui, panel: WidgetId, label: &str, value: &Value) -> WidgetId {
+/// One labeled, editable inspector row; returns the text input's id. `numeric`
+/// restricts typing to numbers.
+fn add_value_row(
+    ui: &mut Ui,
+    panel: WidgetId,
+    label: &str,
+    value: &Value,
+    numeric: bool,
+) -> WidgetId {
     let row = ui.panel(panel, Style::new().row().gap(6.0).align_center());
     ui.label(row, label, Style::new().width(70.0));
-    ui.text_input(
-        row,
-        value_to_text(value),
-        Style::new().grow(1.0).padding(4.0),
-    )
+    let style = Style::new().grow(1.0).padding(4.0);
+    if numeric {
+        ui.numeric_input(row, value_to_text(value), style)
+    } else {
+        ui.text_input(row, value_to_text(value), style)
+    }
+}
+
+/// A Vec2 field as two rows: a colored, draggable axis label (X red, Y green)
+/// beside a numeric input, matching the engine's axis palette. Dragging a
+/// label scrubs that component; typing a value commits it.
+fn add_vec2_field(
+    ui: &mut Ui,
+    panel: WidgetId,
+    name: &str,
+    v: Vec2,
+    field: FieldRef,
+    rows: &mut EditorRows,
+) {
+    ui.label(panel, name, Style::new().foreground(SUBHEAD));
+    for (axis, caption, color) in [(Axis::X, "X", AXIS_X_BG), (Axis::Y, "Y", AXIS_Y_BG)] {
+        let row = ui.panel(panel, Style::new().row().gap(4.0).align_center());
+        let label = ui.button(
+            row,
+            caption,
+            Style::new()
+                .width(24.0)
+                .padding(4.0)
+                .background(color)
+                .foreground(HEADING),
+        );
+        rows.scrub_labels.push((label, field, axis));
+        let input = ui.numeric_input(
+            row,
+            value_to_text(&Value::F32(axis_of(v, axis))),
+            Style::new().grow(1.0).padding(4.0),
+        );
+        rows.vec_inputs.push((input, field, axis));
+    }
 }
 
 /// The docked file explorer: the project's PNG and scene files.
@@ -521,6 +659,48 @@ mod tests {
         let mut registry: slotmap::SlotMap<ImageHandle, ()> = slotmap::SlotMap::with_key();
         let handle = registry.insert(());
         (scene, handle)
+    }
+
+    #[test]
+    fn a_selected_node_gets_vec2_axis_inputs_and_scrub_labels() {
+        let (scene, handle) = demo_scene();
+        let node = scene.children(scene.root())[0];
+        let dir = std::env::temp_dir();
+        let (_ui, rows) = build_editor_ui(
+            &scene,
+            Some(node),
+            handle,
+            &dir,
+            PanelSizes::default(),
+            None,
+            GizmoMode::Select,
+        );
+
+        // Three Vec2 fields (position, scale, sprite size) -> two axes each.
+        assert_eq!(rows.vec_inputs.len(), 6);
+        assert_eq!(rows.scrub_labels.len(), 6);
+        // Position's x/y inputs reference the node's translation axes.
+        let axes: Vec<Axis> = rows
+            .vec_inputs
+            .iter()
+            .filter(|(_, f, _)| *f == FieldRef::Position(node))
+            .map(|(_, _, a)| *a)
+            .collect();
+        assert_eq!(axes, vec![Axis::X, Axis::Y]);
+    }
+
+    #[test]
+    fn vec2_field_helpers_round_trip() {
+        let (mut scene, _) = demo_scene();
+        let node = scene.children(scene.root())[0];
+        let field = FieldRef::Position(node);
+        assert_eq!(field_vec2(&scene, field), Vec2::new(10.0, 10.0));
+
+        // Scrub the X component and read it back; Y is untouched.
+        let moved = with_axis(field_vec2(&scene, field), Axis::X, 42.0);
+        set_field_vec2(&mut scene, field, moved);
+        assert_eq!(field_vec2(&scene, field), Vec2::new(42.0, 10.0));
+        assert_eq!(axis_of(field_vec2(&scene, field), Axis::Y), 10.0);
     }
 
     #[test]

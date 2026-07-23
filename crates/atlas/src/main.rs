@@ -30,10 +30,20 @@ use winit::{
 
 use crate::textures::TextureCache;
 use crate::ui::{
-    ContextMenu, EditorRows, MenuAction, PanelSizes, build_editor_ui, capture_panel_sizes,
-    parse_value,
+    Axis, ContextMenu, EditorRows, FieldRef, MenuAction, PanelSizes, build_editor_ui,
+    capture_panel_sizes, field_vec2, parse_value, set_field_vec2, with_axis,
 };
 use crate::viewport::{Drag, EditorCamera, GizmoHit, GizmoMode};
+
+/// An in-progress inspector label drag-scrub: adjusting one component of a
+/// Vec2 field by the horizontal cursor motion since the press.
+#[derive(Debug, Clone, Copy)]
+struct ScrubDrag {
+    field: FieldRef,
+    axis: Axis,
+    original: Vec2,
+    start_x: f32,
+}
 
 fn main() -> Result<()> {
     init_logging();
@@ -134,6 +144,8 @@ struct State {
     /// The OS clipboard (for text copy/cut/paste), or `None` if it could not
     /// be opened on this platform.
     clipboard: Option<arboard::Clipboard>,
+    /// An in-progress inspector label drag-scrub, if any.
+    scrub: Option<ScrubDrag>,
 }
 
 impl ApplicationHandler for App {
@@ -178,10 +190,16 @@ impl ApplicationHandler for App {
                         return;
                     }
                     state.ui.handle_input(InputEvent::PointerPressed);
+                    // A press on an inspector axis label starts a value scrub
+                    // and consumes the press (no viewport pick behind it).
+                    if state.begin_scrub() {
+                        return;
+                    }
                     state.viewport_press();
                     state.file_press();
                 }
                 (MouseButton::Left, ElementState::Released) => {
+                    state.end_scrub();
                     state.file_drop();
                     state.end_drag();
                     state.ui.handle_input(InputEvent::PointerReleased);
@@ -305,6 +323,7 @@ impl State {
             clipboard: arboard::Clipboard::new()
                 .inspect_err(|err| tracing::warn!("no clipboard available: {err}"))
                 .ok(),
+            scrub: None,
         })
     }
 
@@ -341,6 +360,9 @@ impl State {
 
         if self.panning {
             self.camera.pan_by_screen(delta);
+        }
+        if self.scrub.is_some() {
+            self.apply_scrub();
         }
         if let Some(drag) = self.drag
             && let Some(world) = self.cursor_world()
@@ -599,6 +621,85 @@ impl State {
                 .ensure(&self.engine, &self.project_dir, &draw.texture);
         }
         textures::coalesce_runs(draws)
+    }
+
+    /// Begin a drag-scrub if the press landed on an inspector axis label.
+    /// Returns whether it did (so the caller can consume the press).
+    fn begin_scrub(&mut self) -> bool {
+        let hit = self.ui.hit_test(self.cursor);
+        let Some(&(_, field, axis)) =
+            hit.and_then(|id| self.rows.scrub_labels.iter().find(|(w, ..)| *w == id))
+        else {
+            return false;
+        };
+        self.scrub = Some(ScrubDrag {
+            field,
+            axis,
+            original: field_vec2(&self.project.scene, field),
+            start_x: self.cursor.x,
+        });
+        true
+    }
+
+    /// The scrub sensitivity (value change per horizontal pixel) for a field:
+    /// scale is fine-grained, positions and sizes move a pixel per pixel.
+    fn scrub_step(field: FieldRef) -> f32 {
+        match field {
+            FieldRef::Scale(_) => 0.01,
+            _ => 1.0,
+        }
+    }
+
+    /// Apply the live scrub value for the current cursor (called on move):
+    /// the pressed axis component moves by the horizontal drag since the press.
+    fn apply_scrub(&mut self) {
+        let Some(scrub) = self.scrub else {
+            return;
+        };
+        let delta = (self.cursor.x - scrub.start_x) * Self::scrub_step(scrub.field);
+        let base = crate::ui::axis_of(scrub.original, scrub.axis);
+        let value = with_axis(scrub.original, scrub.axis, base + delta);
+        set_field_vec2(&mut self.project.scene, scrub.field, value);
+        self.dirty = true;
+    }
+
+    /// Finish a scrub: rewind to the press-time value and commit the final one
+    /// through the history, so the whole drag is ONE undo step.
+    fn end_scrub(&mut self) {
+        let Some(scrub) = self.scrub.take() else {
+            return;
+        };
+        let current = field_vec2(&self.project.scene, scrub.field);
+        if current != scrub.original {
+            set_field_vec2(&mut self.project.scene, scrub.field, scrub.original);
+            self.commit_field_vec2(scrub.field, current);
+            self.dirty = true;
+        }
+    }
+
+    /// Commit a Vec2 field value through the undo history.
+    fn commit_field_vec2(&mut self, field: FieldRef, v: Vec2) {
+        let scene = &mut self.project.scene;
+        match field {
+            FieldRef::Position(n) => {
+                let t = Transform {
+                    translation: v,
+                    ..scene.node(n).transform
+                };
+                self.history.set_transform(scene, n, t);
+            }
+            FieldRef::Scale(n) => {
+                let t = Transform {
+                    scale: v,
+                    ..scene.node(n).transform
+                };
+                self.history.set_transform(scene, n, t);
+            }
+            FieldRef::Component { node, index, field } => {
+                self.history
+                    .set_field(scene, node, index, field, Value::Vec2(v));
+            }
+        }
     }
 
     /// Finish a viewport drag: rewind to the press-time transform and commit
@@ -991,9 +1092,31 @@ impl State {
                 AuroraEvent::Submitted(id) => {
                     self.commit_field(id);
                     self.commit_transform_field(id);
+                    self.commit_vec_input(id);
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Commit a submitted Vec2 axis input: parse its text into the pressed
+    /// component and commit the whole Vec2 through the history. A no-op for
+    /// other widgets or unparseable text.
+    fn commit_vec_input(&mut self, id: aurora::WidgetId) {
+        let Some(&(_, field, axis)) = self.rows.vec_inputs.iter().find(|(w, ..)| *w == id) else {
+            return;
+        };
+        let WidgetKind::TextInput(text) = self.ui.kind(id) else {
+            return;
+        };
+        let Ok(parsed) = text.trim().parse::<f32>() else {
+            return;
+        };
+        let current = field_vec2(&self.project.scene, field);
+        let updated = with_axis(current, axis, parsed);
+        if updated != current {
+            self.commit_field_vec2(field, updated);
+            self.dirty = true;
         }
     }
 
