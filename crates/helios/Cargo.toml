@@ -4,3 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+glam = "0.33.2"
+slotmap = "1.1.1"

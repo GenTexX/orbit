@@ -918,6 +918,10 @@ dependencies = [
 [[package]]
 name = "helios"
 version = "0.1.0"
+dependencies = [
+ "glam",
+ "slotmap",
+]
 
 [[package]]
 name = "hermit-abi"
