@@ -163,6 +163,15 @@ dependencies = [
 [[package]]
 name = "aurora-wgpu"
 version = "0.1.0"
+dependencies = [
+ "aurora",
+ "bytemuck",
+ "glam",
+ "pollster",
+ "thiserror 2.0.19",
+ "wgpu",
+ "winit",
+]
 
 [[package]]
 name = "autocfg"

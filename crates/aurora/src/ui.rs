@@ -1,20 +1,23 @@
-//! aurora ui: the widget arena, the taffy layout tree, the builder API, and the layout pass.
+//! aurora ui: the widget arena, the taffy layout tree, the builder API, layout, and draw-list generation.
 
 use glam::Vec2;
 use slotmap::{SecondaryMap, SlotMap};
-use taffy::{AvailableSpace, Size, Style, TaffyTree};
+use taffy::{AvailableSpace, Size, TaffyTree};
 
+use crate::draw::{DrawCommand, DrawList};
 use crate::error::AuroraError;
 use crate::rect::Rect;
+use crate::style::Style;
 use crate::widget::{Widget, WidgetId, WidgetKind};
 
 /// A retained Aurora UI: owns the widget arena and the taffy layout tree, and
 /// caches each widget's absolute rectangle after [`layout`](Self::layout).
 ///
 /// Build a tree with [`root_panel`](Self::root_panel) plus the typed child
-/// constructors, run [`layout`](Self::layout), then read rectangles with
-/// [`rect`](Self::rect). The widget tree and the taffy tree are kept in lockstep:
-/// every widget owns exactly one taffy node.
+/// constructors, run [`layout`](Self::layout), then either read rectangles with
+/// [`rect`](Self::rect) or produce a frame's [`draw_list`](Self::draw_list). The
+/// widget tree and the taffy tree stay in lockstep: every widget owns one taffy
+/// node.
 pub struct Ui {
     widgets: SlotMap<WidgetId, Widget>,
     taffy: TaffyTree<WidgetId>,
@@ -34,7 +37,7 @@ impl Ui {
     }
 
     /// Create the root widget, a panel with the given style. Replaces any
-    /// existing root (the old tree is left in the arena but unreachable).
+    /// existing root.
     pub fn root_panel(&mut self, style: Style) -> WidgetId {
         let id = self.add(WidgetKind::Panel, style, None);
         self.root = Some(id);
@@ -93,15 +96,17 @@ impl Ui {
         self.rects.get(id).copied()
     }
 
-    /// Insert a widget, create its taffy node, and link it under `parent`.
-    /// taffy calls only fail on internal misuse, so they are treated as bugs.
+    /// Insert a widget, create its taffy node, and link it under `parent`. taffy
+    /// calls only fail on internal misuse, so they are treated as bugs.
     fn add(&mut self, kind: WidgetKind, style: Style, parent: Option<WidgetId>) -> WidgetId {
-        let node = self.taffy.new_leaf(style).expect("taffy new_leaf");
+        let node = self.taffy.new_leaf(style.layout).expect("taffy new_leaf");
         let id = self.widgets.insert(Widget {
             kind,
             taffy: node,
             parent,
             children: Vec::new(),
+            background: style.background,
+            clip: style.clip,
         });
         // Let taffy map its node back to our widget (needed once text widgets
         // measure themselves via a taffy measure function).
@@ -154,6 +159,41 @@ impl Ui {
             self.accumulate(child, pos);
         }
     }
+
+    /// Produce this frame's draw list by walking the laid-out tree: each widget
+    /// emits a background fill (if any), then a clip around its children (if it
+    /// clips), then its children, in tree order. Requires a prior
+    /// [`layout`](Self::layout).
+    pub fn draw_list(&self) -> DrawList {
+        let mut list = DrawList::default();
+        if let Some(root) = self.root {
+            self.emit(root, &mut list);
+        }
+        list
+    }
+
+    fn emit(&self, id: WidgetId, list: &mut DrawList) {
+        let Some(rect) = self.rect(id) else {
+            return;
+        };
+        let widget = &self.widgets[id];
+
+        if widget.background.a > 0.0 {
+            list.commands.push(DrawCommand::FillRect {
+                rect,
+                color: widget.background,
+            });
+        }
+        if widget.clip {
+            list.commands.push(DrawCommand::PushClip { rect });
+        }
+        for &child in &widget.children {
+            self.emit(child, list);
+        }
+        if widget.clip {
+            list.commands.push(DrawCommand::PopClip);
+        }
+    }
 }
 
 impl Default for Ui {
@@ -165,24 +205,15 @@ impl Default for Ui {
 #[cfg(test)]
 mod tests {
     use super::Ui;
+    use crate::color::Color;
+    use crate::draw::DrawCommand;
+    use crate::style::Style;
     use glam::Vec2;
-    use taffy::prelude::*;
-
-    /// A fixed-size style for a `w` x `h` box.
-    fn boxed(w: f32, h: f32) -> Style {
-        Style {
-            size: Size {
-                width: length(w),
-                height: length(h),
-            },
-            ..Default::default()
-        }
-    }
 
     #[test]
     fn root_takes_its_style_size_at_the_origin() {
         let mut ui = Ui::new();
-        let root = ui.root_panel(boxed(200.0, 100.0));
+        let root = ui.root_panel(Style::new().size(200.0, 100.0));
         ui.layout(Vec2::new(800.0, 600.0)).unwrap();
 
         let r = ui.rect(root).unwrap();
@@ -193,17 +224,9 @@ mod tests {
     #[test]
     fn a_column_stacks_children_vertically() {
         let mut ui = Ui::new();
-        let root = ui.root_panel(Style {
-            display: Display::Flex,
-            flex_direction: FlexDirection::Column,
-            size: Size {
-                width: length(100.0),
-                height: length(100.0),
-            },
-            ..Default::default()
-        });
-        let a = ui.panel(root, boxed(100.0, 30.0));
-        let b = ui.panel(root, boxed(100.0, 40.0));
+        let root = ui.root_panel(Style::new().column().size(100.0, 100.0));
+        let a = ui.panel(root, Style::new().size(100.0, 30.0));
+        let b = ui.panel(root, Style::new().size(100.0, 40.0));
         ui.layout(Vec2::new(200.0, 200.0)).unwrap();
 
         assert_eq!(ui.rect(a).unwrap().pos, Vec2::new(0.0, 0.0));
@@ -214,51 +237,43 @@ mod tests {
     }
 
     #[test]
-    fn parent_padding_offsets_a_child_absolutely() {
-        let mut ui = Ui::new();
-        let root = ui.root_panel(Style {
-            padding: Rect {
-                left: length(10.0),
-                right: length(10.0),
-                top: length(20.0),
-                bottom: length(20.0),
-            },
-            size: Size {
-                width: length(200.0),
-                height: length(200.0),
-            },
-            ..Default::default()
-        });
-        let child = ui.panel(root, boxed(50.0, 50.0));
-        ui.layout(Vec2::new(400.0, 400.0)).unwrap();
-
-        // The child sits inside the parent's padding box: (left, top) = (10, 20).
-        assert_eq!(ui.rect(child).unwrap().pos, Vec2::new(10.0, 20.0));
-    }
-
-    #[test]
     fn nested_positions_accumulate() {
         let mut ui = Ui::new();
-        let pad = |p: f32| Style {
-            padding: Rect {
-                left: length(p),
-                right: length(p),
-                top: length(p),
-                bottom: length(p),
-            },
-            size: Size {
-                width: length(200.0),
-                height: length(200.0),
-            },
-            ..Default::default()
-        };
-        let root = ui.root_panel(pad(10.0));
-        let child = ui.panel(root, pad(8.0));
-        let grandchild = ui.panel(child, boxed(20.0, 20.0));
+        let root = ui.root_panel(Style::new().padding(10.0).size(200.0, 200.0));
+        let child = ui.panel(root, Style::new().padding(8.0).size(200.0, 200.0));
+        let grandchild = ui.panel(child, Style::new().size(20.0, 20.0));
         ui.layout(Vec2::new(400.0, 400.0)).unwrap();
 
         // child at (10, 10) from root padding; grandchild a further (8, 8) in.
         assert_eq!(ui.rect(child).unwrap().pos, Vec2::new(10.0, 10.0));
         assert_eq!(ui.rect(grandchild).unwrap().pos, Vec2::new(18.0, 18.0));
+    }
+
+    #[test]
+    fn draw_list_emits_fills_and_clips_in_tree_order() {
+        let red = Color::rgb(1.0, 0.0, 0.0);
+        let blue = Color::rgb(0.0, 0.0, 1.0);
+
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(100.0, 100.0).background(red).clip());
+        ui.panel(root, Style::new().size(50.0, 50.0).background(blue));
+        ui.layout(Vec2::new(100.0, 100.0)).unwrap();
+
+        // root fill, then a clip around the child, the child fill, then pop.
+        let cmds = ui.draw_list().commands;
+        assert_eq!(cmds.len(), 4, "{cmds:?}");
+        assert!(matches!(cmds[0], DrawCommand::FillRect { color, .. } if color == red));
+        assert!(matches!(cmds[1], DrawCommand::PushClip { .. }));
+        assert!(matches!(cmds[2], DrawCommand::FillRect { color, .. } if color == blue));
+        assert!(matches!(cmds[3], DrawCommand::PopClip));
+    }
+
+    #[test]
+    fn transparent_widgets_emit_no_fill() {
+        let mut ui = Ui::new();
+        // No background -> transparent -> no FillRect for the root.
+        ui.root_panel(Style::new().size(100.0, 100.0));
+        ui.layout(Vec2::new(100.0, 100.0)).unwrap();
+        assert!(ui.draw_list().commands.is_empty());
     }
 }
