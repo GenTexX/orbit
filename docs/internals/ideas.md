@@ -28,12 +28,10 @@ this list is what "come back and make the editor great" concretely means.
 - **Numeric steppers** (tiny +/- arrows on a numeric field to nudge the
   value) - the slider and the inspector drag-scrub shipped; discrete steppers
   did not.
-- **Icons.** Everything is text; icons would transform the toolbar, tree rows
-  (node type icons, visibility eyes), and file list. Open question on the
-  format: a bitmap atlas (same machinery as the glyph atlas, simplest), SVG
-  (crisp at any scale/DPI but needs a rasterizer like resvg), or a small
-  custom "Aurora icon" vector format (a handful of filled/stroked paths we
-  tessellate ourselves - no dependency, tuned to what we need).
+- **More icons.** The toolbar has icons now (a CPU rasterizer draws them from
+  shape predicates - the "custom Aurora icon" path was chosen). Extend the set
+  to tree rows (node type, visibility eye) and the file list; consider tinting
+  icons (the image pipeline already supports it) for hover/disabled states.
 - **Toggle switch** (a sliding on/off control, optionally animated) as a
   friendlier alternative to the checkbox for booleans.
 - **Tabs widget**: a tab bar plus swappable content panes - the primitive the
