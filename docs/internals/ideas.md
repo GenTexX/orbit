@@ -16,11 +16,9 @@ this list is what "come back and make the editor great" concretely means.
 
 ## Aurora: missing capabilities (framework-level)
 
-- **Scrolling containers.** The number one gap: the scene tree, inspector,
-  and file list all overflow silently today. Needs a scroll offset per
-  container, wheel routing, clip (exists), and a scrollbar widget - and
-  scroll positions must live in editor state across shell rebuilds (the
-  PanelSizes lesson).
+- **Scrollbar interactions**: dragging the thumb, clicking the track to
+  page, and keyboard scrolling (PgUp/PgDn/Home/End) - the wheel-only
+  scrolling that shipped covers the common case but not these.
 - **Text selection** in inputs (shift+arrows, mouse sweep), plus
   **clipboard** (ctrl+c/x/v via winit/arboard) - editing fields without
   selection gets old fast.

@@ -19,6 +19,10 @@ pub enum InputEvent {
     PointerPressed,
     /// The primary pointer button came up.
     PointerReleased,
+    /// The scroll wheel turned over the UI: a vertical delta in pixels,
+    /// positive scrolling the content down (revealing later content). Routed
+    /// to the scroll container under the pointer.
+    Scroll(f32),
     /// A character was typed. The backend should filter out control characters;
     /// the UI ignores them defensively too.
     Text(char),

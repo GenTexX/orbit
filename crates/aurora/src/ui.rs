@@ -44,6 +44,11 @@ pub struct Ui {
     font_system: FontSystem,
     /// One shaped text buffer per text-bearing widget, produced during layout.
     buffers: SecondaryMap<WidgetId, Buffer>,
+    /// Vertical scroll offset per scroll container, in pixels (0 = top).
+    scroll_offsets: SecondaryMap<WidgetId, f32>,
+    /// Content height per scroll container from the last layout, for clamping
+    /// offsets and sizing the scrollbar thumb.
+    scroll_content: SecondaryMap<WidgetId, f32>,
     /// Last known pointer position, or `None` when the pointer is off-surface.
     cursor: Option<Vec2>,
     /// The interactive widget under the pointer (a click bubbles to it).
@@ -71,6 +76,8 @@ impl Ui {
             content_origin: SecondaryMap::new(),
             font_system: text::make_font_system(),
             buffers: SecondaryMap::new(),
+            scroll_offsets: SecondaryMap::new(),
+            scroll_content: SecondaryMap::new(),
             cursor: None,
             hovered: None,
             pressed: None,
@@ -228,6 +235,17 @@ impl Ui {
         self.caret_on = on;
     }
 
+    /// A scroll container's current vertical offset (0 = scrolled to the top).
+    pub fn scroll_offset(&self, id: WidgetId) -> f32 {
+        self.scroll_offsets.get(id).copied().unwrap_or(0.0)
+    }
+
+    /// Set a scroll container's vertical offset (e.g. restoring editor state
+    /// after a rebuild). Clamped against the content during the next layout.
+    pub fn set_scroll_offset(&mut self, id: WidgetId, offset: f32) {
+        self.scroll_offsets.insert(id, offset.max(0.0));
+    }
+
     /// Fix a widget's width in pixels at runtime (e.g. a splitter resizing its
     /// target), pinning the minimum too - the same contract as
     /// [`Style::width`](crate::Style::width). Reads the node's current taffy
@@ -262,7 +280,15 @@ impl Ui {
     /// Insert a widget, create its taffy node, and link it under `parent`. taffy
     /// calls only fail on internal misuse, so they are treated as bugs.
     fn add(&mut self, kind: WidgetKind, style: Style, parent: Option<WidgetId>) -> WidgetId {
-        let node = self.taffy.new_leaf(style.layout).expect("taffy new_leaf");
+        let mut layout = style.layout;
+        // Children of a scroll container keep their natural size: flex would
+        // otherwise shrink them to fit and nothing would ever overflow.
+        if let Some(p) = parent
+            && self.widgets[p].scroll
+        {
+            layout.flex_shrink = 0.0;
+        }
+        let node = self.taffy.new_leaf(layout).expect("taffy new_leaf");
         let id = self.widgets.insert(Widget {
             kind,
             taffy: node,
@@ -270,7 +296,8 @@ impl Ui {
             children: Vec::new(),
             background: style.background,
             foreground: style.foreground,
-            clip: style.clip,
+            clip: style.clip || style.scroll,
+            scroll: style.scroll,
         });
         self.taffy
             .set_node_context(node, Some(id))
@@ -337,9 +364,61 @@ impl Ui {
         self.content_origin.insert(id, pos + inset);
 
         let children = self.widgets[id].children.clone();
-        for child in children {
-            self.accumulate(child, pos);
+
+        // A scroll container shifts its children up by its offset; everything
+        // downstream (rects, text origins, hit-testing, drawing) follows from
+        // the shifted origins automatically. The offset is clamped against the
+        // content height measured from taffy's (unshifted) child layouts.
+        let mut child_origin = pos;
+        if self.widgets[id].scroll {
+            let pad_bottom = layout.padding.bottom + layout.border.bottom;
+            let mut content_bottom = 0.0f32;
+            for &child in &children {
+                let cl = self
+                    .taffy
+                    .layout(self.widgets[child].taffy)
+                    .expect("taffy layout");
+                content_bottom = content_bottom.max(cl.location.y + cl.size.height);
+            }
+            let content = content_bottom + pad_bottom;
+            self.scroll_content.insert(id, content);
+            let max_offset = (content - size.y).max(0.0);
+            let offset = self.scroll_offset(id).clamp(0.0, max_offset);
+            self.scroll_offsets.insert(id, offset);
+            child_origin.y -= offset;
         }
+
+        for child in children {
+            self.accumulate(child, child_origin);
+        }
+    }
+
+    /// The nearest scroll container at or above `id` in the tree.
+    fn scroll_ancestor(&self, id: WidgetId) -> Option<WidgetId> {
+        let mut cur = Some(id);
+        while let Some(w) = cur {
+            if self.widgets[w].scroll {
+                return Some(w);
+            }
+            cur = self.widgets[w].parent;
+        }
+        None
+    }
+
+    /// Apply a wheel delta to the scroll container under the cursor.
+    fn scroll_under_cursor(&mut self, delta: f32) {
+        let Some(target) = self
+            .cursor
+            .and_then(|p| self.hit_test(p))
+            .and_then(|id| self.scroll_ancestor(id))
+        else {
+            return;
+        };
+        let content = self.scroll_content.get(target).copied().unwrap_or(0.0);
+        let height = self.rect(target).map_or(0.0, |r| r.size.y);
+        let max_offset = (content - height).max(0.0);
+        let offset = (self.scroll_offset(target) + delta).clamp(0.0, max_offset);
+        self.scroll_offsets.insert(target, offset);
     }
 
     /// Feed one pointer event into the UI, updating hover/press state and
@@ -372,6 +451,7 @@ impl Ui {
                     self.activate(id);
                 }
             }
+            InputEvent::Scroll(delta) => self.scroll_under_cursor(delta),
             InputEvent::Text(ch) => self.insert_char(ch),
             InputEvent::Key(key) => self.edit_key(key),
         }
@@ -587,9 +667,9 @@ impl Ui {
     /// "Topmost" is the last widget in draw order (deepest, latest sibling).
     ///
     /// Splitters get priority with an inflated grab area: the bar is a few
-    /// pixels thin, so its hit zone extends [`theme::SPLITTER_GRAB_EXTRA`]
-    /// beyond the visual on the drag axis - stealing that sliver from the
-    /// neighboring panels is exactly what makes it grabbable.
+    /// pixels thin, so its hit zone extends a few pixels beyond the visual on
+    /// the drag axis - stealing that sliver from the neighboring panels is
+    /// exactly what makes it grabbable.
     pub fn hit_test(&self, point: Vec2) -> Option<WidgetId> {
         for (id, widget) in &self.widgets {
             if let WidgetKind::Splitter { orientation, .. } = widget.kind
@@ -714,6 +794,29 @@ impl Ui {
         }
         if widget.clip {
             list.commands.push(DrawCommand::PopClip);
+        }
+
+        // A scrollbar thumb over scrolling content: its length mirrors the
+        // visible fraction, its position the scrolled fraction.
+        if widget.scroll
+            && let Some(&content) = self.scroll_content.get(id)
+            && content > rect.size.y
+        {
+            let track = rect.size.y - 2.0 * theme::SCROLLBAR_INSET;
+            let thumb_h = (track * rect.size.y / content).max(theme::SCROLLBAR_MIN_THUMB);
+            let max_offset = content - rect.size.y;
+            let t = (self.scroll_offset(id) / max_offset).clamp(0.0, 1.0);
+            let thumb_y = rect.pos.y + theme::SCROLLBAR_INSET + t * (track - thumb_h);
+            list.commands.push(DrawCommand::FillRect {
+                rect: Rect::new(
+                    Vec2::new(
+                        rect.max().x - theme::SCROLLBAR_INSET - theme::SCROLLBAR_WIDTH,
+                        thumb_y,
+                    ),
+                    Vec2::new(theme::SCROLLBAR_WIDTH, thumb_h),
+                ),
+                color: theme::SCROLLBAR_THUMB,
+            });
         }
     }
 
@@ -1360,6 +1463,119 @@ mod tests {
         ui.handle_input(InputEvent::PointerReleased);
         ui.layout(Vec2::new(300.0, 100.0)).unwrap();
         assert_eq!(ui.rect(right).unwrap().size.x, 130.0);
+    }
+
+    #[test]
+    fn a_scroll_container_shifts_clamps_and_marks_its_content() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 400.0));
+        // A 100px-tall scroll container holding 300px of content.
+        let scroller = ui.panel(root, Style::new().column().size(200.0, 100.0).scroll());
+        let first = ui.panel(scroller, Style::new().size(200.0, 150.0));
+        let second = ui.panel(scroller, Style::new().size(200.0, 150.0));
+        ui.layout(Vec2::new(200.0, 400.0)).unwrap();
+
+        // Children keep their natural 150px height (no flex squashing).
+        assert_eq!(ui.rect(first).unwrap().size.y, 150.0);
+        assert_eq!(ui.rect(first).unwrap().pos.y, 0.0);
+        assert_eq!(ui.rect(second).unwrap().pos.y, 150.0);
+
+        // Wheel down 60px over the container: children shift up by 60.
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(100.0, 50.0)));
+        ui.handle_input(InputEvent::Scroll(60.0));
+        ui.layout(Vec2::new(200.0, 400.0)).unwrap();
+        assert_eq!(ui.scroll_offset(scroller), 60.0);
+        assert_eq!(ui.rect(first).unwrap().pos.y, -60.0);
+
+        // Scrolling far past the end clamps at content - height = 200.
+        ui.handle_input(InputEvent::Scroll(10_000.0));
+        ui.layout(Vec2::new(200.0, 400.0)).unwrap();
+        assert_eq!(ui.scroll_offset(scroller), 200.0);
+        // And back up past the start clamps at zero.
+        ui.handle_input(InputEvent::Scroll(-10_000.0));
+        ui.layout(Vec2::new(200.0, 400.0)).unwrap();
+        assert_eq!(ui.scroll_offset(scroller), 0.0);
+
+        // The overflow draws a scrollbar thumb (a fill on the right edge).
+        ui.handle_input(InputEvent::Scroll(50.0));
+        ui.layout(Vec2::new(200.0, 400.0)).unwrap();
+        let thumbs = ui
+            .draw_list()
+            .commands
+            .iter()
+            .filter(|c| {
+                matches!(c, DrawCommand::FillRect { rect, .. }
+                    if rect.pos.x > 190.0 && rect.size.x < 10.0)
+            })
+            .count();
+        assert_eq!(thumbs, 1);
+    }
+
+    #[test]
+    fn a_scroll_containers_height_comes_from_its_parent_not_its_content() {
+        // The atlas bug this pins: an auto-height scroll container inside a
+        // fixed parent must stretch to the parent, not balloon to its
+        // unshrinkable content (min-height auto would use min-content without
+        // Overflow::Hidden).
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(200.0, 300.0));
+        let scroller = ui.panel(root, Style::new().column().grow(1.0).scroll());
+        ui.panel(scroller, Style::new().size(200.0, 500.0));
+        ui.layout(Vec2::new(200.0, 300.0)).unwrap();
+
+        assert_eq!(ui.rect(scroller).unwrap().size.y, 300.0);
+    }
+
+    #[test]
+    fn a_scroll_container_in_a_nested_row_stays_parent_sized_too() {
+        // The atlas dock shape: root column (fixed) > main row (grow) > a
+        // fixed-width, auto-height scroll panel. Its height must come from
+        // the row, not from its tall content (the cross-axis variant of the
+        // ballooning bug).
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(800.0, 600.0));
+        ui.panel(root, Style::new().height(40.0)); // a toolbar strip
+        // `main` clips: that is what stops the tall content's size
+        // contribution from propagating up through the auto-height row (the
+        // CSS nested-flexbox min-height:0 problem, solved by overflow:hidden).
+        let main = ui.panel(root, Style::new().row().grow(1.0).clip());
+        let scroller = ui.panel(main, Style::new().column().width(220.0).scroll());
+        ui.panel(scroller, Style::new().size(200.0, 2000.0)); // tall content
+        ui.panel(main, Style::new().grow(1.0)); // the viewport area
+
+        ui.layout(Vec2::new(800.0, 600.0)).unwrap();
+        assert_eq!(ui.rect(main).unwrap().size.y, 560.0);
+        assert_eq!(ui.rect(scroller).unwrap().size.y, 560.0);
+    }
+
+    #[test]
+    fn scrolled_away_content_is_not_hittable_and_state_is_restorable() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 400.0));
+        let scroller = ui.panel(root, Style::new().column().size(200.0, 100.0).scroll());
+        let button = ui.button(scroller, "top", Style::new().size(200.0, 40.0));
+        ui.panel(scroller, Style::new().size(200.0, 260.0));
+        ui.layout(Vec2::new(200.0, 400.0)).unwrap();
+
+        // The button is hittable at the top...
+        assert_eq!(ui.hit_test(Vec2::new(100.0, 20.0)), Some(button));
+        // ...then scrolls out of view: the same point now hits the filler
+        // panel that scrolled up into its place, and clicking there does not
+        // reach the button (the clip hides it from hit-testing).
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(100.0, 50.0)));
+        ui.handle_input(InputEvent::Scroll(120.0));
+        ui.layout(Vec2::new(200.0, 400.0)).unwrap();
+        assert_ne!(ui.hit_test(Vec2::new(100.0, 20.0)), Some(button));
+
+        // A fresh Ui (a shell rebuild) restores the offset via the accessor.
+        let mut ui2 = Ui::new();
+        let root2 = ui2.root_panel(Style::new().size(200.0, 400.0));
+        let scroller2 = ui2.panel(root2, Style::new().column().size(200.0, 100.0).scroll());
+        ui2.button(scroller2, "top", Style::new().size(200.0, 40.0));
+        ui2.panel(scroller2, Style::new().size(200.0, 260.0));
+        ui2.set_scroll_offset(scroller2, ui.scroll_offset(scroller));
+        ui2.layout(Vec2::new(200.0, 400.0)).unwrap();
+        assert_eq!(ui2.scroll_offset(scroller2), 120.0);
     }
 
     #[test]

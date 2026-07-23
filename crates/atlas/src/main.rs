@@ -441,9 +441,17 @@ impl State {
         }
     }
 
-    /// Zoom about the cursor when it is over the viewport.
+    /// The wheel zooms the viewport under the cursor; anywhere else it
+    /// scrolls the Aurora scroll container under the cursor (panels).
     fn wheel(&mut self, delta: MouseScrollDelta) {
         if !self.over_viewport() {
+            // Wheel-up (positive line delta) reveals earlier content, i.e. a
+            // negative scroll offset delta; a line tick is ~48px.
+            let px = match delta {
+                MouseScrollDelta::LineDelta(_, y) => -y * 48.0,
+                MouseScrollDelta::PixelDelta(p) => -p.y as f32,
+            };
+            self.ui.handle_input(InputEvent::Scroll(px));
             return;
         }
         let Some(rect) = self.viewport_rect() else {

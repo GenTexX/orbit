@@ -58,6 +58,11 @@ pub struct PanelSizes {
     pub tree_width: f32,
     pub inspector_width: f32,
     pub files_height: f32,
+    /// Scroll offsets, preserved across rebuilds like the sizes (same lesson:
+    /// widget-tree state dies with the tree unless captured and fed back).
+    pub tree_scroll: f32,
+    pub inspector_scroll: f32,
+    pub files_scroll: f32,
 }
 
 impl Default for PanelSizes {
@@ -66,6 +71,9 @@ impl Default for PanelSizes {
             tree_width: 220.0,
             inspector_width: 260.0,
             files_height: 140.0,
+            tree_scroll: 0.0,
+            inspector_scroll: 0.0,
+            files_scroll: 0.0,
         }
     }
 }
@@ -74,10 +82,14 @@ impl Default for PanelSizes {
 /// `prior` for any panel that has no rect yet (e.g. before the first layout).
 pub fn capture_panel_sizes(ui: &Ui, rows: &EditorRows, prior: PanelSizes) -> PanelSizes {
     let size_of = |panel: Option<WidgetId>| panel.and_then(|id| ui.rect(id)).map(|r| r.size);
+    let scroll_of = |panel: Option<WidgetId>| panel.map(|id| ui.scroll_offset(id));
     PanelSizes {
         tree_width: size_of(rows.tree_panel).map_or(prior.tree_width, |s| s.x),
         inspector_width: size_of(rows.inspector_panel).map_or(prior.inspector_width, |s| s.x),
         files_height: size_of(rows.files_panel).map_or(prior.files_height, |s| s.y),
+        tree_scroll: scroll_of(rows.tree_panel).unwrap_or(prior.tree_scroll),
+        inspector_scroll: scroll_of(rows.inspector_panel).unwrap_or(prior.inspector_scroll),
+        files_scroll: scroll_of(rows.files_panel).unwrap_or(prior.files_scroll),
     }
 }
 
@@ -100,7 +112,10 @@ pub fn build_editor_ui(
     // A toolbar strip across the top, then the three-way dock below it.
     let root = ui.root_panel(Style::new().fill().column().background(ROOT_BG));
     build_toolbar(&mut ui, root, &mut rows);
-    let main = ui.panel(root, Style::new().row().grow(1.0));
+    // `main` clips (Overflow::Hidden): this is what lets the scroll panels
+    // inside it stay window-sized instead of ballooning the row to their tall
+    // content - see aurora's nested-row scroll test.
+    let main = ui.panel(root, Style::new().row().grow(1.0).clip());
 
     let tree_panel = build_scene_tree(&mut ui, main, scene, selected, sizes.tree_width, &mut rows);
     let splitter_1 = ui.splitter(main, Orientation::Vertical, 1.0, Style::new().width(4.0));
@@ -131,6 +146,11 @@ pub fn build_editor_ui(
     ui.set_splitter_target(splitter_3, inspector_panel);
 
     build_status_bar(&mut ui, root, &mut rows);
+
+    // Restore the scroll positions captured from the previous shell.
+    ui.set_scroll_offset(tree_panel, sizes.tree_scroll);
+    ui.set_scroll_offset(inspector_panel, sizes.inspector_scroll);
+    ui.set_scroll_offset(files_panel, sizes.files_scroll);
 
     rows.tree_panel = Some(tree_panel);
     rows.inspector_panel = Some(inspector_panel);
@@ -194,6 +214,7 @@ fn build_scene_tree(
             .width(width)
             .padding(10.0)
             .gap(4.0)
+            .scroll()
             .background(PANEL_BG),
     );
     ui.label(panel, "Scene", Style::new().foreground(HEADING));
@@ -254,6 +275,7 @@ fn build_inspector(
             .width(width)
             .padding(10.0)
             .gap(6.0)
+            .scroll()
             .background(PANEL_BG),
     );
     ui.label(panel, "Inspector", Style::new().foreground(HEADING));
@@ -323,6 +345,7 @@ fn build_file_explorer(
             .height(height)
             .padding(10.0)
             .gap(4.0)
+            .scroll()
             .background(PANEL_BG),
     );
     ui.label(panel, "Files", Style::new().foreground(HEADING));
@@ -458,6 +481,38 @@ mod tests {
             sizes.tree_width + 50.0,
             "the dragged width survives the rebuild"
         );
+    }
+
+    #[test]
+    fn scroll_positions_survive_a_shell_rebuild() {
+        // Same class of bug as the panel sizes: scroll offsets live in the
+        // widget tree, so a rebuild must capture and restore them.
+        let (mut scene, handle) = demo_scene();
+        // Enough nodes that the tree panel genuinely overflows and can scroll.
+        let root_node = scene.root();
+        for i in 0..60 {
+            scene.add_child(root_node, helios::Node::new(format!("n{i}")));
+        }
+        let dir = std::env::temp_dir();
+
+        let sizes = PanelSizes::default();
+        let (mut ui, rows) = build_editor_ui(&scene, None, handle, &dir, sizes);
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+
+        // Wheel-scroll the tree panel down.
+        let tree = rows.tree_panel.unwrap();
+        let inside = ui.rect(tree).unwrap().pos + Vec2::new(20.0, 60.0);
+        ui.handle_input(aurora::InputEvent::PointerMoved(inside));
+        ui.handle_input(aurora::InputEvent::Scroll(90.0));
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        assert_eq!(ui.scroll_offset(tree), 90.0);
+
+        // Rebuild with captured state: the offset carries over.
+        let captured = capture_panel_sizes(&ui, &rows, sizes);
+        assert_eq!(captured.tree_scroll, 90.0);
+        let (mut ui2, rows2) = build_editor_ui(&scene, None, handle, &dir, captured);
+        ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        assert_eq!(ui2.scroll_offset(rows2.tree_panel.unwrap()), 90.0);
     }
 
     #[test]

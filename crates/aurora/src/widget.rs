@@ -85,4 +85,6 @@ pub(crate) struct Widget {
     pub foreground: Color,
     /// Whether children are clipped to this widget's rectangle.
     pub clip: bool,
+    /// Whether this widget scrolls its overflowing content vertically.
+    pub scroll: bool,
 }

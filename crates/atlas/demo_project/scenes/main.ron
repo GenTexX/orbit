@@ -11,9 +11,9 @@
             (
                 name: "Sprite",
                 transform: (
-                    translation: (467.77344, 608.04297),
-                    rotation: 0.0,
-                    scale: (1.0, 1.0),
+                    translation: (378.90222, 329.2374),
+                    rotation: -0.43500948,
+                    scale: (1.2868723, 0.95877653),
                 ),
                 components: [
                     (
@@ -30,7 +30,7 @@
             (
                 name: "Sprite 2",
                 transform: (
-                    translation: (533.5481, 518.9896),
+                    translation: (543.3397, 547.96436),
                     rotation: 1.6512694,
                     scale: (1.2803224, 1.3582629),
                 ),
@@ -49,7 +49,7 @@
             (
                 name: "Sprite 3",
                 transform: (
-                    translation: (472.5703, 561.1758),
+                    translation: (370.884, 532.932),
                     rotation: 0.0,
                     scale: (1.0, 1.0),
                 ),

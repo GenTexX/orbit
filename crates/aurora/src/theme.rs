@@ -29,3 +29,11 @@ pub(crate) const SPLITTER_MIN_TARGET: f32 = 40.0;
 /// Extra grab zone per side beyond the splitter's visual bar, in pixels - the
 /// bar is thin, the hit area should not be.
 pub(crate) const SPLITTER_GRAB_EXTRA: f32 = 4.0;
+
+/// Scrollbar thumb width, its inset from the right edge, and its minimum
+/// length, in pixels.
+pub(crate) const SCROLLBAR_WIDTH: f32 = 6.0;
+pub(crate) const SCROLLBAR_INSET: f32 = 2.0;
+pub(crate) const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+/// The scrollbar thumb fill (drawn only while content overflows).
+pub(crate) const SCROLLBAR_THUMB: Color = Color::rgba(0.75, 0.78, 0.85, 0.45);

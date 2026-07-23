@@ -1,7 +1,7 @@
 //! aurora style: layout (delegated to taffy) plus Aurora's own visual style, with a fluent builder.
 
 use taffy::prelude::{length, percent};
-use taffy::{AlignItems, Display, FlexDirection, Rect as TaffyRect, Size};
+use taffy::{AlignItems, Display, FlexDirection, Overflow, Rect as TaffyRect, Size};
 
 use crate::color::Color;
 
@@ -20,6 +20,9 @@ pub struct Style {
     pub foreground: Color,
     /// Clip children to this widget's rectangle.
     pub clip: bool,
+    /// Scroll overflowing content vertically (implies clip). Children of a
+    /// scroll container keep their natural size instead of flex-shrinking.
+    pub scroll: bool,
 }
 
 impl Default for Style {
@@ -29,6 +32,7 @@ impl Default for Style {
             background: Color::TRANSPARENT,
             foreground: Color::WHITE,
             clip: false,
+            scroll: false,
         }
     }
 }
@@ -136,9 +140,29 @@ impl Style {
         self
     }
 
-    /// Clip this widget's children to its rectangle.
+    /// Clip this widget's children to its rectangle. Also maps to taffy
+    /// `Overflow::Hidden` on both axes, which zeroes the widget's automatic
+    /// minimum size - so clipped containers take the size their parent gives
+    /// them instead of ballooning to their content (the CSS overflow:hidden
+    /// behavior, and what makes nested scroll layouts work).
     pub fn clip(mut self) -> Self {
         self.clip = true;
+        self.layout.overflow = taffy::Point {
+            x: Overflow::Hidden,
+            y: Overflow::Hidden,
+        };
+        self
+    }
+
+    /// Scroll overflowing content vertically (mouse wheel; implies clip).
+    /// Children keep their natural size instead of flex-shrinking to fit, so
+    /// tall content overflows and scrolls rather than squashing. The
+    /// container's own automatic minimum height drops to zero (taffy
+    /// `Overflow::Hidden`), so tall content cannot balloon the container
+    /// itself - it stays the size its parent gives it.
+    pub fn scroll(mut self) -> Self {
+        self.scroll = true;
+        self = self.clip();
         self
     }
 }
