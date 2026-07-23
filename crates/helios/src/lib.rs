@@ -8,11 +8,16 @@
 //! module added later.
 
 mod component;
+mod error;
+mod project;
 mod reflect;
 mod scene;
+mod serialize;
 mod transform;
 
 pub use component::{Component, SpriteComponent};
+pub use error::HeliosError;
+pub use project::{Manifest, Project};
 pub use reflect::{Reflect, Value};
 pub use scene::{Node, NodeId, Scene};
 pub use transform::Transform;

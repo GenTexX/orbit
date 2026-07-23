@@ -28,6 +28,16 @@ impl Component {
             Component::Sprite(s) => s,
         }
     }
+
+    /// Construct a default component of the given [`type_name`](Reflect::type_name),
+    /// or `None` if the kind is unknown. Deserialization uses this, then applies
+    /// the saved fields through [`Reflect::set`].
+    pub fn from_type_name(kind: &str) -> Option<Component> {
+        match kind {
+            "Sprite" => Some(Component::Sprite(SpriteComponent::default())),
+            _ => None,
+        }
+    }
 }
 
 /// A drawable sprite: which texture to draw, and how to tint and size it. Where

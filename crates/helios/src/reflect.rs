@@ -2,10 +2,15 @@
 //! inspector, the serializer, and (later) hot-reload all walk (ADR 0016).
 
 use glam::Vec2;
+use serde::{Deserialize, Serialize};
 
 /// A reflected field value: the closed set of field types the engine supports.
 /// A genuinely new field type is a deliberate addition here (ADR 0016).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Value` derives serde so it can be persisted, but that is orthogonal to
+/// reflection: the inspector still walks fields through [`Reflect`], never
+/// through serde's data model (ADR 0016).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     F32(f32),
     Bool(bool),
