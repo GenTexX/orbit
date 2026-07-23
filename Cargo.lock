@@ -163,6 +163,7 @@ dependencies = [
  "image",
  "photon",
  "pollster",
+ "slotmap",
  "tracing",
  "tracing-subscriber",
  "winit",

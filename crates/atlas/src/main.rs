@@ -25,7 +25,7 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use crate::ui::{EditorRows, build_editor_ui, parse_value};
+use crate::ui::{EditorRows, PanelSizes, build_editor_ui, capture_panel_sizes, parse_value};
 
 fn main() -> Result<()> {
     init_logging();
@@ -63,6 +63,9 @@ struct State {
     viewport_handle: ImageHandle,
     ui: aurora::Ui,
     rows: EditorRows,
+    /// The dock's panel sizes, captured from the live `Ui` before each rebuild
+    /// so splitter drags survive rebuilds (and, later, restarts).
+    panel_sizes: PanelSizes,
     /// Set when the scene, selection, or viewport handle changed since the
     /// `Ui` was last built; rebuilding only then (not every frame) keeps
     /// in-progress typing and hover state intact across ordinary frames.
@@ -166,7 +169,14 @@ impl State {
 
         let (scene_target, viewport_handle) =
             build_viewport_target(&mut gui, &engine, (size.width, size.height));
-        let (ui, rows) = build_editor_ui(&project.scene, None, viewport_handle, &project_dir);
+        let panel_sizes = PanelSizes::default();
+        let (ui, rows) = build_editor_ui(
+            &project.scene,
+            None,
+            viewport_handle,
+            &project_dir,
+            panel_sizes,
+        );
 
         Ok(Self {
             window,
@@ -181,6 +191,7 @@ impl State {
             viewport_handle,
             ui,
             rows,
+            panel_sizes,
             dirty: false,
         })
     }
@@ -201,11 +212,16 @@ impl State {
     fn draw(&mut self) -> Result<()> {
         self.react();
         if self.dirty {
+            // Splitter drags live only in the widget tree; read the panels'
+            // current sizes back before discarding it, or a rebuild would snap
+            // every panel to its default (a real bug the first time).
+            self.panel_sizes = capture_panel_sizes(&self.ui, &self.rows, self.panel_sizes);
             let (ui, rows) = build_editor_ui(
                 &self.project.scene,
                 self.selected,
                 self.viewport_handle,
                 &self.project_dir,
+                self.panel_sizes,
             );
             self.ui = ui;
             self.rows = rows;

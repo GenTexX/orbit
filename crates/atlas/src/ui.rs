@@ -23,25 +23,64 @@ pub struct EditorRows {
     /// A submitted field row commits its current text to
     /// `(node, component index, field name)`.
     pub field_rows: Vec<(WidgetId, NodeId, usize, &'static str)>,
+    /// The three resizable panels, for reading their current (possibly
+    /// splitter-dragged) sizes back before a rebuild.
+    pub tree_panel: Option<WidgetId>,
+    pub inspector_panel: Option<WidgetId>,
+    pub files_panel: Option<WidgetId>,
+}
+
+/// The dock's panel sizes. Splitter drags mutate the live widget tree, so the
+/// app captures them here before each shell rebuild ([`capture_panel_sizes`])
+/// and feeds them back in - otherwise a rebuild (selection change, edit)
+/// would silently snap every panel back to its default.
+#[derive(Debug, Clone, Copy)]
+pub struct PanelSizes {
+    pub tree_width: f32,
+    pub inspector_width: f32,
+    pub files_height: f32,
+}
+
+impl Default for PanelSizes {
+    fn default() -> Self {
+        Self {
+            tree_width: 220.0,
+            inspector_width: 260.0,
+            files_height: 140.0,
+        }
+    }
+}
+
+/// Read the current panel sizes out of a laid-out `Ui`, falling back to
+/// `prior` for any panel that has no rect yet (e.g. before the first layout).
+pub fn capture_panel_sizes(ui: &Ui, rows: &EditorRows, prior: PanelSizes) -> PanelSizes {
+    let size_of = |panel: Option<WidgetId>| panel.and_then(|id| ui.rect(id)).map(|r| r.size);
+    PanelSizes {
+        tree_width: size_of(rows.tree_panel).map_or(prior.tree_width, |s| s.x),
+        inspector_width: size_of(rows.inspector_panel).map_or(prior.inspector_width, |s| s.x),
+        files_height: size_of(rows.files_panel).map_or(prior.files_height, |s| s.y),
+    }
 }
 
 /// Build the whole editor shell for one frame: docked, resizable panels
 /// (scene-tree, viewport, inspector, file explorer) around the viewport.
 /// Rebuild whenever the scene or selection changes; the tree is cheap enough
 /// that a fresh rebuild beats diffing (M2's inspector already proved this
-/// pattern's frame cost is negligible).
+/// pattern's frame cost is negligible). `sizes` carries the panel sizes across
+/// rebuilds so splitter drags persist.
 pub fn build_editor_ui(
     scene: &Scene,
     selected: Option<NodeId>,
     viewport_handle: ImageHandle,
     project_dir: &Path,
+    sizes: PanelSizes,
 ) -> (Ui, EditorRows) {
     let mut ui = Ui::new();
     let mut rows = EditorRows::default();
 
     let root = ui.root_panel(Style::new().fill().row().background(ROOT_BG));
 
-    let tree_panel = build_scene_tree(&mut ui, root, scene, selected, &mut rows);
+    let tree_panel = build_scene_tree(&mut ui, root, scene, selected, sizes.tree_width, &mut rows);
     let splitter_1 = ui.splitter(root, Orientation::Vertical, 1.0, Style::new().width(4.0));
     ui.set_splitter_target(splitter_1, tree_panel);
 
@@ -54,13 +93,23 @@ pub fn build_editor_ui(
         -1.0,
         Style::new().height(4.0),
     );
-    let files_panel = build_file_explorer(&mut ui, center, project_dir);
+    let files_panel = build_file_explorer(&mut ui, center, project_dir, sizes.files_height);
     ui.set_splitter_target(splitter_2, files_panel);
 
     let splitter_3 = ui.splitter(root, Orientation::Vertical, -1.0, Style::new().width(4.0));
-    let inspector_panel = build_inspector(&mut ui, root, scene, selected, &mut rows);
+    let inspector_panel = build_inspector(
+        &mut ui,
+        root,
+        scene,
+        selected,
+        sizes.inspector_width,
+        &mut rows,
+    );
     ui.set_splitter_target(splitter_3, inspector_panel);
 
+    rows.tree_panel = Some(tree_panel);
+    rows.inspector_panel = Some(inspector_panel);
+    rows.files_panel = Some(files_panel);
     (ui, rows)
 }
 
@@ -70,13 +119,14 @@ fn build_scene_tree(
     parent: WidgetId,
     scene: &Scene,
     selected: Option<NodeId>,
+    width: f32,
     rows: &mut EditorRows,
 ) -> WidgetId {
     let panel = ui.panel(
         parent,
         Style::new()
             .column()
-            .width(220.0)
+            .width(width)
             .padding(10.0)
             .gap(4.0)
             .background(PANEL_BG),
@@ -129,13 +179,14 @@ fn build_inspector(
     parent: WidgetId,
     scene: &Scene,
     selected: Option<NodeId>,
+    width: f32,
     rows: &mut EditorRows,
 ) -> WidgetId {
     let panel = ui.panel(
         parent,
         Style::new()
             .column()
-            .width(260.0)
+            .width(width)
             .padding(10.0)
             .gap(6.0)
             .background(PANEL_BG),
@@ -173,12 +224,12 @@ fn build_inspector(
 }
 
 /// The docked file explorer: the project's PNG and scene files.
-fn build_file_explorer(ui: &mut Ui, parent: WidgetId, project_dir: &Path) -> WidgetId {
+fn build_file_explorer(ui: &mut Ui, parent: WidgetId, project_dir: &Path, height: f32) -> WidgetId {
     let panel = ui.panel(
         parent,
         Style::new()
             .column()
-            .height(140.0)
+            .height(height)
             .padding(10.0)
             .gap(4.0)
             .background(PANEL_BG),
@@ -243,5 +294,85 @@ pub fn parse_value(text: &str, like: &Value) -> Option<Value> {
                 .collect();
             (nums.len() == 4).then(|| Value::Color([nums[0], nums[1], nums[2], nums[3]]))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helios::{Component, Node, SpriteComponent, Transform};
+
+    fn demo_scene() -> (Scene, ImageHandle) {
+        let mut scene = Scene::new("Root");
+        let root = scene.root();
+        let mut sprite = Node::new("Sprite");
+        sprite.transform = Transform::from_translation(Vec2::new(10.0, 10.0));
+        sprite
+            .components
+            .push(Component::Sprite(SpriteComponent::default()));
+        scene.add_child(root, sprite);
+
+        // A backend mints handles; a bare SlotMap stands in headlessly.
+        let mut registry: slotmap::SlotMap<ImageHandle, ()> = slotmap::SlotMap::with_key();
+        let handle = registry.insert(());
+        (scene, handle)
+    }
+
+    #[test]
+    fn panel_sizes_survive_a_shell_rebuild() {
+        // The regression: drag a splitter, then trigger a rebuild (as a
+        // selection change does) - the dragged size must carry over, not snap
+        // back to the default.
+        let (scene, handle) = demo_scene();
+        let dir = std::env::temp_dir(); // no project files needed for this test
+
+        let sizes = PanelSizes::default();
+        let (mut ui, rows) = build_editor_ui(&scene, None, handle, &dir, sizes);
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+
+        // Drag the tree panel's splitter 50px right, as a user would.
+        let tree = rows.tree_panel.unwrap();
+        assert_eq!(ui.rect(tree).unwrap().size.x, sizes.tree_width);
+        let bar = {
+            // The splitter sits just right of the tree panel.
+            let r = ui.rect(tree).unwrap();
+            Vec2::new(r.max().x + 2.0, 100.0)
+        };
+        ui.handle_input(aurora::InputEvent::PointerMoved(bar));
+        ui.handle_input(aurora::InputEvent::PointerPressed);
+        ui.handle_input(aurora::InputEvent::PointerMoved(bar + Vec2::new(50.0, 0.0)));
+        ui.handle_input(aurora::InputEvent::PointerReleased);
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        assert_eq!(ui.rect(tree).unwrap().size.x, sizes.tree_width + 50.0);
+
+        // Rebuild the shell (what a tree-row click triggers) with captured sizes.
+        let captured = capture_panel_sizes(&ui, &rows, sizes);
+        assert_eq!(captured.tree_width, sizes.tree_width + 50.0);
+        let (mut ui2, rows2) = build_editor_ui(&scene, None, handle, &dir, captured);
+        ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        assert_eq!(
+            ui2.rect(rows2.tree_panel.unwrap()).unwrap().size.x,
+            sizes.tree_width + 50.0,
+            "the dragged width survives the rebuild"
+        );
+    }
+
+    #[test]
+    fn parse_value_accepts_typed_text_and_rejects_junk() {
+        assert_eq!(parse_value("3.5", &Value::F32(0.0)), Some(Value::F32(3.5)));
+        assert_eq!(parse_value("junk", &Value::F32(0.0)), None);
+        assert_eq!(
+            parse_value("1, 2", &Value::Vec2(Vec2::ZERO)),
+            Some(Value::Vec2(Vec2::new(1.0, 2.0)))
+        );
+        assert_eq!(parse_value("1", &Value::Vec2(Vec2::ZERO)), None);
+        assert_eq!(
+            parse_value("0.1, 0.2, 0.3, 1", &Value::Color([0.0; 4])),
+            Some(Value::Color([0.1, 0.2, 0.3, 1.0]))
+        );
+        assert_eq!(
+            parse_value("hero.png", &Value::Asset(String::new())),
+            Some(Value::Asset("hero.png".into()))
+        );
     }
 }
