@@ -16,7 +16,7 @@ pub use color::Color;
 pub use draw::{DrawCommand, DrawList, Glyph, ImageHandle};
 pub use error::AuroraError;
 pub use event::Event;
-pub use input::{InputEvent, Key};
+pub use input::{CursorHint, InputEvent, Key};
 pub use rect::Rect;
 pub use style::Style;
 pub use ui::Ui;
@@ -34,8 +34,8 @@ pub mod prelude {
     //! Convenient imports for building a UI: Aurora's core types plus taffy's
     //! style vocabulary.
     pub use crate::{
-        Color, DrawCommand, DrawList, Event, ImageHandle, InputEvent, Key, Orientation, Rect,
-        Style, Ui, WidgetId, WidgetKind,
+        Color, CursorHint, DrawCommand, DrawList, Event, ImageHandle, InputEvent, Key, Orientation,
+        Rect, Style, Ui, WidgetId, WidgetKind,
     };
     pub use taffy::prelude::*;
 }

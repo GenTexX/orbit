@@ -10,7 +10,7 @@ use crate::color::Color;
 use crate::draw::{DrawCommand, DrawList, Glyph};
 use crate::error::AuroraError;
 use crate::event::Event;
-use crate::input::{InputEvent, Key};
+use crate::input::{CursorHint, InputEvent, Key};
 use crate::rect::Rect;
 use crate::style::Style;
 use crate::widget::{Orientation, Widget, WidgetId, WidgetKind};
@@ -378,14 +378,22 @@ impl Ui {
     }
 
     /// On a press: focus the text input under the pointer (placing the caret at
-    /// the click), or clear focus when the press lands anywhere else.
+    /// the click), or clear focus when the press lands anywhere else. A field
+    /// losing focus submits its current text first - clicking away commits an
+    /// edit rather than silently keeping the old value.
     fn focus_from_press(&mut self) {
+        let previous = self.focused;
         match self.hovered {
             Some(id) if matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) => {
                 self.focused = Some(id);
                 self.caret = self.caret_at_x(id, self.cursor);
             }
             _ => self.focused = None,
+        }
+        if let Some(old) = previous
+            && self.focused != previous
+        {
+            self.events.push(Event::Submitted(old));
         }
     }
 
@@ -545,6 +553,27 @@ impl Ui {
         self.hovered
     }
 
+    /// What the mouse cursor should look like right now: resize arrows over
+    /// (or while dragging) a splitter, a text beam over a text input, the
+    /// default arrow otherwise. The app maps this to its windowing system.
+    pub fn cursor_hint(&self) -> CursorHint {
+        // A pressed splitter keeps its resize cursor even when the pointer
+        // outruns the bar mid-drag.
+        let target = self.pressed.or(self.hovered);
+        match target.map(|id| &self.widgets[id].kind) {
+            Some(WidgetKind::Splitter {
+                orientation: Orientation::Vertical,
+                ..
+            }) => CursorHint::ResizeHorizontal,
+            Some(WidgetKind::Splitter {
+                orientation: Orientation::Horizontal,
+                ..
+            }) => CursorHint::ResizeVertical,
+            Some(WidgetKind::TextInput(_)) => CursorHint::Text,
+            _ => CursorHint::Default,
+        }
+    }
+
     /// Recompute [`hovered`](Self::hovered) from the current cursor: hit-test the
     /// topmost widget, then bubble to its nearest interactive ancestor.
     fn update_hover(&mut self) {
@@ -556,7 +585,20 @@ impl Ui {
 
     /// The topmost widget whose rectangle contains `point`, respecting clips.
     /// "Topmost" is the last widget in draw order (deepest, latest sibling).
+    ///
+    /// Splitters get priority with an inflated grab area: the bar is a few
+    /// pixels thin, so its hit zone extends [`theme::SPLITTER_GRAB_EXTRA`]
+    /// beyond the visual on the drag axis - stealing that sliver from the
+    /// neighboring panels is exactly what makes it grabbable.
     pub fn hit_test(&self, point: Vec2) -> Option<WidgetId> {
+        for (id, widget) in &self.widgets {
+            if let WidgetKind::Splitter { orientation, .. } = widget.kind
+                && let Some(rect) = self.rect(id)
+                && inflate_splitter(rect, orientation).contains(point)
+            {
+                return Some(id);
+            }
+        }
         let root = self.root?;
         self.hit_test_node(root, point, None)
     }
@@ -812,6 +854,22 @@ impl Ui {
 impl Default for Ui {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A splitter's grab rectangle: its visual rect expanded along the drag axis
+/// (the thin one) by [`theme::SPLITTER_GRAB_EXTRA`] per side.
+fn inflate_splitter(rect: Rect, orientation: Orientation) -> Rect {
+    let extra = theme::SPLITTER_GRAB_EXTRA;
+    match orientation {
+        Orientation::Vertical => Rect::new(
+            rect.pos - Vec2::new(extra, 0.0),
+            rect.size + Vec2::new(extra * 2.0, 0.0),
+        ),
+        Orientation::Horizontal => Rect::new(
+            rect.pos - Vec2::new(0.0, extra),
+            rect.size + Vec2::new(0.0, extra * 2.0),
+        ),
     }
 }
 
@@ -1213,10 +1271,15 @@ mod tests {
         click_at(&mut ui, Vec2::new(20.0, 12.0)); // focus the field
         assert_eq!(ui.focused(), Some(field));
 
-        // The button sits at x = 100 (field) + 10 (gap) = 110.
+        // The button sits at x = 100 (field) + 10 (gap) = 110. Clicking it
+        // blurs the field, which submits it (commit-on-focus-loss) before the
+        // button's own click fires.
         click_at(&mut ui, Vec2::new(120.0, 12.0));
         assert_eq!(ui.focused(), None);
-        assert_eq!(ui.drain_events(), vec![Event::Clicked(button)]);
+        assert_eq!(
+            ui.drain_events(),
+            vec![Event::Submitted(field), Event::Clicked(button)]
+        );
     }
 
     #[test]
@@ -1297,6 +1360,56 @@ mod tests {
         ui.handle_input(InputEvent::PointerReleased);
         ui.layout(Vec2::new(300.0, 100.0)).unwrap();
         assert_eq!(ui.rect(right).unwrap().size.x, 130.0);
+    }
+
+    #[test]
+    fn a_splitter_grabs_beyond_its_thin_bar() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().row().size(300.0, 100.0));
+        let left = ui.panel(root, Style::new().width(100.0));
+        let splitter = ui.splitter(root, Orientation::Vertical, 1.0, Style::new().width(4.0));
+        ui.set_splitter_target(splitter, left);
+        ui.panel(root, Style::new().grow(1.0)); // a later sibling beside the bar
+        ui.layout(Vec2::new(300.0, 100.0)).unwrap();
+
+        // The bar spans x 100..104; 3px past its right edge still grabs it,
+        // even though that point lies inside the later-drawn sibling panel.
+        assert_eq!(ui.hit_test(Vec2::new(107.0, 50.0)), Some(splitter));
+        assert_eq!(ui.hit_test(Vec2::new(97.0, 50.0)), Some(splitter));
+        // Well clear of the grab zone, the neighbors win again.
+        assert_ne!(ui.hit_test(Vec2::new(90.0, 50.0)), Some(splitter));
+    }
+
+    #[test]
+    fn cursor_hints_follow_the_hover_target() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().row().size(300.0, 100.0));
+        let left = ui.panel(root, Style::new().width(100.0));
+        let splitter = ui.splitter(root, Orientation::Vertical, 1.0, Style::new().width(4.0));
+        ui.set_splitter_target(splitter, left);
+        let field = ui.text_input(root, "hi", Style::new().size(80.0, 24.0));
+        ui.layout(Vec2::new(300.0, 100.0)).unwrap();
+
+        assert_eq!(ui.cursor_hint(), crate::CursorHint::Default);
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(102.0, 50.0)));
+        assert_eq!(ui.cursor_hint(), crate::CursorHint::ResizeHorizontal);
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(140.0, 10.0)));
+        assert_eq!(ui.cursor_hint(), crate::CursorHint::Text);
+        let _ = field;
+    }
+
+    #[test]
+    fn losing_focus_submits_the_field() {
+        let (mut ui, field) = ui_with_field("typed");
+        click_at(&mut ui, Vec2::new(20.0, 12.0)); // focus
+        ui.drain_events();
+
+        // Press on empty space: the field blurs and submits.
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(250.0, 90.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerReleased);
+        assert_eq!(ui.focused(), None);
+        assert_eq!(ui.drain_events(), vec![Event::Submitted(field)]);
     }
 
     #[test]

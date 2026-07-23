@@ -20,11 +20,12 @@ This is the milestone spine for Orbit. A **milestone** is a big, demonstrable ca
 **Plan:** [Milestone 2 - Aurora](plans/milestone-2-aurora.md).
 **Shipped:** retained widget arena over a taffy tree; a high-level draw list rendered by aurora-wgpu through a single atlas-textured quad pipeline; text via cosmic-text (bundled DejaVu Sans) with a glyph atlas; pointer input with clip-aware hit-testing and bubbling events; buttons, checkboxes, and focusable/editable text inputs; the `inspector` demo runs well under the 16.6ms/frame budget with puffin scopes throughout. 20 headless tests.
 
-### Milestone 3 - Scenes & Editor Shell
+### Milestone 3 - Scenes & Editor Shell (done)
 **Done when:** the editor looks like an editor - docked scene-tree, inspector, and viewport - and you can place, move, and select sprite nodes, then save and load the Project to disk.
 **Proves:** the Node + Component model, scene serialization round-trips, and Aurora assembled into a real docked application. No scripting yet.
 **Brings online:** `helios` (scene tree, components, serialization, input), `atlas` (shell, viewport, scene-tree and inspector panels, file explorer).
-**Plan:** [Milestone 3 - Scenes & Editor Shell](plans/milestone-3-scenes-editor.md) (ADRs 0016-0018).
+**Plan:** [Milestone 3 - Scenes & Editor Shell](plans/milestone-3-scenes-editor.md) (ADRs 0016-0019).
+**Shipped:** helios (Scene/Node/Component model with one Reflect contract, RON round-trip, undoable edit history, scene-to-photon rendering); the shared `aether` GPU crate; the atlas editor - docked resizable panels (scene-tree, viewport, inspector, file explorer), GPU picking, the full move/rotate/scale gizmo pivoting about centered sprite origins (ADR 0019), pan/zoom, undo/redo, Add Sprite + drag-a-PNG-into-the-viewport, Save/Load, toolbar, status bar, profiling. After the milestone: the ideatank iteration phase (docs/internals/ideas.md) polishes the editor bundle by bundle.
 
 ### Milestone 4 - Comet (language runs)
 **Done when:** you write a `.cmt` script, it compiles in milliseconds, runs on wasmtime, and moves a node - and the code editor shows live error squiggles as you type.

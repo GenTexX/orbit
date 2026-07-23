@@ -42,6 +42,11 @@ pub struct EditorRows {
     pub add_sprite: Option<WidgetId>,
     pub save: Option<WidgetId>,
     pub load: Option<WidgetId>,
+    /// Status bar readouts, updated in place every frame via `set_label`.
+    pub status_cursor: Option<WidgetId>,
+    pub status_zoom: Option<WidgetId>,
+    pub status_selected: Option<WidgetId>,
+    pub status_fps: Option<WidgetId>,
 }
 
 /// The dock's panel sizes. Splitter drags mutate the live widget tree, so the
@@ -125,11 +130,32 @@ pub fn build_editor_ui(
     );
     ui.set_splitter_target(splitter_3, inspector_panel);
 
+    build_status_bar(&mut ui, root, &mut rows);
+
     rows.tree_panel = Some(tree_panel);
     rows.inspector_panel = Some(inspector_panel);
     rows.files_panel = Some(files_panel);
     rows.viewport = Some(viewport);
     (ui, rows)
+}
+
+/// The status bar along the bottom: live readouts the app refreshes in place
+/// each frame (set_label), so no shell rebuild is ever needed for them.
+fn build_status_bar(ui: &mut Ui, parent: WidgetId, rows: &mut EditorRows) {
+    let bar = ui.panel(
+        parent,
+        Style::new()
+            .row()
+            .gap(18.0)
+            .padding(4.0)
+            .align_center()
+            .background(PANEL_BG),
+    );
+    let readout = |ui: &mut Ui, text: &str| ui.label(bar, text, Style::new().foreground(SUBHEAD));
+    rows.status_cursor = Some(readout(ui, "x -, y -"));
+    rows.status_zoom = Some(readout(ui, "zoom 100%"));
+    rows.status_selected = Some(readout(ui, "nothing selected"));
+    rows.status_fps = Some(readout(ui, "- fps"));
 }
 
 /// The toolbar: the editor's actions, and later home to the gizmo-mode
@@ -248,7 +274,8 @@ fn build_inspector(
     let t = scene.node(node).transform;
     let transform_fields = [
         ("position", Value::Vec2(t.translation)),
-        ("rotation", Value::F32(t.rotation)),
+        // Stored radians, edited as degrees (the commit path converts back).
+        ("rotation", Value::F32(t.rotation.to_degrees())),
         ("scale", Value::Vec2(t.scale)),
     ];
     for (field, value) in transform_fields {

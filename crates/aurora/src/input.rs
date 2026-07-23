@@ -44,3 +44,18 @@ pub enum Key {
     /// Submit the focused field's current text (e.g. commit an edit).
     Enter,
 }
+
+/// What the mouse cursor should look like over the current hover target. The
+/// app maps this to its windowing system's cursor (Aurora never names one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorHint {
+    /// The ordinary arrow.
+    #[default]
+    Default,
+    /// A text beam (over editable text).
+    Text,
+    /// Horizontal resize arrows (over a vertical splitter, dragged left-right).
+    ResizeHorizontal,
+    /// Vertical resize arrows (over a horizontal splitter, dragged up-down).
+    ResizeVertical,
+}

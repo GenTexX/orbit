@@ -115,6 +115,10 @@ struct State {
     /// Frame counting for the once-a-second fps log.
     frames: u32,
     fps_since: std::time::Instant,
+    /// The fps figure currently shown in the status bar.
+    last_fps: f32,
+    /// The cursor icon currently applied to the window (set only on change).
+    applied_cursor: aurora::CursorHint,
 }
 
 impl ApplicationHandler for App {
@@ -263,6 +267,8 @@ impl State {
             texture_size: Vec2::new(w as f32, h as f32),
             frames: 0,
             fps_since: std::time::Instant::now(),
+            last_fps: 0.0,
+            applied_cursor: aurora::CursorHint::Default,
         })
     }
 
@@ -351,11 +357,22 @@ impl State {
                     pivot: g.center,
                     grab_angle: (world - g.center).to_angle(),
                 },
-                GizmoHit::ScaleUniform => Drag::ScaleUniform {
+                // The corner scales freely; Shift preserves the ratio
+                // (uniform), per the usual editor convention.
+                GizmoHit::ScaleCorner if self.modifiers.shift_key() => Drag::ScaleUniform {
                     node: sel,
                     original,
                     pivot: g.center,
                     grab_dist: world.distance(g.center),
+                },
+                GizmoHit::ScaleCorner => Drag::ScaleFree {
+                    node: sel,
+                    original,
+                    pivot: g.center,
+                    axis_x: g.axis_x,
+                    axis_y: g.axis_y,
+                    grab_proj_x: (world - g.center).dot(g.axis_x),
+                    grab_proj_y: (world - g.center).dot(g.axis_y),
                 },
                 GizmoHit::ScaleX => Drag::ScaleAxis {
                     node: sel,
@@ -554,9 +571,51 @@ impl State {
         let elapsed = self.fps_since.elapsed().as_secs_f32();
         if elapsed >= 1.0 {
             let fps = self.frames as f32 / elapsed;
+            self.last_fps = fps;
             tracing::debug!("{} fps ({:.2} ms/frame)", fps as u32, 1000.0 / fps);
             self.frames = 0;
             self.fps_since = std::time::Instant::now();
+        }
+    }
+
+    /// Map Aurora's cursor hint onto the window cursor (resize arrows over
+    /// splitters, a text beam over inputs), setting it only when it changes.
+    fn apply_cursor(&mut self) {
+        use winit::window::CursorIcon;
+        let hint = self.ui.cursor_hint();
+        if hint == self.applied_cursor {
+            return;
+        }
+        self.applied_cursor = hint;
+        self.window.set_cursor(match hint {
+            aurora::CursorHint::Default => CursorIcon::Default,
+            aurora::CursorHint::Text => CursorIcon::Text,
+            aurora::CursorHint::ResizeHorizontal => CursorIcon::ColResize,
+            aurora::CursorHint::ResizeVertical => CursorIcon::RowResize,
+        });
+    }
+
+    /// Refresh the status bar readouts in place (no shell rebuild).
+    fn update_status_bar(&mut self) {
+        let cursor = match (self.over_viewport(), self.cursor_world()) {
+            (true, Some(w)) => format!("x {:.0}, y {:.0}", w.x, w.y),
+            _ => "x -, y -".to_string(),
+        };
+        let selected = match self.selected {
+            Some(node) => self.project.scene.node(node).name.clone(),
+            None => "nothing selected".to_string(),
+        };
+        let zoom = format!("zoom {:.0}%", self.camera.zoom * 100.0);
+        let fps = format!("{:.0} fps", self.last_fps);
+        for (id, text) in [
+            (self.rows.status_cursor, cursor),
+            (self.rows.status_zoom, zoom),
+            (self.rows.status_selected, selected),
+            (self.rows.status_fps, fps),
+        ] {
+            if let Some(id) = id {
+                self.ui.set_label(id, text);
+            }
         }
     }
 
@@ -579,6 +638,9 @@ impl State {
             self.rows = rows;
             self.dirty = false;
         }
+
+        self.apply_cursor();
+        self.update_status_bar();
 
         // Lay the shell out first: the viewport widget's rect decides how big
         // the scene renders.
@@ -705,8 +767,12 @@ impl State {
                 },
                 _ => t,
             }),
+            // Displayed and edited in degrees, stored in radians.
             "rotation" => parse_value(&text, &Value::F32(t.rotation)).map(|v| match v {
-                Value::F32(r) => Transform { rotation: r, ..t },
+                Value::F32(deg) => Transform {
+                    rotation: deg.to_radians(),
+                    ..t
+                },
                 _ => t,
             }),
             "scale" => parse_value(&text, &Value::Vec2(t.scale)).map(|v| match v {
@@ -751,7 +817,9 @@ impl State {
         // (parse_value returns None; the text the user typed stays visible
         // until they fix it or select elsewhere, since we only rebuild the
         // shell - and so re-render the field from the scene - on success).
-        if let Some(new) = parse_value(&text, &old) {
+        if let Some(new) = parse_value(&text, &old)
+            && new != old
+        {
             self.history
                 .set_field(&mut self.project.scene, node, component, field, new);
             self.dirty = true;

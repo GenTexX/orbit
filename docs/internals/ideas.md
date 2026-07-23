@@ -4,11 +4,11 @@ The idea inbox: anything worth doing that we are not doing right now lands
 here, one bullet per idea, grouped by area. No commitment implied - an entry
 is a captured thought, not a promise.
 
-**The ritual:** at the end of every milestone, before it is declared done, we
-go through this list together and pick what to implement as part of the
-milestone's finishing pass. Everything else stays for the next round. When an
-idea ships, delete its entry (git history remembers); when one dies, delete
-it too.
+**The ritual:** once a milestone is basically done, an open-ended iteration
+phase begins: we go through this list together, pick a bundle, implement it,
+and repeat for as long as we want. Iteration work is not part of the
+milestone itself. When an idea ships, delete its entry (git history
+remembers); when one dies, delete it too.
 
 Seeded from hands-on M3 testing and the big brainstorm session at the end of
 M3 (2026-07-23), with an eye on M4-M6 shifting focus away from the editor:
@@ -49,10 +49,6 @@ this list is what "come back and make the editor great" concretely means.
 - **DPI awareness**: font size and metrics are physical-pixel constants; on a
   hidpi display everything will be tiny. Respect winit's scale factor.
 - **Text ellipsis/truncation** for long labels (file paths, node names).
-- **Cursor hints**: Aurora reports a cursor per hovered widget (resize arrows
-  over splitters, text beam over inputs); the app maps it to winit.
-- **Wider splitter grab area** (hit area larger than the drawn bar - needs a
-  per-widget hit inset).
 - **A real checkmark** in checkboxes (undecided if wanted; the filled square
   is a legit minimalist look).
 - **First-class drag-and-drop**: Aurora-level drag sources/targets with a
@@ -89,16 +85,11 @@ this list is what "come back and make the editor great" concretely means.
   primitives or tinted-quad lines for this.
 - **Zoom indicator + view controls**: current zoom % readout, frame-selected
   (F), frame-all, reset view (double-click middle?).
-- **Status bar** along the bottom: cursor world position, zoom, selected
-  node, fps - cheap and very "real editor".
 - **Checkerboard or configurable background** behind the scene (communicates
   transparency; the flat navy reads as part of the scene).
 - **Gizmo modes with a toolbar above the viewport** (Godot-style): select /
   move / rotate / scale as exclusive modes with Q/W/E/S-style shortcuts; only
   the active mode's gizmo shows. The toolbar now exists to host it.
-- **Corner scale free (non-uniform) by default**, modifier (Shift, per
-  Godot/Figma convention) to preserve ratio - inverts today's uniform-only
-  corner handle.
 - **Snapping**: grid snap for moves, angle increments for rotation (modifier
   held), plus a numeric readout near the cursor while dragging.
 - **Mirror/flip via negative scale** is currently clamped away; allowing a
@@ -131,13 +122,10 @@ this list is what "come back and make the editor great" concretely means.
 - **Numeric fields**: accept only numbers while typing; for `Vec2`, two
   inputs labeled `x` and `y` in the engine axis colors (X red, Y green).
   Drag-to-scrub on the field's label.
-- **Rotation in degrees** (stored radians, displayed/edited as degrees).
 - **Asset fields**: an asset-chooser popup (needs popups), and/or drag a file
   from the explorer onto the field.
 - **Color fields**: a color picker (needs popups); until then at least a
   color swatch preview next to the text.
-- **Commit on focus loss** in addition to Enter (clicking away currently
-  silently keeps the old value - surprising).
 
 ## Engine (helios / photon)
 

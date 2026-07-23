@@ -124,8 +124,9 @@ pub enum GizmoHit {
     MoveY,
     /// The rotate handle: rotate about the center.
     Rotate,
-    /// The corner handle: uniform scale about the center.
-    ScaleUniform,
+    /// The corner handle: free (per-axis) scale about the center, or uniform
+    /// with Shift held - the app chooses the drag kind from the modifier.
+    ScaleCorner,
     /// The right-edge handle: scale X only, about the center.
     ScaleX,
     /// The bottom-edge handle: scale Y only, about the center.
@@ -185,7 +186,7 @@ pub fn hit_gizmo(gizmo: &Gizmo, world: Vec2) -> Option<GizmoHit> {
     let r = gizmo.grab_radius;
     let hits = [
         (GizmoHit::Rotate, gizmo.rotate_center),
-        (GizmoHit::ScaleUniform, gizmo.scale_corner),
+        (GizmoHit::ScaleCorner, gizmo.scale_corner),
         (GizmoHit::ScaleX, gizmo.scale_x),
         (GizmoHit::ScaleY, gizmo.scale_y),
         (GizmoHit::MoveX, gizmo.arrow_x_end),
@@ -350,6 +351,18 @@ pub enum Drag {
         pivot: Vec2,
         grab_dist: f32,
     },
+    /// Scaling both axes independently (the corner handle without Shift): each
+    /// axis scales by the ratio of the cursor's projection onto it against the
+    /// press-time projection.
+    ScaleFree {
+        node: NodeId,
+        original: Transform,
+        pivot: Vec2,
+        axis_x: Vec2,
+        axis_y: Vec2,
+        grab_proj_x: f32,
+        grab_proj_y: f32,
+    },
     /// Scaling one local axis: the cursor's offset from the pivot is projected
     /// onto `axis_world`, and the ratio to the press-time projection scales
     /// that component.
@@ -371,6 +384,7 @@ impl Drag {
             | Drag::MoveAxis { node, original, .. }
             | Drag::Rotate { node, original, .. }
             | Drag::ScaleUniform { node, original, .. }
+            | Drag::ScaleFree { node, original, .. }
             | Drag::ScaleAxis { node, original, .. } => (node, original),
         }
     }
@@ -421,6 +435,22 @@ impl Drag {
                 let k = (world.distance(pivot) / grab_dist.max(1.0e-3)).max(0.05);
                 Transform {
                     scale: original.scale * k,
+                    ..original
+                }
+            }
+            Drag::ScaleFree {
+                original,
+                pivot,
+                axis_x,
+                axis_y,
+                grab_proj_x,
+                grab_proj_y,
+                ..
+            } => {
+                let kx = ((world - pivot).dot(axis_x) / grab_proj_x).max(0.05);
+                let ky = ((world - pivot).dot(axis_y) / grab_proj_y).max(0.05);
+                Transform {
+                    scale: original.scale * Vec2::new(kx, ky),
                     ..original
                 }
             }
@@ -544,7 +574,7 @@ mod tests {
         assert!((g.arrow_y_end - Vec2::new(100.0, 50.0 + 56.0)).length() < EPS);
 
         assert_eq!(hit_gizmo(&g, g.rotate_center), Some(GizmoHit::Rotate));
-        assert_eq!(hit_gizmo(&g, g.scale_corner), Some(GizmoHit::ScaleUniform));
+        assert_eq!(hit_gizmo(&g, g.scale_corner), Some(GizmoHit::ScaleCorner));
         assert_eq!(hit_gizmo(&g, g.scale_x), Some(GizmoHit::ScaleX));
         assert_eq!(hit_gizmo(&g, g.scale_y), Some(GizmoHit::ScaleY));
         assert_eq!(hit_gizmo(&g, g.arrow_x_end), Some(GizmoHit::MoveX));
@@ -673,6 +703,28 @@ mod tests {
         };
         let scaled = drag.apply(&scene, center + Vec2::new(40.0, 0.0));
         assert!((scaled.scale - Vec2::new(2.0, 1.0)).length() < EPS);
+        assert!((scaled.translation - original.translation).length() < EPS);
+    }
+
+    #[test]
+    fn a_free_corner_drag_scales_each_axis_independently() {
+        let (scene, node) = scene_with_sprite(Vec2::new(100.0, 100.0), Vec2::new(40.0, 20.0));
+        let center = world_center(&scene, node);
+        let original = scene.node(node).transform;
+
+        // Grab the corner (at +20, +10 from the center); drag it to (+40, +5):
+        // X doubles while Y halves - the axes move independently.
+        let drag = Drag::ScaleFree {
+            node,
+            original,
+            pivot: center,
+            axis_x: Vec2::X,
+            axis_y: Vec2::Y,
+            grab_proj_x: 20.0,
+            grab_proj_y: 10.0,
+        };
+        let scaled = drag.apply(&scene, center + Vec2::new(40.0, 5.0));
+        assert!((scaled.scale - Vec2::new(2.0, 0.5)).length() < EPS);
         assert!((scaled.translation - original.translation).length() < EPS);
     }
 

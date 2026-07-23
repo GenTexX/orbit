@@ -26,3 +26,6 @@ pub(crate) const CARET: Color = Color::rgb(0.90, 0.92, 0.96);
 pub(crate) const SPLITTER: Color = Color::rgb(0.18, 0.19, 0.23);
 /// The smallest a splitter will resize its target down to, in pixels.
 pub(crate) const SPLITTER_MIN_TARGET: f32 = 40.0;
+/// Extra grab zone per side beyond the splitter's visual bar, in pixels - the
+/// bar is thin, the hit area should not be.
+pub(crate) const SPLITTER_GRAB_EXTRA: f32 = 4.0;
