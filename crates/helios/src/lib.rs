@@ -22,5 +22,6 @@ pub use component::{Component, SpriteComponent};
 pub use error::HeliosError;
 pub use project::{Manifest, Project};
 pub use reflect::{Reflect, Value};
+pub use render::SpriteDraw;
 pub use scene::{Node, NodeId, Scene};
 pub use transform::Transform;

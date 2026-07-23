@@ -8,30 +8,53 @@ use photon::{Color, Sprite};
 use crate::component::{Component, SpriteComponent};
 use crate::scene::{NodeId, Scene};
 
+/// One drawable sprite from the scene: the node that owns it, the texture path
+/// it names (for per-texture batching), and its placed photon [`Sprite`].
+#[derive(Debug, Clone)]
+pub struct SpriteDraw {
+    pub node: NodeId,
+    pub texture: String,
+    pub sprite: Sprite,
+}
+
 impl Scene {
     /// Collect this scene's drawable sprites in draw order (a pre-order walk from
     /// the root, so children draw over their parents), each placed by its node's
     /// world transform. Hand the result to photon to render.
     pub fn sprites(&self) -> Vec<Sprite> {
-        self.sprite_entries().into_iter().map(|(_, s)| s).collect()
+        self.sprite_draws().into_iter().map(|d| d.sprite).collect()
     }
 
     /// Like [`sprites`](Self::sprites), but each sprite paired with the node
-    /// that owns it - the mapping GPU picking needs: photon's `pick` returns an
-    /// index into the sprite list, and this same walk (same order) says which
-    /// node that index belongs to.
+    /// that owns it - the mapping GPU picking needs: photon returns an index
+    /// into the sprite list, and this same walk (same order) says which node
+    /// that index belongs to.
     pub fn sprite_entries(&self) -> Vec<(NodeId, Sprite)> {
+        self.sprite_draws()
+            .into_iter()
+            .map(|d| (d.node, d.sprite))
+            .collect()
+    }
+
+    /// Every drawable sprite in draw order, each with its owning node and the
+    /// texture path it names - what a renderer needs to batch by texture
+    /// (consecutive same-texture sprites) while keeping painter's order.
+    pub fn sprite_draws(&self) -> Vec<SpriteDraw> {
         let mut out = Vec::new();
         self.collect_sprites(self.root(), &mut out);
         out
     }
 
-    fn collect_sprites(&self, id: NodeId, out: &mut Vec<(NodeId, Sprite)>) {
+    fn collect_sprites(&self, id: NodeId, out: &mut Vec<SpriteDraw>) {
         for component in &self.node(id).components {
             // Exhaustive so a new component kind (e.g. Camera) forces a decision
             // here rather than being silently non-drawable.
             match component {
-                Component::Sprite(sprite) => out.push((id, self.build_sprite(id, sprite))),
+                Component::Sprite(sprite) => out.push(SpriteDraw {
+                    node: id,
+                    texture: sprite.texture.clone(),
+                    sprite: self.build_sprite(id, sprite),
+                }),
             }
         }
         for &child in self.children(id) {

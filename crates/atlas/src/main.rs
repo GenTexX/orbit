@@ -6,6 +6,7 @@
 
 mod actions;
 mod project;
+mod textures;
 mod ui;
 mod viewport;
 
@@ -18,7 +19,7 @@ use aurora::{Event as AuroraEvent, ImageHandle, InputEvent, Key, WidgetKind};
 use aurora_wgpu::Renderer as AuroraRenderer;
 use glam::Vec2;
 use helios::{History, NodeId, Project, Transform, Value};
-use photon::{Color as PhotonColor, Renderer as PhotonRenderer, SceneTarget, Texture};
+use photon::{Color as PhotonColor, Renderer as PhotonRenderer, SceneTarget, Sprite, Texture};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
@@ -27,6 +28,7 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use crate::textures::TextureCache;
 use crate::ui::{
     ContextMenu, EditorRows, MenuAction, PanelSizes, build_editor_ui, capture_panel_sizes,
     parse_value,
@@ -82,7 +84,9 @@ struct State {
     window: Arc<Window>,
     gui: AuroraRenderer,
     engine: PhotonRenderer,
-    texture: Texture,
+    /// Scene textures keyed by path, loaded lazily so each sprite draws with
+    /// the texture it names (per-texture batching).
+    textures: TextureCache,
     /// A 1x1 white texture the gizmo overlay tints per sprite.
     white: Texture,
     project: Project,
@@ -232,16 +236,18 @@ impl State {
             .context("create GUI renderer")?;
         let engine = PhotonRenderer::from_gpu(gpu);
         let white = engine.create_texture(&[255, 255, 255, 255], 1, 1);
+        let textures = TextureCache::new(&engine);
 
         let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo_project");
         let project = project::open_or_create(&project_dir)?;
+        // Decode the demo sprite once for its natural pixel size (the default
+        // size for newly spawned sprites); its pixels load through the cache.
         let sprite_bytes =
             std::fs::read(project_dir.join("assets/sprite.png")).context("read demo sprite")?;
-        let decoded = image::load_from_memory(&sprite_bytes)
+        let (w, h) = image::load_from_memory(&sprite_bytes)
             .context("decode demo sprite")?
-            .to_rgba8();
-        let (w, h) = decoded.dimensions();
-        let texture = engine.create_texture(&decoded.into_raw(), w, h);
+            .to_rgba8()
+            .dimensions();
 
         let (scene_target, viewport_handle) =
             build_viewport_target(&mut gui, &engine, (size.width, size.height));
@@ -259,7 +265,7 @@ impl State {
             window,
             gui,
             engine,
-            texture,
+            textures,
             white,
             project,
             project_dir,
@@ -408,20 +414,27 @@ impl State {
             return;
         }
 
-        let entries = scene.sprite_entries();
-        let sprites: Vec<photon::Sprite> = entries.iter().map(|&(_, s)| s).collect();
         let local = self.cursor - rect.pos;
         let camera = self.camera.camera(rect.size);
-        let picked = self.engine.pick(
+        // Pick against the same per-texture runs the scene renders with, so
+        // alpha-discard uses each sprite's real texture; the returned index is
+        // into the flattened draw order, which matches `draws`. (Re-borrow the
+        // scene here so the `scene` binding above is free for `texture_runs`.)
+        let draws = self.project.scene.sprite_draws();
+        let runs = self.texture_runs(&draws);
+        let run_refs: Vec<(&Texture, &[Sprite])> = runs
+            .iter()
+            .map(|(path, sprites)| (self.textures.get(path), sprites.as_slice()))
+            .collect();
+        let picked = self.engine.pick_runs(
             (self.scene_target.width, self.scene_target.height),
             &camera,
-            &self.texture,
-            &sprites,
+            &run_refs,
             (local.x.max(0.0) as u32, local.y.max(0.0) as u32),
         );
         match picked {
             Ok(Some(index)) => {
-                let node = entries[index].0;
+                let node = draws[index].node;
                 self.selected = Some(node);
                 self.drag = Some(Drag::Move {
                     node,
@@ -528,6 +541,18 @@ impl State {
         }
         self.context_menu = None;
         self.dirty = true;
+    }
+
+    /// Coalesce `draws` (already in paint order) into runs of consecutive
+    /// same-texture sprites, loading each texture into the cache. Returns the
+    /// owned runs; the caller borrows the cache to turn them into the
+    /// `(&Texture, &[Sprite])` list photon's run methods take.
+    fn texture_runs(&mut self, draws: &[helios::SpriteDraw]) -> Vec<(String, Vec<Sprite>)> {
+        for draw in draws {
+            self.textures
+                .ensure(&self.engine, &self.project_dir, &draw.texture);
+        }
+        textures::coalesce_runs(draws)
     }
 
     /// Finish a viewport drag: rewind to the press-time transform and commit
@@ -784,13 +809,16 @@ impl State {
         profiling::scope!("scene_render");
         let clear = PhotonColor::new(0.02, 0.02, 0.05, 1.0);
         let camera = self.camera.camera(Vec2::new(w as f32, h as f32));
-        self.engine.render_to_target(
-            &self.scene_target,
-            clear,
-            &camera,
-            &self.texture,
-            &self.project.scene.sprites(),
-        );
+        // Draw the scene as per-texture runs, so each sprite shows the texture
+        // it names (consecutive same-texture sprites batch, order preserved).
+        let draws = self.project.scene.sprite_draws();
+        let runs = self.texture_runs(&draws);
+        let run_refs: Vec<(&Texture, &[Sprite])> = runs
+            .iter()
+            .map(|(path, sprites)| (self.textures.get(path), sprites.as_slice()))
+            .collect();
+        self.engine
+            .render_runs_to_target(&self.scene_target, clear, &camera, &run_refs);
 
         // Editor overlays, drawn over the scene in a second pass (LoadOp::Load)
         // with the tintable white texture: the axis guide line first (under),

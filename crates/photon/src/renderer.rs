@@ -493,6 +493,56 @@ impl Renderer {
         self.gpu.queue.submit(Some(encoder.finish()));
     }
 
+    /// Render ordered `runs` of sprites into `target`, each run with its own
+    /// texture, in a single pass (one draw per run). Runs draw in order, so a
+    /// caller that coalesces consecutive same-texture sprites keeps exact
+    /// painter's order while still batching - the way a scene with several
+    /// textures is drawn correctly (each sprite with the texture it names,
+    /// ADR 0018's per-texture batching).
+    pub fn render_runs_to_target(
+        &self,
+        target: &SceneTarget,
+        clear: Color,
+        camera: &Camera,
+        runs: &[(&Texture, &[Sprite])],
+    ) {
+        profiling::scope!("render_runs");
+        let camera_bind_group = self.camera_bind_group(camera);
+        let (instances, draws) = self.build_runs(runs);
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sprite runs pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target.view(),
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear.to_wgpu()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if let Some(instances) = &instances {
+                pass.set_pipeline(&self.offscreen_pipeline);
+                pass.set_bind_group(0, &camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, instances.slice(..));
+                for (texture_bind_group, first, count) in &draws {
+                    pass.set_bind_group(1, texture_bind_group, &[]);
+                    pass.draw(0..6, *first..*first + *count);
+                }
+            }
+        }
+        self.gpu.queue.submit(Some(encoder.finish()));
+    }
+
     /// Draw `sprites` over `target`'s existing contents (no clear) - a second
     /// pass for editor overlays like selection outlines and gizmos, which may
     /// use a different texture than the scene pass (e.g. a solid white texel
@@ -623,6 +673,124 @@ impl Renderer {
         Ok((id != 0).then(|| (id - 1) as usize))
     }
 
+    /// Like [`pick`](Self::pick), but over ordered `runs` (each with its own
+    /// texture) so alpha-discard uses each sprite's real texture. Returns the
+    /// index into the flattened run sprites (run 0's sprites, then run 1's,
+    /// ...) of the topmost covering sprite, or `None` for empty space.
+    pub fn pick_runs(
+        &self,
+        size: (u32, u32),
+        camera: &Camera,
+        runs: &[(&Texture, &[Sprite])],
+        pixel: (u32, u32),
+    ) -> Result<Option<usize>, RendererError> {
+        let (width, height) = (size.0.max(1), size.1.max(1));
+        if pixel.0 >= width || pixel.1 >= height {
+            return Ok(None);
+        }
+        let device = &self.gpu.device;
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pick id buffer"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PICK_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let camera_bind_group = self.camera_bind_group(camera);
+        let (instances, draws) = self.build_runs(runs);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pick readback"),
+            size: 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("pick runs pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if let Some(instances) = &instances {
+                pass.set_pipeline(&self.pick_pipeline);
+                pass.set_bind_group(0, &camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, instances.slice(..));
+                // A non-zero first_instance makes `instance_index` global
+                // across runs while still reading this run's slice of the one
+                // shared buffer, so the id maps to the flattened sprite index.
+                for (texture_bind_group, first, count) in &draws {
+                    pass.set_bind_group(1, texture_bind_group, &[]);
+                    pass.draw(0..6, *first..*first + *count);
+                }
+            }
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: pixel.0,
+                    y: pixel.1,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: None,
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.gpu.queue.submit(Some(encoder.finish()));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx.send(res);
+            });
+        self.gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
+        rx.recv().expect("map_async never signalled")?;
+        let mapped = readback
+            .slice(..)
+            .get_mapped_range()
+            .expect("buffer was just mapped for reading");
+        let id = u32::from_le_bytes([mapped[0], mapped[1], mapped[2], mapped[3]]);
+        drop(mapped);
+        readback.unmap();
+        Ok((id != 0).then(|| (id - 1) as usize))
+    }
+
     /// Build the per-batch GPU resources (camera uniform, bind groups, instance
     /// buffer) shared by the window and offscreen paths.
     fn prepare_batch(
@@ -632,56 +800,107 @@ impl Renderer {
         sprites: &[Sprite],
     ) -> BatchResources {
         profiling::scope!("prepare_batch");
-        let device = &self.gpu.device;
+        let (instances, count) = self.instance_buffer(sprites);
+        BatchResources {
+            camera_bind_group: self.camera_bind_group(camera),
+            texture_bind_group: self.texture_bind_group(texture),
+            instances,
+            count,
+        }
+    }
 
+    /// The camera uniform bound at group 0. The returned bind group keeps its
+    /// backing buffer alive, so the buffer itself need not be stored.
+    fn camera_bind_group(&self, camera: &Camera) -> wgpu::BindGroup {
         let camera_uniform = CameraUniform {
             view_proj: camera.view_projection().to_cols_array(),
         };
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("camera uniform"),
-            contents: bytemuck::bytes_of(&camera_uniform),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        // The bind group keeps `camera_buffer` alive, so it need not be stored.
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera bind group"),
-            layout: &self.camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-        });
-
-        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sprite texture bind group"),
-            layout: &self.texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
+        let camera_buffer = self
+            .gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("camera uniform"),
+                contents: bytemuck::bytes_of(&camera_uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        self.gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("camera bind group"),
+                layout: &self.camera_layout,
+                entries: &[wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+                    resource: camera_buffer.as_entire_binding(),
+                }],
+            })
+    }
 
+    /// The texture+sampler bound at group 1.
+    fn texture_bind_group(&self, texture: &Texture) -> wgpu::BindGroup {
+        self.gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("sprite texture bind group"),
+                layout: &self.texture_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&texture.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            })
+    }
+
+    /// Pack `sprites` into a per-instance vertex buffer (`None` for an empty
+    /// slice - a zero-sized vertex buffer is invalid) and its instance count.
+    fn instance_buffer(&self, sprites: &[Sprite]) -> (Option<wgpu::Buffer>, u32) {
         let raw: Vec<RawInstance> = sprites.iter().map(|s| s.to_raw()).collect();
         let instances = (!raw.is_empty()).then(|| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("sprite instances"),
-                contents: bytemuck::cast_slice(&raw),
-                usage: wgpu::BufferUsages::VERTEX,
-            })
+            self.gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("sprite instances"),
+                    contents: bytemuck::cast_slice(&raw),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
         });
+        (instances, raw.len() as u32)
+    }
 
-        BatchResources {
-            camera_bind_group,
-            texture_bind_group,
-            instances,
-            count: raw.len() as u32,
+    /// Concatenate `runs` into one instance buffer plus a per-run
+    /// `(texture bind group, first instance, count)` draw list. The single
+    /// buffer keeps instance indices global across runs, so the pick shader's
+    /// `instance_index` maps straight to the flattened sprite index - and a
+    /// non-zero `first_instance` draw reads the right slice of the same buffer.
+    #[allow(clippy::type_complexity)]
+    fn build_runs(
+        &self,
+        runs: &[(&Texture, &[Sprite])],
+    ) -> (Option<wgpu::Buffer>, Vec<(wgpu::BindGroup, u32, u32)>) {
+        let mut raw: Vec<RawInstance> = Vec::new();
+        let mut draws = Vec::new();
+        for (texture, sprites) in runs {
+            let first = raw.len() as u32;
+            raw.extend(sprites.iter().map(|s| s.to_raw()));
+            let count = raw.len() as u32 - first;
+            if count > 0 {
+                draws.push((self.texture_bind_group(texture), first, count));
+            }
         }
+        let instances = (!raw.is_empty()).then(|| {
+            self.gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("sprite run instances"),
+                    contents: bytemuck::cast_slice(&raw),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
+        (instances, draws)
     }
 
     /// Record a single sprite pass into `encoder`, loading `view` per `load`
@@ -847,6 +1066,46 @@ mod tests {
         assert_eq!(pick((40, 40)), Some(1), "b drew later, so b wins overlap");
         assert_eq!(pick((60, 40)), Some(1), "only b covers this pixel");
         assert_eq!(pick((90, 90)), None, "empty space picks nothing");
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; run locally with --ignored"]
+    fn runs_render_each_group_with_its_own_texture_in_order() {
+        let renderer = Renderer::headless().expect("headless renderer");
+        let red = renderer.create_texture(&[255, 0, 0, 255], 1, 1);
+        let green = renderer.create_texture(&[0, 255, 0, 255], 1, 1);
+        let (w, h) = (64u32, 64u32);
+        let camera = Camera::new(Vec2::ZERO, Vec2::new(w as f32, h as f32));
+        let target = renderer.create_scene_target(w, h);
+
+        // Two runs, different textures, overlapping: the green run draws after
+        // the red one, so green wins the overlap - painter's order across runs.
+        let a = Sprite::new(Vec2::new(4.0, 4.0), Vec2::new(30.0, 30.0));
+        let b = Sprite::new(Vec2::new(20.0, 20.0), Vec2::new(30.0, 30.0));
+        let runs: &[(&Texture, &[Sprite])] = &[(&red, &[a]), (&green, &[b])];
+        renderer.render_runs_to_target(&target, Color::BLACK, &camera, runs);
+
+        // Pick proves each run kept its texture and the ids are global across
+        // runs: (10,10) is only the red sprite (index 0), (25,25) is the green
+        // one on top (index 1).
+        assert_eq!(
+            renderer
+                .pick_runs((w, h), &camera, runs, (10, 10))
+                .expect("pick"),
+            Some(0)
+        );
+        assert_eq!(
+            renderer
+                .pick_runs((w, h), &camera, runs, (25, 25))
+                .expect("pick"),
+            Some(1)
+        );
+        assert_eq!(
+            renderer
+                .pick_runs((w, h), &camera, runs, (60, 60))
+                .expect("pick"),
+            None
+        );
     }
 
     #[test]
