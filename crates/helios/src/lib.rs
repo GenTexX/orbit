@@ -7,6 +7,7 @@
 //! and unit-tested headlessly; scene rendering (via photon) lives in a separate
 //! module added later.
 
+mod command;
 mod component;
 mod error;
 mod project;
@@ -15,6 +16,7 @@ mod scene;
 mod serialize;
 mod transform;
 
+pub use command::{Edit, History};
 pub use component::{Component, SpriteComponent};
 pub use error::HeliosError;
 pub use project::{Manifest, Project};

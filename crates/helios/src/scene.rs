@@ -109,6 +109,56 @@ impl Scene {
             None => local,
         }
     }
+
+    // ---- low-level tree ops, used by the edit commands (command.rs) ----
+    //
+    // Delete detaches rather than removes, so a node keeps its `NodeId` while it
+    // sits in the undo history (slotmap cannot re-insert a freed key). A node
+    // detached and never re-linked stays in the arena until the scene is dropped
+    // or re-saved (it is not walked from the root); harmless for an editor.
+
+    /// Insert a node into the arena without attaching it to the tree, returning
+    /// its handle. The caller links it (see [`link`](Self::link)).
+    pub(crate) fn insert_detached(&mut self, mut node: Node) -> NodeId {
+        node.parent = None;
+        self.nodes.insert(node)
+    }
+
+    /// Attach `child` under `parent` at `index` (clamped to the child count).
+    pub(crate) fn link(&mut self, child: NodeId, parent: NodeId, index: usize) {
+        self.nodes[child].parent = Some(parent);
+        let children = &mut self.nodes[parent].children;
+        let index = index.min(children.len());
+        children.insert(index, child);
+    }
+
+    /// Detach `child` from its parent, leaving it in the arena.
+    pub(crate) fn unlink(&mut self, child: NodeId) {
+        if let Some(parent) = self.nodes[child].parent.take()
+            && let Some(pos) = self.nodes[parent].children.iter().position(|&c| c == child)
+        {
+            self.nodes[parent].children.remove(pos);
+        }
+    }
+
+    /// The index of `child` within its parent's children, or `None` if detached.
+    pub(crate) fn child_index(&self, child: NodeId) -> Option<usize> {
+        let parent = self.nodes[child].parent?;
+        self.nodes[parent].children.iter().position(|&c| c == child)
+    }
+
+    /// Whether `ancestor` lies on the path from `of` up to the root (so
+    /// reparenting `of` under `ancestor`'s subtree would create a cycle).
+    pub(crate) fn is_ancestor(&self, ancestor: NodeId, of: NodeId) -> bool {
+        let mut cur = self.nodes[of].parent;
+        while let Some(id) = cur {
+            if id == ancestor {
+                return true;
+            }
+            cur = self.nodes[id].parent;
+        }
+        false
+    }
 }
 
 #[cfg(test)]
