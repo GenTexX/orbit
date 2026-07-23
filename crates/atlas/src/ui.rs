@@ -23,6 +23,9 @@ pub struct EditorRows {
     /// A submitted field row commits its current text to
     /// `(node, component index, field name)`.
     pub field_rows: Vec<(WidgetId, NodeId, usize, &'static str)>,
+    /// A submitted transform row commits to the node's Transform; the field is
+    /// `"position"`, `"rotation"`, or `"scale"`.
+    pub transform_rows: Vec<(WidgetId, NodeId, &'static str)>,
     /// The three resizable panels, for reading their current (possibly
     /// splitter-dragged) sizes back before a rebuild.
     pub tree_panel: Option<WidgetId>,
@@ -208,6 +211,20 @@ fn build_inspector(
         Style::new().foreground(HEADING),
     );
 
+    // The node's own transform first: it is what viewport drags edit, so its
+    // rows double as a live readout while dragging.
+    ui.label(panel, "Transform", Style::new().foreground(SUBHEAD));
+    let t = scene.node(node).transform;
+    let transform_fields = [
+        ("position", Value::Vec2(t.translation)),
+        ("rotation", Value::F32(t.rotation)),
+        ("scale", Value::Vec2(t.scale)),
+    ];
+    for (field, value) in transform_fields {
+        let input = add_value_row(ui, panel, field, &value);
+        rows.transform_rows.push((input, node, field));
+    }
+
     for (i, component) in scene.node(node).components.iter().enumerate() {
         let reflect = component.as_reflect();
         ui.label(panel, reflect.type_name(), Style::new().foreground(SUBHEAD));
@@ -215,17 +232,22 @@ fn build_inspector(
             let Some(value) = reflect.get(field) else {
                 continue;
             };
-            let field_row = ui.panel(panel, Style::new().row().gap(6.0).align_center());
-            ui.label(field_row, field, Style::new().width(70.0));
-            let input = ui.text_input(
-                field_row,
-                value_to_text(&value),
-                Style::new().grow(1.0).padding(4.0),
-            );
+            let input = add_value_row(ui, panel, field, &value);
             rows.field_rows.push((input, node, i, field));
         }
     }
     panel
+}
+
+/// One labeled, editable inspector row; returns the text input's id.
+fn add_value_row(ui: &mut Ui, panel: WidgetId, label: &str, value: &Value) -> WidgetId {
+    let row = ui.panel(panel, Style::new().row().gap(6.0).align_center());
+    ui.label(row, label, Style::new().width(70.0));
+    ui.text_input(
+        row,
+        value_to_text(value),
+        Style::new().grow(1.0).padding(4.0),
+    )
 }
 
 /// The docked file explorer: the project's PNG and scene files.

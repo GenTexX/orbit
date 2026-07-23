@@ -6,6 +6,7 @@
 
 mod project;
 mod ui;
+mod viewport;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,17 +16,18 @@ use anyhow::{Context, Result};
 use aurora::{Event as AuroraEvent, ImageHandle, InputEvent, Key, WidgetKind};
 use aurora_wgpu::Renderer as AuroraRenderer;
 use glam::Vec2;
-use helios::{History, NodeId, Project};
-use photon::{Camera, Color as PhotonColor, Renderer as PhotonRenderer, SceneTarget, Texture};
+use helios::{History, NodeId, Project, Transform, Value};
+use photon::{Color as PhotonColor, Renderer as PhotonRenderer, SceneTarget, Texture};
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, MouseButton, WindowEvent},
+    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key as WinitKey, NamedKey},
+    keyboard::{Key as WinitKey, ModifiersState, NamedKey},
     window::{Window, WindowId},
 };
 
 use crate::ui::{EditorRows, PanelSizes, build_editor_ui, capture_panel_sizes, parse_value};
+use crate::viewport::{Drag, EditorCamera, GizmoHit};
 
 fn main() -> Result<()> {
     init_logging();
@@ -55,6 +57,8 @@ struct State {
     gui: AuroraRenderer,
     engine: PhotonRenderer,
     texture: Texture,
+    /// A 1x1 white texture the gizmo overlay tints per sprite.
+    white: Texture,
     project: Project,
     project_dir: PathBuf,
     history: History,
@@ -70,6 +74,16 @@ struct State {
     /// `Ui` was last built; rebuilding only then (not every frame) keeps
     /// in-progress typing and hover state intact across ordinary frames.
     dirty: bool,
+    /// The editor's pan/zoom view of the scene.
+    camera: EditorCamera,
+    /// An in-progress viewport drag (move, rotate, or scale).
+    drag: Option<Drag>,
+    /// Whether a middle-button pan is in progress.
+    panning: bool,
+    /// The last cursor position, in window pixels.
+    cursor: Vec2,
+    /// The current keyboard modifiers (for the undo/redo shortcuts).
+    modifiers: ModifiersState,
 }
 
 impl ApplicationHandler for App {
@@ -98,23 +112,35 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => state.resize((size.width, size.height)),
             WindowEvent::CursorMoved { position, .. } => {
                 let p = Vec2::new(position.x as f32, position.y as f32);
-                state.ui.handle_input(InputEvent::PointerMoved(p));
+                state.pointer_moved(p);
             }
             WindowEvent::CursorLeft { .. } => state.ui.handle_input(InputEvent::PointerLeft),
             WindowEvent::MouseInput {
                 state: btn_state,
-                button: MouseButton::Left,
+                button,
                 ..
-            } => {
-                let ev = match btn_state {
-                    ElementState::Pressed => InputEvent::PointerPressed,
-                    ElementState::Released => InputEvent::PointerReleased,
-                };
-                state.ui.handle_input(ev);
-            }
+            } => match (button, btn_state) {
+                (MouseButton::Left, ElementState::Pressed) => {
+                    state.ui.handle_input(InputEvent::PointerPressed);
+                    state.viewport_press();
+                }
+                (MouseButton::Left, ElementState::Released) => {
+                    state.end_drag();
+                    state.ui.handle_input(InputEvent::PointerReleased);
+                }
+                (MouseButton::Middle, ElementState::Pressed) => {
+                    state.panning = state.over_viewport();
+                }
+                (MouseButton::Middle, ElementState::Released) => state.panning = false,
+                _ => {}
+            },
+            WindowEvent::MouseWheel { delta, .. } => state.wheel(delta),
+            WindowEvent::ModifiersChanged(m) => state.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                for ev in translate_key(&event) {
-                    state.ui.handle_input(ev);
+                if !state.handle_shortcut(&event) {
+                    for ev in translate_key(&event) {
+                        state.ui.handle_input(ev);
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -156,6 +182,7 @@ impl State {
         let mut gui = AuroraRenderer::from_gpu(gpu.clone(), surface, (size.width, size.height))
             .context("create GUI renderer")?;
         let engine = PhotonRenderer::from_gpu(gpu);
+        let white = engine.create_texture(&[255, 255, 255, 255], 1, 1);
 
         let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo_project");
         let project = project::open_or_create(&project_dir)?;
@@ -183,6 +210,7 @@ impl State {
             gui,
             engine,
             texture,
+            white,
             project,
             project_dir,
             history: History::new(),
@@ -193,6 +221,11 @@ impl State {
             rows,
             panel_sizes,
             dirty: false,
+            camera: EditorCamera::default(),
+            drag: None,
+            panning: false,
+            cursor: Vec2::ZERO,
+            modifiers: ModifiersState::default(),
         })
     }
 
@@ -201,6 +234,174 @@ impl State {
         // target to the viewport widget's laid-out rect every frame, which a
         // window resize changes like any panel drag does.
         self.gui.resize(size);
+    }
+
+    /// The viewport widget's on-screen rectangle, from the last layout.
+    fn viewport_rect(&self) -> Option<aurora::Rect> {
+        self.rows.viewport.and_then(|id| self.ui.rect(id))
+    }
+
+    /// Whether the cursor is over the viewport itself (and not a panel).
+    fn over_viewport(&self) -> bool {
+        self.ui.hit_test(self.cursor).is_some()
+            && self.ui.hit_test(self.cursor) == self.rows.viewport
+    }
+
+    /// The cursor's world-space position, when the viewport has a layout.
+    fn cursor_world(&self) -> Option<Vec2> {
+        let rect = self.viewport_rect()?;
+        Some(self.camera.screen_to_world(self.cursor - rect.pos))
+    }
+
+    /// Route a pointer move: Aurora always sees it; a live pan or drag applies
+    /// its delta too.
+    fn pointer_moved(&mut self, p: Vec2) {
+        let delta = p - self.cursor;
+        self.cursor = p;
+        self.ui.handle_input(InputEvent::PointerMoved(p));
+
+        if self.panning {
+            self.camera.pan_by_screen(delta);
+        }
+        if let Some(drag) = self.drag
+            && let Some(world) = self.cursor_world()
+        {
+            let (node, _) = drag.target();
+            let new = drag.apply(&self.project.scene, world);
+            self.project.scene.node_mut(node).transform = new;
+            // Rebuild so the inspector's transform rows read out live.
+            self.dirty = true;
+        }
+    }
+
+    /// A left press over the viewport: grab a gizmo handle of the current
+    /// selection, else GPU-pick the sprite under the cursor (select and start
+    /// moving it), else clear the selection.
+    fn viewport_press(&mut self) {
+        if self.ui.hit_test(self.cursor) != self.rows.viewport {
+            return;
+        }
+        let (Some(rect), Some(world)) = (self.viewport_rect(), self.cursor_world()) else {
+            return;
+        };
+        let scene = &self.project.scene;
+
+        // Gizmo handles first: they float outside the sprite, so they must win
+        // over picking (which only sees sprite pixels).
+        if let Some(sel) = self.selected
+            && let Some(g) = viewport::gizmo(scene, sel, self.camera.zoom)
+        {
+            let original = scene.node(sel).transform;
+            match viewport::hit_gizmo(&g, world) {
+                Some(GizmoHit::Rotate) => {
+                    self.drag = Some(Drag::Rotate {
+                        node: sel,
+                        original,
+                        anchor: g.anchor,
+                        grab_angle: (world - g.anchor).to_angle(),
+                    });
+                    return;
+                }
+                Some(GizmoHit::Scale) => {
+                    self.drag = Some(Drag::Scale {
+                        node: sel,
+                        original,
+                        anchor: g.anchor,
+                        grab_dist: world.distance(g.anchor),
+                    });
+                    return;
+                }
+                None => {}
+            }
+        }
+
+        let entries = scene.sprite_entries();
+        let sprites: Vec<photon::Sprite> = entries.iter().map(|&(_, s)| s).collect();
+        let local = self.cursor - rect.pos;
+        let camera = self.camera.camera(rect.size);
+        let picked = self.engine.pick(
+            (self.scene_target.width, self.scene_target.height),
+            &camera,
+            &self.texture,
+            &sprites,
+            (local.x.max(0.0) as u32, local.y.max(0.0) as u32),
+        );
+        match picked {
+            Ok(Some(index)) => {
+                let node = entries[index].0;
+                self.selected = Some(node);
+                self.drag = Some(Drag::Move {
+                    node,
+                    original: self.project.scene.node(node).transform,
+                    grab_world: world,
+                });
+                self.dirty = true;
+            }
+            Ok(None) => {
+                if self.selected.take().is_some() {
+                    self.dirty = true;
+                }
+            }
+            Err(err) => tracing::error!("pick failed: {err}"),
+        }
+    }
+
+    /// Finish a viewport drag: rewind to the press-time transform and commit
+    /// the final one through the history, so the whole drag is ONE undo step.
+    fn end_drag(&mut self) {
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        let (node, original) = drag.target();
+        let dragged = self.project.scene.node(node).transform;
+        if dragged != original {
+            self.project.scene.node_mut(node).transform = original;
+            self.history
+                .set_transform(&mut self.project.scene, node, dragged);
+            self.dirty = true;
+        }
+    }
+
+    /// Zoom about the cursor when it is over the viewport.
+    fn wheel(&mut self, delta: MouseScrollDelta) {
+        if !self.over_viewport() {
+            return;
+        }
+        let Some(rect) = self.viewport_rect() else {
+            return;
+        };
+        let factor = match delta {
+            MouseScrollDelta::LineDelta(_, y) => 1.1f32.powf(y),
+            MouseScrollDelta::PixelDelta(p) => 1.001f32.powf(p.y as f32),
+        };
+        self.camera.zoom_about(self.cursor - rect.pos, factor);
+    }
+
+    /// Undo/redo shortcuts (ctrl+z, ctrl+shift+z, ctrl+y). Consumed only when
+    /// no text field is focused, so typing is never hijacked. Returns whether
+    /// the key was handled.
+    fn handle_shortcut(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if !self.modifiers.control_key() || self.ui.focused().is_some() {
+            return false;
+        }
+        let WinitKey::Character(c) = &event.logical_key else {
+            return false;
+        };
+        let changed = if c.eq_ignore_ascii_case("z") {
+            if self.modifiers.shift_key() {
+                self.history.redo(&mut self.project.scene)
+            } else {
+                self.history.undo(&mut self.project.scene)
+            }
+        } else if c.eq_ignore_ascii_case("y") {
+            self.history.redo(&mut self.project.scene)
+        } else {
+            return false;
+        };
+        if changed {
+            self.dirty = true;
+        }
+        true
     }
 
     fn draw(&mut self) -> Result<()> {
@@ -248,7 +449,7 @@ impl State {
         }
 
         let clear = PhotonColor::new(0.02, 0.02, 0.05, 1.0);
-        let camera = Camera::new(Vec2::ZERO, Vec2::new(w as f32, h as f32));
+        let camera = self.camera.camera(Vec2::new(w as f32, h as f32));
         self.engine.render_to_target(
             &self.scene_target,
             clear,
@@ -256,6 +457,16 @@ impl State {
             &self.texture,
             &self.project.scene.sprites(),
         );
+
+        // The selection's outline and gizmo handles, drawn over the scene in a
+        // second pass (LoadOp::Load) with the tintable white texture.
+        if let Some(sel) = self.selected
+            && let Some(g) = viewport::gizmo(&self.project.scene, sel, self.camera.zoom)
+        {
+            let overlay = viewport::gizmo_sprites(&g, self.camera.zoom);
+            self.engine
+                .overlay_to_target(&self.scene_target, &camera, &self.white, &overlay);
+        }
 
         let list = self.ui.draw_list();
         self.gui.render(
@@ -279,9 +490,55 @@ impl State {
                         self.dirty = true;
                     }
                 }
-                AuroraEvent::Submitted(id) => self.commit_field(id),
+                AuroraEvent::Submitted(id) => {
+                    self.commit_field(id);
+                    self.commit_transform_field(id);
+                }
                 _ => {}
             }
+        }
+    }
+
+    /// Commit a submitted transform row (position/rotation/scale) through the
+    /// undo history. A no-op for other widgets or unparseable text.
+    fn commit_transform_field(&mut self, id: aurora::WidgetId) {
+        let Some(&(_, node, field)) = self
+            .rows
+            .transform_rows
+            .iter()
+            .find(|(widget, ..)| *widget == id)
+        else {
+            return;
+        };
+        let WidgetKind::TextInput(text) = self.ui.kind(id) else {
+            return;
+        };
+        let text = text.clone();
+        let t = self.project.scene.node(node).transform;
+        let new = match field {
+            "position" => parse_value(&text, &Value::Vec2(t.translation)).map(|v| match v {
+                Value::Vec2(p) => Transform {
+                    translation: p,
+                    ..t
+                },
+                _ => t,
+            }),
+            "rotation" => parse_value(&text, &Value::F32(t.rotation)).map(|v| match v {
+                Value::F32(r) => Transform { rotation: r, ..t },
+                _ => t,
+            }),
+            "scale" => parse_value(&text, &Value::Vec2(t.scale)).map(|v| match v {
+                Value::Vec2(s) => Transform { scale: s, ..t },
+                _ => t,
+            }),
+            _ => None,
+        };
+        if let Some(new) = new
+            && new != t
+        {
+            self.history
+                .set_transform(&mut self.project.scene, node, new);
+            self.dirty = true;
         }
     }
 

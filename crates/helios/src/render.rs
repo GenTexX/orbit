@@ -12,17 +12,25 @@ impl Scene {
     /// the root, so children draw over their parents), each placed by its node's
     /// world transform. Hand the result to photon to render.
     pub fn sprites(&self) -> Vec<Sprite> {
+        self.sprite_entries().into_iter().map(|(_, s)| s).collect()
+    }
+
+    /// Like [`sprites`](Self::sprites), but each sprite paired with the node
+    /// that owns it - the mapping GPU picking needs: photon's `pick` returns an
+    /// index into the sprite list, and this same walk (same order) says which
+    /// node that index belongs to.
+    pub fn sprite_entries(&self) -> Vec<(NodeId, Sprite)> {
         let mut out = Vec::new();
         self.collect_sprites(self.root(), &mut out);
         out
     }
 
-    fn collect_sprites(&self, id: NodeId, out: &mut Vec<Sprite>) {
+    fn collect_sprites(&self, id: NodeId, out: &mut Vec<(NodeId, Sprite)>) {
         for component in &self.node(id).components {
             // Exhaustive so a new component kind (e.g. Camera) forces a decision
             // here rather than being silently non-drawable.
             match component {
-                Component::Sprite(sprite) => out.push(self.build_sprite(id, sprite)),
+                Component::Sprite(sprite) => out.push((id, self.build_sprite(id, sprite))),
             }
         }
         for &child in self.children(id) {
