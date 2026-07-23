@@ -6,6 +6,9 @@ use slotmap::SlotMap;
 
 struct RegisteredImage {
     bind_group: wgpu::BindGroup,
+    /// Kept alive for registry-owned textures (e.g. rasterized icons); `None`
+    /// when the caller owns the texture (e.g. the viewport's render target).
+    _texture: Option<wgpu::Texture>,
 }
 
 /// The registered images, each holding a bind group (texture + sampler) built
@@ -65,7 +68,60 @@ impl ImageRegistry {
         view: &wgpu::TextureView,
     ) -> ImageHandle {
         let bind_group = self.build_bind_group(device, layout, view);
-        self.images.insert(RegisteredImage { bind_group })
+        self.images.insert(RegisteredImage {
+            bind_group,
+            _texture: None,
+        })
+    }
+
+    /// Register a registry-owned image from raw RGBA8 bytes (`width * height *
+    /// 4`, row-major) - e.g. a rasterized icon. The texture is created, filled,
+    /// and kept alive here, so the caller need not manage it.
+    pub fn register_rgba(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> ImageHandle {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("registered image"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.build_bind_group(device, layout, &view);
+        self.images.insert(RegisteredImage {
+            bind_group,
+            _texture: Some(texture),
+        })
     }
 
     /// Point an existing handle at a new texture view (e.g. the viewport's

@@ -5,6 +5,7 @@
 //! across panels and inspector edits committed through the undo history.
 
 mod actions;
+mod icons;
 mod project;
 mod textures;
 mod ui;
@@ -28,6 +29,7 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use crate::icons::Icons;
 use crate::textures::TextureCache;
 use crate::ui::{
     Axis, ContextMenu, EditorRows, FieldRef, MenuAction, PanelSizes, build_editor_ui,
@@ -146,6 +148,8 @@ struct State {
     clipboard: Option<arboard::Clipboard>,
     /// An in-progress inspector label drag-scrub, if any.
     scrub: Option<ScrubDrag>,
+    /// The toolbar icons, rasterized and registered once at startup.
+    icons: Icons,
 }
 
 impl ApplicationHandler for App {
@@ -266,6 +270,7 @@ impl State {
         let engine = PhotonRenderer::from_gpu(gpu);
         let white = engine.create_texture(&[255, 255, 255, 255], 1, 1);
         let textures = TextureCache::new(&engine);
+        let icons = Icons::build(&mut gui);
 
         let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo_project");
         let project = project::open_or_create(&project_dir)?;
@@ -289,6 +294,7 @@ impl State {
             panel_sizes,
             None,
             GizmoMode::default(),
+            Some(icons),
         );
 
         Ok(Self {
@@ -324,6 +330,7 @@ impl State {
                 .inspect_err(|err| tracing::warn!("no clipboard available: {err}"))
                 .ok(),
             scrub: None,
+            icons,
         })
     }
 
@@ -959,6 +966,7 @@ impl State {
                 self.panel_sizes,
                 self.context_menu.as_ref(),
                 self.gizmo_mode,
+                Some(self.icons),
             );
             self.ui = ui;
             self.rows = rows;

@@ -323,6 +323,20 @@ impl Renderer {
             .register(&self.gpu.device, &self.texture_layout, view)
     }
 
+    /// Register an image from raw RGBA8 bytes (`width * height * 4`, row-major),
+    /// keeping the texture alive internally - for CPU-generated images like
+    /// rasterized icons. Returns the handle Aurora's draw list references.
+    pub fn register_image_rgba(&mut self, rgba: &[u8], width: u32, height: u32) -> ImageHandle {
+        self.images.register_rgba(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &self.texture_layout,
+            rgba,
+            width,
+            height,
+        )
+    }
+
     /// Point an already-registered image at a new texture view (e.g. the
     /// viewport's render target recreated at a new size). The handle - and
     /// every widget referencing it - stays valid, so no UI rebuild is needed.

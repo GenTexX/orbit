@@ -8,6 +8,7 @@ use aurora::{Color, ImageHandle, Orientation, Style, Ui, WidgetId};
 use glam::Vec2;
 use helios::{NodeId, Scene, Value};
 
+use crate::icons::Icons;
 use crate::viewport::GizmoMode;
 
 const PANEL_BG: Color = Color::rgb(0.13, 0.14, 0.18);
@@ -204,6 +205,9 @@ pub fn capture_panel_sizes(ui: &Ui, rows: &EditorRows, prior: PanelSizes) -> Pan
 /// that a fresh rebuild beats diffing (M2's inspector already proved this
 /// pattern's frame cost is negligible). `sizes` carries the panel sizes across
 /// rebuilds so splitter drags persist.
+// The editor view is described by several small pieces of state; a params
+// struct would not read more clearly than these named arguments.
+#[allow(clippy::too_many_arguments)]
 pub fn build_editor_ui(
     scene: &Scene,
     selected: Option<NodeId>,
@@ -212,13 +216,14 @@ pub fn build_editor_ui(
     sizes: PanelSizes,
     menu: Option<&ContextMenu>,
     gizmo_mode: GizmoMode,
+    icons: Option<Icons>,
 ) -> (Ui, EditorRows) {
     let mut ui = Ui::new();
     let mut rows = EditorRows::default();
 
-    // A toolbar strip across the top, then the three-way dock below it.
+    // The three-way dock fills the window (no full-width strip above it - the
+    // toolbar sits over the viewport, in the center column).
     let root = ui.root_panel(Style::new().fill().column().background(ROOT_BG));
-    build_toolbar(&mut ui, root, gizmo_mode, &mut rows);
     // `main` clips (Overflow::Hidden): this is what lets the scroll panels
     // inside it stay window-sized instead of ballooning the row to their tall
     // content - see aurora's nested-row scroll test.
@@ -228,8 +233,10 @@ pub fn build_editor_ui(
     let splitter_1 = ui.splitter(main, Orientation::Vertical, 1.0, Style::new().width(4.0));
     ui.set_splitter_target(splitter_1, tree_panel);
 
-    // Center: the viewport on top, a resizable file-explorer strip below.
+    // Center: the toolbar directly above the viewport, then a resizable
+    // file-explorer strip below (Godot's viewport-toolbar layout).
     let center = ui.panel(main, Style::new().column().grow(1.0));
+    build_toolbar(&mut ui, center, gizmo_mode, icons, &mut rows);
     let viewport = ui.image(center, viewport_handle, Style::new().grow(1.0));
     let splitter_2 = ui.splitter(
         center,
@@ -291,39 +298,91 @@ fn build_status_bar(ui: &mut Ui, parent: WidgetId, rows: &mut EditorRows) {
     rows.status_fps = Some(readout(ui, "- fps"));
 }
 
-/// The toolbar: the editor's actions on the left, the gizmo-mode switches on
-/// the right (the active mode highlighted). A natural home for more tool
-/// switches later.
-fn build_toolbar(ui: &mut Ui, parent: WidgetId, mode: GizmoMode, rows: &mut EditorRows) {
+/// The toolbar directly above the viewport: the editor's actions on the left,
+/// the gizmo-mode switches on the right (the active mode highlighted). Each
+/// button shows an icon when `icons` is available (falling back to its text
+/// caption, e.g. in headless tests). A natural home for more tool switches.
+fn build_toolbar(
+    ui: &mut Ui,
+    parent: WidgetId,
+    mode: GizmoMode,
+    icons: Option<Icons>,
+    rows: &mut EditorRows,
+) {
     let bar = ui.panel(
         parent,
         Style::new()
             .row()
-            .gap(6.0)
-            .padding(6.0)
+            .gap(4.0)
+            .padding(5.0)
             .align_center()
             .background(PANEL_BG),
     );
-    let button = |ui: &mut Ui, caption: &str| {
-        ui.button(bar, caption, Style::new().padding(6.0).foreground(HEADING))
-    };
-    rows.add_sprite = Some(button(ui, "Add Sprite"));
-    rows.save = Some(button(ui, "Save"));
-    rows.load = Some(button(ui, "Load"));
+    rows.add_sprite = Some(toolbar_button(
+        ui,
+        bar,
+        "Add Sprite",
+        icons.map(|i| i.add),
+        PANEL_BG,
+    ));
+    rows.save = Some(toolbar_button(
+        ui,
+        bar,
+        "Save",
+        icons.map(|i| i.save),
+        PANEL_BG,
+    ));
+    rows.load = Some(toolbar_button(
+        ui,
+        bar,
+        "Load",
+        icons.map(|i| i.load),
+        PANEL_BG,
+    ));
 
     // A spacer pushes the mode switches to the right edge of the bar.
     ui.panel(bar, Style::new().grow(1.0));
     for m in GizmoMode::ALL {
         let background = if m == mode { MODE_ACTIVE } else { PANEL_BG };
-        let button = ui.button(
+        let icon = icons.map(|i| mode_icon(i, m));
+        let button = toolbar_button(ui, bar, m.label(), icon, background);
+        rows.mode_buttons.push((button, m));
+    }
+}
+
+/// A toolbar button: an icon inside a fixed square when an icon is given, else
+/// a text-captioned button (the headless-test / no-icon fallback).
+fn toolbar_button(
+    ui: &mut Ui,
+    bar: WidgetId,
+    caption: &str,
+    icon: Option<ImageHandle>,
+    background: Color,
+) -> WidgetId {
+    match icon {
+        Some(handle) => {
+            let button = ui.button(bar, "", Style::new().padding(5.0).background(background));
+            ui.image(button, handle, Style::new().size(18.0, 18.0));
+            button
+        }
+        None => ui.button(
             bar,
-            m.label(),
+            caption,
             Style::new()
                 .padding(6.0)
                 .background(background)
                 .foreground(HEADING),
-        );
-        rows.mode_buttons.push((button, m));
+        ),
+    }
+}
+
+/// The icon for a gizmo mode.
+fn mode_icon(icons: Icons, mode: GizmoMode) -> ImageHandle {
+    match mode {
+        GizmoMode::Select => icons.select,
+        GizmoMode::Move => icons.translate,
+        GizmoMode::Rotate => icons.rotate,
+        GizmoMode::Scale => icons.scale,
     }
 }
 
@@ -674,6 +733,7 @@ mod tests {
             PanelSizes::default(),
             None,
             GizmoMode::Select,
+            None,
         );
 
         // Three Vec2 fields (position, scale, sprite size) -> two axes each.
@@ -712,8 +772,16 @@ mod tests {
         let dir = std::env::temp_dir(); // no project files needed for this test
 
         let sizes = PanelSizes::default();
-        let (mut ui, rows) =
-            build_editor_ui(&scene, None, handle, &dir, sizes, None, GizmoMode::Select);
+        let (mut ui, rows) = build_editor_ui(
+            &scene,
+            None,
+            handle,
+            &dir,
+            sizes,
+            None,
+            GizmoMode::Select,
+            None,
+        );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
         // Drag the tree panel's splitter 50px right, as a user would.
@@ -742,6 +810,7 @@ mod tests {
             captured,
             None,
             GizmoMode::Select,
+            None,
         );
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
         assert_eq!(
@@ -763,6 +832,7 @@ mod tests {
             PanelSizes::default(),
             None,
             GizmoMode::Rotate,
+            None,
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -804,6 +874,7 @@ mod tests {
             PanelSizes::default(),
             Some(&menu),
             GizmoMode::Select,
+            None,
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -835,8 +906,16 @@ mod tests {
         let dir = std::env::temp_dir();
 
         let sizes = PanelSizes::default();
-        let (mut ui, rows) =
-            build_editor_ui(&scene, None, handle, &dir, sizes, None, GizmoMode::Select);
+        let (mut ui, rows) = build_editor_ui(
+            &scene,
+            None,
+            handle,
+            &dir,
+            sizes,
+            None,
+            GizmoMode::Select,
+            None,
+        );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
         // Wheel-scroll the tree panel down.
@@ -858,6 +937,7 @@ mod tests {
             captured,
             None,
             GizmoMode::Select,
+            None,
         );
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
         assert_eq!(ui2.scroll_offset(rows2.tree_panel.unwrap()), 90.0);
@@ -880,6 +960,7 @@ mod tests {
             PanelSizes::default(),
             None,
             GizmoMode::Select,
+            None,
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
         let viewport = rows.viewport.unwrap();
