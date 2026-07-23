@@ -29,15 +29,44 @@ pub enum WidgetKind {
     /// A registered texture (e.g. the engine's viewport), drawn to fill this
     /// widget's rectangle. Backend-resolved, not interactive (ADR 0018).
     Image(ImageHandle),
+    /// A draggable divider that resizes `target` along `orientation`'s axis -
+    /// the foundation resizable, then fully dockable, panels grow from.
+    /// `target` starts unset (see [`Ui::splitter`](crate::Ui::splitter)'s doc)
+    /// since a splitter is often placed *before* the sibling it resizes, which
+    /// does not exist yet at construction time.
+    Splitter {
+        orientation: Orientation,
+        target: Option<WidgetId>,
+        /// +1.0 if dragging in the positive axis direction (right, or down)
+        /// should grow `target` - true when `target` sits before this
+        /// splitter in layout order (e.g. a left-docked panel with the
+        /// splitter on its right edge). -1.0 for the mirror case (e.g. a
+        /// right-docked panel with the splitter on its left edge).
+        sign: f32,
+    },
+}
+
+/// Which axis a [`WidgetKind::Splitter`] drags along, and so which dimension of
+/// its target it resizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Orientation {
+    /// A vertical bar; dragging it horizontally resizes the target's width.
+    Vertical,
+    /// A horizontal bar; dragging it vertically resizes the target's height.
+    Horizontal,
 }
 
 impl WidgetKind {
     /// Whether this kind responds to pointer input (so hit-testing bubbles a
-    /// click up to it): buttons and checkboxes activate, text inputs take focus.
+    /// click up to it): buttons and checkboxes activate, text inputs take
+    /// focus, splitters drag.
     pub(crate) fn is_interactive(&self) -> bool {
         matches!(
             self,
-            WidgetKind::Button(_) | WidgetKind::Checkbox(_) | WidgetKind::TextInput(_)
+            WidgetKind::Button(_)
+                | WidgetKind::Checkbox(_)
+                | WidgetKind::TextInput(_)
+                | WidgetKind::Splitter { .. }
         )
     }
 }

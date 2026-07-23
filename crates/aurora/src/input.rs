@@ -41,4 +41,6 @@ pub enum Key {
     Home,
     /// Move the caret to the end of the text.
     End,
+    /// Submit the focused field's current text (e.g. commit an edit).
+    Enter,
 }

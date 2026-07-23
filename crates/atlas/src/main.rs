@@ -1,25 +1,31 @@
 //! atlas - the Editor application: Aurora-based UI shell, scene editing, inspector, code editor, embedded Play.
 //!
-//! Milestone 3 step 5: a bare window proving the GPU integration (ADR 0018) -
-//! one shared wgpu device, the engine's scene rendered into a texture, and
-//! Aurora compositing that texture into a viewport widget. No panels, no
-//! interaction yet; that is step 6.
+//! Milestone 3 step 6: the editor looks like an editor - a docked, resizable
+//! scene-tree, viewport, inspector, and file explorer, with selection shared
+//! across panels and inspector edits committed through the undo history.
 
+mod project;
+mod ui;
+
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use aether::Gpu;
 use anyhow::{Context, Result};
-use aurora::{Style, Ui};
+use aurora::{Event as AuroraEvent, ImageHandle, InputEvent, Key, WidgetKind};
 use aurora_wgpu::Renderer as AuroraRenderer;
 use glam::Vec2;
-use helios::{Component, Node, Scene, SpriteComponent, Transform};
+use helios::{History, NodeId, Project};
 use photon::{Camera, Color as PhotonColor, Renderer as PhotonRenderer, SceneTarget, Texture};
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{Key as WinitKey, NamedKey},
     window::{Window, WindowId},
 };
+
+use crate::ui::{EditorRows, build_editor_ui, parse_value};
 
 fn main() -> Result<()> {
     init_logging();
@@ -48,10 +54,19 @@ struct State {
     window: Arc<Window>,
     gui: AuroraRenderer,
     engine: PhotonRenderer,
-    white: Texture,
-    scene: Scene,
+    texture: Texture,
+    project: Project,
+    project_dir: PathBuf,
+    history: History,
+    selected: Option<NodeId>,
     scene_target: SceneTarget,
-    ui: Ui,
+    viewport_handle: ImageHandle,
+    ui: aurora::Ui,
+    rows: EditorRows,
+    /// Set when the scene, selection, or viewport handle changed since the
+    /// `Ui` was last built; rebuilding only then (not every frame) keeps
+    /// in-progress typing and hover state intact across ordinary frames.
+    dirty: bool,
 }
 
 impl ApplicationHandler for App {
@@ -78,6 +93,27 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize((size.width, size.height)),
+            WindowEvent::CursorMoved { position, .. } => {
+                let p = Vec2::new(position.x as f32, position.y as f32);
+                state.ui.handle_input(InputEvent::PointerMoved(p));
+            }
+            WindowEvent::CursorLeft { .. } => state.ui.handle_input(InputEvent::PointerLeft),
+            WindowEvent::MouseInput {
+                state: btn_state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let ev = match btn_state {
+                    ElementState::Pressed => InputEvent::PointerPressed,
+                    ElementState::Released => InputEvent::PointerReleased,
+                };
+                state.ui.handle_input(ev);
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                for ev in translate_key(&event) {
+                    state.ui.handle_input(ev);
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let Err(err) = state.draw() {
                     tracing::error!("render error: {err:#}");
@@ -96,7 +132,7 @@ impl ApplicationHandler for App {
 
 impl State {
     /// Bootstrap the shared GPU context (ADR 0018), the two renderers it feeds,
-    /// a small demo scene, and the viewport widget that shows it.
+    /// the demo project (opened or created), and the editor shell around it.
     fn new(event_loop: &ActiveEventLoop) -> Result<Self> {
         let window = Arc::new(
             event_loop
@@ -106,8 +142,7 @@ impl State {
         let size = window.inner_size();
 
         // One instance, one adapter, one device: photon (the scene) and
-        // aurora-wgpu (the chrome) both render on it (ADR 0018). The adapter is
-        // chosen compatible with the window surface aurora-wgpu will present to.
+        // aurora-wgpu (the chrome) both render on it (ADR 0018).
         let instance = Gpu::default_instance();
         let surface = instance
             .create_surface(window.clone())
@@ -118,50 +153,78 @@ impl State {
         let mut gui = AuroraRenderer::from_gpu(gpu.clone(), surface, (size.width, size.height))
             .context("create GUI renderer")?;
         let engine = PhotonRenderer::from_gpu(gpu);
-        let white = engine.create_texture(&[255, 255, 255, 255], 1, 1);
 
-        let scene = demo_scene();
-        let (scene_target, ui) = build_viewport(&mut gui, &engine, (size.width, size.height));
+        let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo_project");
+        let project = project::open_or_create(&project_dir)?;
+        let sprite_bytes =
+            std::fs::read(project_dir.join("assets/sprite.png")).context("read demo sprite")?;
+        let decoded = image::load_from_memory(&sprite_bytes)
+            .context("decode demo sprite")?
+            .to_rgba8();
+        let (w, h) = decoded.dimensions();
+        let texture = engine.create_texture(&decoded.into_raw(), w, h);
+
+        let (scene_target, viewport_handle) =
+            build_viewport_target(&mut gui, &engine, (size.width, size.height));
+        let (ui, rows) = build_editor_ui(&project.scene, None, viewport_handle, &project_dir);
 
         Ok(Self {
             window,
             gui,
             engine,
-            white,
-            scene,
+            texture,
+            project,
+            project_dir,
+            history: History::new(),
+            selected: None,
             scene_target,
+            viewport_handle,
             ui,
+            rows,
+            dirty: false,
         })
     }
 
     fn resize(&mut self, size: (u32, u32)) {
         self.gui.resize(size);
-        // ImageRegistry has no update-in-place (see aurora-wgpu's image.rs), so
-        // a resized scene target is re-registered under a fresh handle, and the
-        // (currently trivial) widget tree is rebuilt to reference it.
-        let (scene_target, ui) = build_viewport(&mut self.gui, &self.engine, size);
+        // The scene target and its registered handle are sized to the window,
+        // so both are rebuilt; the shell is rebuilt next draw to reference the
+        // fresh handle (ImageRegistry has no update-in-place - see
+        // aurora-wgpu's image.rs).
+        let (scene_target, viewport_handle) =
+            build_viewport_target(&mut self.gui, &self.engine, size);
         self.scene_target = scene_target;
-        self.ui = ui;
+        self.viewport_handle = viewport_handle;
+        self.dirty = true;
     }
 
     fn draw(&mut self) -> Result<()> {
+        self.react();
+        if self.dirty {
+            let (ui, rows) = build_editor_ui(
+                &self.project.scene,
+                self.selected,
+                self.viewport_handle,
+                &self.project_dir,
+            );
+            self.ui = ui;
+            self.rows = rows;
+            self.dirty = false;
+        }
+
         let size = self.window.inner_size();
         let viewport = Vec2::new(size.width.max(1) as f32, size.height.max(1) as f32);
         let clear = PhotonColor::new(0.02, 0.02, 0.05, 1.0);
 
-        // Render the scene into its offscreen target, on the same device the
-        // GUI will composite it from (no readback - ADR 0018).
         let camera = Camera::new(Vec2::ZERO, viewport);
         self.engine.render_to_target(
             &self.scene_target,
             clear,
             &camera,
-            &self.white,
-            &self.scene.sprites(),
+            &self.texture,
+            &self.project.scene.sprites(),
         );
 
-        // Lay out and draw the (trivial, for now) Aurora tree: one widget
-        // sampling the scene texture just rendered.
         self.ui.layout(viewport)?;
         let list = self.ui.draw_list();
         self.gui.render(
@@ -171,36 +234,94 @@ impl State {
         )?;
         Ok(())
     }
+
+    /// Drain this frame's Aurora events: a tree-row click selects its node, a
+    /// submitted field commits its text through the undo history.
+    fn react(&mut self) {
+        for event in self.ui.drain_events() {
+            match event {
+                AuroraEvent::Clicked(id) => {
+                    if let Some(&(_, node)) =
+                        self.rows.tree_rows.iter().find(|(widget, _)| *widget == id)
+                    {
+                        self.selected = Some(node);
+                        self.dirty = true;
+                    }
+                }
+                AuroraEvent::Submitted(id) => self.commit_field(id),
+                _ => {}
+            }
+        }
+    }
+
+    fn commit_field(&mut self, id: aurora::WidgetId) {
+        let Some(&(_, node, component, field)) = self
+            .rows
+            .field_rows
+            .iter()
+            .find(|(widget, ..)| *widget == id)
+        else {
+            return;
+        };
+        let WidgetKind::TextInput(text) = self.ui.kind(id) else {
+            return;
+        };
+        let text = text.clone();
+        let Some(old) = self
+            .project
+            .scene
+            .node(node)
+            .components
+            .get(component)
+            .and_then(|c| c.as_reflect().get(field))
+        else {
+            return;
+        };
+        // A value that fails to parse leaves the field's prior value in place
+        // (parse_value returns None; the text the user typed stays visible
+        // until they fix it or select elsewhere, since we only rebuild the
+        // shell - and so re-render the field from the scene - on success).
+        if let Some(new) = parse_value(&text, &old) {
+            self.history
+                .set_field(&mut self.project.scene, node, component, field, new);
+            self.dirty = true;
+        }
+    }
 }
 
-/// Create the scene render target sized to `size`, register it as an Aurora
-/// image, and build the (currently trivial) widget tree around it.
-fn build_viewport(
+/// Create the scene render target sized to `size` and register it as an
+/// Aurora image, returning the handle the viewport widget will reference.
+fn build_viewport_target(
     gui: &mut AuroraRenderer,
     engine: &PhotonRenderer,
     size: (u32, u32),
-) -> (SceneTarget, Ui) {
+) -> (SceneTarget, ImageHandle) {
     let scene_target = engine.create_scene_target(size.0.max(1), size.1.max(1));
     let handle = gui.register_image(scene_target.view());
-
-    let mut ui = Ui::new();
-    let root = ui.root_panel(Style::new().fill());
-    ui.image(root, handle, Style::new().fill());
-
-    (scene_target, ui)
+    (scene_target, handle)
 }
 
-/// A small scene to prove the pipeline: one red sprite, off-center.
-fn demo_scene() -> Scene {
-    let mut scene = Scene::new("root");
-    let root = scene.root();
-    let mut sprite = Node::new("sprite");
-    sprite.transform = Transform::from_translation(Vec2::new(80.0, 60.0));
-    sprite.components.push(Component::Sprite(SpriteComponent {
-        texture: String::new(),
-        tint: [0.85, 0.30, 0.30, 1.0],
-        size: Vec2::new(120.0, 90.0),
-    }));
-    scene.add_child(root, sprite);
-    scene
+/// Map a winit key press to Aurora input: a named editing key, or the typed
+/// text as a run of character events.
+fn translate_key(event: &winit::event::KeyEvent) -> Vec<InputEvent> {
+    let named = match &event.logical_key {
+        WinitKey::Named(NamedKey::Backspace) => Some(Key::Backspace),
+        WinitKey::Named(NamedKey::Delete) => Some(Key::Delete),
+        WinitKey::Named(NamedKey::ArrowLeft) => Some(Key::Left),
+        WinitKey::Named(NamedKey::ArrowRight) => Some(Key::Right),
+        WinitKey::Named(NamedKey::Home) => Some(Key::Home),
+        WinitKey::Named(NamedKey::End) => Some(Key::End),
+        WinitKey::Named(NamedKey::Enter) => Some(Key::Enter),
+        _ => None,
+    };
+    if let Some(key) = named {
+        return vec![InputEvent::Key(key)];
+    }
+    event
+        .text
+        .iter()
+        .flat_map(|t| t.chars())
+        .filter(|c| !c.is_control())
+        .map(InputEvent::Text)
+        .collect()
 }

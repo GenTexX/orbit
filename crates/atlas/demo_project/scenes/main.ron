@@ -1,0 +1,32 @@
+(
+    root: (
+        name: "Root",
+        transform: (
+            translation: (0.0, 0.0),
+            rotation: 0.0,
+            scale: (1.0, 1.0),
+        ),
+        components: [],
+        children: [
+            (
+                name: "Sprite",
+                transform: (
+                    translation: (60.0, 60.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                components: [
+                    (
+                        kind: "Sprite",
+                        fields: [
+                            ("texture", Asset("assets/sprite.png")),
+                            ("tint", Color((1.0, 1.0, 1.0, 1.0))),
+                            ("size", Vec2((160.0, 160.0))),
+                        ],
+                    ),
+                ],
+                children: [],
+            ),
+        ],
+    ),
+)

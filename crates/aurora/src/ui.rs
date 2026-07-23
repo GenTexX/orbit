@@ -3,6 +3,7 @@
 use cosmic_text::{Buffer, FontSystem, Shaping};
 use glam::Vec2;
 use slotmap::{SecondaryMap, SlotMap};
+use taffy::prelude::length;
 use taffy::{AvailableSpace, Size, TaffyTree};
 
 use crate::color::Color;
@@ -12,7 +13,7 @@ use crate::event::Event;
 use crate::input::{InputEvent, Key};
 use crate::rect::Rect;
 use crate::style::Style;
-use crate::widget::{Widget, WidgetId, WidgetKind};
+use crate::widget::{Orientation, Widget, WidgetId, WidgetKind};
 use crate::{text, theme};
 
 /// The visual state of an interactive widget, derived from the pointer each
@@ -134,6 +135,43 @@ impl Ui {
         self.add(WidgetKind::Image(handle), style, Some(parent))
     }
 
+    /// Add a draggable divider under `parent` that will resize a target widget
+    /// along `orientation`'s axis - the foundation resizable panels are built
+    /// from. The target is wired up afterward via
+    /// [`set_splitter_target`](Self::set_splitter_target): a splitter placed
+    /// before the sibling it resizes (the common case - see `sign`) cannot
+    /// take that sibling's handle yet, since it does not exist until built.
+    /// `sign` is `1.0` if the target will sit before this splitter in layout
+    /// order (dragging right/down grows it) or `-1.0` if it will sit after
+    /// (dragging right/down shrinks it) - see [`WidgetKind::Splitter`].
+    /// `style` sets the bar's own thickness (`width` for a vertical splitter,
+    /// `height` for a horizontal one) and appearance.
+    pub fn splitter(
+        &mut self,
+        parent: WidgetId,
+        orientation: Orientation,
+        sign: f32,
+        style: Style,
+    ) -> WidgetId {
+        self.add(
+            WidgetKind::Splitter {
+                orientation,
+                target: None,
+                sign,
+            },
+            style,
+            Some(parent),
+        )
+    }
+
+    /// Set the widget a splitter resizes when dragged. A no-op if `splitter`
+    /// is not a splitter.
+    pub fn set_splitter_target(&mut self, splitter: WidgetId, target: WidgetId) {
+        if let WidgetKind::Splitter { target: t, .. } = &mut self.widgets[splitter].kind {
+            *t = Some(target);
+        }
+    }
+
     /// The kind (and per-widget data) of a widget.
     pub fn kind(&self, id: WidgetId) -> &WidgetKind {
         &self.widgets[id].kind
@@ -188,6 +226,29 @@ impl Ui {
     /// blinking caret drive this from a timer; the default is steady-on.
     pub fn set_caret_on(&mut self, on: bool) {
         self.caret_on = on;
+    }
+
+    /// Fix a widget's width in pixels at runtime (e.g. a splitter resizing its
+    /// target), pinning the minimum too - the same contract as
+    /// [`Style::width`](crate::Style::width). Reads the node's current taffy
+    /// style back, mutates just the width, and writes it - other layout
+    /// properties (padding, flex, height) are preserved.
+    pub fn set_width(&mut self, id: WidgetId, width: f32) {
+        let node = self.widgets[id].taffy;
+        let mut style = self.taffy.style(node).expect("taffy style").clone();
+        style.size.width = length(width);
+        style.min_size.width = length(width);
+        self.taffy.set_style(node, style).expect("taffy set_style");
+    }
+
+    /// Fix a widget's height in pixels at runtime; see
+    /// [`set_width`](Self::set_width).
+    pub fn set_height(&mut self, id: WidgetId, height: f32) {
+        let node = self.widgets[id].taffy;
+        let mut style = self.taffy.style(node).expect("taffy style").clone();
+        style.size.height = length(height);
+        style.min_size.height = length(height);
+        self.taffy.set_style(node, style).expect("taffy set_style");
     }
 
     /// Mark a text widget's layout node dirty after its text changed. taffy
@@ -287,7 +348,9 @@ impl Ui {
     pub fn handle_input(&mut self, event: InputEvent) {
         match event {
             InputEvent::PointerMoved(p) => {
+                let delta = self.cursor.map(|c| p - c).unwrap_or(Vec2::ZERO);
                 self.cursor = Some(p);
+                self.drag_splitter(delta);
                 self.update_hover();
             }
             InputEvent::PointerLeft => {
@@ -326,6 +389,38 @@ impl Ui {
         }
     }
 
+    /// If a splitter is currently pressed, resize its target by `delta` along
+    /// the splitter's axis (direction per `sign`), floored at a minimum size.
+    fn drag_splitter(&mut self, delta: Vec2) {
+        let Some(id) = self.pressed else {
+            return;
+        };
+        let WidgetKind::Splitter {
+            orientation,
+            target,
+            sign,
+        } = self.widgets[id].kind
+        else {
+            return;
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let Some(rect) = self.rect(target) else {
+            return;
+        };
+        match orientation {
+            Orientation::Vertical => {
+                let width = (rect.size.x + delta.x * sign).max(theme::SPLITTER_MIN_TARGET);
+                self.set_width(target, width);
+            }
+            Orientation::Horizontal => {
+                let height = (rect.size.y + delta.y * sign).max(theme::SPLITTER_MIN_TARGET);
+                self.set_height(target, height);
+            }
+        }
+    }
+
     /// The focused text input, if any.
     pub fn focused(&self) -> Option<WidgetId> {
         self.focused
@@ -357,6 +452,11 @@ impl Ui {
         let Some(id) = self.focused else {
             return;
         };
+        // Enter commits rather than edits, and needs no text borrow.
+        if key == Key::Enter {
+            self.events.push(Event::Submitted(id));
+            return;
+        }
         let WidgetKind::TextInput(s) = &mut self.widgets[id].kind else {
             return;
         };
@@ -382,6 +482,7 @@ impl Ui {
             }
             // Backspace at the start / Delete at the end: nothing to remove.
             Key::Backspace | Key::Delete => self.caret = caret,
+            Key::Enter => unreachable!("handled above"),
         }
         if edited {
             self.invalidate_text(id);
@@ -559,6 +660,7 @@ impl Ui {
                 rect,
                 handle: *handle,
             }),
+            WidgetKind::Splitter { .. } => self.emit_splitter(id, rect, widget, list),
         }
 
         // Children, optionally clipped to this widget's rectangle.
@@ -616,6 +718,22 @@ impl Ui {
                 color: theme::CHECKBOX_MARK,
             });
         }
+    }
+
+    /// A splitter: a state-shaded bar (its style background, or the theme
+    /// default), so it reads as grabbable without needing a resize cursor.
+    fn emit_splitter(&self, id: WidgetId, rect: Rect, widget: &Widget, list: &mut DrawList) {
+        let base = if widget.background.a > 0.0 {
+            widget.background
+        } else {
+            theme::SPLITTER
+        };
+        let color = match self.interaction(id) {
+            Interaction::Idle => base,
+            Interaction::Hovered => base.lighten(0.10),
+            Interaction::Pressed => base.lighten(0.20),
+        };
+        list.commands.push(DrawCommand::FillRect { rect, color });
     }
 
     /// A text input: a field fill (with an accent frame when focused), its text
@@ -730,9 +848,11 @@ fn measure_widget(
                 height: theme::CHECKBOX_SIZE,
             };
         }
-        // Panels and images have no intrinsic content size; they take their
-        // size from style (fixed size, grow, or fill), like a Panel.
-        WidgetKind::Panel | WidgetKind::Image(_) => return Size::ZERO,
+        // Panels, images, and splitters have no intrinsic content size; they
+        // take their size from style (fixed size, grow, or fill).
+        WidgetKind::Panel | WidgetKind::Image(_) | WidgetKind::Splitter { .. } => {
+            return Size::ZERO;
+        }
     };
 
     // Wrap to a known width if taffy gives one, else the available width.
@@ -773,7 +893,7 @@ mod tests {
     use crate::input::{InputEvent, Key};
     use crate::rect::Rect;
     use crate::style::Style;
-    use crate::widget::WidgetKind;
+    use crate::widget::{Orientation, WidgetKind};
     use glam::Vec2;
 
     /// Move the pointer to `p`, then press and release: a click at `p`.
@@ -1124,5 +1244,69 @@ mod tests {
                 handle,
             }]
         );
+    }
+
+    #[test]
+    fn dragging_a_splitter_resizes_its_target_and_clamps_at_the_minimum() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().row().size(300.0, 100.0));
+        let left = ui.panel(root, Style::new().width(100.0));
+        // sign = 1.0: left sits BEFORE this splitter, so dragging right grows it.
+        let splitter = ui.splitter(root, Orientation::Vertical, 1.0, Style::new().width(6.0));
+        ui.set_splitter_target(splitter, left);
+        ui.layout(Vec2::new(300.0, 100.0)).unwrap();
+        assert_eq!(ui.rect(left).unwrap().size.x, 100.0);
+        let bar = ui.rect(splitter).unwrap(); // sits right after `left`, at x=100
+
+        // Press on the bar and drag it 30px right: left should grow to 130.
+        ui.handle_input(InputEvent::PointerMoved(bar.pos + Vec2::new(2.0, 2.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerMoved(bar.pos + Vec2::new(32.0, 2.0)));
+        ui.handle_input(InputEvent::PointerReleased);
+        ui.layout(Vec2::new(300.0, 100.0)).unwrap();
+        assert_eq!(ui.rect(left).unwrap().size.x, 130.0);
+
+        // Dragging far left clamps at the theme minimum rather than going
+        // negative or to zero.
+        ui.handle_input(InputEvent::PointerMoved(ui.rect(splitter).unwrap().pos));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(-500.0, 2.0)));
+        ui.handle_input(InputEvent::PointerReleased);
+        ui.layout(Vec2::new(300.0, 100.0)).unwrap();
+        assert_eq!(
+            ui.rect(left).unwrap().size.x,
+            crate::theme::SPLITTER_MIN_TARGET
+        );
+    }
+
+    #[test]
+    fn a_negative_sign_splitter_shrinks_its_target_when_dragged_toward_it() {
+        // Mirrors a right-docked panel: the splitter sits BEFORE the panel it
+        // resizes, so dragging right (toward the panel) shrinks it.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().row().size(300.0, 100.0));
+        let splitter = ui.splitter(root, Orientation::Vertical, -1.0, Style::new().width(6.0));
+        let right = ui.panel(root, Style::new().width(150.0));
+        ui.set_splitter_target(splitter, right);
+        ui.layout(Vec2::new(300.0, 100.0)).unwrap();
+        let bar = ui.rect(splitter).unwrap();
+
+        ui.handle_input(InputEvent::PointerMoved(bar.pos + Vec2::new(2.0, 2.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerMoved(bar.pos + Vec2::new(22.0, 2.0)));
+        ui.handle_input(InputEvent::PointerReleased);
+        ui.layout(Vec2::new(300.0, 100.0)).unwrap();
+        assert_eq!(ui.rect(right).unwrap().size.x, 130.0);
+    }
+
+    #[test]
+    fn enter_submits_without_changing_the_fields_text() {
+        let (mut ui, field) = ui_with_field("hello");
+        click_at(&mut ui, Vec2::new(20.0, 12.0)); // focus the field
+        assert_eq!(ui.focused(), Some(field));
+
+        ui.handle_input(InputEvent::Key(Key::Enter));
+        assert_eq!(ui.drain_events(), vec![Event::Submitted(field)]);
+        assert_eq!(text_of(&ui, field), "hello"); // unchanged - Enter commits, not edits
     }
 }

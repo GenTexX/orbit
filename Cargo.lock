@@ -160,6 +160,7 @@ dependencies = [
  "aurora-wgpu",
  "glam",
  "helios",
+ "image",
  "photon",
  "pollster",
  "tracing",

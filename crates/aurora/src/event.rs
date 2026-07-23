@@ -12,4 +12,8 @@ pub enum Event {
     /// A checkbox toggled to a new state. The widget already holds `checked`;
     /// it is repeated here so the app can react without querying.
     Toggled { id: WidgetId, checked: bool },
+    /// The focused text input's edit was submitted (`Key::Enter`). Read the
+    /// current text via `Ui::kind(id)`; the field itself is unchanged, so a
+    /// rejected submission just leaves the user's typing in place.
+    Submitted(WidgetId),
 }
