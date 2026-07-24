@@ -96,4 +96,6 @@ pub(crate) struct Widget {
     pub numeric: bool,
     /// Whether this button renders flat (no raised fill; hover/press only).
     pub flat: bool,
+    /// Whether hit-testing ignores this widget (decorative overlays).
+    pub hit_transparent: bool,
 }

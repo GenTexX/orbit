@@ -480,6 +480,7 @@ impl Ui {
             scroll: style.scroll,
             numeric: false,
             flat: style.flat,
+            hit_transparent: style.hit_transparent,
         });
         self.taffy
             .set_node_context(node, Some(id))
@@ -1037,6 +1038,11 @@ impl Ui {
         }
         if hit.is_some() {
             return hit;
+        }
+        // A hit-transparent widget (a decorative overlay) never claims the hit
+        // itself - the cursor passes through to whatever is behind it.
+        if self.widgets[id].hit_transparent {
+            return None;
         }
         // Otherwise the widget itself, if the point is within it and its clip.
         let visible = clip.is_none_or(|c| c.contains(point));
@@ -2062,6 +2068,21 @@ mod tests {
         ui.handle_input(InputEvent::PointerReleased);
         ui.layout(Vec2::new(300.0, 100.0)).unwrap();
         assert_eq!(ui.rect(right).unwrap().size.x, 130.0);
+    }
+
+    #[test]
+    fn a_hit_transparent_popup_lets_the_cursor_through() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().fill());
+        let under = ui.button(root, "under", Style::new().fill());
+        // A hit-transparent overlay covering the button (e.g. an insertion line).
+        ui.popup(
+            Vec2::new(0.0, 0.0),
+            Style::new().size(400.0, 300.0).hit_transparent(),
+        );
+        ui.layout(Vec2::new(400.0, 300.0)).unwrap();
+        // The cursor passes through the overlay to the button beneath it.
+        assert_eq!(ui.hit_test(Vec2::new(200.0, 150.0)), Some(under));
     }
 
     #[test]

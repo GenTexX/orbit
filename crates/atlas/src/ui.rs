@@ -714,11 +714,14 @@ pub fn add_reparent_line(ui: &mut Ui, rows: &EditorRows, spot: DropSpot) {
         return;
     };
     let y = if after { rect.max().y } else { rect.pos.y };
+    // Hit-transparent so the cursor passes through the line to the row beneath
+    // it - otherwise the 2px line steals the hover and the drop spot flickers.
     ui.popup(
         Vec2::new(rect.pos.x, y - 1.0),
         Style::new()
             .size(rect.size.x.max(1.0), 2.0)
-            .background(ROW_DROP),
+            .background(ROW_DROP)
+            .hit_transparent(),
     );
 }
 

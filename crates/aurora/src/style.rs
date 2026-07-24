@@ -27,6 +27,9 @@ pub struct Style {
     /// highlight on hover/press (plus its own background if set). For list and
     /// tree rows that should not read as raised buttons.
     pub flat: bool,
+    /// Ignore this widget in hit-testing (the cursor passes through to whatever
+    /// is behind it). For decorative overlays like a drag insertion line.
+    pub hit_transparent: bool,
 }
 
 impl Default for Style {
@@ -38,6 +41,7 @@ impl Default for Style {
             clip: false,
             scroll: false,
             flat: false,
+            hit_transparent: false,
         }
     }
 }
@@ -149,6 +153,13 @@ impl Style {
     /// highlight over its background) - for list and tree rows.
     pub fn flat(mut self) -> Self {
         self.flat = true;
+        self
+    }
+
+    /// Make this widget invisible to hit-testing (the cursor passes through) -
+    /// for decorative overlays like a drag insertion line.
+    pub fn hit_transparent(mut self) -> Self {
+        self.hit_transparent = true;
         self
     }
 
