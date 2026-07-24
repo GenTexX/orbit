@@ -1,6 +1,6 @@
 //! aurora ui: the widget arena, the taffy layout tree (with text measurement), and draw-list generation.
 
-use cosmic_text::{Buffer, FontSystem, Shaping};
+use cosmic_text::{Buffer, Cursor, FontSystem, Shaping};
 use glam::Vec2;
 use slotmap::{SecondaryMap, SlotMap};
 use taffy::prelude::length;
@@ -163,6 +163,22 @@ impl Ui {
         style: Style,
     ) -> WidgetId {
         self.add(WidgetKind::TextInput(text.into()), style, Some(parent))
+    }
+
+    /// Add a multi-line text input (a text area): Enter inserts a newline and
+    /// Up/Down move the caret between lines. A convenience for `text_input` with
+    /// `Style::multiline()`.
+    pub fn text_area(
+        &mut self,
+        parent: WidgetId,
+        text: impl Into<String>,
+        style: Style,
+    ) -> WidgetId {
+        self.add(
+            WidgetKind::TextInput(text.into()),
+            style.multiline(),
+            Some(parent),
+        )
     }
 
     /// Add a text input that accepts only numeric text (a leading `-`, digits,
@@ -507,6 +523,7 @@ impl Ui {
             mask: style.mask,
             placeholder: style.placeholder.unwrap_or_default(),
             font_size: style.font_size.unwrap_or(text::FONT_SIZE),
+            multiline: style.multiline,
             draggable: style.draggable,
             drop_target: style.drop_target,
             flat: style.flat,
@@ -879,9 +896,14 @@ impl Ui {
         let Some(id) = self.focused else {
             return;
         };
-        // Enter commits rather than edits, and needs no text borrow.
+        let multiline = self.widgets[id].multiline;
+        // Enter inserts a newline in a text area, otherwise it commits the edit.
         if key == Key::Enter {
-            self.events.push(Event::Submitted(id));
+            if multiline {
+                self.insert_newline();
+            } else {
+                self.events.push(Event::Submitted(id));
+            }
             return;
         }
         // Tab steps focus to the next (or previous, with shift) input.
@@ -893,20 +915,45 @@ impl Ui {
         if matches!(key, Key::Backspace | Key::Delete) && self.delete_selection() {
             return;
         }
-        let shift = self.shift;
-        let WidgetKind::TextInput(s) = &mut self.widgets[id].kind else {
-            return;
-        };
-        let caret = self.caret.min(s.len());
-        // A shift+movement extends a selection: anchor the fixed end here if
-        // none yet. A plain movement collapses any selection.
-        if matches!(key, Key::Left | Key::Right | Key::Home | Key::End) {
-            if shift {
+        // A shift+movement extends a selection (anchoring the fixed end here if
+        // none yet); a plain movement collapses it.
+        if matches!(
+            key,
+            Key::Left | Key::Right | Key::Up | Key::Down | Key::Home | Key::End
+        ) {
+            let caret = self.caret.min(self.text_len(id));
+            if self.shift {
                 self.selection_anchor.get_or_insert(caret);
             } else {
                 self.selection_anchor = None;
             }
         }
+        // Vertical and line-scoped moves are 2D (text areas only); Up/Down are a
+        // no-op on a single-line field.
+        match key {
+            Key::Up if multiline => {
+                self.caret = self.caret_vertical(id, -1);
+                return;
+            }
+            Key::Down if multiline => {
+                self.caret = self.caret_vertical(id, 1);
+                return;
+            }
+            Key::Up | Key::Down => return,
+            Key::Home if multiline => {
+                self.caret = self.line_start(id, self.caret);
+                return;
+            }
+            Key::End if multiline => {
+                self.caret = self.line_end(id, self.caret);
+                return;
+            }
+            _ => {}
+        }
+        let WidgetKind::TextInput(s) = &mut self.widgets[id].kind else {
+            return;
+        };
+        let caret = self.caret.min(s.len());
         let mut edited = false;
         match key {
             Key::Left => self.caret = prev_boundary(s, caret),
@@ -927,26 +974,96 @@ impl Ui {
             }
             // Backspace at the start / Delete at the end: nothing to remove.
             Key::Backspace | Key::Delete => self.caret = caret,
-            Key::Enter | Key::Tab => unreachable!("handled above"),
+            // Up/Down/Home/End multiline paths returned above; single-line
+            // Up/Down returned; the rest are unreachable here.
+            Key::Up | Key::Down | Key::Enter | Key::Tab => unreachable!("handled above"),
         }
         if edited {
             self.invalidate_text(id);
         }
     }
 
+    /// Insert a newline at the caret of the focused text area (replacing any
+    /// selection). Bypasses the control-character filter that `insert_str` and
+    /// `insert_char` apply, which is what keeps a single-line field single-line.
+    fn insert_newline(&mut self) {
+        let Some(id) = self.focused else {
+            return;
+        };
+        let (lo, hi) = self.selection_bounds(id);
+        if let WidgetKind::TextInput(s) = &mut self.widgets[id].kind {
+            s.replace_range(lo..hi, "\n");
+        } else {
+            return;
+        }
+        self.caret = lo + 1;
+        self.selection_anchor = None;
+        self.invalidate_text(id);
+    }
+
+    /// Move the caret one visual line up (`dir < 0`) or down: find its current
+    /// pixel position, then hit-test the same x on the adjacent line's middle.
+    fn caret_vertical(&self, id: WidgetId, dir: i32) -> usize {
+        let WidgetKind::TextInput(s) = &self.widgets[id].kind else {
+            return self.caret;
+        };
+        let Some(buffer) = self.buffers.get(id) else {
+            return self.caret;
+        };
+        let caret = self.caret.min(s.len());
+        let cursor = byte_to_cursor(s, caret);
+        let Some((x, top)) = buffer.cursor_position(&cursor) else {
+            return caret;
+        };
+        let line_h = text::metrics_for(self.widgets[id].font_size).line_height;
+        let target_y = top + dir as f32 * line_h + line_h * 0.5;
+        buffer
+            .hit(x, target_y.max(0.0))
+            .map_or(caret, |c| cursor_to_byte(s, c))
+    }
+
+    /// The byte offset of the start of the text line (by hard newline)
+    /// containing `byte`.
+    fn line_start(&self, id: WidgetId, byte: usize) -> usize {
+        let WidgetKind::TextInput(s) = &self.widgets[id].kind else {
+            return byte;
+        };
+        let b = byte.min(s.len());
+        s[..b].rfind('\n').map_or(0, |i| i + 1)
+    }
+
+    /// The byte offset of the end of the text line (by hard newline) containing
+    /// `byte` - just before the next newline, or the end of the text.
+    fn line_end(&self, id: WidgetId, byte: usize) -> usize {
+        let WidgetKind::TextInput(s) = &self.widgets[id].kind else {
+            return byte;
+        };
+        let b = byte.min(s.len());
+        b + s[b..].find('\n').unwrap_or(s.len() - b)
+    }
+
     /// The caret byte offset nearest to a cursor position (for click-to-place).
-    /// Falls back to the end of the text when off-field or not yet shaped.
+    /// Falls back to the end of the text when off-field or not yet shaped. A
+    /// text area hit-tests in 2D (line and column); a single-line field uses x.
     fn caret_at_x(&self, id: WidgetId, cursor: Option<Vec2>) -> usize {
         let text_len = self.text_len(id);
         let (Some(cursor), Some(buffer)) = (cursor, self.buffers.get(id)) else {
             return text_len;
         };
         let origin = self.content_origin.get(id).copied().unwrap_or(Vec2::ZERO);
-        let local_x = cursor.x - origin.x;
+        let local = cursor - origin;
+        if self.widgets[id].multiline {
+            if let WidgetKind::TextInput(s) = &self.widgets[id].kind
+                && let Some(c) = buffer.hit(local.x.max(0.0), local.y.max(0.0))
+            {
+                return cursor_to_byte(s, c);
+            }
+            return text_len;
+        }
         for run in buffer.layout_runs() {
             for g in run.glyphs {
                 // Snap to whichever side of the glyph's midpoint the click is on.
-                if local_x < g.x + g.w * 0.5 {
+                if local.x < g.x + g.w * 0.5 {
                     return g.start;
                 }
             }
@@ -1524,31 +1641,86 @@ impl Ui {
             let (lo, hi) = self.selection_bounds(id);
             if lo != hi {
                 let origin = self.content_origin.get(id).copied().unwrap_or(rect.pos);
-                let x0 = origin.x + self.x_offset_at(id, lo);
-                let x1 = origin.x + self.x_offset_at(id, hi);
-                list.commands.push(DrawCommand::FillRect {
-                    rect: Rect::new(
-                        Vec2::new(x0, rect.pos.y + 3.0),
-                        Vec2::new((x1 - x0).max(0.0), (rect.size.y - 6.0).max(0.0)),
-                    ),
-                    color: theme::SELECTION,
-                });
+                if widget.multiline {
+                    self.emit_multiline_selection(id, lo, hi, origin, list);
+                } else {
+                    let x0 = origin.x + self.x_offset_at(id, lo);
+                    let x1 = origin.x + self.x_offset_at(id, hi);
+                    list.commands.push(DrawCommand::FillRect {
+                        rect: Rect::new(
+                            Vec2::new(x0, rect.pos.y + 3.0),
+                            Vec2::new((x1 - x0).max(0.0), (rect.size.y - 6.0).max(0.0)),
+                        ),
+                        color: theme::SELECTION,
+                    });
+                }
             }
         }
         self.emit_text(id, widget.foreground, list);
         if focused && self.caret_on {
             let origin = self.content_origin.get(id).copied().unwrap_or(rect.pos);
-            let x = origin.x + self.caret_x_offset(id);
-            let caret = Rect::new(
-                Vec2::new(x, rect.pos.y + 3.0),
-                Vec2::new(1.5, (rect.size.y - 6.0).max(0.0)),
-            );
-            list.commands.push(DrawCommand::FillRect {
-                rect: caret,
-                color: theme::CARET,
-            });
+            let caret = if widget.multiline {
+                self.multiline_caret(id).map(|(cx, top)| {
+                    let line_h = text::metrics_for(widget.font_size).line_height;
+                    Rect::new(origin + Vec2::new(cx, top), Vec2::new(1.5, line_h))
+                })
+            } else {
+                let x = origin.x + self.caret_x_offset(id);
+                Some(Rect::new(
+                    Vec2::new(x, rect.pos.y + 3.0),
+                    Vec2::new(1.5, (rect.size.y - 6.0).max(0.0)),
+                ))
+            };
+            if let Some(caret) = caret {
+                list.commands.push(DrawCommand::FillRect {
+                    rect: caret,
+                    color: theme::CARET,
+                });
+            }
         }
         list.commands.push(DrawCommand::PopClip);
+    }
+
+    /// Emit the selection highlight for a text area: one rectangle per visual
+    /// line, using cosmic-text's per-run highlight spans (which handle wrapping
+    /// and line breaks). `origin` is the field's content-box top-left.
+    fn emit_multiline_selection(
+        &self,
+        id: WidgetId,
+        lo: usize,
+        hi: usize,
+        origin: Vec2,
+        list: &mut DrawList,
+    ) {
+        let WidgetKind::TextInput(s) = &self.widgets[id].kind else {
+            return;
+        };
+        let Some(buffer) = self.buffers.get(id) else {
+            return;
+        };
+        let (start, end) = (byte_to_cursor(s, lo), byte_to_cursor(s, hi));
+        for run in buffer.layout_runs() {
+            for (x, w) in run.highlight(start, end) {
+                list.commands.push(DrawCommand::FillRect {
+                    rect: Rect::new(
+                        origin + Vec2::new(x, run.line_top),
+                        Vec2::new(w.max(0.0), run.line_height),
+                    ),
+                    color: theme::SELECTION,
+                });
+            }
+        }
+    }
+
+    /// The text-area caret's (x, top) offset within the content box, from the
+    /// shaped buffer - `None` if the field is not shaped yet.
+    fn multiline_caret(&self, id: WidgetId) -> Option<(f32, f32)> {
+        let WidgetKind::TextInput(s) = &self.widgets[id].kind else {
+            return None;
+        };
+        let buffer = self.buffers.get(id)?;
+        let cursor = byte_to_cursor(s, self.caret.min(s.len()));
+        buffer.cursor_position(&cursor)
     }
 
     /// Emit a text command for a text-bearing widget from its shaped buffer,
@@ -1604,6 +1776,29 @@ fn inflate_splitter(rect: Rect, orientation: Orientation) -> Rect {
             rect.size + Vec2::new(0.0, extra * 2.0),
         ),
     }
+}
+
+/// A whole-string byte offset as a cosmic-text [`Cursor`] (buffer line index +
+/// byte within that line). Text areas store the caret as a flat byte offset;
+/// cosmic-text positions and hit-tests in (line, index) - these two convert.
+fn byte_to_cursor(text: &str, byte: usize) -> Cursor {
+    let byte = byte.min(text.len());
+    let line = text[..byte].bytes().filter(|&b| b == b'\n').count();
+    let line_start = text[..byte].rfind('\n').map_or(0, |i| i + 1);
+    Cursor::new(line, byte - line_start)
+}
+
+/// A cosmic-text [`Cursor`] back to a whole-string byte offset (the inverse of
+/// [`byte_to_cursor`]).
+fn cursor_to_byte(text: &str, cursor: Cursor) -> usize {
+    let mut start = 0;
+    for _ in 0..cursor.line {
+        match text[start..].find('\n') {
+            Some(i) => start += i + 1,
+            None => return text.len(),
+        }
+    }
+    (start + cursor.index).min(text.len())
 }
 
 /// The byte offset of the character boundary just before `i` (or 0). Keeps the
@@ -1786,6 +1981,97 @@ mod tests {
 
         assert_eq!(ui.rect(child).unwrap().pos, Vec2::new(10.0, 10.0));
         assert_eq!(ui.rect(grandchild).unwrap().pos, Vec2::new(18.0, 18.0));
+    }
+
+    #[test]
+    fn byte_and_cursor_round_trip_across_lines() {
+        let text = "ab\ncde\n\nfg";
+        for byte in 0..=text.len() {
+            if !text.is_char_boundary(byte) {
+                continue;
+            }
+            let cur = super::byte_to_cursor(text, byte);
+            assert_eq!(super::cursor_to_byte(text, cur), byte, "byte {byte}");
+        }
+        // Spot-check the mapping itself: the 'd' at index 4 is line 1, column 1.
+        assert_eq!(
+            super::byte_to_cursor(text, 4),
+            cosmic_text::Cursor::new(1, 1)
+        );
+    }
+
+    #[test]
+    fn a_text_area_inserts_newlines_on_enter() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(300.0, 200.0));
+        let area = ui.text_area(root, "", Style::new().size(280.0, 120.0));
+        ui.layout(Vec2::new(300.0, 200.0)).unwrap();
+        click_at(&mut ui, Vec2::new(20.0, 20.0));
+
+        for ch in "ab".chars() {
+            ui.handle_input(InputEvent::Text(ch));
+        }
+        ui.handle_input(InputEvent::Key(Key::Enter));
+        for ch in "cd".chars() {
+            ui.handle_input(InputEvent::Text(ch));
+        }
+        assert_eq!(text_of(&ui, area), "ab\ncd");
+        // Enter inserted a newline; it did not submit.
+        assert!(
+            !ui.drain_events()
+                .iter()
+                .any(|e| matches!(e, Event::Submitted(_)))
+        );
+    }
+
+    #[test]
+    fn text_area_up_then_home_lands_on_the_line_above() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(300.0, 200.0));
+        let area = ui.text_area(root, "", Style::new().size(280.0, 120.0));
+        ui.layout(Vec2::new(300.0, 200.0)).unwrap();
+        click_at(&mut ui, Vec2::new(20.0, 20.0));
+
+        // Build "aa\nbb" with the caret at the end (line 2).
+        for ch in "aa".chars() {
+            ui.handle_input(InputEvent::Text(ch));
+        }
+        ui.handle_input(InputEvent::Key(Key::Enter));
+        for ch in "bb".chars() {
+            ui.handle_input(InputEvent::Text(ch));
+        }
+        // Re-shape after editing (the app lays out every frame; Up/Home read the
+        // shaped buffer to position the caret in 2D).
+        ui.layout(Vec2::new(300.0, 200.0)).unwrap();
+        // Up moves onto line 1; multiline Home snaps to its start; typing there
+        // proves the caret really crossed the line break.
+        ui.handle_input(InputEvent::Key(Key::Up));
+        ui.handle_input(InputEvent::Key(Key::Home));
+        ui.handle_input(InputEvent::Text('X'));
+        assert_eq!(text_of(&ui, area), "Xaa\nbb");
+    }
+
+    #[test]
+    fn a_text_area_selection_highlights_each_line() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(300.0, 200.0));
+        let _area = ui.text_area(root, "ab\ncd", Style::new().size(280.0, 120.0));
+        ui.layout(Vec2::new(300.0, 200.0)).unwrap();
+        click_at(&mut ui, Vec2::new(20.0, 20.0));
+        ui.select_all();
+        ui.layout(Vec2::new(300.0, 200.0)).unwrap();
+
+        // Two selected lines -> at least two selection-colored highlight rects.
+        let highlights = ui
+            .draw_list()
+            .commands
+            .iter()
+            .filter(|c| matches!(c, DrawCommand::FillRect { color, .. } if *color == crate::theme::SELECTION))
+            .count();
+        assert!(
+            highlights >= 2,
+            "expected a highlight per line, got {highlights}"
+        );
     }
 
     #[test]

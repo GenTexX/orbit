@@ -147,6 +147,10 @@ pub(crate) struct Widget {
     /// Font size in pixels for this widget's text (the UI default when unset via
     /// style). Drives both shaping and measurement.
     pub font_size: f32,
+    /// Whether this text input is multi-line (a text area): Enter inserts a
+    /// newline instead of submitting, and the caret moves by line. Other kinds
+    /// ignore it.
+    pub multiline: bool,
     /// Whether this widget is a drag source (see [`crate::Style::draggable`]).
     pub draggable: bool,
     /// Whether this widget accepts drops (see [`crate::Style::drop_target`]).

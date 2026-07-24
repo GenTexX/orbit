@@ -41,6 +41,10 @@ pub enum Key {
     Left,
     /// Move the caret one character right.
     Right,
+    /// Move the caret up one visual line (multiline fields).
+    Up,
+    /// Move the caret down one visual line (multiline fields).
+    Down,
     /// Move the caret to the start of the text.
     Home,
     /// Move the caret to the end of the text.

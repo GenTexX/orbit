@@ -1630,6 +1630,8 @@ fn translate_key(event: &winit::event::KeyEvent) -> Vec<InputEvent> {
         WinitKey::Named(NamedKey::Delete) => Some(Key::Delete),
         WinitKey::Named(NamedKey::ArrowLeft) => Some(Key::Left),
         WinitKey::Named(NamedKey::ArrowRight) => Some(Key::Right),
+        WinitKey::Named(NamedKey::ArrowUp) => Some(Key::Up),
+        WinitKey::Named(NamedKey::ArrowDown) => Some(Key::Down),
         WinitKey::Named(NamedKey::Home) => Some(Key::Home),
         WinitKey::Named(NamedKey::End) => Some(Key::End),
         WinitKey::Named(NamedKey::Enter) => Some(Key::Enter),

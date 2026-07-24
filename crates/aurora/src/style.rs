@@ -41,6 +41,8 @@ pub struct Style {
     pub mask: Mask,
     /// Font size in pixels for this widget's text, or `None` for the UI default.
     pub font_size: Option<f32>,
+    /// Whether a text input is multi-line (a text area). Ignored by other kinds.
+    pub multiline: bool,
     /// Whether this widget is a drag source: pressing and moving past a small
     /// threshold starts a drag carrying this widget (see `Event::DragStarted`).
     pub draggable: bool,
@@ -63,6 +65,7 @@ impl Default for Style {
             placeholder: None,
             mask: Mask::None,
             font_size: None,
+            multiline: false,
             draggable: false,
             drop_target: false,
         }
@@ -299,6 +302,15 @@ impl Style {
     /// Text is re-shaped at this size and the widget measures to match.
     pub fn font_size(mut self, px: f32) -> Self {
         self.font_size = Some(px);
+        self
+    }
+
+    /// Make a text input multi-line (a text area): Enter inserts a newline
+    /// instead of submitting, and Up/Down move the caret between lines. The
+    /// field measures to its wrapped content height (it grows as lines are
+    /// added).
+    pub fn multiline(mut self) -> Self {
+        self.multiline = true;
         self
     }
 
