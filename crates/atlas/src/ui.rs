@@ -8,6 +8,7 @@ use aurora::{Color, ImageHandle, Orientation, Style, Ui, WidgetId};
 use glam::Vec2;
 use helios::{NodeId, Scene, Value};
 
+use crate::color;
 use crate::icons::{Icon, Icons};
 use crate::viewport::GizmoMode;
 
@@ -90,6 +91,44 @@ pub fn set_field_vec2(scene: &mut Scene, r: FieldRef, v: Vec2) {
     }
 }
 
+/// A `Color`-valued component field the color picker edits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColorTarget {
+    pub node: NodeId,
+    pub index: usize,
+    pub field: &'static str,
+}
+
+/// The current value of a color field (opaque black if it is not a `Color`).
+pub fn field_color(scene: &Scene, t: ColorTarget) -> [f32; 4] {
+    match scene.node(t.node).components[t.index]
+        .as_reflect()
+        .get(t.field)
+    {
+        Some(Value::Color(c)) => c,
+        _ => [0.0, 0.0, 0.0, 1.0],
+    }
+}
+
+/// Write a color field directly (no undo step) - the picker commits the final
+/// value through the history when it closes.
+pub fn set_field_color(scene: &mut Scene, t: ColorTarget, rgba: [f32; 4]) {
+    scene.node_mut(t.node).components[t.index]
+        .as_reflect_mut()
+        .set(t.field, Value::Color(rgba));
+}
+
+/// What the app hands [`build_color_picker`] to draw the open picker: where it
+/// floats, the current color (for the hex field and swatch), and the handles
+/// of its three gradient images (which the app keeps updated).
+pub struct ColorPickerView {
+    pub anchor: Vec2,
+    pub rgba: [f32; 4],
+    pub sv: ImageHandle,
+    pub hue: ImageHandle,
+    pub alpha: ImageHandle,
+}
+
 /// Maps widget handles back to the domain data they represent, so the app can
 /// react to Aurora events without Aurora knowing about `Scene`/`NodeId`.
 #[derive(Default)]
@@ -135,6 +174,15 @@ pub struct EditorRows {
     /// clickable item rows mapped to the action each performs.
     pub menu_popup: Option<WidgetId>,
     pub menu_items: Vec<(WidgetId, MenuAction)>,
+    /// Inspector color swatches; clicking one opens the picker for that field.
+    pub color_swatches: Vec<(WidgetId, ColorTarget)>,
+    /// The open color picker: its popup (for dismiss), the three draggable
+    /// gradient regions, and the hex input.
+    pub picker_popup: Option<WidgetId>,
+    pub picker_sv: Option<WidgetId>,
+    pub picker_hue: Option<WidgetId>,
+    pub picker_alpha: Option<WidgetId>,
+    pub picker_hex: Option<WidgetId>,
 }
 
 /// An action offered by a right-click context menu (built on Aurora popups).
@@ -401,6 +449,54 @@ fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, rows: &mut EditorRows) {
     rows.menu_popup = Some(popup);
 }
 
+/// The size of the color picker's SV square, and its bar dimensions (px).
+const PICKER_SV: f32 = 150.0;
+const PICKER_HUE_W: f32 = 18.0;
+const PICKER_ALPHA_H: f32 = 16.0;
+
+/// Build the open color picker on Aurora's popup layer: an SV square + hue bar
+/// (as gradient images the app keeps updated), an alpha bar, and a hex field
+/// with a preview swatch. The regions are recorded for the app's drag routing.
+pub fn build_color_picker(ui: &mut Ui, view: &ColorPickerView, rows: &mut EditorRows) {
+    let popup = ui.popup(
+        view.anchor,
+        Style::new()
+            .column()
+            .gap(6.0)
+            .padding(8.0)
+            .background(MENU_BG)
+            .clip(),
+    );
+    let top = ui.panel(popup, Style::new().row().gap(6.0));
+    let sv = ui.image(top, view.sv, Style::new().size(PICKER_SV, PICKER_SV));
+    let hue = ui.image(top, view.hue, Style::new().size(PICKER_HUE_W, PICKER_SV));
+    let alpha = ui.image(
+        popup,
+        view.alpha,
+        Style::new().size(PICKER_SV, PICKER_ALPHA_H),
+    );
+
+    let bottom = ui.panel(popup, Style::new().row().gap(6.0).align_center());
+    let hex = ui.text_input(
+        bottom,
+        color::to_hex(view.rgba),
+        Style::new().grow(1.0).padding(4.0),
+    );
+    let [r, g, b, a] = view.rgba;
+    ui.panel(
+        bottom,
+        Style::new()
+            .size(28.0, 24.0)
+            .background(Color::rgba(r, g, b, a)),
+    );
+
+    rows.picker_popup = Some(popup);
+    rows.picker_sv = Some(sv);
+    rows.picker_hue = Some(hue);
+    rows.picker_alpha = Some(alpha);
+    rows.picker_hex = Some(hex);
+}
+
 /// The docked scene-tree panel: one clickable row per node, indented by depth.
 fn build_scene_tree(
     ui: &mut Ui,
@@ -523,19 +619,43 @@ fn build_inspector(
             let Some(value) = reflect.get(field) else {
                 continue;
             };
-            // A Vec2 field gets the two-axis treatment; everything else a plain
-            // (numeric where it makes sense) row.
-            if let Value::Vec2(v) = value {
-                let r = FieldRef::Component {
-                    node,
-                    index: i,
-                    field,
-                };
-                add_vec2_field(ui, panel, field, v, r, rows);
-            } else {
-                let numeric = matches!(value, Value::F32(_));
-                let input = add_value_row(ui, panel, field, &value, numeric);
-                rows.field_rows.push((input, node, i, field));
+            // A Vec2 field gets the two-axis treatment, a Color field a swatch
+            // that opens the picker; everything else a plain (numeric where it
+            // makes sense) row.
+            match value {
+                Value::Vec2(v) => {
+                    let r = FieldRef::Component {
+                        node,
+                        index: i,
+                        field,
+                    };
+                    add_vec2_field(ui, panel, field, v, r, rows);
+                }
+                Value::Color(c) => {
+                    let row = ui.panel(panel, Style::new().row().gap(6.0).align_center());
+                    ui.label(row, field, Style::new().width(70.0));
+                    let swatch = ui.button(
+                        row,
+                        "",
+                        Style::new()
+                            .width(48.0)
+                            .padding(6.0)
+                            .background(Color::rgba(c[0], c[1], c[2], c[3])),
+                    );
+                    rows.color_swatches.push((
+                        swatch,
+                        ColorTarget {
+                            node,
+                            index: i,
+                            field,
+                        },
+                    ));
+                }
+                _ => {
+                    let numeric = matches!(value, Value::F32(_));
+                    let input = add_value_row(ui, panel, field, &value, numeric);
+                    rows.field_rows.push((input, node, i, field));
+                }
             }
         }
     }
@@ -879,6 +999,50 @@ mod tests {
             ui.hit_test(item_rect.pos + item_rect.size * 0.5),
             Some(item)
         );
+    }
+
+    #[test]
+    fn a_selected_sprite_shows_a_color_swatch_and_the_picker_builds() {
+        let (scene, handle) = demo_scene();
+        let node = scene.children(scene.root())[0];
+        let dir = std::env::temp_dir();
+        let (_ui, rows) = build_editor_ui(
+            &scene,
+            Some(node),
+            handle,
+            &dir,
+            PanelSizes::default(),
+            None,
+            GizmoMode::Select,
+            None,
+        );
+        // The sprite's tint is a Color field, so the inspector has one swatch.
+        assert_eq!(rows.color_swatches.len(), 1);
+        assert_eq!(rows.color_swatches[0].1.field, "tint");
+
+        // The picker popup builds its three gradient regions and hex input,
+        // and hit-tests above the tree behind it.
+        let mut ui = Ui::new();
+        ui.root_panel(Style::new().fill());
+        let mut rows = EditorRows::default();
+        let view = ColorPickerView {
+            anchor: Vec2::new(200.0, 150.0),
+            rgba: [1.0, 0.5, 0.2, 1.0],
+            sv: handle,
+            hue: handle,
+            alpha: handle,
+        };
+        build_color_picker(&mut ui, &view, &mut rows);
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+
+        let popup = rows.picker_popup.unwrap();
+        assert!(ui.is_within(rows.picker_sv.unwrap(), popup));
+        assert!(ui.is_within(rows.picker_hue.unwrap(), popup));
+        assert!(ui.is_within(rows.picker_alpha.unwrap(), popup));
+        assert!(ui.is_within(rows.picker_hex.unwrap(), popup));
+        // A press on the SV square hits it (not something behind the popup).
+        let sv = ui.rect(rows.picker_sv.unwrap()).unwrap();
+        assert_eq!(ui.hit_test(sv.pos + sv.size * 0.5), rows.picker_sv);
     }
 
     #[test]

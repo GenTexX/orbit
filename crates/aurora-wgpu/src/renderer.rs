@@ -337,6 +337,27 @@ impl Renderer {
         )
     }
 
+    /// Replace a registry-owned image's pixels in place (keeps its handle) - for
+    /// CPU-generated images that change, like the color picker's gradients.
+    /// Returns `false` on an unknown handle.
+    pub fn update_image_rgba(
+        &mut self,
+        handle: ImageHandle,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> bool {
+        self.images.update_rgba(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &self.texture_layout,
+            handle,
+            rgba,
+            width,
+            height,
+        )
+    }
+
     /// Point an already-registered image at a new texture view (e.g. the
     /// viewport's render target recreated at a new size). The handle - and
     /// every widget referencing it - stays valid, so no UI rebuild is needed.

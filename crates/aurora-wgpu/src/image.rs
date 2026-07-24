@@ -86,6 +86,51 @@ impl ImageRegistry {
         width: u32,
         height: u32,
     ) -> ImageHandle {
+        let (texture, bind_group) = self.make_rgba(device, queue, layout, rgba, width, height);
+        self.images.insert(RegisteredImage {
+            bind_group,
+            _texture: Some(texture),
+        })
+    }
+
+    /// Replace a registry-owned image's pixels (e.g. the color picker's SV
+    /// square as the hue changes), keeping its handle valid. Returns `false`
+    /// on an unknown handle.
+    // Mirrors register_rgba's GPU handles plus the target handle; a params
+    // struct would not read more clearly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_rgba(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        handle: ImageHandle,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> bool {
+        let (texture, bind_group) = self.make_rgba(device, queue, layout, rgba, width, height);
+        match self.images.get_mut(handle) {
+            Some(image) => {
+                image.bind_group = bind_group;
+                image._texture = Some(texture);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Create a texture from RGBA8 bytes and its bind group (shared by
+    /// register/update).
+    fn make_rgba(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::BindGroup) {
         let size = wgpu::Extent3d {
             width,
             height,
@@ -118,10 +163,7 @@ impl ImageRegistry {
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.build_bind_group(device, layout, &view);
-        self.images.insert(RegisteredImage {
-            bind_group,
-            _texture: Some(texture),
-        })
+        (texture, bind_group)
     }
 
     /// Point an existing handle at a new texture view (e.g. the viewport's
