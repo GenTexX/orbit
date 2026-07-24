@@ -35,9 +35,9 @@ use crate::color::Hsva;
 use crate::icons::Icons;
 use crate::textures::TextureCache;
 use crate::ui::{
-    Axis, ColorPickerView, ColorTarget, ContextMenu, EditorRows, FieldRef, MenuAction, PanelSizes,
-    TreeView, build_color_picker, build_editor_ui, capture_panel_sizes, field_color, field_vec2,
-    parse_value, set_field_color, set_field_vec2, with_axis,
+    Axis, ColorPickerView, ColorTarget, ContextMenu, DropSpot, EditorRows, FieldRef, MenuAction,
+    PanelSizes, TreeView, build_color_picker, build_editor_ui, capture_panel_sizes, field_color,
+    field_vec2, parse_value, resolve_drop, set_field_color, set_field_vec2, with_axis,
 };
 use crate::viewport::{Drag, EditorCamera, GizmoHit, GizmoMode};
 
@@ -194,12 +194,12 @@ struct State {
     reparent: Option<ReparentDrag>,
 }
 
-/// A tree row being dragged to reparent it; `target` is the node currently
-/// under the cursor (a valid drop), highlighted in the tree.
+/// A tree row being dragged to reparent it; `target` is the current valid drop
+/// spot under the cursor (into a node, or before/after it for reordering).
 #[derive(Debug, Clone, Copy)]
 struct ReparentDrag {
     source: NodeId,
-    target: Option<NodeId>,
+    target: Option<DropSpot>,
 }
 
 impl ApplicationHandler for App {
@@ -832,16 +832,32 @@ impl State {
         }
     }
 
-    /// Track the drop target under the cursor: a different row that is not a
-    /// descendant of the dragged node (which would make a cycle). Highlighted
-    /// green via the tree view.
+    /// The drop spot under the cursor: the top/bottom quarter of a row inserts
+    /// before/after it (reordering siblings), the middle drops into it as a
+    /// child.
+    fn drop_spot_at_cursor(&self) -> Option<DropSpot> {
+        let node = self.tree_row_at_cursor()?;
+        let id = self.rows.tree_rows.iter().find(|(_, n)| *n == node)?.0;
+        let rect = self.ui.rect(id)?;
+        let rel = ((self.cursor.y - rect.pos.y) / rect.size.y.max(1.0)).clamp(0.0, 1.0);
+        Some(if rel < 0.28 {
+            DropSpot::Before(node)
+        } else if rel > 0.72 {
+            DropSpot::After(node)
+        } else {
+            DropSpot::Into(node)
+        })
+    }
+
+    /// Track the drop spot under the cursor, keeping only valid ones (a real
+    /// reparent, no cycle). Drives the tree's highlight / insertion line.
     fn update_reparent_target(&mut self) {
         let Some(mut drag) = self.reparent else {
             return;
         };
         let target = self
-            .tree_row_at_cursor()
-            .filter(|&t| t != drag.source && !self.project.scene.is_ancestor(drag.source, t));
+            .drop_spot_at_cursor()
+            .filter(|&s| resolve_drop(&self.project.scene, drag.source, s).is_some());
         if target != drag.target {
             drag.target = target;
             self.reparent = Some(drag);
@@ -849,16 +865,17 @@ impl State {
         }
     }
 
-    /// On release, reparent the dragged node under the drop target (appended as
-    /// its last child) through the history - one undo step.
+    /// On release, apply the drop spot (reparent / reorder) through the history
+    /// as one undo step.
     fn finish_reparent(&mut self) {
         let Some(drag) = self.reparent.take() else {
             return;
         };
-        if let Some(target) = drag.target {
-            let index = self.project.scene.children(target).len();
+        if let Some(spot) = drag.target
+            && let Some((parent, index)) = resolve_drop(&self.project.scene, drag.source, spot)
+        {
             self.history
-                .reparent(&mut self.project.scene, drag.source, target, index);
+                .reparent(&mut self.project.scene, drag.source, parent, index);
             self.selected = Some(drag.source);
             self.dirty = true;
         }

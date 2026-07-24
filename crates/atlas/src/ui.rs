@@ -132,14 +132,59 @@ pub struct ColorPickerView {
     pub alpha: ImageHandle,
 }
 
+/// Where a dragged tree row will drop, relative to the row under the cursor:
+/// as a child of it, or as a sibling just before or after it (for reordering).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DropSpot {
+    Into(NodeId),
+    Before(NodeId),
+    After(NodeId),
+}
+
+/// Resolve a drop into `(new_parent, index)` for `History::reparent`, or `None`
+/// if it is invalid (onto itself, into its own descendant, or relative to
+/// itself). The index is into the parent's child list AFTER `source` is
+/// unlinked - exactly what `reparent` (unlink-then-link) needs, so a same-level
+/// reorder lands correctly.
+pub fn resolve_drop(scene: &Scene, source: NodeId, spot: DropSpot) -> Option<(NodeId, usize)> {
+    match spot {
+        DropSpot::Into(n) => {
+            if n == source || scene.is_ancestor(source, n) {
+                return None;
+            }
+            Some((n, scene.children(n).len()))
+        }
+        DropSpot::Before(n) | DropSpot::After(n) => {
+            if n == source {
+                return None;
+            }
+            let parent = scene.parent(n)?;
+            if parent == source || scene.is_ancestor(source, parent) {
+                return None;
+            }
+            let siblings: Vec<NodeId> = scene
+                .children(parent)
+                .iter()
+                .copied()
+                .filter(|&c| c != source)
+                .collect();
+            let pos = siblings.iter().position(|&c| c == n)?;
+            Some((
+                parent,
+                pos + usize::from(matches!(spot, DropSpot::After(_))),
+            ))
+        }
+    }
+}
+
 /// The scene tree's editor state, kept across shell rebuilds (the same lesson
 /// as panel sizes and scroll): which nodes are collapsed, and the current
-/// reparent drop target (highlighted while dragging a row). Cheap to clone
-/// (a handful of node ids) at each rebuild.
+/// reparent drop spot (a row highlight for Into, an insertion line for
+/// Before/After). Cheap to clone (a handful of node ids) at each rebuild.
 #[derive(Debug, Clone, Default)]
 pub struct TreeView {
     pub collapsed: HashSet<NodeId>,
-    pub drop_target: Option<NodeId>,
+    pub drop_target: Option<DropSpot>,
 }
 
 /// Maps widget handles back to the domain data they represent, so the app can
@@ -576,10 +621,15 @@ fn add_tree_row(
     icons: Option<&Icons>,
     rows: &mut EditorRows,
 ) {
-    // Selected wins the highlight; a reparent drop target tints green.
+    // An insertion line above this row for a Before-drop (reordering).
+    if tree.drop_target == Some(DropSpot::Before(node)) {
+        insertion_line(ui, parent, depth);
+    }
+
+    // Selected wins the highlight; an Into-drop target tints green.
     let background = if selected == Some(node) {
         ROW_SELECTED
-    } else if tree.drop_target == Some(node) {
+    } else if tree.drop_target == Some(DropSpot::Into(node)) {
         ROW_DROP
     } else {
         Color::TRANSPARENT
@@ -635,6 +685,11 @@ fn add_tree_row(
     );
     rows.tree_rows.push((row, node));
 
+    // An insertion line below this row for an After-drop (reordering).
+    if tree.drop_target == Some(DropSpot::After(node)) {
+        insertion_line(ui, parent, depth);
+    }
+
     if has_children && !collapsed {
         for &child in scene.children(node) {
             add_tree_row(
@@ -650,6 +705,19 @@ fn add_tree_row(
             );
         }
     }
+}
+
+/// A thin horizontal insertion bar (indented to the row's depth) marking where
+/// a dragged row would drop between siblings.
+fn insertion_line(ui: &mut Ui, parent: WidgetId, depth: u32) {
+    let line = ui.panel(parent, Style::new().row().height(3.0));
+    if depth > 0 {
+        ui.panel(line, Style::new().width(depth as f32 * TREE_DISCLOSURE));
+    }
+    ui.panel(
+        line,
+        Style::new().grow(1.0).height(2.0).background(ROW_DROP),
+    );
 }
 
 /// The docked inspector panel: the selected node's reflected component fields
@@ -921,6 +989,43 @@ mod tests {
         let mut registry: slotmap::SlotMap<ImageHandle, ()> = slotmap::SlotMap::with_key();
         let handle = registry.insert(());
         (scene, handle)
+    }
+
+    #[test]
+    fn resolve_drop_reorders_and_reparents_correctly() {
+        use helios::History;
+        let mut scene = Scene::new("Root");
+        let root = scene.root();
+        let a = scene.add_child(root, Node::new("A"));
+        let b = scene.add_child(root, Node::new("B"));
+        let c = scene.add_child(root, Node::new("C"));
+        let names = |s: &Scene, p| {
+            s.children(p)
+                .iter()
+                .map(|&n| s.node(n).name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Move A to after B: [A, B, C] -> [B, A, C].
+        let (p, i) = resolve_drop(&scene, a, DropSpot::After(b)).unwrap();
+        let mut hist = History::new();
+        hist.reparent(&mut scene, a, p, i);
+        assert_eq!(names(&scene, root), ["B", "A", "C"]);
+
+        // Move C before B: -> [B, C, A] -> ... now list is [B, A, C]; C before B.
+        let (p, i) = resolve_drop(&scene, c, DropSpot::Before(b)).unwrap();
+        hist.reparent(&mut scene, c, p, i);
+        assert_eq!(names(&scene, root), ["C", "B", "A"]);
+
+        // Into makes a child; invalid drops (self, own descendant) are None.
+        assert_eq!(resolve_drop(&scene, a, DropSpot::Into(b)), Some((b, 0)));
+        assert_eq!(resolve_drop(&scene, a, DropSpot::Before(a)), None);
+        hist.reparent(&mut scene, a, b, 0); // A is now a child of B
+        assert_eq!(
+            resolve_drop(&scene, b, DropSpot::Into(a)),
+            None,
+            "no cycles"
+        );
     }
 
     #[test]
