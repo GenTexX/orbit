@@ -4,6 +4,7 @@ use taffy::prelude::{length, percent};
 use taffy::{AlignItems, Display, FlexDirection, Overflow, Rect as TaffyRect, Size};
 
 use crate::color::Color;
+use crate::widget::Mask;
 
 /// How a widget lays out and looks. Layout is a taffy `Style` (size, padding,
 /// flex, gap); the visual properties (background, clipping) are Aurora's own.
@@ -33,6 +34,11 @@ pub struct Style {
     /// Render this widget (and its subtree) dimmed and inert: it takes no hover,
     /// press, click, or focus. For controls that are unavailable right now.
     pub disabled: bool,
+    /// Placeholder text a text input shows, dimmed, while empty. Ignored by
+    /// other widget kinds.
+    pub placeholder: Option<String>,
+    /// The input mask a text input enforces as you type. Ignored by other kinds.
+    pub mask: Mask,
 }
 
 impl Default for Style {
@@ -46,6 +52,8 @@ impl Default for Style {
             flat: false,
             hit_transparent: false,
             disabled: false,
+            placeholder: None,
+            mask: Mask::None,
         }
     }
 }
@@ -260,6 +268,19 @@ impl Style {
     /// focus). For a control that is unavailable in the current context.
     pub fn disabled(mut self) -> Self {
         self.disabled = true;
+        self
+    }
+
+    /// Set placeholder text a text input shows, dimmed, while it is empty.
+    pub fn placeholder(mut self, text: impl Into<String>) -> Self {
+        self.placeholder = Some(text.into());
+        self
+    }
+
+    /// Set the input mask a text input enforces as you type (rejecting edits
+    /// that would break it). See [`Mask`](crate::Mask).
+    pub fn mask(mut self, mask: Mask) -> Self {
+        self.mask = mask;
         self
     }
 

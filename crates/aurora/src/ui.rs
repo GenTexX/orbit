@@ -13,7 +13,7 @@ use crate::event::Event;
 use crate::input::{CursorHint, InputEvent, Key};
 use crate::rect::Rect;
 use crate::style::Style;
-use crate::widget::{Orientation, Widget, WidgetId, WidgetKind};
+use crate::widget::{Mask, Orientation, Widget, WidgetId, WidgetKind};
 use crate::{text, theme};
 
 /// The visual state of an interactive widget, derived from the pointer each
@@ -44,6 +44,9 @@ pub struct Ui {
     font_system: FontSystem,
     /// One shaped text buffer per text-bearing widget, produced during layout.
     buffers: SecondaryMap<WidgetId, Buffer>,
+    /// A shaped buffer for each placeholder-bearing text input, produced after
+    /// layout and drawn (dimmed) only while the input's own text is empty.
+    placeholder_buffers: SecondaryMap<WidgetId, Buffer>,
     /// Vertical scroll offset per scroll container, in pixels (0 = top).
     scroll_offsets: SecondaryMap<WidgetId, f32>,
     /// Content height per scroll container from the last layout, for clamping
@@ -86,6 +89,7 @@ impl Ui {
             content_origin: SecondaryMap::new(),
             font_system: text::make_font_system(),
             buffers: SecondaryMap::new(),
+            placeholder_buffers: SecondaryMap::new(),
             scroll_offsets: SecondaryMap::new(),
             scroll_content: SecondaryMap::new(),
             popups: Vec::new(),
@@ -146,7 +150,8 @@ impl Ui {
 
     /// Add a text input that accepts only numeric text (a leading `-`, digits,
     /// and a single `.`). Keystrokes and pastes that would break that are
-    /// rejected - the primitive the inspector's numeric fields build on.
+    /// rejected - the primitive the inspector's numeric fields build on. A
+    /// convenience for `text_input` with `Style::mask(Mask::Decimal)`.
     pub fn numeric_input(
         &mut self,
         parent: WidgetId,
@@ -154,7 +159,10 @@ impl Ui {
         style: Style,
     ) -> WidgetId {
         let id = self.add(WidgetKind::TextInput(text.into()), style, Some(parent));
-        self.widgets[id].numeric = true;
+        // An explicit style mask wins; otherwise default this field to Decimal.
+        if self.widgets[id].mask == Mask::None {
+            self.widgets[id].mask = Mask::Decimal;
+        }
         id
     }
 
@@ -384,13 +392,14 @@ impl Ui {
         }
         let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
         let (lo, hi) = self.selection_bounds(id);
-        // A numeric field rejects an edit that would make its text non-numeric.
-        if self.widgets[id].numeric
+        // A masked field rejects an edit that would make its whole text stop
+        // matching the mask.
+        if self.widgets[id].mask != Mask::None
             && let WidgetKind::TextInput(s) = &self.widgets[id].kind
         {
             let mut candidate = s.clone();
             candidate.replace_range(lo..hi, &cleaned);
-            if !is_numeric_text(&candidate) {
+            if !self.widgets[id].mask.accepts(&candidate) {
                 return;
             }
         }
@@ -478,7 +487,8 @@ impl Ui {
             foreground: style.foreground,
             clip: style.clip || style.scroll,
             scroll: style.scroll,
-            numeric: false,
+            mask: style.mask,
+            placeholder: style.placeholder.unwrap_or_default(),
             flat: style.flat,
             hit_transparent: style.hit_transparent,
             disabled: style.disabled,
@@ -537,10 +547,47 @@ impl Ui {
                 }
             }
         }
+        // Shape placeholder text now that fields have their widths (needed to
+        // wrap), so emit can draw it while a field is empty.
+        self.shape_placeholders();
         // Layout may have moved widgets under a stationary pointer, so refresh
         // what is hovered from the last known cursor position.
         self.update_hover();
         Ok(())
+    }
+
+    /// Shape the placeholder string of each placeholder-bearing text input into
+    /// its own buffer, wrapped to the field's content width. Runs after layout,
+    /// when those widths are known; the result is drawn only while the field is
+    /// empty (see [`emit_text_input`](Self::emit_text_input)).
+    fn shape_placeholders(&mut self) {
+        // Collect the work first (text + field width), then split the buffer and
+        // font-system borrows to shape - the same borrow dance as layout().
+        let jobs: Vec<(WidgetId, String, f32)> = self
+            .widgets
+            .iter()
+            .filter(|(_, w)| {
+                matches!(w.kind, WidgetKind::TextInput(_)) && !w.placeholder.is_empty()
+            })
+            .map(|(id, w)| {
+                (
+                    id,
+                    w.placeholder.clone(),
+                    self.rect(id).map_or(0.0, |r| r.size.x),
+                )
+            })
+            .collect();
+        let buffers = &mut self.placeholder_buffers;
+        let font_system = &mut self.font_system;
+        for (id, text, width) in jobs {
+            if !buffers.contains_key(id) {
+                buffers.insert(id, Buffer::new(font_system, text::metrics()));
+            }
+            let mut borrowed = buffers[id].borrow_with(font_system);
+            borrowed.set_size(Some(width.max(1.0)), None);
+            borrowed.set_text(&text, &text::default_attrs(), Shaping::Advanced, None);
+            borrowed.shape_until_scroll(false);
+        }
     }
 
     /// Translate a whole subtree's cached rects and text origins by `delta`
@@ -1362,6 +1409,13 @@ impl Ui {
 
         // Clip the text, selection, and caret so long content stays in-field.
         list.commands.push(DrawCommand::PushClip { rect });
+        // While the field is empty, show its placeholder (dimmed) in place of
+        // the text - it does not take focus, a caret, or a selection.
+        let empty = matches!(&widget.kind, WidgetKind::TextInput(s) if s.is_empty());
+        if empty && let Some(buffer) = self.placeholder_buffers.get(id) {
+            let origin = self.content_origin.get(id).copied().unwrap_or(rect.pos);
+            self.emit_buffer(buffer, origin, theme::PLACEHOLDER, list);
+        }
         // The selection highlight, behind the text.
         if focused {
             let (lo, hi) = self.selection_bounds(id);
@@ -1401,6 +1455,13 @@ impl Ui {
             return;
         };
         let origin = self.content_origin.get(id).copied().unwrap_or(Vec2::ZERO);
+        self.emit_buffer(buffer, origin, color, list);
+    }
+
+    /// Emit a `Text` command for a shaped `buffer` drawn from `origin` (its
+    /// content-box top-left), in `color`. Shared by the main text and the
+    /// placeholder.
+    fn emit_buffer(&self, buffer: &Buffer, origin: Vec2, color: Color, list: &mut DrawList) {
         let mut glyphs = Vec::new();
         for run in buffer.layout_runs() {
             for glyph in run.glyphs {
@@ -1440,27 +1501,6 @@ fn inflate_splitter(rect: Rect, orientation: Orientation) -> Rect {
             rect.size + Vec2::new(0.0, extra * 2.0),
         ),
     }
-}
-
-/// Whether `s` is valid as-you-type numeric text: an optional leading `-`,
-/// digits, and at most one `.`. Intermediate states like ``, `-`, `1.`, `.5`
-/// are allowed so a value can be typed; a full parse happens on commit.
-fn is_numeric_text(s: &str) -> bool {
-    let body = s.strip_prefix('-').unwrap_or(s);
-    let mut dots = 0;
-    for c in body.chars() {
-        match c {
-            '.' => {
-                dots += 1;
-                if dots > 1 {
-                    return false;
-                }
-            }
-            _ if c.is_ascii_digit() => {}
-            _ => return false,
-        }
-    }
-    true
 }
 
 /// The byte offset of the character boundary just before `i` (or 0). Keeps the
@@ -1544,7 +1584,7 @@ mod tests {
     use crate::input::{InputEvent, Key};
     use crate::rect::Rect;
     use crate::style::Style;
-    use crate::widget::{Orientation, WidgetKind};
+    use crate::widget::{Mask, Orientation, WidgetKind};
     use glam::Vec2;
 
     /// Move the pointer to `p`, then press and release: a click at `p`.
@@ -1930,6 +1970,58 @@ mod tests {
         assert_eq!(ui.hit_test(Vec2::new(105.0, 10.0)), Some(s));
         // Well past the overhang, it does not.
         assert_ne!(ui.hit_test(Vec2::new(130.0, 10.0)), Some(s));
+    }
+
+    #[test]
+    fn mask_accepts_matches_each_kind() {
+        // Signed masks accept the empty string and a lone '-' so a value can be
+        // typed sign-first; the digit-only masks do not take a sign.
+        assert!(Mask::Integer.accepts(""));
+        assert!(Mask::Integer.accepts("-42"));
+        assert!(!Mask::Integer.accepts("4.2"));
+        assert!(Mask::Decimal.accepts("-3.14"));
+        assert!(!Mask::Decimal.accepts("1.2.3"));
+        assert!(Mask::Digits.accepts("2048"));
+        assert!(!Mask::Digits.accepts("-5"));
+        assert!(Mask::Hex.accepts("1aF"));
+        assert!(!Mask::Hex.accepts("xyz"));
+        assert!(Mask::None.accepts("anything at all"));
+    }
+
+    #[test]
+    fn a_style_masked_input_rejects_out_of_mask_edits() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 60.0));
+        let field = ui.text_input(root, "", Style::new().size(180.0, 24.0).mask(Mask::Hex));
+        ui.layout(Vec2::new(200.0, 60.0)).unwrap();
+        click_at(&mut ui, Vec2::new(10.0, 12.0));
+        for ch in "1a".chars() {
+            ui.handle_input(InputEvent::Text(ch));
+        }
+        // A non-hex letter is rejected; a hex one is accepted.
+        ui.handle_input(InputEvent::Text('g'));
+        ui.handle_input(InputEvent::Text('F'));
+        assert_eq!(text_of(&ui, field), "1aF");
+    }
+
+    #[test]
+    fn a_placeholder_shows_only_while_the_field_is_empty() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 60.0));
+        let field = ui.text_input(root, "", Style::new().size(180.0, 24.0).placeholder("Name"));
+        ui.layout(Vec2::new(200.0, 60.0)).unwrap();
+        // Empty: the placeholder is drawn (a Text command in the dimmed color).
+        let shows_placeholder = |ui: &Ui| {
+            ui.draw_list().commands.iter().any(|c| {
+                matches!(c, DrawCommand::Text { color, .. } if *color == crate::theme::PLACEHOLDER)
+            })
+        };
+        assert!(shows_placeholder(&ui));
+
+        // Once it has text, the placeholder is gone.
+        ui.set_text_input(field, "abc");
+        ui.layout(Vec2::new(200.0, 60.0)).unwrap();
+        assert!(!shows_placeholder(&ui));
     }
 
     #[test]

@@ -551,7 +551,7 @@ pub fn build_color_picker(ui: &mut Ui, view: &ColorPickerView, rows: &mut Editor
     let hex = ui.text_input(
         bottom,
         color::to_hex(view.rgba),
-        Style::new().grow(1.0).padding(4.0),
+        Style::new().grow(1.0).padding(4.0).placeholder("#RRGGBBAA"),
     );
     let [r, g, b, a] = view.rgba;
     ui.panel(

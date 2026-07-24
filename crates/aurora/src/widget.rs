@@ -49,6 +49,53 @@ pub enum WidgetKind {
     },
 }
 
+/// An input mask: which text a [`WidgetKind::TextInput`] will accept. A
+/// keystroke or paste that would make the field's whole text stop matching the
+/// mask is rejected, leaving the field unchanged (validation as you type).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mask {
+    /// Accept any text (the default).
+    #[default]
+    None,
+    /// A signed integer: an optional leading `-`, then ASCII digits.
+    Integer,
+    /// A signed decimal: an optional leading `-`, ASCII digits, and at most one
+    /// `.` (the primitive the inspector's numeric fields build on).
+    Decimal,
+    /// ASCII digits only - unsigned, no sign or separator (counts, ports).
+    Digits,
+    /// ASCII hexadecimal digits only (`0-9`, `a-f`, `A-F`) - e.g. hex colors.
+    Hex,
+}
+
+impl Mask {
+    /// Whether `candidate` (the field's text after a proposed edit) is
+    /// acceptable. An empty string and a lone `-` (for the signed masks) are
+    /// always accepted so a field can be cleared and a number typed sign-first.
+    pub fn accepts(self, candidate: &str) -> bool {
+        match self {
+            Mask::None => true,
+            Mask::Integer => {
+                let body = candidate.strip_prefix('-').unwrap_or(candidate);
+                body.chars().all(|c| c.is_ascii_digit())
+            }
+            Mask::Decimal => {
+                let body = candidate.strip_prefix('-').unwrap_or(candidate);
+                let mut dots = 0;
+                body.chars().all(|c| match c {
+                    '.' => {
+                        dots += 1;
+                        dots <= 1
+                    }
+                    _ => c.is_ascii_digit(),
+                })
+            }
+            Mask::Digits => candidate.chars().all(|c| c.is_ascii_digit()),
+            Mask::Hex => candidate.chars().all(|c| c.is_ascii_hexdigit()),
+        }
+    }
+}
+
 /// Which axis a [`WidgetKind::Splitter`] drags along, and so which dimension of
 /// its target it resizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,9 +138,12 @@ pub(crate) struct Widget {
     pub clip: bool,
     /// Whether this widget scrolls its overflowing content vertically.
     pub scroll: bool,
-    /// Whether this text input accepts only numeric text (a leading `-`,
-    /// digits, and a single `.`) - other keystrokes and pastes are rejected.
-    pub numeric: bool,
+    /// The input mask this text input enforces as you type (`Mask::None` for a
+    /// plain field). Other kinds ignore it.
+    pub mask: Mask,
+    /// Placeholder text shown, dimmed, while a text input is empty (empty string
+    /// for none). Other kinds ignore it.
+    pub placeholder: String,
     /// Whether this button renders flat (no raised fill; hover/press only).
     pub flat: bool,
     /// Whether hit-testing ignores this widget (decorative overlays).
