@@ -170,23 +170,44 @@ fn arc(x: f32, y: f32, rin: f32, rout: f32, a0: f32, a1: f32) -> bool {
     a >= a0 && a <= a1
 }
 
+/// A rectangle `[x0, x1] x [y0, y1]`.
+fn rect(x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> bool {
+    (x0..=x1).contains(&x) && (y0..=y1).contains(&y)
+}
+
+/// A sharp arrowhead: a triangle with its `tip` pointing along `dir` (any
+/// non-zero vector; normalized here), `len` long and `2*hw` wide at the base.
+fn arrowhead(x: f32, y: f32, tip: (f32, f32), dir: (f32, f32), len: f32, hw: f32) -> bool {
+    let inv = 1.0 / dir.0.hypot(dir.1).max(1.0e-6);
+    let (dx, dy) = (dir.0 * inv, dir.1 * inv);
+    let base = (tip.0 - dx * len, tip.1 - dy * len);
+    let (px, py) = (-dy * hw, dx * hw);
+    tri(
+        x,
+        y,
+        tip,
+        (base.0 + px, base.1 + py),
+        (base.0 - px, base.1 - py),
+    )
+}
+
 // --- the icons ---
+//
+// A common thin stroke keeps the set consistent (the Godot-toolbar look).
+
+/// The shared line/arrow stroke width.
+const STROKE: f32 = 0.07;
 
 /// A plus.
 fn icon_add(x: f32, y: f32) -> bool {
-    line(x, y, (0.5, 0.2), (0.5, 0.8), 0.16) || line(x, y, (0.2, 0.5), (0.8, 0.5), 0.16)
+    line(x, y, (0.5, 0.18), (0.5, 0.82), 0.13) || line(x, y, (0.2, 0.5), (0.8, 0.5), 0.13)
 }
 
 /// A down arrow onto a baseline (save/export to disk).
 fn icon_save(x: f32, y: f32) -> bool {
-    line(x, y, (0.5, 0.14), (0.5, 0.52), 0.13)
-        || tri(x, y, (0.32, 0.46), (0.68, 0.46), (0.5, 0.68))
-        || line(x, y, (0.22, 0.84), (0.78, 0.84), 0.11)
-}
-
-/// A rectangle `[x0, x1] x [y0, y1]`.
-fn rect(x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> bool {
-    (x0..=x1).contains(&x) && (y0..=y1).contains(&y)
+    line(x, y, (0.5, 0.14), (0.5, 0.5), STROKE)
+        || arrowhead(x, y, (0.5, 0.66), (0.0, 1.0), 0.22, 0.14)
+        || line(x, y, (0.22, 0.84), (0.78, 0.84), STROKE)
 }
 
 /// A folder (open/load): a body rectangle with a tab.
@@ -208,30 +229,30 @@ fn icon_select(x: f32, y: f32) -> bool {
     poly(x, y, &PTS)
 }
 
-/// Four-way arrows (move).
+/// Four thin arrows radiating from the center (move), sharp heads at the edges.
 fn icon_move(x: f32, y: f32) -> bool {
-    line(x, y, (0.5, 0.2), (0.5, 0.8), 0.1)
-        || line(x, y, (0.2, 0.5), (0.8, 0.5), 0.1)
-        || tri(x, y, (0.5, 0.08), (0.4, 0.24), (0.6, 0.24))
-        || tri(x, y, (0.5, 0.92), (0.4, 0.76), (0.6, 0.76))
-        || tri(x, y, (0.08, 0.5), (0.24, 0.4), (0.24, 0.6))
-        || tri(x, y, (0.92, 0.5), (0.76, 0.4), (0.76, 0.6))
+    line(x, y, (0.5, 0.2), (0.5, 0.8), STROKE)
+        || line(x, y, (0.2, 0.5), (0.8, 0.5), STROKE)
+        || arrowhead(x, y, (0.5, 0.09), (0.0, -1.0), 0.16, 0.11)
+        || arrowhead(x, y, (0.5, 0.91), (0.0, 1.0), 0.16, 0.11)
+        || arrowhead(x, y, (0.09, 0.5), (-1.0, 0.0), 0.16, 0.11)
+        || arrowhead(x, y, (0.91, 0.5), (1.0, 0.0), 0.16, 0.11)
 }
 
-/// A circular arrow (rotate): a ~300-degree ring with an arrowhead at one end.
+/// A circular arrow (rotate): a thin ~290-degree ring with a sharp arrowhead
+/// on the upper end, pointing along the ring's tangent (clockwise).
 fn icon_rotate(x: f32, y: f32) -> bool {
     use std::f32::consts::PI;
-    // Ring open near the top (a gap around angle -PI/2, i.e. 3PI/2).
-    arc(x, y, 0.24, 0.36, 0.15 * PI, 1.35 * PI)
-        // An arrowhead at the top end of the arc (pointing up).
-        || tri(x, y, (0.5, 0.06), (0.36, 0.2), (0.58, 0.22))
+    // Ring open at the top; the upper end sits near (0.40, 0.20).
+    arc(x, y, 0.28, 0.35, 0.1 * PI, 1.4 * PI)
+        || arrowhead(x, y, (0.52, 0.16), (0.95, -0.31), 0.17, 0.1)
 }
 
-/// A diagonal double-headed arrow (scale/resize).
+/// A diagonal double-headed arrow (scale/resize), thin with sharp heads.
 fn icon_scale(x: f32, y: f32) -> bool {
-    line(x, y, (0.28, 0.72), (0.72, 0.28), 0.1)
-        || tri(x, y, (0.16, 0.84), (0.16, 0.58), (0.42, 0.84))
-        || tri(x, y, (0.84, 0.16), (0.84, 0.42), (0.58, 0.16))
+    line(x, y, (0.26, 0.74), (0.74, 0.26), STROKE)
+        || arrowhead(x, y, (0.16, 0.84), (-1.0, 1.0), 0.22, 0.12)
+        || arrowhead(x, y, (0.84, 0.16), (1.0, -1.0), 0.22, 0.12)
 }
 
 #[cfg(test)]
