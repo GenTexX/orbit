@@ -11,6 +11,10 @@ pub(crate) const BUTTON: Color = Color::rgb(0.26, 0.28, 0.34);
 /// Subtle hover/press overlays for flat (list/tree) rows.
 pub(crate) const ROW_HOVER: Color = Color::rgba(1.0, 1.0, 1.0, 0.06);
 pub(crate) const ROW_PRESSED: Color = Color::rgba(1.0, 1.0, 1.0, 0.11);
+/// Alpha multiplier applied to a disabled widget's fills and text, fading the
+/// whole subtree toward the background so it reads as unavailable.
+pub(crate) const DISABLED_FADE: f32 = 0.38;
+
 /// The checkbox box fill.
 pub(crate) const CHECKBOX_BOX: Color = Color::rgb(0.20, 0.21, 0.26);
 /// The checkmark (inner square) fill when a checkbox is checked.

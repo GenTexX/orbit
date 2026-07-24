@@ -98,4 +98,6 @@ pub(crate) struct Widget {
     pub flat: bool,
     /// Whether hit-testing ignores this widget (decorative overlays).
     pub hit_transparent: bool,
+    /// Whether this widget is disabled: drawn dimmed and inert to all input.
+    pub disabled: bool,
 }

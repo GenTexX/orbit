@@ -51,6 +51,12 @@ impl Color {
             self.a,
         )
     }
+
+    /// Scale the alpha by `t` (`t` in `0.0..=1.0`), keeping the color. Used to
+    /// fade a disabled widget's fills and text toward the background.
+    pub fn fade(self, t: f32) -> Self {
+        Self::rgba(self.r, self.g, self.b, self.a * t)
+    }
 }
 
 impl Default for Color {

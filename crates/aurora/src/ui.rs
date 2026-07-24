@@ -481,6 +481,7 @@ impl Ui {
             numeric: false,
             flat: style.flat,
             hit_transparent: style.hit_transparent,
+            disabled: style.disabled,
         });
         self.taffy
             .set_node_context(node, Some(id))
@@ -895,7 +896,7 @@ impl Ui {
     }
 
     fn collect_focusable(&self, id: WidgetId, ring: &mut Vec<WidgetId>) {
-        if matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
+        if matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) && !self.widgets[id].disabled {
             ring.push(id);
         }
         for &child in &self.widgets[id].children {
@@ -1003,6 +1004,11 @@ impl Ui {
             }
         }
         for (id, widget) in &self.widgets {
+            // A disabled splitter/slider is inert; skip its extended grab zone so
+            // it neither drags nor steals the hit from anything behind it.
+            if widget.disabled {
+                continue;
+            }
             if let WidgetKind::Splitter { orientation, .. } = widget.kind
                 && let Some(rect) = self.rect(id)
                 && inflate_splitter(rect, orientation).contains(point)
@@ -1062,7 +1068,9 @@ impl Ui {
     fn interactive_ancestor(&self, id: WidgetId) -> Option<WidgetId> {
         let mut cur = Some(id);
         while let Some(w) = cur {
-            if self.widgets[w].kind.is_interactive() {
+            // A disabled widget is inert: it is never the interactive target, so
+            // hover/press/focus skip past it (to a non-disabled ancestor, if any).
+            if self.widgets[w].kind.is_interactive() && !self.widgets[w].disabled {
                 return Some(w);
             }
             cur = self.widgets[w].parent;
@@ -1121,6 +1129,9 @@ impl Ui {
             return;
         };
         let widget = &self.widgets[id];
+        // A disabled widget fades its whole subtree: remember where this
+        // widget's commands start, then scale their alpha down at the end.
+        let dim_from = widget.disabled.then_some(list.commands.len());
 
         // The widget's own visuals, by kind.
         match &widget.kind {
@@ -1178,6 +1189,18 @@ impl Ui {
                 ),
                 color: theme::SCROLLBAR_THUMB,
             });
+        }
+
+        // Fade the fills and text this disabled widget (and its subtree) emitted.
+        if let Some(from) = dim_from {
+            for cmd in &mut list.commands[from..] {
+                match cmd {
+                    DrawCommand::FillRect { color, .. } | DrawCommand::Text { color, .. } => {
+                        *color = color.fade(theme::DISABLED_FADE);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -1711,6 +1734,58 @@ mod tests {
         assert_eq!(ui.drain_events(), vec![Event::Clicked(button)]);
         // Events are consumed by draining.
         assert!(ui.drain_events().is_empty());
+    }
+
+    #[test]
+    fn a_disabled_button_takes_no_hover_or_click() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 100.0));
+        let _button = ui.button(root, "Go", Style::new().size(80.0, 30.0).disabled());
+        ui.layout(Vec2::new(200.0, 100.0)).unwrap();
+
+        // Hover resolves to nothing interactive, and a full click fires no event.
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(10.0, 10.0)));
+        assert_eq!(ui.hovered(), None);
+        click_at(&mut ui, Vec2::new(10.0, 10.0));
+        assert!(ui.drain_events().is_empty());
+    }
+
+    #[test]
+    fn a_disabled_text_input_is_skipped_by_tab_focus() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 100.0).column());
+        let a = ui.text_input(root, "a", Style::new().size(80.0, 24.0));
+        let _off = ui.text_input(root, "b", Style::new().size(80.0, 24.0).disabled());
+        let c = ui.text_input(root, "c", Style::new().size(80.0, 24.0));
+        ui.layout(Vec2::new(200.0, 100.0)).unwrap();
+
+        // Tabbing from the first field lands on the third, past the disabled one.
+        ui.focus_step(1); // focus first
+        assert_eq!(ui.focused(), Some(a));
+        ui.focus_step(1); // skip disabled -> third
+        assert_eq!(ui.focused(), Some(c));
+    }
+
+    #[test]
+    fn a_disabled_widget_fades_its_fill() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 100.0));
+        // An opaque-backgrounded button so its fill alpha is unambiguous.
+        ui.button(
+            root,
+            "Go",
+            Style::new()
+                .size(80.0, 30.0)
+                .background(Color::rgb(0.3, 0.3, 0.3))
+                .disabled(),
+        );
+        ui.layout(Vec2::new(200.0, 100.0)).unwrap();
+
+        let faded = ui.draw_list().commands.iter().any(|c| {
+            matches!(c, DrawCommand::FillRect { color, .. }
+                if (color.a - crate::theme::DISABLED_FADE).abs() < 1e-6)
+        });
+        assert!(faded, "disabled button fill should be faded");
     }
 
     #[test]

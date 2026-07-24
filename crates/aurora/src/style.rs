@@ -30,6 +30,9 @@ pub struct Style {
     /// Ignore this widget in hit-testing (the cursor passes through to whatever
     /// is behind it). For decorative overlays like a drag insertion line.
     pub hit_transparent: bool,
+    /// Render this widget (and its subtree) dimmed and inert: it takes no hover,
+    /// press, click, or focus. For controls that are unavailable right now.
+    pub disabled: bool,
 }
 
 impl Default for Style {
@@ -42,6 +45,7 @@ impl Default for Style {
             scroll: false,
             flat: false,
             hit_transparent: false,
+            disabled: false,
         }
     }
 }
@@ -249,6 +253,20 @@ impl Style {
     /// for decorative overlays like a drag insertion line.
     pub fn hit_transparent(mut self) -> Self {
         self.hit_transparent = true;
+        self
+    }
+
+    /// Mark this widget disabled: dimmed and inert (no hover, press, click, or
+    /// focus). For a control that is unavailable in the current context.
+    pub fn disabled(mut self) -> Self {
+        self.disabled = true;
+        self
+    }
+
+    /// Set the disabled state from a flag, for `style.enabled(cond)`-style call
+    /// sites that toggle a control on a condition.
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.disabled = !enabled;
         self
     }
 
