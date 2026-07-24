@@ -254,14 +254,14 @@ fn icon_rotate(x: f32, y: f32) -> bool {
         || arrowhead(x, y, (0.52, 0.16), (0.95, -0.31), 0.17, 0.1)
 }
 
-/// A small solid triangle pointing right (a collapsed tree node).
+/// A solid triangle pointing right (a collapsed tree node).
 fn icon_chevron_right(x: f32, y: f32) -> bool {
-    tri(x, y, (0.38, 0.28), (0.38, 0.72), (0.66, 0.5))
+    tri(x, y, (0.3, 0.16), (0.3, 0.84), (0.78, 0.5))
 }
 
-/// A small solid triangle pointing down (an expanded tree node).
+/// A solid triangle pointing down (an expanded tree node).
 fn icon_chevron_down(x: f32, y: f32) -> bool {
-    tri(x, y, (0.28, 0.38), (0.72, 0.38), (0.5, 0.66))
+    tri(x, y, (0.16, 0.3), (0.84, 0.3), (0.5, 0.78))
 }
 
 /// A diagonal double-headed arrow (scale/resize), thin with sharp heads.

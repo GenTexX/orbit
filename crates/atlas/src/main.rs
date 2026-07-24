@@ -809,13 +809,15 @@ impl State {
         self.dirty = true;
     }
 
-    /// The scene-tree row node under the cursor, if any (a drop target).
+    /// The scene-tree row node under the cursor, if any (a drop target). Uses
+    /// the interactive widget under the cursor (the row button), since a tree
+    /// row now contains a label child that a raw hit-test would return instead.
     fn tree_row_at_cursor(&self) -> Option<NodeId> {
-        let hit = self.ui.hit_test(self.cursor)?;
+        let hovered = self.ui.hovered()?;
         self.rows
             .tree_rows
             .iter()
-            .find(|(w, _)| *w == hit)
+            .find(|(w, _)| *w == hovered)
             .map(|(_, n)| *n)
     }
 

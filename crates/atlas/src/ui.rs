@@ -560,8 +560,9 @@ fn build_scene_tree(
     panel
 }
 
-/// The size of a disclosure triangle / its spacer, in pixels.
-const TREE_DISCLOSURE: f32 = 14.0;
+/// The width of a disclosure column / indent step, and the chevron glyph size.
+const TREE_DISCLOSURE: f32 = 16.0;
+const TREE_CHEVRON: f32 = 14.0;
 
 #[allow(clippy::too_many_arguments)]
 fn add_tree_row(
@@ -617,7 +618,11 @@ fn add_tree_row(
             } else {
                 icons.get(Icon::ChevronDown)
             };
-            ui.image(toggle, chevron, Style::new().size(11.0, 11.0));
+            ui.image(
+                toggle,
+                chevron,
+                Style::new().size(TREE_CHEVRON, TREE_CHEVRON),
+            );
         }
         rows.tree_toggles.push((toggle, node));
     } else {
@@ -963,6 +968,44 @@ mod tests {
         );
         // The parent still has a disclosure toggle to expand it again.
         assert!(rows.tree_toggles.iter().any(|(_, n)| *n == parent));
+    }
+
+    #[test]
+    fn hovering_a_tree_row_resolves_to_its_row_widget() {
+        // The reparent drag looks up the row via the interactive widget under
+        // the cursor (hovered), not a raw hit-test - which would return the
+        // row's label child and miss. This pins that.
+        let (scene, handle) = demo_scene();
+        let sprite = scene.children(scene.root())[0];
+        let dir = std::env::temp_dir();
+        let (mut ui, rows) = build_editor_ui(
+            &scene,
+            None,
+            handle,
+            &dir,
+            PanelSizes::default(),
+            None,
+            GizmoMode::Select,
+            None,
+            &TreeView::default(),
+        );
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+
+        let (row_id, _) = *rows
+            .tree_rows
+            .iter()
+            .find(|(_, n)| *n == sprite)
+            .expect("the sprite has a row");
+        let rect = ui.rect(row_id).unwrap();
+        // Move the cursor over the row's name (right of the disclosure column).
+        ui.handle_input(aurora::InputEvent::PointerMoved(
+            rect.pos + Vec2::new(rect.size.x - 20.0, rect.size.y * 0.5),
+        ));
+        assert_eq!(
+            ui.hovered(),
+            Some(row_id),
+            "the interactive widget under a row is the row itself"
+        );
     }
 
     #[test]
