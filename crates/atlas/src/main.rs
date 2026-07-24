@@ -12,6 +12,7 @@ mod textures;
 mod ui;
 mod viewport;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -35,8 +36,8 @@ use crate::icons::Icons;
 use crate::textures::TextureCache;
 use crate::ui::{
     Axis, ColorPickerView, ColorTarget, ContextMenu, EditorRows, FieldRef, MenuAction, PanelSizes,
-    build_color_picker, build_editor_ui, capture_panel_sizes, field_color, field_vec2, parse_value,
-    set_field_color, set_field_vec2, with_axis,
+    TreeView, build_color_picker, build_editor_ui, capture_panel_sizes, field_color, field_vec2,
+    parse_value, set_field_color, set_field_vec2, with_axis,
 };
 use crate::viewport::{Drag, EditorCamera, GizmoHit, GizmoMode};
 
@@ -186,6 +187,19 @@ struct State {
     picker_sv: ImageHandle,
     picker_hue: ImageHandle,
     picker_alpha: ImageHandle,
+    /// Collapsed scene-tree nodes (editor state, kept across shell rebuilds).
+    tree_collapsed: HashSet<NodeId>,
+    /// An in-progress reparent drag: the row being dragged and the current
+    /// drop target under the cursor.
+    reparent: Option<ReparentDrag>,
+}
+
+/// A tree row being dragged to reparent it; `target` is the node currently
+/// under the cursor (a valid drop), highlighted in the tree.
+#[derive(Debug, Clone, Copy)]
+struct ReparentDrag {
+    source: NodeId,
+    target: Option<NodeId>,
 }
 
 impl ApplicationHandler for App {
@@ -240,10 +254,14 @@ impl ApplicationHandler for App {
                     if state.begin_scrub() {
                         return;
                     }
+                    // A press on a tree row arms a reparent drag (non-consuming:
+                    // a plain click still selects via the row's Clicked event).
+                    state.begin_reparent();
                     state.viewport_press();
                     state.file_press();
                 }
                 (MouseButton::Left, ElementState::Released) => {
+                    state.finish_reparent();
                     state.end_picker_drag();
                     state.end_scrub();
                     state.file_drop();
@@ -347,6 +365,7 @@ impl State {
             None,
             GizmoMode::default(),
             Some(&icons),
+            &TreeView::default(),
         );
 
         Ok(Self {
@@ -387,6 +406,8 @@ impl State {
             picker_sv,
             picker_hue,
             picker_alpha,
+            tree_collapsed: HashSet::new(),
+            reparent: None,
         })
     }
 
@@ -429,6 +450,9 @@ impl State {
         }
         if self.picker.is_some_and(|p| p.drag.is_some()) {
             self.apply_picker_drag();
+        }
+        if self.reparent.is_some() {
+            self.update_reparent_target();
         }
         if let Some(drag) = self.drag
             && let Some(world) = self.cursor_world()
@@ -765,6 +789,76 @@ impl State {
                 self.history
                     .set_field(scene, node, index, field, Value::Vec2(v));
             }
+        }
+    }
+
+    /// The scene tree's editor state for a rebuild: the collapsed set plus the
+    /// current reparent drop target (highlighted while dragging).
+    fn tree_view(&self) -> TreeView {
+        TreeView {
+            collapsed: self.tree_collapsed.clone(),
+            drop_target: self.reparent.and_then(|r| r.target),
+        }
+    }
+
+    /// Collapse or expand a node's children in the tree.
+    fn toggle_collapse(&mut self, node: NodeId) {
+        if !self.tree_collapsed.remove(&node) {
+            self.tree_collapsed.insert(node);
+        }
+        self.dirty = true;
+    }
+
+    /// The scene-tree row node under the cursor, if any (a drop target).
+    fn tree_row_at_cursor(&self) -> Option<NodeId> {
+        let hit = self.ui.hit_test(self.cursor)?;
+        self.rows
+            .tree_rows
+            .iter()
+            .find(|(w, _)| *w == hit)
+            .map(|(_, n)| *n)
+    }
+
+    /// A press on a tree row arms a reparent drag (a plain click still selects
+    /// via the row's Clicked event; only a drag onto another row reparents).
+    fn begin_reparent(&mut self) {
+        if let Some(source) = self.tree_row_at_cursor() {
+            self.reparent = Some(ReparentDrag {
+                source,
+                target: None,
+            });
+        }
+    }
+
+    /// Track the drop target under the cursor: a different row that is not a
+    /// descendant of the dragged node (which would make a cycle). Highlighted
+    /// green via the tree view.
+    fn update_reparent_target(&mut self) {
+        let Some(mut drag) = self.reparent else {
+            return;
+        };
+        let target = self
+            .tree_row_at_cursor()
+            .filter(|&t| t != drag.source && !self.project.scene.is_ancestor(drag.source, t));
+        if target != drag.target {
+            drag.target = target;
+            self.reparent = Some(drag);
+            self.dirty = true;
+        }
+    }
+
+    /// On release, reparent the dragged node under the drop target (appended as
+    /// its last child) through the history - one undo step.
+    fn finish_reparent(&mut self) {
+        let Some(drag) = self.reparent.take() else {
+            return;
+        };
+        if let Some(target) = drag.target {
+            let index = self.project.scene.children(target).len();
+            self.history
+                .reparent(&mut self.project.scene, drag.source, target, index);
+            self.selected = Some(drag.source);
+            self.dirty = true;
         }
     }
 
@@ -1186,6 +1280,7 @@ impl State {
                 self.context_menu.as_ref(),
                 self.gizmo_mode,
                 Some(&self.icons),
+                &self.tree_view(),
             );
             self.ui = ui;
             self.rows = rows;
@@ -1332,6 +1427,18 @@ impl State {
                         .map(|(_, t)| *t)
                         .expect("guarded by the match arm");
                     self.open_color_picker(target);
+                }
+                AuroraEvent::Clicked(id)
+                    if self.rows.tree_toggles.iter().any(|(w, _)| *w == id) =>
+                {
+                    let node = self
+                        .rows
+                        .tree_toggles
+                        .iter()
+                        .find(|(w, _)| *w == id)
+                        .map(|(_, n)| *n)
+                        .expect("guarded by the match arm");
+                    self.toggle_collapse(node);
                 }
                 AuroraEvent::Clicked(id) => {
                     if let Some(&(_, node)) =

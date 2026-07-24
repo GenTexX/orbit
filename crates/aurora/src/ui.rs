@@ -479,6 +479,7 @@ impl Ui {
             clip: style.clip || style.scroll,
             scroll: style.scroll,
             numeric: false,
+            flat: style.flat,
         });
         self.taffy
             .set_node_context(node, Some(id))
@@ -1224,6 +1225,23 @@ impl Ui {
     /// A button: a state-shaded fill (its style background, or the theme default)
     /// under its caption.
     fn emit_button(&self, id: WidgetId, rect: Rect, widget: &Widget, list: &mut DrawList) {
+        if widget.flat {
+            // A flat button (list/tree row): its own background when idle
+            // (transparent draws nothing). A row with a background (selected)
+            // keeps it and just brightens on hover; a plain row gets a subtle
+            // overlay, so nothing reads as a raised button.
+            let bg = widget.background;
+            let color = match self.interaction(id) {
+                Interaction::Idle => bg,
+                Interaction::Hovered if bg.a > 0.0 => bg.lighten(0.06),
+                Interaction::Hovered => theme::ROW_HOVER,
+                Interaction::Pressed if bg.a > 0.0 => bg.darken(0.06),
+                Interaction::Pressed => theme::ROW_PRESSED,
+            };
+            self.fill_background(rect, color, list);
+            self.emit_text(id, widget.foreground, list);
+            return;
+        }
         let base = if widget.background.a > 0.0 {
             widget.background
         } else {

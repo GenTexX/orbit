@@ -94,4 +94,6 @@ pub(crate) struct Widget {
     /// Whether this text input accepts only numeric text (a leading `-`,
     /// digits, and a single `.`) - other keystrokes and pastes are rejected.
     pub numeric: bool,
+    /// Whether this button renders flat (no raised fill; hover/press only).
+    pub flat: bool,
 }

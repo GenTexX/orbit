@@ -23,6 +23,10 @@ pub struct Style {
     /// Scroll overflowing content vertically (implies clip). Children of a
     /// scroll container keep their natural size instead of flex-shrinking.
     pub scroll: bool,
+    /// Render a button "flat": no default fill when idle, only a subtle
+    /// highlight on hover/press (plus its own background if set). For list and
+    /// tree rows that should not read as raised buttons.
+    pub flat: bool,
 }
 
 impl Default for Style {
@@ -33,6 +37,7 @@ impl Default for Style {
             foreground: Color::WHITE,
             clip: false,
             scroll: false,
+            flat: false,
         }
     }
 }
@@ -137,6 +142,13 @@ impl Style {
     /// Set the text (foreground) color.
     pub fn foreground(mut self, color: Color) -> Self {
         self.foreground = color;
+        self
+    }
+
+    /// Render a button flat (no raised fill; only a subtle hover/press
+    /// highlight over its background) - for list and tree rows.
+    pub fn flat(mut self) -> Self {
+        self.flat = true;
         self
     }
 

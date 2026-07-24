@@ -149,7 +149,7 @@ impl Scene {
 
     /// Whether `ancestor` lies on the path from `of` up to the root (so
     /// reparenting `of` under `ancestor`'s subtree would create a cycle).
-    pub(crate) fn is_ancestor(&self, ancestor: NodeId, of: NodeId) -> bool {
+    pub fn is_ancestor(&self, ancestor: NodeId, of: NodeId) -> bool {
         let mut cur = self.nodes[of].parent;
         while let Some(id) = cur {
             if id == ancestor {

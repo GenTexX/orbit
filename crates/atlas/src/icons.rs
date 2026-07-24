@@ -41,6 +41,10 @@ pub enum Icon {
     Move,
     Rotate,
     Scale,
+    /// A disclosure triangle pointing right (a collapsed tree node).
+    ChevronRight,
+    /// A disclosure triangle pointing down (an expanded tree node).
+    ChevronDown,
 }
 
 /// An icon's coverage predicate over the normalized `[0, 1]` square.
@@ -56,6 +60,8 @@ const SPECS: &[(Icon, Predicate)] = &[
     (Icon::Move, icon_move),
     (Icon::Rotate, icon_rotate),
     (Icon::Scale, icon_scale),
+    (Icon::ChevronRight, icon_chevron_right),
+    (Icon::ChevronDown, icon_chevron_down),
 ];
 
 /// The registered icon images, looked up by [`Icon`].
@@ -246,6 +252,16 @@ fn icon_rotate(x: f32, y: f32) -> bool {
     // Ring open at the top; the upper end sits near (0.40, 0.20).
     arc(x, y, 0.28, 0.35, 0.1 * PI, 1.4 * PI)
         || arrowhead(x, y, (0.52, 0.16), (0.95, -0.31), 0.17, 0.1)
+}
+
+/// A small solid triangle pointing right (a collapsed tree node).
+fn icon_chevron_right(x: f32, y: f32) -> bool {
+    tri(x, y, (0.38, 0.28), (0.38, 0.72), (0.66, 0.5))
+}
+
+/// A small solid triangle pointing down (an expanded tree node).
+fn icon_chevron_down(x: f32, y: f32) -> bool {
+    tri(x, y, (0.28, 0.38), (0.72, 0.38), (0.5, 0.66))
 }
 
 /// A diagonal double-headed arrow (scale/resize), thin with sharp heads.

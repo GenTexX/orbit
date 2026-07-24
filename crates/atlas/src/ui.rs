@@ -2,6 +2,7 @@
 //! file explorer) from the current scene, selection, and project directory
 //! (M3 step 6 - "the editor looks like an editor").
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use aurora::{Color, ImageHandle, Orientation, Style, Ui, WidgetId};
@@ -17,6 +18,8 @@ const ROOT_BG: Color = Color::rgb(0.08, 0.08, 0.10);
 const HEADING: Color = Color::rgb(0.96, 0.97, 1.0);
 const SUBHEAD: Color = Color::rgb(0.55, 0.60, 0.72);
 const ROW_SELECTED: Color = Color::rgb(0.20, 0.28, 0.42);
+/// The drop-target highlight while dragging a tree row to reparent it.
+const ROW_DROP: Color = Color::rgb(0.18, 0.40, 0.30);
 const MENU_BG: Color = Color::rgb(0.16, 0.17, 0.22);
 const MODE_ACTIVE: Color = Color::rgb(0.24, 0.40, 0.62);
 /// The engine axis palette (matches the viewport gizmo): X red, Y green. Used
@@ -129,12 +132,25 @@ pub struct ColorPickerView {
     pub alpha: ImageHandle,
 }
 
+/// The scene tree's editor state, kept across shell rebuilds (the same lesson
+/// as panel sizes and scroll): which nodes are collapsed, and the current
+/// reparent drop target (highlighted while dragging a row). Cheap to clone
+/// (a handful of node ids) at each rebuild.
+#[derive(Debug, Clone, Default)]
+pub struct TreeView {
+    pub collapsed: HashSet<NodeId>,
+    pub drop_target: Option<NodeId>,
+}
+
 /// Maps widget handles back to the domain data they represent, so the app can
 /// react to Aurora events without Aurora knowing about `Scene`/`NodeId`.
 #[derive(Default)]
 pub struct EditorRows {
-    /// A clicked tree row selects this node.
+    /// A clicked tree row selects this node (and a press begins a reparent
+    /// drag); the row rect also serves as the drop target during a drag.
     pub tree_rows: Vec<(WidgetId, NodeId)>,
+    /// A clicked disclosure triangle collapses/expands this node.
+    pub tree_toggles: Vec<(WidgetId, NodeId)>,
     /// A submitted field row commits its current text to
     /// `(node, component index, field name)`.
     pub field_rows: Vec<(WidgetId, NodeId, usize, &'static str)>,
@@ -265,6 +281,7 @@ pub fn build_editor_ui(
     menu: Option<&ContextMenu>,
     gizmo_mode: GizmoMode,
     icons: Option<&Icons>,
+    tree: &TreeView,
 ) -> (Ui, EditorRows) {
     let mut ui = Ui::new();
     let mut rows = EditorRows::default();
@@ -277,7 +294,16 @@ pub fn build_editor_ui(
     // content - see aurora's nested-row scroll test.
     let main = ui.panel(root, Style::new().row().grow(1.0).clip());
 
-    let tree_panel = build_scene_tree(&mut ui, main, scene, selected, sizes.tree_width, &mut rows);
+    let tree_panel = build_scene_tree(
+        &mut ui,
+        main,
+        scene,
+        selected,
+        sizes.tree_width,
+        tree,
+        icons,
+        &mut rows,
+    );
     let splitter_1 = ui.splitter(main, Orientation::Vertical, 1.0, Style::new().width(4.0));
     ui.set_splitter_target(splitter_1, tree_panel);
 
@@ -498,12 +524,15 @@ pub fn build_color_picker(ui: &mut Ui, view: &ColorPickerView, rows: &mut Editor
 }
 
 /// The docked scene-tree panel: one clickable row per node, indented by depth.
+#[allow(clippy::too_many_arguments)]
 fn build_scene_tree(
     ui: &mut Ui,
     parent: WidgetId,
     scene: &Scene,
     selected: Option<NodeId>,
     width: f32,
+    tree: &TreeView,
+    icons: Option<&Icons>,
     rows: &mut EditorRows,
 ) -> WidgetId {
     let panel = ui.panel(
@@ -512,15 +541,29 @@ fn build_scene_tree(
             .column()
             .width(width)
             .padding(10.0)
-            .gap(4.0)
+            .gap(1.0)
             .scroll()
             .background(PANEL_BG),
     );
     ui.label(panel, "Scene", Style::new().foreground(HEADING));
-    add_tree_row(ui, panel, scene, scene.root(), 0, selected, rows);
+    add_tree_row(
+        ui,
+        panel,
+        scene,
+        scene.root(),
+        0,
+        selected,
+        tree,
+        icons,
+        rows,
+    );
     panel
 }
 
+/// The size of a disclosure triangle / its spacer, in pixels.
+const TREE_DISCLOSURE: f32 = 14.0;
+
+#[allow(clippy::too_many_arguments)]
 fn add_tree_row(
     ui: &mut Ui,
     parent: WidgetId,
@@ -528,32 +571,79 @@ fn add_tree_row(
     node: NodeId,
     depth: u32,
     selected: Option<NodeId>,
+    tree: &TreeView,
+    icons: Option<&Icons>,
     rows: &mut EditorRows,
 ) {
-    let row = ui.panel(parent, Style::new().row().gap(4.0));
-    if depth > 0 {
-        // A blank fixed-width spacer stands in for per-side padding, which
-        // Style does not expose yet - the smallest thing that indents.
-        ui.panel(row, Style::new().width(depth as f32 * 14.0));
-    }
-    let highlight = if selected == Some(node) {
+    // Selected wins the highlight; a reparent drop target tints green.
+    let background = if selected == Some(node) {
         ROW_SELECTED
+    } else if tree.drop_target == Some(node) {
+        ROW_DROP
     } else {
         Color::TRANSPARENT
     };
-    let button = ui.button(
+    // The whole row is one flat, selectable button (a tree row, not a raised
+    // button); the disclosure triangle sits on top of it as a child.
+    let row = ui.button(
+        parent,
+        "",
+        Style::new()
+            .row()
+            .gap(4.0)
+            .align_center()
+            .padding(3.0)
+            .flat()
+            .background(background),
+    );
+
+    // Indent by depth; then a disclosure triangle for a parent, or a spacer.
+    if depth > 0 {
+        ui.panel(row, Style::new().width(depth as f32 * TREE_DISCLOSURE));
+    }
+    let has_children = !scene.children(node).is_empty();
+    let collapsed = tree.collapsed.contains(&node);
+    if has_children {
+        // A flat button holding the disclosure triangle; clicking it toggles
+        // collapse. The chevron image is decoration (present when icons are).
+        let toggle = ui.button(
+            row,
+            "",
+            Style::new().flat().padding(1.0).width(TREE_DISCLOSURE),
+        );
+        if let Some(icons) = icons {
+            let chevron = if collapsed {
+                icons.get(Icon::ChevronRight)
+            } else {
+                icons.get(Icon::ChevronDown)
+            };
+            ui.image(toggle, chevron, Style::new().size(11.0, 11.0));
+        }
+        rows.tree_toggles.push((toggle, node));
+    } else {
+        ui.panel(row, Style::new().width(TREE_DISCLOSURE));
+    }
+    ui.label(
         row,
         scene.node(node).name.clone(),
-        Style::new()
-            .grow(1.0)
-            .padding(4.0)
-            .background(highlight)
-            .foreground(HEADING),
+        Style::new().grow(1.0).foreground(HEADING),
     );
-    rows.tree_rows.push((button, node));
+    rows.tree_rows.push((row, node));
 
-    for &child in scene.children(node) {
-        add_tree_row(ui, parent, scene, child, depth + 1, selected, rows);
+    if has_children && !collapsed {
+        for &child in scene.children(node) {
+            add_tree_row(
+                ui,
+                parent,
+                scene,
+                child,
+                depth + 1,
+                selected,
+                tree,
+                icons,
+                rows,
+            );
+        }
     }
 }
 
@@ -829,6 +919,53 @@ mod tests {
     }
 
     #[test]
+    fn collapsing_a_node_hides_its_children_in_the_tree() {
+        // root -> parent -> child
+        let mut scene = Scene::new("Root");
+        let root = scene.root();
+        let parent = scene.add_child(root, Node::new("Parent"));
+        let child = scene.add_child(parent, Node::new("Child"));
+        let mut reg: slotmap::SlotMap<ImageHandle, ()> = slotmap::SlotMap::with_key();
+        let handle = reg.insert(());
+        let dir = std::env::temp_dir();
+
+        let build = |tree: &TreeView| {
+            build_editor_ui(
+                &scene,
+                None,
+                handle,
+                &dir,
+                PanelSizes::default(),
+                None,
+                GizmoMode::Select,
+                None,
+                tree,
+            )
+            .1
+        };
+        // Expanded: rows for root, parent, and child.
+        let rows = build(&TreeView::default());
+        let nodes: Vec<NodeId> = rows.tree_rows.iter().map(|(_, n)| *n).collect();
+        assert!(nodes.contains(&child));
+
+        // Collapse the parent: the child's row is gone, the parent's stays.
+        let mut collapsed = HashSet::new();
+        collapsed.insert(parent);
+        let rows = build(&TreeView {
+            collapsed,
+            drop_target: None,
+        });
+        let nodes: Vec<NodeId> = rows.tree_rows.iter().map(|(_, n)| *n).collect();
+        assert!(nodes.contains(&parent));
+        assert!(
+            !nodes.contains(&child),
+            "collapsed parent's child is hidden"
+        );
+        // The parent still has a disclosure toggle to expand it again.
+        assert!(rows.tree_toggles.iter().any(|(_, n)| *n == parent));
+    }
+
+    #[test]
     fn a_selected_node_gets_vec2_axis_inputs_and_scrub_labels() {
         let (scene, handle) = demo_scene();
         let node = scene.children(scene.root())[0];
@@ -842,6 +979,7 @@ mod tests {
             None,
             GizmoMode::Select,
             None,
+            &TreeView::default(),
         );
 
         // Three Vec2 fields (position, scale, sprite size) -> two axes each.
@@ -889,6 +1027,7 @@ mod tests {
             None,
             GizmoMode::Select,
             None,
+            &TreeView::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -919,6 +1058,7 @@ mod tests {
             None,
             GizmoMode::Select,
             None,
+            &TreeView::default(),
         );
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
         assert_eq!(
@@ -941,6 +1081,7 @@ mod tests {
             None,
             GizmoMode::Rotate,
             None,
+            &TreeView::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -983,6 +1124,7 @@ mod tests {
             Some(&menu),
             GizmoMode::Select,
             None,
+            &TreeView::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -1015,6 +1157,7 @@ mod tests {
             None,
             GizmoMode::Select,
             None,
+            &TreeView::default(),
         );
         // The sprite's tint is a Color field, so the inspector has one swatch.
         assert_eq!(rows.color_swatches.len(), 1);
@@ -1067,6 +1210,7 @@ mod tests {
             None,
             GizmoMode::Select,
             None,
+            &TreeView::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -1090,6 +1234,7 @@ mod tests {
             None,
             GizmoMode::Select,
             None,
+            &TreeView::default(),
         );
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
         assert_eq!(ui2.scroll_offset(rows2.tree_panel.unwrap()), 90.0);
@@ -1113,6 +1258,7 @@ mod tests {
             None,
             GizmoMode::Select,
             None,
+            &TreeView::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
         let viewport = rows.viewport.unwrap();
