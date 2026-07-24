@@ -100,6 +100,95 @@ impl Style {
         self
     }
 
+    /// Horizontal padding (left and right), in pixels. Composes with the
+    /// vertical and per-side setters.
+    pub fn padding_x(mut self, pad: f32) -> Self {
+        self.layout.padding.left = length(pad);
+        self.layout.padding.right = length(pad);
+        self
+    }
+
+    /// Vertical padding (top and bottom), in pixels.
+    pub fn padding_y(mut self, pad: f32) -> Self {
+        self.layout.padding.top = length(pad);
+        self.layout.padding.bottom = length(pad);
+        self
+    }
+
+    /// Left padding only, in pixels.
+    pub fn padding_left(mut self, pad: f32) -> Self {
+        self.layout.padding.left = length(pad);
+        self
+    }
+
+    /// Right padding only, in pixels.
+    pub fn padding_right(mut self, pad: f32) -> Self {
+        self.layout.padding.right = length(pad);
+        self
+    }
+
+    /// Top padding only, in pixels.
+    pub fn padding_top(mut self, pad: f32) -> Self {
+        self.layout.padding.top = length(pad);
+        self
+    }
+
+    /// Bottom padding only, in pixels.
+    pub fn padding_bottom(mut self, pad: f32) -> Self {
+        self.layout.padding.bottom = length(pad);
+        self
+    }
+
+    /// Uniform margin on all four sides, in pixels. Margin is space *outside*
+    /// the box, between it and its siblings (it does not fill with background).
+    pub fn margin(mut self, m: f32) -> Self {
+        self.layout.margin = TaffyRect {
+            left: length(m),
+            right: length(m),
+            top: length(m),
+            bottom: length(m),
+        };
+        self
+    }
+
+    /// Horizontal margin (left and right), in pixels.
+    pub fn margin_x(mut self, m: f32) -> Self {
+        self.layout.margin.left = length(m);
+        self.layout.margin.right = length(m);
+        self
+    }
+
+    /// Vertical margin (top and bottom), in pixels.
+    pub fn margin_y(mut self, m: f32) -> Self {
+        self.layout.margin.top = length(m);
+        self.layout.margin.bottom = length(m);
+        self
+    }
+
+    /// Left margin only, in pixels.
+    pub fn margin_left(mut self, m: f32) -> Self {
+        self.layout.margin.left = length(m);
+        self
+    }
+
+    /// Right margin only, in pixels.
+    pub fn margin_right(mut self, m: f32) -> Self {
+        self.layout.margin.right = length(m);
+        self
+    }
+
+    /// Top margin only, in pixels.
+    pub fn margin_top(mut self, m: f32) -> Self {
+        self.layout.margin.top = length(m);
+        self
+    }
+
+    /// Bottom margin only, in pixels.
+    pub fn margin_bottom(mut self, m: f32) -> Self {
+        self.layout.margin.bottom = length(m);
+        self
+    }
+
     /// Gap between flex children, in pixels.
     pub fn gap(mut self, gap: f32) -> Self {
         self.layout.gap = Size {

@@ -1670,6 +1670,37 @@ mod tests {
     }
 
     #[test]
+    fn per_side_padding_insets_the_child() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(
+            Style::new()
+                .size(200.0, 200.0)
+                .padding_left(10.0)
+                .padding_top(6.0),
+        );
+        let child = ui.panel(root, Style::new().fill());
+        ui.layout(Vec2::new(200.0, 200.0)).unwrap();
+        // The child starts at the padded top-left corner.
+        assert_eq!(ui.rect(child).unwrap().pos, Vec2::new(10.0, 6.0));
+    }
+
+    #[test]
+    fn per_side_margin_offsets_the_box() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 200.0).column());
+        let child = ui.panel(
+            root,
+            Style::new()
+                .size(20.0, 20.0)
+                .margin_left(15.0)
+                .margin_top(4.0),
+        );
+        ui.layout(Vec2::new(200.0, 200.0)).unwrap();
+        // Margin pushes the box in from the container's edges (no padding here).
+        assert_eq!(ui.rect(child).unwrap().pos, Vec2::new(15.0, 4.0));
+    }
+
+    #[test]
     fn clicking_a_button_emits_clicked() {
         let mut ui = Ui::new();
         let root = ui.root_panel(Style::new().size(200.0, 100.0));
