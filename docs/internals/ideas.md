@@ -136,8 +136,6 @@ this list is what "come back and make the editor great" concretely means.
 
 - **Asset fields**: an asset-chooser popup (needs popups), and/or drag a file
   from the explorer onto the field.
-- **Color fields**: a color picker (needs popups); until then at least a
-  color swatch preview next to the text.
 
 ## Engine (helios / photon)
 
