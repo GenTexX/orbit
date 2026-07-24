@@ -77,8 +77,6 @@ this list is what "come back and make the editor great" concretely means.
   the inspector - Node.name is already there, just not editable).
 - **Delete** the selected node (Del key + context menu), **duplicate**
   (ctrl+D), and **copy/paste** across the tree - all through History.
-- **Reparent by dragging** rows in the scene tree (the drag-drop machinery
-  above; History::reparent already exists and refuses cycles).
 - **Multi-select**: ctrl+click in tree and viewport, box-select by dragging
   over empty viewport space; group move/delete; the inspector shows shared
   fields.
