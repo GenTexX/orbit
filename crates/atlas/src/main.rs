@@ -294,7 +294,7 @@ impl State {
             panel_sizes,
             None,
             GizmoMode::default(),
-            Some(icons),
+            Some(&icons),
         );
 
         Ok(Self {
@@ -966,7 +966,7 @@ impl State {
                 self.panel_sizes,
                 self.context_menu.as_ref(),
                 self.gizmo_mode,
-                Some(self.icons),
+                Some(&self.icons),
             );
             self.ui = ui;
             self.rows = rows;

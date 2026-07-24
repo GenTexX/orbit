@@ -8,7 +8,7 @@ use aurora::{Color, ImageHandle, Orientation, Style, Ui, WidgetId};
 use glam::Vec2;
 use helios::{NodeId, Scene, Value};
 
-use crate::icons::Icons;
+use crate::icons::{Icon, Icons};
 use crate::viewport::GizmoMode;
 
 const PANEL_BG: Color = Color::rgb(0.13, 0.14, 0.18);
@@ -216,7 +216,7 @@ pub fn build_editor_ui(
     sizes: PanelSizes,
     menu: Option<&ContextMenu>,
     gizmo_mode: GizmoMode,
-    icons: Option<Icons>,
+    icons: Option<&Icons>,
 ) -> (Ui, EditorRows) {
     let mut ui = Ui::new();
     let mut rows = EditorRows::default();
@@ -306,7 +306,7 @@ fn build_toolbar(
     ui: &mut Ui,
     parent: WidgetId,
     mode: GizmoMode,
-    icons: Option<Icons>,
+    icons: Option<&Icons>,
     rows: &mut EditorRows,
 ) {
     let bar = ui.panel(
@@ -318,34 +318,22 @@ fn build_toolbar(
             .align_center()
             .background(PANEL_BG),
     );
+    let icon = |id: Icon| icons.map(|i| i.get(id));
     rows.add_sprite = Some(toolbar_button(
         ui,
         bar,
         "Add Sprite",
-        icons.map(|i| i.add),
+        icon(Icon::Add),
         PANEL_BG,
     ));
-    rows.save = Some(toolbar_button(
-        ui,
-        bar,
-        "Save",
-        icons.map(|i| i.save),
-        PANEL_BG,
-    ));
-    rows.load = Some(toolbar_button(
-        ui,
-        bar,
-        "Load",
-        icons.map(|i| i.load),
-        PANEL_BG,
-    ));
+    rows.save = Some(toolbar_button(ui, bar, "Save", icon(Icon::Save), PANEL_BG));
+    rows.load = Some(toolbar_button(ui, bar, "Load", icon(Icon::Load), PANEL_BG));
 
     // A spacer pushes the mode switches to the right edge of the bar.
     ui.panel(bar, Style::new().grow(1.0));
     for m in GizmoMode::ALL {
         let background = if m == mode { MODE_ACTIVE } else { PANEL_BG };
-        let icon = icons.map(|i| mode_icon(i, m));
-        let button = toolbar_button(ui, bar, m.label(), icon, background);
+        let button = toolbar_button(ui, bar, m.label(), icon(mode_icon(m)), background);
         rows.mode_buttons.push((button, m));
     }
 }
@@ -377,12 +365,12 @@ fn toolbar_button(
 }
 
 /// The icon for a gizmo mode.
-fn mode_icon(icons: Icons, mode: GizmoMode) -> ImageHandle {
+fn mode_icon(mode: GizmoMode) -> Icon {
     match mode {
-        GizmoMode::Select => icons.select,
-        GizmoMode::Move => icons.translate,
-        GizmoMode::Rotate => icons.rotate,
-        GizmoMode::Scale => icons.scale,
+        GizmoMode::Select => Icon::Select,
+        GizmoMode::Move => Icon::Move,
+        GizmoMode::Rotate => Icon::Rotate,
+        GizmoMode::Scale => Icon::Scale,
     }
 }
 

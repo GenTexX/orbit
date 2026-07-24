@@ -2,10 +2,26 @@
 //! white-on-transparent bitmaps once at startup, registered as Aurora images.
 //!
 //! Each icon is a boolean coverage predicate in a normalized `[0, 1]` square
-//! (union of simple shapes - discs, capsules, triangles, polygons, arcs). The
+//! (union of simple shapes - capsules, triangles, polygons, arcs, rects). The
 //! rasterizer supersamples it into an alpha mask; the RGB is white, so the
 //! image pipeline's tint can recolor it later. No new GPU pipeline, no bundled
 //! font or art assets - the "custom Aurora icon" path from the ideatank.
+//!
+//! # Adding an icon
+//!
+//! 1. Add a variant to [`Icon`].
+//! 2. Write its predicate (a `fn(f32, f32) -> bool` over the `[0, 1]` square,
+//!    composed from the shape helpers below).
+//! 3. Add the `(variant, predicate)` row to [`SPECS`].
+//!
+//! Then draw it with `icons.get(Icon::YourVariant)`. To see how it looks, run
+//! the preview which renders every icon to a PNG:
+//!
+//! ```text
+//! cargo test -p atlas icons::tests::write_preview -- --ignored --nocapture
+//! ```
+
+use std::collections::HashMap;
 
 use aurora::ImageHandle;
 use aurora_wgpu::Renderer as AuroraRenderer;
@@ -15,39 +31,62 @@ const SIZE: usize = 24;
 /// Supersampling factor per axis for the coverage mask (anti-aliasing).
 const SS: usize = 4;
 
-/// The registered toolbar icons (opaque handles; cheap to copy).
-#[derive(Debug, Clone, Copy)]
+/// A named icon. Add a variant here (and a row in [`SPECS`]) to add an icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Icon {
+    Add,
+    Save,
+    Load,
+    Select,
+    Move,
+    Rotate,
+    Scale,
+}
+
+/// An icon's coverage predicate over the normalized `[0, 1]` square.
+type Predicate = fn(f32, f32) -> bool;
+
+/// Every icon paired with the predicate that draws it. This table IS the icon
+/// set - adding a row (plus the [`Icon`] variant) is the whole change.
+const SPECS: &[(Icon, Predicate)] = &[
+    (Icon::Add, icon_add),
+    (Icon::Save, icon_save),
+    (Icon::Load, icon_load),
+    (Icon::Select, icon_select),
+    (Icon::Move, icon_move),
+    (Icon::Rotate, icon_rotate),
+    (Icon::Scale, icon_scale),
+];
+
+/// The registered icon images, looked up by [`Icon`].
 pub struct Icons {
-    pub add: ImageHandle,
-    pub save: ImageHandle,
-    pub load: ImageHandle,
-    pub select: ImageHandle,
-    pub translate: ImageHandle,
-    pub rotate: ImageHandle,
-    pub scale: ImageHandle,
+    handles: HashMap<Icon, ImageHandle>,
 }
 
 impl Icons {
-    /// Rasterize and register every toolbar icon on the GUI renderer.
+    /// Rasterize and register every icon in [`SPECS`] on the GUI renderer.
     pub fn build(gui: &mut AuroraRenderer) -> Self {
-        let mut register = |predicate: fn(f32, f32) -> bool| {
-            let rgba = rasterize(predicate);
-            gui.register_image_rgba(&rgba, SIZE as u32, SIZE as u32)
-        };
-        Self {
-            add: register(icon_add),
-            save: register(icon_save),
-            load: register(icon_load),
-            select: register(icon_select),
-            translate: register(icon_move),
-            rotate: register(icon_rotate),
-            scale: register(icon_scale),
-        }
+        let handles = SPECS
+            .iter()
+            .map(|&(icon, predicate)| {
+                let rgba = rasterize(predicate);
+                (
+                    icon,
+                    gui.register_image_rgba(&rgba, SIZE as u32, SIZE as u32),
+                )
+            })
+            .collect();
+        Self { handles }
+    }
+
+    /// The registered handle for `icon` (every [`SPECS`] icon is registered).
+    pub fn get(&self, icon: Icon) -> ImageHandle {
+        self.handles[&icon]
     }
 }
 
 /// Supersample `inside` into a white RGBA8 mask (alpha = coverage).
-fn rasterize(inside: fn(f32, f32) -> bool) -> Vec<u8> {
+fn rasterize(inside: Predicate) -> Vec<u8> {
     let mut rgba = vec![0u8; SIZE * SIZE * 4];
     for py in 0..SIZE {
         for px in 0..SIZE {
@@ -203,22 +242,47 @@ mod tests {
     fn every_icon_covers_some_but_not_all_pixels() {
         // A sanity check that each predicate draws something recognizable (a
         // non-trivial coverage fraction), so a broken predicate is caught.
-        for icon in [
-            icon_add as fn(f32, f32) -> bool,
-            icon_save,
-            icon_load,
-            icon_select,
-            icon_move,
-            icon_rotate,
-            icon_scale,
-        ] {
-            let rgba = rasterize(icon);
+        for &(icon, predicate) in SPECS {
+            let rgba = rasterize(predicate);
             let covered = rgba.iter().skip(3).step_by(4).filter(|&&a| a > 0).count();
             let total = SIZE * SIZE;
             assert!(
                 covered > total / 40 && covered < total * 9 / 10,
-                "icon coverage {covered}/{total} is out of range"
+                "{icon:?} coverage {covered}/{total} is out of range"
             );
         }
+    }
+
+    /// Render every icon into one PNG (white on a dark strip, scaled up) so a
+    /// new or tweaked icon can be eyeballed. Ignored by default; run with
+    /// `cargo test -p atlas icons::tests::write_preview -- --ignored --nocapture`
+    /// then open the printed path.
+    #[test]
+    #[ignore = "writes a preview PNG; run with --ignored to regenerate"]
+    fn write_preview() {
+        const SCALE: usize = 8;
+        let cols = SPECS.len();
+        let (w, h) = (cols * SIZE * SCALE, SIZE * SCALE);
+        let mut img = image::RgbImage::from_pixel(w as u32, h as u32, image::Rgb([40, 42, 52]));
+        for (col, &(_, predicate)) in SPECS.iter().enumerate() {
+            let mask = rasterize(predicate);
+            for py in 0..SIZE {
+                for px in 0..SIZE {
+                    let a = mask[(py * SIZE + px) * 4 + 3] as u32;
+                    let mix = |bg: u32| ((bg * (255 - a) + 255 * a) / 255) as u8;
+                    let color = image::Rgb([mix(40), mix(42), mix(52)]);
+                    for yy in 0..SCALE {
+                        for xx in 0..SCALE {
+                            let x = (col * SIZE + px) * SCALE + xx;
+                            let y = py * SCALE + yy;
+                            img.put_pixel(x as u32, y as u32, color);
+                        }
+                    }
+                }
+            }
+        }
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/icons_preview.png");
+        img.save(path).expect("write preview");
+        println!("icon preview written to {path}");
     }
 }
