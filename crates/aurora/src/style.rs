@@ -41,6 +41,12 @@ pub struct Style {
     pub mask: Mask,
     /// Font size in pixels for this widget's text, or `None` for the UI default.
     pub font_size: Option<f32>,
+    /// Whether this widget is a drag source: pressing and moving past a small
+    /// threshold starts a drag carrying this widget (see `Event::DragStarted`).
+    pub draggable: bool,
+    /// Whether this widget accepts drops: a drag released over it reports it as
+    /// the target (see `Event::Dropped`).
+    pub drop_target: bool,
 }
 
 impl Default for Style {
@@ -57,6 +63,8 @@ impl Default for Style {
             placeholder: None,
             mask: Mask::None,
             font_size: None,
+            draggable: false,
+            drop_target: false,
         }
     }
 }
@@ -291,6 +299,20 @@ impl Style {
     /// Text is re-shaped at this size and the widget measures to match.
     pub fn font_size(mut self, px: f32) -> Self {
         self.font_size = Some(px);
+        self
+    }
+
+    /// Make this widget a drag source: a press-and-drag past a small threshold
+    /// starts a drag carrying it (see [`Event::DragStarted`](crate::Event)).
+    pub fn draggable(mut self) -> Self {
+        self.draggable = true;
+        self
+    }
+
+    /// Make this widget a drop target: a drag released over it reports it as the
+    /// target (see [`Event::Dropped`](crate::Event)).
+    pub fn drop_target(mut self) -> Self {
+        self.drop_target = true;
         self
     }
 

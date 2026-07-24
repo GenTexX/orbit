@@ -147,6 +147,10 @@ pub(crate) struct Widget {
     /// Font size in pixels for this widget's text (the UI default when unset via
     /// style). Drives both shaping and measurement.
     pub font_size: f32,
+    /// Whether this widget is a drag source (see [`crate::Style::draggable`]).
+    pub draggable: bool,
+    /// Whether this widget accepts drops (see [`crate::Style::drop_target`]).
+    pub drop_target: bool,
     /// Whether this button renders flat (no raised fill; hover/press only).
     pub flat: bool,
     /// Whether hit-testing ignores this widget (decorative overlays).

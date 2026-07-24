@@ -25,6 +25,20 @@ enum Interaction {
     Pressed,
 }
 
+/// An in-progress drag from a draggable widget. Armed on press over the source,
+/// it goes `active` once the pointer moves past [`DRAG_THRESHOLD`] from the
+/// press point (so a plain click is never a drag).
+#[derive(Clone, Copy)]
+struct DragState {
+    source: WidgetId,
+    start: Vec2,
+    active: bool,
+}
+
+/// How far the pointer must move from the press point before an armed drag
+/// becomes live, in pixels.
+const DRAG_THRESHOLD: f32 = 4.0;
+
 /// A retained Aurora UI: owns the widget arena, the taffy layout tree, the font
 /// system, and the shaped text buffers; caches each widget's absolute rectangle
 /// after [`layout`](Self::layout).
@@ -62,6 +76,8 @@ pub struct Ui {
     hovered: Option<WidgetId>,
     /// The interactive widget a press landed on, armed until release.
     pressed: Option<WidgetId>,
+    /// An armed or live drag from a draggable widget (first-class drag-and-drop).
+    drag: Option<DragState>,
     /// The focused text input, which receives keyboard input.
     focused: Option<WidgetId>,
     /// Caret position in the focused input, as a byte offset into its text.
@@ -96,6 +112,7 @@ impl Ui {
             cursor: None,
             hovered: None,
             pressed: None,
+            drag: None,
             focused: None,
             caret: 0,
             selection_anchor: None,
@@ -490,6 +507,8 @@ impl Ui {
             mask: style.mask,
             placeholder: style.placeholder.unwrap_or_default(),
             font_size: style.font_size.unwrap_or(text::FONT_SIZE),
+            draggable: style.draggable,
+            drop_target: style.drop_target,
             flat: style.flat,
             hit_transparent: style.hit_transparent,
             disabled: style.disabled,
@@ -702,6 +721,7 @@ impl Ui {
                 {
                     self.caret = self.caret_at_x(id, self.cursor);
                 }
+                self.update_drag(p);
                 self.update_hover();
             }
             InputEvent::PointerLeft => {
@@ -712,6 +732,15 @@ impl Ui {
                 // Arm the widget under the pointer; a release over the same one
                 // is a click.
                 self.pressed = self.hovered;
+                // Arm a drag if the press landed on (or within) a draggable.
+                self.drag = self
+                    .cursor
+                    .and_then(|p| self.draggable_at(p))
+                    .map(|source| DragState {
+                        source,
+                        start: self.cursor.unwrap_or(Vec2::ZERO),
+                        active: false,
+                    });
                 self.focus_from_press();
                 // A press on a slider jumps it to the cursor immediately.
                 if let Some(id) = self.pressed {
@@ -719,6 +748,18 @@ impl Ui {
                 }
             }
             InputEvent::PointerReleased => {
+                // A live drag resolves to a drop (over a target, or a cancel);
+                // it also suppressed the click by clearing `pressed` when it went
+                // live, so the activation below only fires for a plain click.
+                if let Some(drag) = self.drag.take()
+                    && drag.active
+                {
+                    let target = self.cursor.and_then(|p| self.drop_target_at(p));
+                    self.events.push(Event::Dropped {
+                        source: drag.source,
+                        target,
+                    });
+                }
                 // `take` always disarms; activation happens only on a release
                 // over the same widget the press landed on.
                 if let Some(id) = self.pressed.take()
@@ -1008,6 +1049,58 @@ impl Ui {
     pub fn interactive_at(&self, point: Vec2) -> Option<WidgetId> {
         self.hit_test(point)
             .and_then(|id| self.interactive_ancestor(id))
+    }
+
+    /// Whether a first-class drag is currently live (past the start threshold).
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some_and(|d| d.active)
+    }
+
+    /// The draggable widget a live drag started on, if any (for drag feedback).
+    pub fn drag_source(&self) -> Option<WidgetId> {
+        self.drag.filter(|d| d.active).map(|d| d.source)
+    }
+
+    /// The drop-target widget under `point`: a hit-test bubbled to the nearest
+    /// ancestor marked [`drop_target`](crate::Style::drop_target). Exposed so an
+    /// app can highlight the target it is hovering during a drag.
+    pub fn drop_target_at(&self, point: Vec2) -> Option<WidgetId> {
+        let mut cur = self.hit_test(point);
+        while let Some(w) = cur {
+            if self.widgets[w].drop_target {
+                return Some(w);
+            }
+            cur = self.widgets[w].parent;
+        }
+        None
+    }
+
+    /// The draggable widget under `point`: a hit-test bubbled to the nearest
+    /// ancestor marked [`draggable`](crate::Style::draggable).
+    fn draggable_at(&self, point: Vec2) -> Option<WidgetId> {
+        let mut cur = self.hit_test(point);
+        while let Some(w) = cur {
+            if self.widgets[w].draggable {
+                return Some(w);
+            }
+            cur = self.widgets[w].parent;
+        }
+        None
+    }
+
+    /// Advance an armed drag: once the pointer moves past the threshold from the
+    /// press point, the drag goes live - it emits `DragStarted` and cancels the
+    /// pending click (clearing `pressed`) so a release drops rather than clicks.
+    fn update_drag(&mut self, p: Vec2) {
+        if let Some(drag) = &mut self.drag
+            && !drag.active
+            && (p - drag.start).length() > DRAG_THRESHOLD
+        {
+            drag.active = true;
+            let source = drag.source;
+            self.pressed = None;
+            self.events.push(Event::DragStarted { source });
+        }
     }
 
     /// What the mouse cursor should look like right now: resize arrows over
@@ -1693,6 +1786,49 @@ mod tests {
 
         assert_eq!(ui.rect(child).unwrap().pos, Vec2::new(10.0, 10.0));
         assert_eq!(ui.rect(grandchild).unwrap().pos, Vec2::new(18.0, 18.0));
+    }
+
+    #[test]
+    fn a_drag_from_a_source_onto_a_target_drops() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().row().size(400.0, 100.0));
+        let source = ui.button(root, "drag me", Style::new().size(120.0, 100.0).draggable());
+        let target = ui.panel(root, Style::new().size(120.0, 100.0).drop_target());
+        ui.layout(Vec2::new(400.0, 100.0)).unwrap();
+
+        // Press on the source, move past the threshold (drag goes live), move
+        // over the target, release.
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(60.0, 50.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(200.0, 50.0)));
+        assert!(ui.is_dragging());
+        assert_eq!(ui.drag_source(), Some(source));
+        ui.handle_input(InputEvent::PointerReleased);
+
+        let events = ui.drain_events();
+        assert!(events.contains(&Event::DragStarted { source }));
+        assert!(events.contains(&Event::Dropped {
+            source,
+            target: Some(target)
+        }));
+        // A drop is not a click: the source button never fired Clicked.
+        assert!(!events.iter().any(|e| matches!(e, Event::Clicked(_))));
+    }
+
+    #[test]
+    fn a_plain_click_on_a_draggable_is_not_a_drag() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 100.0));
+        let source = ui.button(root, "x", Style::new().size(120.0, 60.0).draggable());
+        ui.layout(Vec2::new(200.0, 100.0)).unwrap();
+
+        // Press and release without moving past the threshold: a click, no drop.
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(30.0, 20.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerReleased);
+
+        let events = ui.drain_events();
+        assert_eq!(events, vec![Event::Clicked(source)]);
     }
 
     #[test]

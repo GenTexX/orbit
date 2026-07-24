@@ -156,9 +156,6 @@ struct State {
     cursor: Vec2,
     /// The current keyboard modifiers (for the undo/redo shortcuts).
     modifiers: ModifiersState,
-    /// A PNG being dragged from the file explorer; dropped over the viewport
-    /// it spawns a sprite there, dropped anywhere else it just cancels.
-    file_drag: Option<String>,
     /// The demo texture's natural pixel size (spawned sprites default to it).
     texture_size: Vec2,
     /// Frame counting for the once-a-second fps log.
@@ -258,14 +255,14 @@ impl ApplicationHandler for App {
                     // a plain click still selects via the row's Clicked event).
                     state.begin_reparent();
                     state.viewport_press();
-                    state.file_press();
                 }
                 (MouseButton::Left, ElementState::Released) => {
                     state.finish_reparent();
                     state.end_picker_drag();
                     state.end_scrub();
-                    state.file_drop();
                     state.end_drag();
+                    // Aurora's PointerReleased may emit Event::Dropped for a
+                    // file-explorer drag onto the viewport (handled in react).
                     state.ui.handle_input(InputEvent::PointerReleased);
                 }
                 (MouseButton::Right, ElementState::Pressed) => state.open_context_menu(),
@@ -389,7 +386,6 @@ impl State {
             panning: false,
             cursor: Vec2::ZERO,
             modifiers: ModifiersState::default(),
-            file_drag: None,
             texture_size: Vec2::new(w as f32, h as f32),
             frames: 0,
             fps_since: std::time::Instant::now(),
@@ -1154,27 +1150,22 @@ impl State {
         self.clipboard.as_mut()?.get_text().ok()
     }
 
-    /// A press over a PNG row in the file explorer arms a file drag; releasing
-    /// over the viewport drops it as a new sprite ([`file_drop`](Self::file_drop)).
-    fn file_press(&mut self) {
-        let hit = self.ui.hit_test(self.cursor);
-        self.file_drag = self
+    /// Handle an Aurora `Dropped`: a PNG row (`source`) dragged onto the
+    /// viewport (`target`) spawns a sprite showing that texture at the drop
+    /// point. Any other source/target pair is ignored.
+    fn drop_file(&mut self, source: aurora::WidgetId, target: Option<aurora::WidgetId>) {
+        if target != self.rows.viewport {
+            return;
+        }
+        let Some(path) = self
             .rows
             .file_rows
             .iter()
-            .find(|(widget, _)| Some(*widget) == hit)
-            .map(|(_, path)| path.clone());
-    }
-
-    /// Complete (or cancel) a file drag: dropped over the viewport, spawn a
-    /// sprite showing that texture at the drop point; anywhere else, cancel.
-    fn file_drop(&mut self) {
-        let Some(path) = self.file_drag.take() else {
+            .find(|(widget, _)| *widget == source)
+            .map(|(_, path)| path.clone())
+        else {
             return;
         };
-        if self.ui.hit_test(self.cursor) != self.rows.viewport {
-            return;
-        }
         let Some(world) = self.cursor_world() else {
             return;
         };
@@ -1506,6 +1497,7 @@ impl State {
                     self.commit_vec_input(id);
                     self.commit_picker_hex(id);
                 }
+                AuroraEvent::Dropped { source, target } => self.drop_file(source, target),
                 _ => {}
             }
         }

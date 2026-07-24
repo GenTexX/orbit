@@ -360,7 +360,12 @@ pub fn build_editor_ui(
     // file-explorer strip below (Godot's viewport-toolbar layout).
     let center = ui.panel(main, Style::new().column().grow(1.0));
     build_toolbar(&mut ui, center, gizmo_mode, icons, &mut rows);
-    let viewport = ui.image(center, viewport_handle, Style::new().grow(1.0));
+    // A drop target so a PNG dragged from the file explorer can land here.
+    let viewport = ui.image(
+        center,
+        viewport_handle,
+        Style::new().grow(1.0).drop_target(),
+    );
     let splitter_2 = ui.splitter(
         center,
         Orientation::Horizontal,
@@ -940,13 +945,13 @@ fn build_file_explorer(
     );
     for name in list_project_files(project_dir) {
         if name.ends_with(".png") {
-            // A PNG row is a button so it reads as grabbable; press it and
-            // drag into the viewport to spawn a sprite there (main.rs routes
-            // the press-drag-release; a plain click does nothing yet).
+            // A PNG row is a draggable button: drag it onto the viewport (a
+            // drop target) to spawn a sprite there. Aurora runs the drag and
+            // emits Event::Dropped; a plain click does nothing yet.
             let row = ui.button(
                 panel,
                 name.clone(),
-                Style::new().padding(2.0).foreground(HEADING),
+                Style::new().padding(2.0).foreground(HEADING).draggable(),
             );
             rows.file_rows.push((row, name));
         } else {

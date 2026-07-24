@@ -18,4 +18,14 @@ pub enum Event {
     Submitted(WidgetId),
     /// A slider was dragged to a new value (already stored in the widget).
     SliderChanged { id: WidgetId, value: f32 },
+    /// A drag from a draggable widget crossed the start threshold and is now
+    /// live. `source` is the draggable widget the drag began on.
+    DragStarted { source: WidgetId },
+    /// A live drag was released. `target` is the drop-target widget under the
+    /// pointer, or `None` if it was released over none (a cancel). The app maps
+    /// `source`/`target` back to its own data to complete the drop.
+    Dropped {
+        source: WidgetId,
+        target: Option<WidgetId>,
+    },
 }
