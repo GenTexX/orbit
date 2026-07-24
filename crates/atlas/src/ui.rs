@@ -17,6 +17,8 @@ const PANEL_BG: Color = Color::rgb(0.13, 0.14, 0.18);
 const ROOT_BG: Color = Color::rgb(0.08, 0.08, 0.10);
 const HEADING: Color = Color::rgb(0.96, 0.97, 1.0);
 const SUBHEAD: Color = Color::rgb(0.55, 0.60, 0.72);
+/// Font size for a panel's title (larger than the default UI text).
+const PANEL_TITLE: f32 = 17.0;
 const ROW_SELECTED: Color = Color::rgb(0.20, 0.28, 0.42);
 /// The drop-target highlight while dragging a tree row to reparent it.
 const ROW_DROP: Color = Color::rgb(0.18, 0.40, 0.30);
@@ -590,7 +592,11 @@ fn build_scene_tree(
             .scroll()
             .background(PANEL_BG),
     );
-    ui.label(panel, "Scene", Style::new().foreground(HEADING));
+    ui.label(
+        panel,
+        "Scene",
+        Style::new().foreground(HEADING).font_size(PANEL_TITLE),
+    );
     add_tree_row(
         ui,
         panel,
@@ -745,7 +751,11 @@ fn build_inspector(
             .scroll()
             .background(PANEL_BG),
     );
-    ui.label(panel, "Inspector", Style::new().foreground(HEADING));
+    ui.label(
+        panel,
+        "Inspector",
+        Style::new().foreground(HEADING).font_size(PANEL_TITLE),
+    );
 
     let Some(node) = selected else {
         ui.label(panel, "Nothing selected", Style::new().foreground(SUBHEAD));
@@ -900,7 +910,11 @@ fn build_file_explorer(
             .scroll()
             .background(PANEL_BG),
     );
-    ui.label(panel, "Files", Style::new().foreground(HEADING));
+    ui.label(
+        panel,
+        "Files",
+        Style::new().foreground(HEADING).font_size(PANEL_TITLE),
+    );
     for name in list_project_files(project_dir) {
         if name.ends_with(".png") {
             // A PNG row is a button so it reads as grabbable; press it and

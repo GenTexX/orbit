@@ -144,6 +144,9 @@ pub(crate) struct Widget {
     /// Placeholder text shown, dimmed, while a text input is empty (empty string
     /// for none). Other kinds ignore it.
     pub placeholder: String,
+    /// Font size in pixels for this widget's text (the UI default when unset via
+    /// style). Drives both shaping and measurement.
+    pub font_size: f32,
     /// Whether this button renders flat (no raised fill; hover/press only).
     pub flat: bool,
     /// Whether hit-testing ignores this widget (decorative overlays).

@@ -11,9 +11,21 @@ pub(crate) const LINE_HEIGHT: f32 = 20.0;
 /// so tests and CI do not depend on the machine's installed fonts).
 const DEJAVU_SANS: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
 
-/// Metrics for the default UI font.
-pub(crate) fn metrics() -> Metrics {
-    Metrics::new(FONT_SIZE, LINE_HEIGHT)
+/// Metrics for an arbitrary font size, keeping the default's line-height ratio
+/// so larger text stays proportionally spaced.
+pub(crate) fn metrics_for(font_size: f32) -> Metrics {
+    Metrics::new(font_size, font_size * LINE_HEIGHT / FONT_SIZE)
+}
+
+/// The glyph a checked checkbox draws: a heavy check mark (present in the
+/// bundled DejaVu Sans), so the tick is a real vector glyph, not a filled box.
+pub(crate) const CHECK_MARK: &str = "\u{2714}";
+
+/// Metrics for the checkbox check glyph, sized so its line box exactly fills a
+/// `box_size` square - the box height then centers the glyph vertically by the
+/// font's own metrics, no magic offsets.
+pub(crate) fn checkmark_metrics(box_size: f32) -> Metrics {
+    metrics_for(box_size * FONT_SIZE / LINE_HEIGHT)
 }
 
 /// Default text attributes (resolve to the bundled sans-serif font).

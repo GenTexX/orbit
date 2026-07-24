@@ -489,6 +489,7 @@ impl Ui {
             scroll: style.scroll,
             mask: style.mask,
             placeholder: style.placeholder.unwrap_or_default(),
+            font_size: style.font_size.unwrap_or(text::FONT_SIZE),
             flat: style.flat,
             hit_transparent: style.hit_transparent,
             disabled: style.disabled,
@@ -563,7 +564,7 @@ impl Ui {
     fn shape_placeholders(&mut self) {
         // Collect the work first (text + field width), then split the buffer and
         // font-system borrows to shape - the same borrow dance as layout().
-        let jobs: Vec<(WidgetId, String, f32)> = self
+        let jobs: Vec<(WidgetId, String, f32, f32)> = self
             .widgets
             .iter()
             .filter(|(_, w)| {
@@ -574,16 +575,19 @@ impl Ui {
                     id,
                     w.placeholder.clone(),
                     self.rect(id).map_or(0.0, |r| r.size.x),
+                    w.font_size,
                 )
             })
             .collect();
         let buffers = &mut self.placeholder_buffers;
         let font_system = &mut self.font_system;
-        for (id, text, width) in jobs {
+        for (id, text, width, font_size) in jobs {
+            let metrics = text::metrics_for(font_size);
             if !buffers.contains_key(id) {
-                buffers.insert(id, Buffer::new(font_system, text::metrics()));
+                buffers.insert(id, Buffer::new(font_system, metrics));
             }
             let mut borrowed = buffers[id].borrow_with(font_system);
+            borrowed.set_metrics(metrics);
             borrowed.set_size(Some(width.max(1.0)), None);
             borrowed.set_text(&text, &text::default_attrs(), Shaping::Advanced, None);
             borrowed.shape_until_scroll(false);
@@ -1352,13 +1356,19 @@ impl Ui {
             rect,
             color: box_color,
         });
-        if checked {
-            let inset = rect.size * 0.28;
-            let inner = Rect::new(rect.pos + inset, (rect.size - inset * 2.0).max(Vec2::ZERO));
-            list.commands.push(DrawCommand::FillRect {
-                rect: inner,
-                color: theme::CHECKBOX_MARK,
-            });
+        // When checked, draw the check glyph centered in the box: horizontally
+        // by its advance, vertically by the box height (the glyph's line box was
+        // sized to the box in measure, so the font's metrics center it).
+        if checked
+            && let Some(buffer) = self.buffers.get(id)
+            && let Some(run) = buffer.layout_runs().next()
+        {
+            let line_h = text::checkmark_metrics(theme::CHECKBOX_SIZE).line_height;
+            let origin = Vec2::new(
+                rect.pos.x + (rect.size.x - run.line_w) * 0.5,
+                rect.pos.y + (rect.size.y - line_h) * 0.5,
+            );
+            self.emit_buffer(buffer, origin, theme::CHECKBOX_MARK, list);
         }
     }
 
@@ -1529,8 +1539,24 @@ fn measure_widget(
     };
     let content = match &widgets[id].kind {
         WidgetKind::Label(t) | WidgetKind::Button(t) | WidgetKind::TextInput(t) => t.as_str(),
-        // A checkbox has a fixed intrinsic size and no text to shape.
+        // A checkbox has a fixed intrinsic size. Shape the check glyph into its
+        // buffer (drawn only when checked, see emit_checkbox) so the tick is a
+        // real glyph rather than a filled square.
         WidgetKind::Checkbox(_) => {
+            let metrics = text::checkmark_metrics(theme::CHECKBOX_SIZE);
+            if !buffers.contains_key(id) {
+                buffers.insert(id, Buffer::new(font_system, metrics));
+            }
+            let mut borrowed = buffers[id].borrow_with(font_system);
+            borrowed.set_metrics(metrics);
+            borrowed.set_size(None, None);
+            borrowed.set_text(
+                text::CHECK_MARK,
+                &text::default_attrs(),
+                Shaping::Advanced,
+                None,
+            );
+            borrowed.shape_until_scroll(false);
             return Size {
                 width: theme::CHECKBOX_SIZE,
                 height: theme::CHECKBOX_SIZE,
@@ -1552,12 +1578,16 @@ fn measure_widget(
         AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
     });
 
+    // Shape at this widget's font size, so headings and captions measure (and
+    // later draw) larger or smaller than the UI default.
+    let metrics = text::metrics_for(widgets[id].font_size);
     if !buffers.contains_key(id) {
-        buffers.insert(id, Buffer::new(font_system, text::metrics()));
+        buffers.insert(id, Buffer::new(font_system, metrics));
     }
     let buffer = &mut buffers[id];
     {
         let mut borrowed = buffer.borrow_with(font_system);
+        borrowed.set_metrics(metrics);
         borrowed.set_size(wrap_width, None);
         borrowed.set_text(content, &text::default_attrs(), Shaping::Advanced, None);
         borrowed.shape_until_scroll(false);
@@ -1571,7 +1601,7 @@ fn measure_widget(
     }
     Size {
         width: width.ceil(),
-        height: lines.max(1) as f32 * text::LINE_HEIGHT,
+        height: lines.max(1) as f32 * metrics.line_height,
     }
 }
 
@@ -1761,6 +1791,43 @@ mod tests {
         ui.layout(Vec2::new(200.0, 200.0)).unwrap();
         // Margin pushes the box in from the container's edges (no padding here).
         assert_eq!(ui.rect(child).unwrap().pos, Vec2::new(15.0, 4.0));
+    }
+
+    #[test]
+    fn a_larger_font_size_measures_bigger() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 200.0).column());
+        // Same text, default vs a big font size: the big one is taller (in a
+        // column the cross axis stretches both to full width, so height is the
+        // unambiguous signal).
+        let small = ui.label(root, "Heading", Style::new());
+        let big = ui.label(root, "Heading", Style::new().font_size(40.0));
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+
+        let s = ui.rect(small).unwrap().size;
+        let b = ui.rect(big).unwrap().size;
+        assert!(b.y > s.y, "small={s:?} big={b:?}");
+    }
+
+    #[test]
+    fn a_checked_checkbox_draws_the_check_glyph() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(60.0, 60.0).row());
+        let on = ui.checkbox(root, true, Style::new());
+        let off = ui.checkbox(root, false, Style::new());
+        ui.layout(Vec2::new(60.0, 60.0)).unwrap();
+
+        // The checked box emits a check-colored Text glyph run; the box fill is
+        // a FillRect, so a Text command is unambiguously the mark.
+        let cmds = ui.draw_list().commands;
+        let mark = |c: &DrawCommand| {
+            matches!(c, DrawCommand::Text { color, glyphs }
+                if *color == crate::theme::CHECKBOX_MARK && !glyphs.is_empty())
+        };
+        assert!(cmds.iter().any(mark), "checked box should draw the glyph");
+        // Sanity: exactly one mark (only the checked box), and both boxes exist.
+        assert_eq!(cmds.iter().filter(|c| mark(c)).count(), 1);
+        assert!(ui.rect(on).unwrap().size.x > 0.0 && ui.rect(off).unwrap().size.x > 0.0);
     }
 
     #[test]

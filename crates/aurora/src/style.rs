@@ -39,6 +39,8 @@ pub struct Style {
     pub placeholder: Option<String>,
     /// The input mask a text input enforces as you type. Ignored by other kinds.
     pub mask: Mask,
+    /// Font size in pixels for this widget's text, or `None` for the UI default.
+    pub font_size: Option<f32>,
 }
 
 impl Default for Style {
@@ -54,6 +56,7 @@ impl Default for Style {
             disabled: false,
             placeholder: None,
             mask: Mask::None,
+            font_size: None,
         }
     }
 }
@@ -281,6 +284,13 @@ impl Style {
     /// that would break it). See [`Mask`](crate::Mask).
     pub fn mask(mut self, mask: Mask) -> Self {
         self.mask = mask;
+        self
+    }
+
+    /// Set this widget's text size in pixels (headings, captions, and the like).
+    /// Text is re-shaped at this size and the widget measures to match.
+    pub fn font_size(mut self, px: f32) -> Self {
+        self.font_size = Some(px);
         self
     }
 
