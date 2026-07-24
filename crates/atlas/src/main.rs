@@ -1285,6 +1285,12 @@ impl State {
     fn draw(&mut self) -> Result<()> {
         profiling::scope!("editor_frame");
         self.react();
+        // While a reparent drag is active, rebuild every frame so the insertion
+        // line overlay (added post-layout) starts from a fresh Ui and never
+        // accumulates across still frames. The shell rebuild is cheap.
+        if self.reparent.is_some() {
+            self.dirty = true;
+        }
         if self.dirty {
             // Splitter drags live only in the widget tree; read the panels'
             // current sizes back before discarding it, or a rebuild would snap
@@ -1327,6 +1333,14 @@ impl State {
         let size = self.window.inner_size();
         let window = Vec2::new(size.width.max(1) as f32, size.height.max(1) as f32);
         self.ui.layout(window)?;
+
+        // A reparent between-rows drop shows an insertion line, overlaid on the
+        // popup layer (so it does not shift the rows) using their laid-out
+        // rects; add it then lay out once more to position it.
+        if let Some(spot) = self.reparent.and_then(|r| r.target) {
+            ui::add_reparent_line(&mut self.ui, &self.rows, spot);
+            self.ui.layout(window)?;
+        }
 
         // Match the scene target to the viewport widget's on-screen size, so
         // sprites draw 1:1 (a panel resize reflows the viewport, it does not

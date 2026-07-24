@@ -621,11 +621,6 @@ fn add_tree_row(
     icons: Option<&Icons>,
     rows: &mut EditorRows,
 ) {
-    // An insertion line above this row for a Before-drop (reordering).
-    if tree.drop_target == Some(DropSpot::Before(node)) {
-        insertion_line(ui, parent, depth);
-    }
-
     // Selected wins the highlight; an Into-drop target tints green.
     let background = if selected == Some(node) {
         ROW_SELECTED
@@ -685,11 +680,6 @@ fn add_tree_row(
     );
     rows.tree_rows.push((row, node));
 
-    // An insertion line below this row for an After-drop (reordering).
-    if tree.drop_target == Some(DropSpot::After(node)) {
-        insertion_line(ui, parent, depth);
-    }
-
     if has_children && !collapsed {
         for &child in scene.children(node) {
             add_tree_row(
@@ -707,16 +697,28 @@ fn add_tree_row(
     }
 }
 
-/// A thin horizontal insertion bar (indented to the row's depth) marking where
-/// a dragged row would drop between siblings.
-fn insertion_line(ui: &mut Ui, parent: WidgetId, depth: u32) {
-    let line = ui.panel(parent, Style::new().row().height(3.0));
-    if depth > 0 {
-        ui.panel(line, Style::new().width(depth as f32 * TREE_DISCLOSURE));
-    }
-    ui.panel(
-        line,
-        Style::new().grow(1.0).height(2.0).background(ROW_DROP),
+/// Overlay a thin insertion line at a Before/After drop spot, on Aurora's popup
+/// layer so it takes no layout space (an inline line would shift the rows and
+/// make the detected drop spot flicker). Call after layout, then lay out once
+/// more so the line popup is positioned. A no-op for an Into spot.
+pub fn add_reparent_line(ui: &mut Ui, rows: &EditorRows, spot: DropSpot) {
+    let (node, after) = match spot {
+        DropSpot::Before(n) => (n, false),
+        DropSpot::After(n) => (n, true),
+        DropSpot::Into(_) => return,
+    };
+    let Some(&(id, _)) = rows.tree_rows.iter().find(|(_, n)| *n == node) else {
+        return;
+    };
+    let Some(rect) = ui.rect(id) else {
+        return;
+    };
+    let y = if after { rect.max().y } else { rect.pos.y };
+    ui.popup(
+        Vec2::new(rect.pos.x, y - 1.0),
+        Style::new()
+            .size(rect.size.x.max(1.0), 2.0)
+            .background(ROW_DROP),
     );
 }
 
