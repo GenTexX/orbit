@@ -25,10 +25,22 @@ struct SceneDoc {
 struct NodeDoc {
     name: String,
     transform: TransformDoc,
+    // Older scenes predate node visibility; default to visible so they load.
+    // Only hidden nodes serialize a `visible: false`, keeping files clean.
+    #[serde(default = "visible_default", skip_serializing_if = "is_visible")]
+    visible: bool,
     #[serde(default)]
     components: Vec<ComponentDoc>,
     #[serde(default)]
     children: Vec<NodeDoc>,
+}
+
+fn visible_default() -> bool {
+    true
+}
+
+fn is_visible(visible: &bool) -> bool {
+    *visible
 }
 
 #[derive(Serialize, Deserialize)]
@@ -68,6 +80,7 @@ fn node_to_doc(scene: &Scene, id: NodeId) -> NodeDoc {
     NodeDoc {
         name: node.name.clone(),
         transform: transform_to_doc(node.transform),
+        visible: node.visible,
         components: node.components.iter().map(component_to_doc).collect(),
         children: scene
             .children(id)
@@ -103,6 +116,7 @@ fn component_to_doc(component: &Component) -> ComponentDoc {
 /// then its children, recursively.
 fn apply_doc(scene: &mut Scene, id: NodeId, doc: &NodeDoc) -> Result<(), HeliosError> {
     scene.node_mut(id).transform = doc_to_transform(&doc.transform);
+    scene.node_mut(id).visible = doc.visible;
     for cd in &doc.components {
         let mut component = Component::from_type_name(&cd.kind)
             .ok_or_else(|| HeliosError::UnknownComponent(cd.kind.clone()))?;

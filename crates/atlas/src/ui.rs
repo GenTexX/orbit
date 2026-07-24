@@ -198,6 +198,8 @@ pub struct EditorRows {
     pub tree_rows: Vec<(WidgetId, NodeId)>,
     /// A clicked disclosure triangle collapses/expands this node.
     pub tree_toggles: Vec<(WidgetId, NodeId)>,
+    /// A clicked eye icon toggles this node's visibility.
+    pub eye_toggles: Vec<(WidgetId, NodeId)>,
     /// A submitted field row commits its current text to
     /// `(node, component index, field name)`.
     pub field_rows: Vec<(WidgetId, NodeId, usize, &'static str)>,
@@ -679,11 +681,32 @@ fn add_tree_row(
     } else {
         ui.panel(row, Style::new().width(TREE_DISCLOSURE));
     }
+    // A hidden node's name is muted, so the tree reads its state at a glance.
+    let visible = scene.node(node).visible;
     ui.label(
         row,
         scene.node(node).name.clone(),
-        Style::new().grow(1.0).foreground(HEADING),
+        Style::new()
+            .grow(1.0)
+            .foreground(if visible { HEADING } else { SUBHEAD }),
     );
+    // An eye toggle at the row's right edge: open when visible, struck through
+    // when hidden. Clicking it toggles visibility (it does not select the row,
+    // being its own interactive child).
+    let eye = ui.button(
+        row,
+        "",
+        Style::new().flat().padding(1.0).width(TREE_DISCLOSURE),
+    );
+    if let Some(icons) = icons {
+        let glyph = if visible { Icon::Eye } else { Icon::EyeOff };
+        ui.image(
+            eye,
+            icons.get(glyph),
+            Style::new().size(TREE_CHEVRON, TREE_CHEVRON),
+        );
+    }
+    rows.eye_toggles.push((eye, node));
     rows.tree_rows.push((row, node));
 
     if has_children && !collapsed {
@@ -1092,6 +1115,31 @@ mod tests {
         );
         // The parent still has a disclosure toggle to expand it again.
         assert!(rows.tree_toggles.iter().any(|(_, n)| *n == parent));
+    }
+
+    #[test]
+    fn every_tree_row_has_an_eye_toggle() {
+        let mut scene = Scene::new("Root");
+        let root = scene.root();
+        let a = scene.add_child(root, Node::new("A"));
+        let mut reg: slotmap::SlotMap<ImageHandle, ()> = slotmap::SlotMap::with_key();
+        let handle = reg.insert(());
+        let dir = std::env::temp_dir();
+        let (_, rows) = build_editor_ui(
+            &scene,
+            None,
+            handle,
+            &dir,
+            PanelSizes::default(),
+            None,
+            GizmoMode::Select,
+            None,
+            &TreeView::default(),
+        );
+        // One eye toggle per row (root and A), each mapped to its node.
+        assert_eq!(rows.eye_toggles.len(), rows.tree_rows.len());
+        assert!(rows.eye_toggles.iter().any(|(_, n)| *n == root));
+        assert!(rows.eye_toggles.iter().any(|(_, n)| *n == a));
     }
 
     #[test]

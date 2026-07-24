@@ -46,6 +46,10 @@ impl Scene {
     }
 
     fn collect_sprites(&self, id: NodeId, out: &mut Vec<SpriteDraw>) {
+        // A hidden node hides its whole subtree: skip its sprites and children.
+        if !self.node(id).visible {
+            return;
+        }
         for component in &self.node(id).components {
             // Exhaustive so a new component kind (e.g. Camera) forces a decision
             // here rather than being silently non-drawable.
@@ -140,6 +144,20 @@ mod tests {
         let mut scene = Scene::new("root"); // the root has no components
         let root = scene.root();
         scene.add_child(root, Node::new("empty"));
+        assert!(scene.sprites().is_empty());
+    }
+
+    #[test]
+    fn a_hidden_node_hides_itself_and_its_subtree() {
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        let parent = scene.add_child(root, sprite_node(Vec2::splat(10.0), [1.0; 4]));
+        scene.add_child(parent, sprite_node(Vec2::splat(10.0), [1.0; 4]));
+        // Both the parent's and the child's sprites draw while visible.
+        assert_eq!(scene.sprites().len(), 2);
+
+        // Hiding the parent drops its sprite and its child's too (whole subtree).
+        scene.node_mut(parent).visible = false;
         assert!(scene.sprites().is_empty());
     }
 

@@ -42,6 +42,8 @@ pub enum Edit {
         old: Transform,
         new: Transform,
     },
+    /// Toggle a node's visibility (show/hide).
+    SetVisible { node: NodeId, old: bool, new: bool },
     /// Replace one reflected field of one component on a node.
     SetField {
         node: NodeId,
@@ -71,6 +73,7 @@ impl Edit {
                 scene.link(*child, *new_parent, *new_index);
             }
             Edit::SetTransform { node, new, .. } => scene.node_mut(*node).transform = *new,
+            Edit::SetVisible { node, new, .. } => scene.node_mut(*node).visible = *new,
             Edit::SetField {
                 node,
                 component,
@@ -99,6 +102,7 @@ impl Edit {
                 scene.link(*child, *old_parent, *old_index);
             }
             Edit::SetTransform { node, old, .. } => scene.node_mut(*node).transform = *old,
+            Edit::SetVisible { node, old, .. } => scene.node_mut(*node).visible = *old,
             Edit::SetField {
                 node,
                 component,
@@ -242,6 +246,23 @@ impl History {
         );
     }
 
+    /// Set `node`'s visibility (show/hide its subtree at render time). Undoable;
+    /// a no-op that records nothing when the value is unchanged.
+    pub fn set_visible(&mut self, scene: &mut Scene, node: NodeId, visible: bool) {
+        let old = scene.node(node).visible;
+        if old == visible {
+            return;
+        }
+        self.push(
+            scene,
+            Edit::SetVisible {
+                node,
+                old,
+                new: visible,
+            },
+        );
+    }
+
     /// Set one reflected field of one component on `node`. Returns `false` (and
     /// records nothing) if the component index or field name is invalid.
     pub fn set_field(
@@ -316,6 +337,23 @@ mod tests {
 
         history.undo(&mut scene);
         assert_eq!(scene.children(root), &[node]);
+    }
+
+    #[test]
+    fn set_visible_toggles_and_undoes() {
+        let (mut scene, root) = scene_with_root();
+        let mut history = History::new();
+        let node = history.add_node(&mut scene, root, Node::new("child"));
+        assert!(scene.node(node).visible);
+
+        history.set_visible(&mut scene, node, false);
+        assert!(!scene.node(node).visible);
+        // Setting the current value records nothing: no phantom edit, so a
+        // single undo (below) is enough to restore visibility.
+        history.set_visible(&mut scene, node, false);
+
+        history.undo(&mut scene); // one undo restores the only real change
+        assert!(scene.node(node).visible);
     }
 
     #[test]

@@ -21,6 +21,9 @@ pub struct Node {
     pub name: String,
     /// The node's local transform, relative to its parent.
     pub transform: Transform,
+    /// Whether this node (and its subtree) is drawn. A hidden node keeps its
+    /// place in the tree and stays editable; it is only skipped at render time.
+    pub visible: bool,
     /// The capabilities attached to this node.
     pub components: Vec<Component>,
     pub(crate) parent: Option<NodeId>,
@@ -33,6 +36,7 @@ impl Node {
         Self {
             name: name.into(),
             transform: Transform::IDENTITY,
+            visible: true,
             components: Vec::new(),
             parent: None,
             children: Vec::new(),

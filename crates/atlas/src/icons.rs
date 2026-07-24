@@ -45,6 +45,10 @@ pub enum Icon {
     ChevronRight,
     /// A disclosure triangle pointing down (an expanded tree node).
     ChevronDown,
+    /// An open eye (a visible node's visibility toggle).
+    Eye,
+    /// A struck-through eye (a hidden node's visibility toggle).
+    EyeOff,
 }
 
 /// An icon's coverage predicate over the normalized `[0, 1]` square.
@@ -62,6 +66,8 @@ const SPECS: &[(Icon, Predicate)] = &[
     (Icon::Scale, icon_scale),
     (Icon::ChevronRight, icon_chevron_right),
     (Icon::ChevronDown, icon_chevron_down),
+    (Icon::Eye, icon_eye),
+    (Icon::EyeOff, icon_eye_off),
 ];
 
 /// The registered icon images, looked up by [`Icon`].
@@ -262,6 +268,34 @@ fn icon_chevron_right(x: f32, y: f32) -> bool {
 /// A solid triangle pointing down (an expanded tree node).
 fn icon_chevron_down(x: f32, y: f32) -> bool {
     tri(x, y, (0.16, 0.3), (0.84, 0.3), (0.5, 0.78))
+}
+
+/// An open eye: an almond lid outline with a filled pupil (a visible node).
+fn icon_eye(x: f32, y: f32) -> bool {
+    // The lid, as a closed outline of thin segments around an almond.
+    const LID: [(f32, f32); 8] = [
+        (0.11, 0.5),
+        (0.3, 0.33),
+        (0.5, 0.28),
+        (0.7, 0.33),
+        (0.89, 0.5),
+        (0.7, 0.67),
+        (0.5, 0.72),
+        (0.3, 0.67),
+    ];
+    // Each lid point joined to the next (wrapping) by a thin segment.
+    for (&a, &b) in LID.iter().zip(LID.iter().cycle().skip(1)) {
+        if line(x, y, a, b, 0.06) {
+            return true;
+        }
+    }
+    // The pupil: a filled disc at the center (arc with a zero inner radius).
+    arc(x, y, 0.0, 0.14, 0.0, std::f32::consts::TAU)
+}
+
+/// A struck-through eye (a hidden node): the eye plus a diagonal slash.
+fn icon_eye_off(x: f32, y: f32) -> bool {
+    icon_eye(x, y) || line(x, y, (0.16, 0.16), (0.84, 0.84), 0.075)
 }
 
 /// A diagonal double-headed arrow (scale/resize), thin with sharp heads.

@@ -1478,6 +1478,20 @@ impl State {
                         .expect("guarded by the match arm");
                     self.toggle_collapse(node);
                 }
+                AuroraEvent::Clicked(id) if self.rows.eye_toggles.iter().any(|(w, _)| *w == id) => {
+                    let node = self
+                        .rows
+                        .eye_toggles
+                        .iter()
+                        .find(|(w, _)| *w == id)
+                        .map(|(_, n)| *n)
+                        .expect("guarded by the match arm");
+                    // Toggle visibility through the history (one undo step).
+                    let now = self.project.scene.node(node).visible;
+                    self.history
+                        .set_visible(&mut self.project.scene, node, !now);
+                    self.dirty = true;
+                }
                 AuroraEvent::Clicked(id) => {
                     if let Some(&(_, node)) =
                         self.rows.tree_rows.iter().find(|(widget, _)| *widget == id)
