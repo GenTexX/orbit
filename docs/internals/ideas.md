@@ -28,44 +28,40 @@ this list is what "come back and make the editor great" concretely means.
 - **Numeric steppers** (tiny +/- arrows on a numeric field to nudge the
   value) - the slider and the inspector drag-scrub shipped; discrete steppers
   did not.
-- **More icons.** The toolbar has icons now (a CPU rasterizer draws them from
-  shape predicates - the "custom Aurora icon" path was chosen). Extend the set
-  to tree rows (node type, visibility eye) and the file list; consider tinting
-  icons (the image pipeline already supports it) for hover/disabled states.
+- **More icons.** The toolbar and scene-tree rows have icons (a CPU rasterizer
+  draws them from shape predicates - the "custom Aurora icon" path). The tree's
+  visibility eye shipped; still open: node-type icons in the tree, icons in the
+  file list, and hover/disabled tint states (the image pipeline supports tint).
 - **Toggle switch** (a sliding on/off control, optionally animated) as a
   friendlier alternative to the checkbox for booleans.
 - **Tabs widget**: a tab bar plus swappable content panes - the primitive the
   editor's scene tabs and any tabbed inspector would build on.
-- **Text area**: a multi-line text input (wrapping, vertical scroll, caret
-  navigation across lines) - distinct from today's single-line field, and the
-  foundation the M4 code editor needs.
-- **Multiple font sizes** (and weights): the whole UI is one size today.
-  Headings, body, and small captions want distinct sizes - pairs with
-  theming-as-data.
-- **Input placeholders**: greyed hint text shown in an empty field (e.g.
-  "search...", "name").
-- **Richer input masks**: numeric masking shipped; integer-only and hex-color
-  masks would round it out (the color picker will want hex).
+- **Font weights**: font sizes shipped (`Style::font_size`, used by the panel
+  titles); distinct weights (bold headings) are still a single weight today.
+  Pairs with theming-as-data.
+- **Text-area vertical scroll**: the multi-line text area shipped (wrapping,
+  newline on Enter, 2D caret, Up/Down, multi-line selection) and auto-grows to
+  its content. A fixed-height area that scrolls its overflow is the remaining
+  piece, and the M4 code editor will want it.
 - **Anti-aliasing** for the UI: rounded-rect and rotated-line edges are hard
   today (single-sample quads). MSAA on the aurora-wgpu pass, or SDF-based
   shapes, for crisp edges - also helps photon's gizmo overlay lines.
 - **Node editor**: a pan/zoom canvas of nodes with draggable ports and wires
   between them - for a future visual scripting / shader / state-machine graph.
   A big one; needs the popup/canvas and drag-and-drop groundwork.
-- **Disabled state** for widgets (grayed out, non-interactive) - e.g. Save
-  when nothing changed, Load when no project.
-- **Per-side padding/margin in Style.** The tree indents with a spacer-panel
-  hack today because padding is all-sides-equal.
+- **Disabled state shipped** (`Style::disabled()`: dimmed and inert). Still
+  worth wiring at call sites - e.g. Save when nothing changed, Load when no
+  project - once the editor tracks that state.
 - **Theming as data**: one Theme struct (colors, spacing, font sizes) instead
   of scattered consts, so the editor can restyle Aurora without editing it.
 - **DPI awareness**: font size and metrics are physical-pixel constants; on a
   hidpi display everything will be tiny. Respect winit's scale factor.
 - **Text ellipsis/truncation** for long labels (file paths, node names).
-- **A real checkmark** in checkboxes (undecided if wanted; the filled square
-  is a legit minimalist look).
-- **First-class drag-and-drop**: Aurora-level drag sources/targets with a
-  drag payload and hover feedback, replacing the app-level press/release
-  routing the file-to-viewport drop uses today.
+- **Drag-and-drop feedback**: first-class drag-and-drop shipped
+  (`Style::draggable`/`drop_target`, `Event::DragStarted`/`Dropped`; the
+  file-to-viewport drop is built on it). Still open: a drag ghost that follows
+  the cursor and a highlight on the hovered drop target (the state to draw it,
+  `is_dragging`/`drop_target_at`, is exposed).
 
 ## Editor: scene editing
 
@@ -82,8 +78,9 @@ this list is what "come back and make the editor great" concretely means.
   fields.
 - **Sibling order = draw order controls**: move up/down in the tree (z-order
   today is implicit pre-order), maybe an explicit z-index later.
-- **Node visibility toggle** (eye icon per tree row, drawn state in helios)
-  and **lock** (excluded from picking).
+- **Node lock** (excluded from picking). The visibility toggle shipped (an eye
+  icon per tree row, `Node.visible` in helios, undoable, hides the subtree);
+  lock is the remaining half.
 - **Search/filter box** above the scene tree.
 - **Alt-drag to duplicate** in the viewport (grab a sprite with alt held:
   duplicates it and moves the copy).
@@ -149,8 +146,6 @@ this list is what "come back and make the editor great" concretely means.
   debug drawing, and eventually game use.
 - **World-space text** (photon reusing Aurora's glyph atlas machinery) -
   node labels in the viewport, debug overlays, in-game text later.
-- **Node visibility flag** in helios (skipped by sprites() when off) -
-  pairs with the tree's eye icon.
 
 ## File explorer
 
