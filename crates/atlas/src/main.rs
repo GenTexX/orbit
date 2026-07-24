@@ -809,15 +809,16 @@ impl State {
         self.dirty = true;
     }
 
-    /// The scene-tree row node under the cursor, if any (a drop target). Uses
-    /// the interactive widget under the cursor (the row button), since a tree
-    /// row now contains a label child that a raw hit-test would return instead.
+    /// The scene-tree row node under the cursor, if any (a drop target). Reads
+    /// the interactive widget under the cursor (the row button, not the label
+    /// child a raw hit-test would return) with a fresh query, not the retained
+    /// hover - so it stays correct on the frames a drag rebuilds the shell.
     fn tree_row_at_cursor(&self) -> Option<NodeId> {
-        let hovered = self.ui.hovered()?;
+        let row = self.ui.interactive_at(self.cursor)?;
         self.rows
             .tree_rows
             .iter()
-            .find(|(w, _)| *w == hovered)
+            .find(|(w, _)| *w == row)
             .map(|(_, n)| *n)
     }
 
@@ -1285,12 +1286,14 @@ impl State {
     fn draw(&mut self) -> Result<()> {
         profiling::scope!("editor_frame");
         self.react();
-        // While a reparent drag is active, rebuild every frame so the insertion
-        // line overlay (added post-layout) starts from a fresh Ui and never
-        // accumulates across still frames. The shell rebuild is cheap.
-        if self.reparent.is_some() {
-            self.dirty = true;
-        }
+        // Whether this frame rebuilds the shell. The insertion-line overlay is
+        // added post-layout onto the popup layer, so it only exists on frames
+        // that (re)build - on still frames the previous frame's line persists
+        // (a single copy, no accumulation). Crucially we do NOT force a rebuild
+        // every frame during a reparent: that would reset Aurora's retained
+        // `pressed`/`hovered` between a press and its release, killing a plain
+        // click's selection and making the held-still insertion line flicker.
+        let rebuilt = self.dirty;
         if self.dirty {
             // Splitter drags live only in the widget tree; read the panels'
             // current sizes back before discarding it, or a rebuild would snap
@@ -1336,8 +1339,10 @@ impl State {
 
         // A reparent between-rows drop shows an insertion line, overlaid on the
         // popup layer (so it does not shift the rows) using their laid-out
-        // rects; add it then lay out once more to position it.
-        if let Some(spot) = self.reparent.and_then(|r| r.target) {
+        // rects; add it then lay out once more to position it. Only on frames we
+        // just rebuilt: a fresh Ui has no line yet, while a still frame keeps the
+        // one from the last rebuild (adding again would stack duplicates).
+        if rebuilt && let Some(spot) = self.reparent.and_then(|r| r.target) {
             ui::add_reparent_line(&mut self.ui, &self.rows, spot);
             self.ui.layout(window)?;
         }

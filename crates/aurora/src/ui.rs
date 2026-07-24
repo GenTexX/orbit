@@ -949,6 +949,15 @@ impl Ui {
         self.hovered
     }
 
+    /// The interactive widget under `point`: a fresh hit-test bubbled to its
+    /// nearest interactive ancestor. Unlike [`hovered`](Self::hovered) this reads
+    /// nothing retained, so it stays correct immediately after a rebuild (which
+    /// resets the cached hover) - what a drag that rebuilds every frame needs.
+    pub fn interactive_at(&self, point: Vec2) -> Option<WidgetId> {
+        self.hit_test(point)
+            .and_then(|id| self.interactive_ancestor(id))
+    }
+
     /// What the mouse cursor should look like right now: resize arrows over
     /// (or while dragging) a splitter, a text beam over a text input, the
     /// default arrow otherwise. The app maps this to its windowing system.
@@ -2083,6 +2092,10 @@ mod tests {
         ui.layout(Vec2::new(400.0, 300.0)).unwrap();
         // The cursor passes through the overlay to the button beneath it.
         assert_eq!(ui.hit_test(Vec2::new(200.0, 150.0)), Some(under));
+        // interactive_at reads nothing retained (no PointerMoved needed) and
+        // bubbles a hit on the label child up to the button - so a drag that
+        // rebuilds every frame can still resolve the row under the cursor.
+        assert_eq!(ui.interactive_at(Vec2::new(200.0, 150.0)), Some(under));
     }
 
     #[test]
