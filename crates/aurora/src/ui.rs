@@ -40,6 +40,9 @@ struct DragState {
 /// becomes live, in pixels.
 const DRAG_THRESHOLD: f32 = 4.0;
 
+/// Opacity of the drag "ghost" (the faded copy of the dragged widget).
+const DRAG_GHOST_ALPHA: f32 = 0.6;
+
 /// A retained Aurora UI: owns the widget arena, the taffy layout tree, the font
 /// system, and the shaped text buffers; caches each widget's absolute rectangle
 /// after [`layout`](Self::layout).
@@ -1330,6 +1333,10 @@ impl Ui {
     /// (or while dragging) a splitter, a text beam over a text input, the
     /// default arrow otherwise. The app maps this to its windowing system.
     pub fn cursor_hint(&self) -> CursorHint {
+        // A live first-class drag shows the grabbing hand, over everything else.
+        if self.is_dragging() {
+            return CursorHint::Grabbing;
+        }
         // A pressed splitter keeps its resize cursor even when the pointer
         // outruns the bar mid-drag.
         let target = self.pressed.or(self.hovered);
@@ -1492,7 +1499,42 @@ impl Ui {
         for &popup in &self.popups {
             self.emit(popup, &mut list);
         }
+        // Drag feedback (drop-target highlight + drag ghost) sits above even the
+        // popups, following the cursor.
+        self.emit_drag_feedback(&mut list);
         list
+    }
+
+    /// While a first-class drag is live, draw two cues on top of everything: a
+    /// highlight on the drop target under the cursor, and a faded "ghost" of the
+    /// dragged widget following the cursor.
+    fn emit_drag_feedback(&self, list: &mut DrawList) {
+        let (Some(drag), Some(cursor)) = (self.drag.filter(|d| d.active), self.cursor) else {
+            return;
+        };
+        // Highlight the drop target under the cursor (a translucent accent fill
+        // plus an accent border), so it reads as "drop here".
+        if let Some(target) = self.drop_target_at(cursor)
+            && let Some(rect) = self.rect(target)
+        {
+            list.commands.push(DrawCommand::RoundedRect {
+                rect,
+                color: self.theme.focus.fade(0.20),
+                radius: self.widgets[target].corner_radius,
+                border_width: 2.0,
+                border_color: self.theme.focus,
+            });
+        }
+        // The ghost: re-emit the source's subtree, then translate it by the drag
+        // delta (so it sits under the cursor as when grabbed) and fade it.
+        if self.rect(drag.source).is_some() {
+            let delta = cursor - drag.start;
+            let from = list.commands.len();
+            self.emit(drag.source, list);
+            for cmd in &mut list.commands[from..] {
+                translate_and_fade(cmd, delta, DRAG_GHOST_ALPHA);
+            }
+        }
     }
 
     fn emit(&self, id: WidgetId, list: &mut DrawList) {
@@ -2000,6 +2042,40 @@ fn next_boundary(s: &str, i: usize) -> usize {
     s[i..].chars().next().map_or(i, |c| i + c.len_utf8())
 }
 
+/// Offset a draw command's geometry by `delta` and fade its colors by `fade`
+/// (used to turn a re-emitted widget subtree into a drag ghost).
+fn translate_and_fade(cmd: &mut DrawCommand, delta: Vec2, fade: f32) {
+    match cmd {
+        DrawCommand::FillRect { rect, color } => {
+            rect.pos += delta;
+            *color = color.fade(fade);
+        }
+        DrawCommand::RoundedRect {
+            rect,
+            color,
+            border_color,
+            ..
+        } => {
+            rect.pos += delta;
+            *color = color.fade(fade);
+            *border_color = border_color.fade(fade);
+        }
+        DrawCommand::Text { glyphs, color } => {
+            for g in glyphs.iter_mut() {
+                g.x += delta.x;
+                g.y += delta.y;
+            }
+            *color = color.fade(fade);
+        }
+        DrawCommand::Image { rect, tint, .. } => {
+            rect.pos += delta;
+            *tint = tint.fade(fade);
+        }
+        DrawCommand::PushClip { rect } => rect.pos += delta,
+        DrawCommand::PopClip => {}
+    }
+}
+
 /// The previous word boundary at or before `i`: skip any whitespace to the left,
 /// then the run of word characters, landing at the word's start (ctrl+left).
 fn prev_word_boundary(s: &str, i: usize) -> usize {
@@ -2135,7 +2211,7 @@ mod tests {
     use crate::color::Color;
     use crate::draw::DrawCommand;
     use crate::event::Event;
-    use crate::input::{InputEvent, Key};
+    use crate::input::{CursorHint, InputEvent, Key};
     use crate::rect::Rect;
     use crate::style::Style;
     use crate::theme::Theme;
@@ -2899,6 +2975,53 @@ mod tests {
         // there proves the caret position.
         ui.handle_input(InputEvent::Text('!'));
         assert_eq!(text_of(&ui, field), "hello world !foo");
+    }
+
+    #[test]
+    fn a_live_drag_shows_the_grab_cursor_ghost_and_drop_highlight() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 200.0).row());
+        let src_fill = Color::rgb(0.2, 0.2, 0.2);
+        let source = ui.button(
+            root,
+            "file.png",
+            Style::new()
+                .size(100.0, 24.0)
+                .background(src_fill)
+                .draggable(),
+        );
+        let target = ui.panel(root, Style::new().size(200.0, 200.0).drop_target());
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+
+        // Press on the source, then move well past the threshold onto the target.
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(20.0, 12.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(250.0, 100.0)));
+
+        assert!(ui.is_dragging());
+        assert_eq!(ui.cursor_hint(), CursorHint::Grabbing);
+
+        let cmds = ui.draw_list().commands;
+        // Drop-target highlight: a bordered RoundedRect over the target's rect.
+        let target_rect = ui.rect(target).unwrap();
+        assert!(
+            cmds.iter().any(|c| matches!(c,
+                DrawCommand::RoundedRect { rect, border_width, .. }
+                    if *border_width > 0.0 && *rect == target_rect)),
+            "the drop target should be highlighted"
+        );
+        // Ghost: a faded copy of the source fill, offset from the original.
+        let ghost = Color {
+            a: src_fill.a * super::DRAG_GHOST_ALPHA,
+            ..src_fill
+        };
+        let src_pos = ui.rect(source).unwrap().pos;
+        assert!(
+            cmds.iter().any(|c| matches!(c,
+                DrawCommand::FillRect { rect, color }
+                    if *color == ghost && rect.pos != src_pos)),
+            "a faded, offset ghost of the source should be drawn"
+        );
     }
 
     #[test]

@@ -1276,6 +1276,7 @@ impl State {
             aurora::CursorHint::Text => CursorIcon::Text,
             aurora::CursorHint::ResizeHorizontal => CursorIcon::ColResize,
             aurora::CursorHint::ResizeVertical => CursorIcon::RowResize,
+            aurora::CursorHint::Grabbing => CursorIcon::Grabbing,
         });
     }
 

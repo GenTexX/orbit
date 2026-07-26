@@ -72,4 +72,6 @@ pub enum CursorHint {
     ResizeHorizontal,
     /// Vertical resize arrows (over a horizontal splitter, dragged up-down).
     ResizeVertical,
+    /// A closed/grabbing hand (while a first-class drag is in progress).
+    Grabbing,
 }
