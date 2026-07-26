@@ -1,10 +1,11 @@
 # Bundled fonts
 
-## DejaVu Sans (`DejaVuSans.ttf`)
+## DejaVu Sans (`DejaVuSans.ttf`, `-Bold.ttf`, `-ExtraLight.ttf`)
 
 Aurora bundles DejaVu Sans as its default UI font so text rendering is
 deterministic and does not depend on whatever fonts a host system happens to
-have installed (see ADR 0013).
+have installed (see ADR 0013). The Regular, Bold, and ExtraLight faces are all
+bundled so a widget can select a font weight (`Style::weight` / `Style::bold`).
 
 - Source: the DejaVu Fonts project, https://dejavu-fonts.github.io/
 - License: a permissive, free license derived from the Bitstream Vera Fonts

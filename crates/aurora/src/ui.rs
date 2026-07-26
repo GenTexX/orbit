@@ -14,7 +14,7 @@ use crate::input::{CursorHint, InputEvent, Key};
 use crate::rect::Rect;
 use crate::style::Style;
 use crate::theme::Theme;
-use crate::widget::{Mask, Orientation, Widget, WidgetId, WidgetKind};
+use crate::widget::{FontWeight, Mask, Orientation, Widget, WidgetId, WidgetKind};
 use crate::{text, theme};
 
 /// The visual state of an interactive widget, derived from the pointer each
@@ -579,6 +579,7 @@ impl Ui {
             mask: style.mask,
             placeholder: style.placeholder.unwrap_or_default(),
             font_size: style.font_size.unwrap_or(text::FONT_SIZE),
+            font_weight: style.font_weight,
             multiline: style.multiline,
             text_center: style.text_center,
             icon_button: style.icon_button,
@@ -673,7 +674,7 @@ impl Ui {
     fn shape_placeholders(&mut self) {
         // Collect the work first (text + field width), then split the buffer and
         // font-system borrows to shape - the same borrow dance as layout().
-        let jobs: Vec<(WidgetId, String, f32, f32)> = self
+        let jobs: Vec<(WidgetId, String, f32, f32, FontWeight)> = self
             .widgets
             .iter()
             .filter(|(_, w)| {
@@ -685,12 +686,13 @@ impl Ui {
                     w.placeholder.clone(),
                     self.rect(id).map_or(0.0, |r| r.size.x),
                     w.font_size,
+                    w.font_weight,
                 )
             })
             .collect();
         let buffers = &mut self.placeholder_buffers;
         let font_system = &mut self.font_system;
-        for (id, text, width, font_size) in jobs {
+        for (id, text, width, font_size, weight) in jobs {
             let metrics = text::metrics_for(font_size);
             if !buffers.contains_key(id) {
                 buffers.insert(id, Buffer::new(font_system, metrics));
@@ -698,7 +700,7 @@ impl Ui {
             let mut borrowed = buffers[id].borrow_with(font_system);
             borrowed.set_metrics(metrics);
             borrowed.set_size(Some(width.max(1.0)), None);
-            borrowed.set_text(&text, &text::default_attrs(), Shaping::Advanced, None);
+            borrowed.set_text(&text, &text::attrs_for(weight), Shaping::Advanced, None);
             borrowed.shape_until_scroll(false);
         }
     }
@@ -2315,7 +2317,8 @@ fn measure_widget(
                 let mut borrowed = buffers[id].borrow_with(font_system);
                 borrowed.set_metrics(metrics);
                 borrowed.set_size(None, None);
-                borrowed.set_text(label, &text::default_attrs(), Shaping::Advanced, None);
+                let attrs = text::attrs_for(widgets[id].font_weight);
+                borrowed.set_text(label, &attrs, Shaping::Advanced, None);
                 borrowed.shape_until_scroll(false);
                 label_w = borrowed.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
             }
@@ -2357,9 +2360,10 @@ fn measure_widget(
         })
     };
 
-    // Shape at this widget's font size, so headings and captions measure (and
-    // later draw) larger or smaller than the UI default.
+    // Shape at this widget's font size and weight, so headings and captions
+    // measure (and later draw) at their size and weight.
     let metrics = text::metrics_for(widgets[id].font_size);
+    let attrs = text::attrs_for(widgets[id].font_weight);
     if !buffers.contains_key(id) {
         buffers.insert(id, Buffer::new(font_system, metrics));
     }
@@ -2368,7 +2372,7 @@ fn measure_widget(
         let mut borrowed = buffer.borrow_with(font_system);
         borrowed.set_metrics(metrics);
         borrowed.set_size(wrap_width, None);
-        borrowed.set_text(content, &text::default_attrs(), Shaping::Advanced, None);
+        borrowed.set_text(content, &attrs, Shaping::Advanced, None);
         borrowed.shape_until_scroll(false);
     }
 
@@ -2855,6 +2859,20 @@ mod tests {
         let s = ui.rect(small).unwrap().size;
         let b = ui.rect(big).unwrap().size;
         assert!(b.y > s.y, "small={s:?} big={b:?}");
+    }
+
+    #[test]
+    fn bold_text_measures_wider_than_normal() {
+        let mut ui = Ui::new();
+        // A row so each label sizes to its own content width (the main axis).
+        let root = ui.root_panel(Style::new().size(600.0, 60.0).row());
+        let normal = ui.label(root, "Weight", Style::new());
+        let bold = ui.label(root, "Weight", Style::new().bold());
+        ui.layout(Vec2::new(600.0, 60.0)).unwrap();
+
+        let n = ui.rect(normal).unwrap().size.x;
+        let b = ui.rect(bold).unwrap().size.x;
+        assert!(b > n, "bold ({b}) should measure wider than normal ({n})");
     }
 
     #[test]

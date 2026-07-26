@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use aurora::{Color, Event, InputEvent, Key, Mask, Style, Theme, Ui, WidgetId};
+use aurora::{Color, Event, FontWeight, InputEvent, Key, Mask, Style, Theme, Ui, WidgetId};
 use aurora_wgpu::Renderer;
 use glam::Vec2;
 use winit::{
@@ -290,8 +290,18 @@ fn build_ui(light: bool) -> (Ui, Ids) {
     ui.label(
         root,
         "Aurora - every input widget  (F2: toggle theme)",
-        label(text).font_size(20.0),
+        label(text).font_size(20.0).bold(),
     );
+
+    // Font weights: the same word in light, normal, and bold.
+    let weights = ui.panel(root, Style::new().row().gap(12.0).align_center());
+    for (name, weight) in [
+        ("Light", FontWeight::Light),
+        ("Normal", FontWeight::Normal),
+        ("Bold", FontWeight::Bold),
+    ] {
+        ui.label(weights, name, label(text).font_size(18.0).weight(weight));
+    }
 
     // A button next to a live counter label. Rounded, with a subtle border, to
     // show off corner_radius()/border().

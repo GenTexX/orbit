@@ -4,7 +4,7 @@ use taffy::prelude::{length, percent};
 use taffy::{AlignItems, Display, FlexDirection, Overflow, Rect as TaffyRect, Size};
 
 use crate::color::Color;
-use crate::widget::Mask;
+use crate::widget::{FontWeight, Mask};
 
 /// How a widget lays out and looks. Layout is a taffy `Style` (size, padding,
 /// flex, gap); the visual properties (background, clipping) are Aurora's own.
@@ -41,6 +41,8 @@ pub struct Style {
     pub mask: Mask,
     /// Font size in pixels for this widget's text, or `None` for the UI default.
     pub font_size: Option<f32>,
+    /// Font weight for this widget's text.
+    pub font_weight: FontWeight,
     /// Whether a text input is multi-line (a text area). Ignored by other kinds.
     pub multiline: bool,
     /// Center this widget's text horizontally within its content box (labels and
@@ -77,6 +79,7 @@ impl Default for Style {
             placeholder: None,
             mask: Mask::None,
             font_size: None,
+            font_weight: FontWeight::Normal,
             multiline: false,
             text_center: false,
             icon_button: false,
@@ -320,6 +323,17 @@ impl Style {
     pub fn font_size(mut self, px: f32) -> Self {
         self.font_size = Some(px);
         self
+    }
+
+    /// Set this widget's text weight (light / normal / bold).
+    pub fn weight(mut self, weight: FontWeight) -> Self {
+        self.font_weight = weight;
+        self
+    }
+
+    /// Shorthand for bold text (`weight(FontWeight::Bold)`).
+    pub fn bold(self) -> Self {
+        self.weight(FontWeight::Bold)
     }
 
     /// Make a text input multi-line (a text area): Enter inserts a newline

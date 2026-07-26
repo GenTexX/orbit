@@ -97,6 +97,18 @@ impl Mask {
     }
 }
 
+/// A font weight for a widget's text. Maps to a bundled DejaVu Sans face.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FontWeight {
+    /// A lighter-than-normal weight (DejaVu Sans ExtraLight).
+    Light,
+    /// The normal UI weight (the default).
+    #[default]
+    Normal,
+    /// Bold (DejaVu Sans Bold), for emphasis and headings.
+    Bold,
+}
+
 /// Which axis a [`WidgetKind::Splitter`] drags along, and so which dimension of
 /// its target it resizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +160,8 @@ pub(crate) struct Widget {
     /// Font size in pixels for this widget's text (the UI default when unset via
     /// style). Drives both shaping and measurement.
     pub font_size: f32,
+    /// Font weight for this widget's text (normal by default).
+    pub font_weight: FontWeight,
     /// Whether this text input is multi-line (a text area): Enter inserts a
     /// newline instead of submitting, and the caret moves by line. Other kinds
     /// ignore it.

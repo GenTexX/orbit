@@ -21,7 +21,7 @@ pub use rect::Rect;
 pub use style::Style;
 pub use theme::Theme;
 pub use ui::Ui;
-pub use widget::{Mask, Orientation, WidgetId, WidgetKind};
+pub use widget::{FontWeight, Mask, Orientation, WidgetId, WidgetKind};
 
 /// The layout engine. Re-exported so callers can reach taffy types without a
 /// direct dependency, e.g. `aurora::taffy::AlignItems`.
@@ -35,8 +35,8 @@ pub mod prelude {
     //! Convenient imports for building a UI: Aurora's core types plus taffy's
     //! style vocabulary.
     pub use crate::{
-        Color, CursorHint, DrawCommand, DrawList, Event, ImageHandle, InputEvent, Key, Mask,
-        Orientation, Rect, Style, Theme, Ui, WidgetId, WidgetKind,
+        Color, CursorHint, DrawCommand, DrawList, Event, FontWeight, ImageHandle, InputEvent, Key,
+        Mask, Orientation, Rect, Style, Theme, Ui, WidgetId, WidgetKind,
     };
     pub use taffy::prelude::*;
 }

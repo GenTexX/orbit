@@ -749,7 +749,8 @@ fn build_scene_tree(
         "Scene",
         Style::new()
             .foreground(theme.heading)
-            .font_size(PANEL_TITLE),
+            .font_size(PANEL_TITLE)
+            .bold(),
     );
     add_tree_row(
         ui,
@@ -954,7 +955,8 @@ fn build_inspector(
         "Inspector",
         Style::new()
             .foreground(theme.heading)
-            .font_size(PANEL_TITLE),
+            .font_size(PANEL_TITLE)
+            .bold(),
     );
 
     let Some(node) = selected else {
@@ -1227,7 +1229,8 @@ fn build_file_explorer(
         "Files",
         Style::new()
             .foreground(theme.heading)
-            .font_size(PANEL_TITLE),
+            .font_size(PANEL_TITLE)
+            .bold(),
     );
     for name in list_project_files(project_dir) {
         if name.ends_with(".png") {
