@@ -1,19 +1,23 @@
-//! controls - an interactive aurora-wgpu demo: a button, a checkbox, and an
-//! editable text field wired to real pointer and keyboard input. Click the
-//! button to bump a counter; toggle the checkbox to show an accent box; click
-//! the field and type (Backspace/Delete/arrows/Home/End work).
+//! controls - an interactive aurora-wgpu demo showcasing every input widget:
+//! a button, a checkbox, a plain text field (with a placeholder), masked fields
+//! (integer/decimal/hex), a disabled field and button, a multi-line text area,
+//! and a slider - all wired to real pointer and keyboard input. Click the button
+//! to bump a counter; toggle the checkbox to show an accent box; click a field
+//! and type; Tab moves between fields; shift+arrows extend a selection and
+//! ctrl+a/c/x/v select-all/copy/cut/paste; in the text area Enter adds a newline
+//! and Up/Down move by line.
 //! Run with: `cargo run -p aurora-wgpu --example controls`.
 
 use std::sync::Arc;
 
-use aurora::{Color, Event, InputEvent, Key, Style, Ui, WidgetId};
+use aurora::{Color, Event, InputEvent, Key, Mask, Style, Ui, WidgetId};
 use aurora_wgpu::Renderer;
 use glam::Vec2;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key as WinitKey, NamedKey},
+    keyboard::{Key as WinitKey, ModifiersState, NamedKey},
     window::{Window, WindowId},
 };
 
@@ -35,6 +39,10 @@ struct State {
     ui: Ui,
     ids: Ids,
     clicks: u32,
+    /// The current keyboard modifiers (for shift-selection and ctrl shortcuts).
+    modifiers: ModifiersState,
+    /// The OS clipboard for ctrl+c/x/v, or `None` if it could not be opened.
+    clipboard: Option<arboard::Clipboard>,
 }
 
 /// Handles to the widgets the app reacts to after building the tree.
@@ -66,6 +74,8 @@ impl ApplicationHandler for App {
             ui,
             ids,
             clicks: 0,
+            modifiers: ModifiersState::default(),
+            clipboard: arboard::Clipboard::new().ok(),
         };
         state.window.request_redraw();
         self.state = Some(state);
@@ -103,10 +113,19 @@ impl ApplicationHandler for App {
                 state.ui.handle_input(ev);
                 state.window.request_redraw();
             }
-            // Translate winit key presses into Aurora text/key events.
+            // Track modifiers so shift extends a selection and ctrl arms the
+            // clipboard shortcuts.
+            WindowEvent::ModifiersChanged(m) => {
+                state.modifiers = m.state();
+                state.ui.set_shift(m.state().shift_key());
+            }
+            // Translate winit key presses into Aurora text/key events. Ctrl+a/c/
+            // x/v are intercepted as clipboard shortcuts first.
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                for ev in translate_key(&event) {
-                    state.ui.handle_input(ev);
+                if !clipboard_shortcut(state, &event) {
+                    for ev in translate_key(&event, state.modifiers.control_key()) {
+                        state.ui.handle_input(ev);
+                    }
                 }
                 state.window.request_redraw();
             }
@@ -159,16 +178,54 @@ fn react(state: &mut State) {
     }
 }
 
+/// Handle ctrl+a/c/x/v on the focused field, backed by the OS clipboard.
+/// Returns whether the key was a (handled) clipboard shortcut.
+fn clipboard_shortcut(state: &mut State, event: &winit::event::KeyEvent) -> bool {
+    if !state.modifiers.control_key() {
+        return false;
+    }
+    let WinitKey::Character(c) = &event.logical_key else {
+        return false;
+    };
+    match c.as_str() {
+        "a" | "A" => state.ui.select_all(),
+        "c" | "C" => {
+            if let (Some(text), Some(cb)) = (state.ui.selected_text(), state.clipboard.as_mut()) {
+                let _ = cb.set_text(text);
+            }
+        }
+        "x" | "X" => {
+            if let (Some(text), Some(cb)) = (state.ui.selected_text(), state.clipboard.as_mut()) {
+                let _ = cb.set_text(text);
+                state.ui.delete_selection();
+            }
+        }
+        "v" | "V" => {
+            if let Some(text) = state.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
+                state.ui.insert_str(&text);
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// Map a winit key press to Aurora input: a named editing key, or the typed
-/// text as a run of character events.
-fn translate_key(event: &winit::event::KeyEvent) -> Vec<InputEvent> {
+/// text as a run of character events. `ctrl` upgrades the arrows to word motion.
+fn translate_key(event: &winit::event::KeyEvent, ctrl: bool) -> Vec<InputEvent> {
     let named = match &event.logical_key {
         WinitKey::Named(NamedKey::Backspace) => Some(Key::Backspace),
         WinitKey::Named(NamedKey::Delete) => Some(Key::Delete),
+        WinitKey::Named(NamedKey::ArrowLeft) if ctrl => Some(Key::WordLeft),
+        WinitKey::Named(NamedKey::ArrowRight) if ctrl => Some(Key::WordRight),
         WinitKey::Named(NamedKey::ArrowLeft) => Some(Key::Left),
         WinitKey::Named(NamedKey::ArrowRight) => Some(Key::Right),
+        WinitKey::Named(NamedKey::ArrowUp) => Some(Key::Up),
+        WinitKey::Named(NamedKey::ArrowDown) => Some(Key::Down),
         WinitKey::Named(NamedKey::Home) => Some(Key::Home),
         WinitKey::Named(NamedKey::End) => Some(Key::End),
+        WinitKey::Named(NamedKey::Enter) => Some(Key::Enter),
+        WinitKey::Named(NamedKey::Tab) => Some(Key::Tab),
         _ => None,
     };
     if let Some(key) = named {
@@ -197,8 +254,10 @@ fn build_ui() -> (Ui, Ids) {
 
     ui.label(
         root,
-        "Aurora - interactive controls",
-        Style::new().foreground(Color::rgb(0.95, 0.95, 0.98)),
+        "Aurora - every input widget",
+        Style::new()
+            .foreground(Color::rgb(0.95, 0.95, 0.98))
+            .font_size(20.0),
     );
 
     // A button next to a live counter label.
@@ -215,13 +274,60 @@ fn build_ui() -> (Ui, Ids) {
     let checkbox = ui.checkbox(check_row, false, Style::new());
     ui.label(check_row, "Show accent box", Style::new().padding(2.0));
 
-    // An editable text field next to its caption. Click it and type.
-    let field_row = ui.panel(root, Style::new().row().gap(8.0));
-    ui.label(field_row, "Name:", Style::new().padding(6.0));
+    // An editable text field next to its caption. Click it and type. A
+    // placeholder shows while it is empty; Tab moves between the fields.
+    let field_row = ui.panel(root, Style::new().row().gap(8.0).align_center());
+    ui.label(field_row, "Name:", Style::new().padding(6.0).width(64.0));
     ui.text_input(
         field_row,
-        "player one",
-        Style::new().size(220.0, 28.0).padding(6.0),
+        "",
+        Style::new()
+            .size(240.0, 28.0)
+            .padding(6.0)
+            .placeholder("type a name..."),
+    );
+
+    // Masked inputs: each rejects any keystroke that would break its mask.
+    let field = |px: f32| Style::new().size(px, 28.0).padding(6.0);
+    for (caption, mask, hint) in [
+        ("Integer:", Mask::Integer, "-1234"),
+        ("Decimal:", Mask::Decimal, "-3.14"),
+        ("Hex:", Mask::Hex, "1a2b3c"),
+    ] {
+        let row = ui.panel(root, Style::new().row().gap(8.0).align_center());
+        ui.label(row, caption, Style::new().padding(6.0).width(64.0));
+        ui.text_input(row, "", field(160.0).mask(mask).placeholder(hint));
+    }
+
+    // A disabled field and button: dimmed and inert (no hover, focus, or click).
+    let disabled_row = ui.panel(root, Style::new().row().gap(8.0).align_center());
+    ui.label(
+        disabled_row,
+        "Disabled:",
+        Style::new().padding(6.0).width(64.0),
+    );
+    ui.text_input(disabled_row, "read only", field(160.0).disabled());
+    ui.button(
+        disabled_row,
+        "Save",
+        Style::new()
+            .padding(8.0)
+            .disabled()
+            .foreground(Color::WHITE),
+    );
+
+    // A multi-line text area: Enter inserts a newline, Up/Down move by line,
+    // Home/End act on the line, and a selection highlights each line. It grows
+    // as lines are added.
+    ui.label(
+        root,
+        "Notes (text area):",
+        Style::new().foreground(Color::rgb(0.7, 0.72, 0.8)),
+    );
+    ui.text_area(
+        root,
+        "A multi-line text area.\nEnter adds a newline.\nUp/Down move by line.",
+        Style::new().width(320.0).padding(6.0),
     );
 
     // A slider with a live value readout.
