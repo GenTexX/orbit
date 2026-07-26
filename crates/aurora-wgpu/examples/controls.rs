@@ -5,12 +5,12 @@
 //! to bump a counter; toggle the checkbox to show an accent box; click a field
 //! and type; Tab moves between fields; shift+arrows extend a selection and
 //! ctrl+a/c/x/v select-all/copy/cut/paste; in the text area Enter adds a newline
-//! and Up/Down move by line.
+//! and Up/Down move by line. Press F2 to toggle the light/dark theme.
 //! Run with: `cargo run -p aurora-wgpu --example controls`.
 
 use std::sync::Arc;
 
-use aurora::{Color, Event, InputEvent, Key, Mask, Style, Ui, WidgetId};
+use aurora::{Color, Event, InputEvent, Key, Mask, Style, Theme, Ui, WidgetId};
 use aurora_wgpu::Renderer;
 use glam::Vec2;
 use winit::{
@@ -43,6 +43,8 @@ struct State {
     modifiers: ModifiersState,
     /// The OS clipboard for ctrl+c/x/v, or `None` if it could not be opened.
     clipboard: Option<arboard::Clipboard>,
+    /// Whether the light theme is active (toggled with F2).
+    light: bool,
 }
 
 /// Handles to the widgets the app reacts to after building the tree.
@@ -67,7 +69,7 @@ impl ApplicationHandler for App {
         );
         let size = window.inner_size();
         let renderer = Renderer::new(window.clone(), (size.width, size.height)).expect("renderer");
-        let (ui, ids) = build_ui();
+        let (ui, ids) = build_ui(false);
         let state = State {
             window,
             renderer,
@@ -76,6 +78,7 @@ impl ApplicationHandler for App {
             clicks: 0,
             modifiers: ModifiersState::default(),
             clipboard: arboard::Clipboard::new().ok(),
+            light: false,
         };
         state.window.request_redraw();
         self.state = Some(state);
@@ -118,6 +121,18 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(m) => {
                 state.modifiers = m.state();
                 state.ui.set_shift(m.state().shift_key());
+            }
+            // F2 toggles the theme: rebuild the panel with the other palette.
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.logical_key == WinitKey::Named(NamedKey::F2) =>
+            {
+                state.light = !state.light;
+                let (ui, ids) = build_ui(state.light);
+                state.ui = ui;
+                state.ids = ids;
+                state.clicks = 0;
+                state.window.request_redraw();
             }
             // Translate winit key presses into Aurora text/key events. Ctrl+a/c/
             // x/v are intercepted as clipboard shortcuts first.
@@ -240,24 +255,42 @@ fn translate_key(event: &winit::event::KeyEvent, ctrl: bool) -> Vec<InputEvent> 
         .collect()
 }
 
-/// Build the control panel and return the handles the app reacts to.
-fn build_ui() -> (Ui, Ids) {
+/// Build the control panel and return the handles the app reacts to. `light`
+/// picks the theme (Theme::light/dark) and matching surface/text colors, so
+/// pressing F2 rebuilds this whole panel recolored.
+fn build_ui(light: bool) -> (Ui, Ids) {
     let mut ui = Ui::new();
+    ui.set_theme(if light { Theme::light() } else { Theme::dark() });
+    // App-level colors (aurora themes the widgets; the app owns its surface and
+    // its label text).
+    let (surface, text, dim) = if light {
+        (
+            Color::rgb(0.93, 0.94, 0.96),
+            Color::rgb(0.14, 0.15, 0.18),
+            Color::rgb(0.42, 0.45, 0.52),
+        )
+    } else {
+        (
+            Color::rgb(0.13, 0.14, 0.18),
+            Color::rgb(0.95, 0.95, 0.98),
+            Color::rgb(0.62, 0.65, 0.72),
+        )
+    };
+    let label = |text: Color| Style::new().foreground(text);
+
     let root = ui.root_panel(
         Style::new()
             .fill()
             .column()
             .padding(16.0)
             .gap(12.0)
-            .background(Color::rgb(0.13, 0.14, 0.18)),
+            .background(surface),
     );
 
     ui.label(
         root,
-        "Aurora - every input widget",
-        Style::new()
-            .foreground(Color::rgb(0.95, 0.95, 0.98))
-            .font_size(20.0),
+        "Aurora - every input widget  (F2: toggle theme)",
+        label(text).font_size(20.0),
     );
 
     // A button next to a live counter label. Rounded, with a subtle border, to
@@ -266,43 +299,49 @@ fn build_ui() -> (Ui, Ids) {
     let button = ui.button(
         button_row,
         "Click me",
-        Style::new()
+        label(text)
             .padding(8.0)
-            .foreground(Color::WHITE)
             .corner_radius(6.0)
             .border(1.0, Color::rgb(0.45, 0.55, 0.75)),
     );
-    let clicks_label = ui.label(button_row, "Clicks: 0", Style::new().padding(8.0));
+    let clicks_label = ui.label(button_row, "Clicks: 0", label(text).padding(8.0));
 
     // A checkbox next to its caption.
     let check_row = ui.panel(root, Style::new().row().gap(8.0).padding(4.0));
     let checkbox = ui.checkbox(check_row, false, Style::new());
-    ui.label(check_row, "Show accent box", Style::new().padding(2.0));
+    ui.label(check_row, "Show accent box", label(text).padding(2.0));
 
     // An editable text field next to its caption. Click it and type. A
     // placeholder shows while it is empty; Tab moves between the fields.
     let field_row = ui.panel(root, Style::new().row().gap(8.0).align_center());
-    ui.label(field_row, "Name:", Style::new().padding(6.0).width(64.0));
+    ui.label(field_row, "Name:", label(text).padding(6.0).width(64.0));
     ui.text_input(
         field_row,
         "",
         Style::new()
             .size(240.0, 28.0)
             .padding(6.0)
+            .foreground(text)
             .corner_radius(4.0)
             .placeholder("type a name..."),
     );
 
     // Masked inputs: each rejects any keystroke that would break its mask. The
     // fields are rounded (corner_radius) to show the rounded-rect rendering.
-    let field = |px: f32| Style::new().size(px, 28.0).padding(6.0).corner_radius(4.0);
+    let field = |px: f32| {
+        Style::new()
+            .size(px, 28.0)
+            .padding(6.0)
+            .foreground(text)
+            .corner_radius(4.0)
+    };
     for (caption, mask, hint) in [
         ("Integer:", Mask::Integer, "-1234"),
         ("Decimal:", Mask::Decimal, "-3.14"),
         ("Hex:", Mask::Hex, "1a2b3c"),
     ] {
         let row = ui.panel(root, Style::new().row().gap(8.0).align_center());
-        ui.label(row, caption, Style::new().padding(6.0).width(64.0));
+        ui.label(row, caption, label(text).padding(6.0).width(64.0));
         ui.text_input(row, "", field(160.0).mask(mask).placeholder(hint));
     }
 
@@ -311,36 +350,25 @@ fn build_ui() -> (Ui, Ids) {
     ui.label(
         disabled_row,
         "Disabled:",
-        Style::new().padding(6.0).width(64.0),
+        label(text).padding(6.0).width(64.0),
     );
     ui.text_input(disabled_row, "read only", field(160.0).disabled());
-    ui.button(
-        disabled_row,
-        "Save",
-        Style::new()
-            .padding(8.0)
-            .disabled()
-            .foreground(Color::WHITE),
-    );
+    ui.button(disabled_row, "Save", label(text).padding(8.0).disabled());
 
     // A multi-line text area: Enter inserts a newline, Up/Down move by line,
     // Home/End act on the line, and a selection highlights each line. It grows
     // as lines are added.
-    ui.label(
-        root,
-        "Notes (text area):",
-        Style::new().foreground(Color::rgb(0.7, 0.72, 0.8)),
-    );
+    ui.label(root, "Notes (text area):", label(dim));
     ui.text_area(
         root,
         "A multi-line text area.\nEnter adds a newline.\nUp/Down move by line.",
-        Style::new().width(320.0).padding(6.0),
+        Style::new().width(320.0).padding(6.0).foreground(text),
     );
 
     // A slider with a live value readout.
     let slider_row = ui.panel(root, Style::new().row().gap(8.0).align_center());
     let slider = ui.slider(slider_row, 50.0, 0.0, 100.0, Style::new().size(220.0, 24.0));
-    let slider_label = ui.label(slider_row, "50", Style::new().padding(6.0));
+    let slider_label = ui.label(slider_row, "50", label(text).padding(6.0));
 
     // The box the checkbox reveals (transparent until toggled on).
     let accent = ui.panel(

@@ -13,6 +13,7 @@ use crate::event::Event;
 use crate::input::{CursorHint, InputEvent, Key};
 use crate::rect::Rect;
 use crate::style::Style;
+use crate::theme::Theme;
 use crate::widget::{Mask, Orientation, Widget, WidgetId, WidgetKind};
 use crate::{text, theme};
 
@@ -96,6 +97,8 @@ pub struct Ui {
     caret_on: bool,
     /// Semantic events accumulated since the last [`drain_events`](Self::drain_events).
     events: Vec<Event>,
+    /// The color palette the built-in widgets draw with (swap with `set_theme`).
+    theme: Theme,
 }
 
 impl Ui {
@@ -124,7 +127,20 @@ impl Ui {
             shift: false,
             caret_on: true,
             events: Vec::new(),
+            theme: Theme::default(),
         }
+    }
+
+    /// Replace the color theme the built-in widgets draw with. Takes effect on
+    /// the next [`draw_list`](Self::draw_list); per-widget [`Style`](crate::Style)
+    /// colors still override it locally.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
+    /// The current theme.
+    pub fn theme(&self) -> Theme {
+        self.theme
     }
 
     /// Create the root widget, a panel with the given style. Replaces any
@@ -1543,7 +1559,7 @@ impl Ui {
                     ),
                     Vec2::new(theme::SCROLLBAR_WIDTH, thumb_h),
                 ),
-                color: theme::SCROLLBAR_THUMB,
+                color: self.theme.scrollbar_thumb,
             });
         }
 
@@ -1552,15 +1568,15 @@ impl Ui {
             for cmd in &mut list.commands[from..] {
                 match cmd {
                     DrawCommand::FillRect { color, .. } | DrawCommand::Text { color, .. } => {
-                        *color = color.fade(theme::DISABLED_FADE);
+                        *color = color.fade(self.theme.disabled_fade);
                     }
                     DrawCommand::RoundedRect {
                         color,
                         border_color,
                         ..
                     } => {
-                        *color = color.fade(theme::DISABLED_FADE);
-                        *border_color = border_color.fade(theme::DISABLED_FADE);
+                        *color = color.fade(self.theme.disabled_fade);
+                        *border_color = border_color.fade(self.theme.disabled_fade);
                     }
                     _ => {}
                 }
@@ -1587,7 +1603,7 @@ impl Ui {
         );
         list.commands.push(DrawCommand::FillRect {
             rect: track,
-            color: theme::SLIDER_TRACK,
+            color: self.theme.slider_track,
         });
         let t = if max > min {
             ((value - min) / (max - min)).clamp(0.0, 1.0)
@@ -1597,12 +1613,12 @@ impl Ui {
         // The filled portion.
         list.commands.push(DrawCommand::FillRect {
             rect: Rect::new(track.pos, Vec2::new(track.size.x * t, track_h)),
-            color: theme::SLIDER_FILL,
+            color: self.theme.slider_fill,
         });
         // The thumb: a small square centered on the value position.
         let half = rect.size.y * 0.5;
         let cx = rect.pos.x + track.size.x * t;
-        let base = theme::SLIDER_FILL;
+        let base = self.theme.slider_fill;
         let color = match self.interaction(id) {
             Interaction::Idle => base,
             Interaction::Hovered => base.lighten(0.10),
@@ -1653,7 +1669,7 @@ impl Ui {
             && self.widgets[button].icon_button
             && self.interaction(button) != Interaction::Idle
         {
-            return theme::ICON_HOVER;
+            return self.theme.icon_hover;
         }
         widget.foreground
     }
@@ -1676,9 +1692,9 @@ impl Ui {
             let color = match self.interaction(id) {
                 Interaction::Idle => bg,
                 Interaction::Hovered if bg.a > 0.0 => bg.lighten(0.06),
-                Interaction::Hovered => theme::ROW_HOVER,
+                Interaction::Hovered => self.theme.row_hover,
                 Interaction::Pressed if bg.a > 0.0 => bg.darken(0.06),
-                Interaction::Pressed => theme::ROW_PRESSED,
+                Interaction::Pressed => self.theme.row_pressed,
             };
             self.fill_widget_bg(id, rect, color, list);
             self.emit_text(id, widget.foreground, list);
@@ -1687,7 +1703,7 @@ impl Ui {
         let base = if widget.background.a > 0.0 {
             widget.background
         } else {
-            theme::BUTTON
+            self.theme.button
         };
         let color = match self.interaction(id) {
             Interaction::Idle => base,
@@ -1701,9 +1717,9 @@ impl Ui {
     /// A checkbox: a state-shaded box, with an inset accent square when checked.
     fn emit_checkbox(&self, id: WidgetId, rect: Rect, checked: bool, list: &mut DrawList) {
         let box_color = match self.interaction(id) {
-            Interaction::Idle => theme::CHECKBOX_BOX,
-            Interaction::Hovered => theme::CHECKBOX_BOX.lighten(0.12),
-            Interaction::Pressed => theme::CHECKBOX_BOX.darken(0.10),
+            Interaction::Idle => self.theme.checkbox_box,
+            Interaction::Hovered => self.theme.checkbox_box.lighten(0.12),
+            Interaction::Pressed => self.theme.checkbox_box.darken(0.10),
         };
         self.fill_widget_bg(id, rect, box_color, list);
         // When checked, draw the check glyph centered in the box: horizontally
@@ -1718,7 +1734,7 @@ impl Ui {
                 rect.pos.x + (rect.size.x - run.line_w) * 0.5,
                 rect.pos.y + (rect.size.y - line_h) * 0.5,
             );
-            self.emit_buffer(buffer, origin, theme::CHECKBOX_MARK, None, list);
+            self.emit_buffer(buffer, origin, self.theme.checkbox_mark, None, list);
         }
     }
 
@@ -1728,7 +1744,7 @@ impl Ui {
         let base = if widget.background.a > 0.0 {
             widget.background
         } else {
-            theme::SPLITTER
+            self.theme.splitter
         };
         let color = match self.interaction(id) {
             Interaction::Idle => base,
@@ -1745,12 +1761,12 @@ impl Ui {
         let fill = if widget.background.a > 0.0 {
             widget.background
         } else {
-            theme::FIELD
+            self.theme.field
         };
         // The border is the focus accent when focused, else the field's own
         // style border. A rounded or bordered field draws as one RoundedRect.
         let (border_w, border_c) = if focused {
-            (widget.border_width.max(1.5), theme::FOCUS)
+            (widget.border_width.max(1.5), self.theme.focus)
         } else {
             (widget.border_width, widget.border_color)
         };
@@ -1778,7 +1794,7 @@ impl Ui {
         // the text - it does not take focus, a caret, or a selection.
         let empty = matches!(&widget.kind, WidgetKind::TextInput(s) if s.is_empty());
         if empty && let Some(buffer) = self.placeholder_buffers.get(id) {
-            self.emit_buffer(buffer, base, theme::PLACEHOLDER, None, list);
+            self.emit_buffer(buffer, base, self.theme.placeholder, None, list);
         }
         // The selection highlight, behind the text.
         if focused {
@@ -1794,7 +1810,7 @@ impl Ui {
                             Vec2::new(x0, rect.pos.y + 3.0),
                             Vec2::new((x1 - x0).max(0.0), (rect.size.y - 6.0).max(0.0)),
                         ),
-                        color: theme::SELECTION,
+                        color: self.theme.selection,
                     });
                 }
             }
@@ -1818,7 +1834,7 @@ impl Ui {
             if let Some(caret) = caret {
                 list.commands.push(DrawCommand::FillRect {
                     rect: caret,
-                    color: theme::CARET,
+                    color: self.theme.caret,
                 });
             }
         }
@@ -1857,7 +1873,7 @@ impl Ui {
                         origin + Vec2::new(x, run.line_top),
                         Vec2::new(w.max(0.0), run.line_height),
                     ),
-                    color: theme::SELECTION,
+                    color: self.theme.selection,
                 });
             }
         }
@@ -2122,6 +2138,7 @@ mod tests {
     use crate::input::{InputEvent, Key};
     use crate::rect::Rect;
     use crate::style::Style;
+    use crate::theme::Theme;
     use crate::widget::{Mask, Orientation, WidgetKind};
     use glam::Vec2;
 
@@ -2231,7 +2248,7 @@ mod tests {
             .commands
             .iter()
             .filter_map(|c| match c {
-                DrawCommand::FillRect { rect, color } if *color == crate::theme::SELECTION => {
+                DrawCommand::FillRect { rect, color } if *color == Theme::dark().selection => {
                     Some(*rect)
                 }
                 _ => None,
@@ -2386,7 +2403,7 @@ mod tests {
             .draw_list()
             .commands
             .iter()
-            .filter(|c| matches!(c, DrawCommand::FillRect { color, .. } if *color == crate::theme::SELECTION))
+            .filter(|c| matches!(c, DrawCommand::FillRect { color, .. } if *color == Theme::dark().selection))
             .count();
         assert!(
             highlights >= 2,
@@ -2589,7 +2606,7 @@ mod tests {
         let cmds = ui.draw_list().commands;
         let mark = |c: &DrawCommand| {
             matches!(c, DrawCommand::Text { color, glyphs }
-                if *color == crate::theme::CHECKBOX_MARK && !glyphs.is_empty())
+                if *color == Theme::dark().checkbox_mark && !glyphs.is_empty())
         };
         assert!(cmds.iter().any(mark), "checked box should draw the glyph");
         // Sanity: exactly one mark (only the checked box), and both boxes exist.
@@ -2657,7 +2674,7 @@ mod tests {
 
         let faded = ui.draw_list().commands.iter().any(|c| {
             matches!(c, DrawCommand::FillRect { color, .. }
-                if (color.a - crate::theme::DISABLED_FADE).abs() < 1e-6)
+                if (color.a - Theme::dark().disabled_fade).abs() < 1e-6)
         });
         assert!(faded, "disabled button fill should be faded");
     }
@@ -2847,7 +2864,7 @@ mod tests {
         // Empty: the placeholder is drawn (a Text command in the dimmed color).
         let shows_placeholder = |ui: &Ui| {
             ui.draw_list().commands.iter().any(|c| {
-                matches!(c, DrawCommand::Text { color, .. } if *color == crate::theme::PLACEHOLDER)
+                matches!(c, DrawCommand::Text { color, .. } if *color == Theme::dark().placeholder)
             })
         };
         assert!(shows_placeholder(&ui));
@@ -2882,6 +2899,29 @@ mod tests {
         // there proves the caret position.
         ui.handle_input(InputEvent::Text('!'));
         assert_eq!(text_of(&ui, field), "hello world !foo");
+    }
+
+    #[test]
+    fn set_theme_recolors_the_built_in_widgets() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(120.0, 40.0));
+        // A button with no style background fills with the theme's button color.
+        ui.button(root, "Go", Style::new().size(80.0, 24.0));
+        ui.layout(Vec2::new(120.0, 40.0)).unwrap();
+
+        let fills_with = |ui: &Ui, want: Color| {
+            ui.draw_list()
+                .commands
+                .iter()
+                .any(|c| matches!(c, DrawCommand::FillRect { color, .. } if *color == want))
+        };
+        // Default (dark) theme paints the dark button fill.
+        assert!(fills_with(&ui, Theme::dark().button));
+
+        // Switching the theme repaints it with the new palette's button color.
+        ui.set_theme(Theme::light());
+        assert_ne!(Theme::dark().button, Theme::light().button);
+        assert!(fills_with(&ui, Theme::light().button));
     }
 
     #[test]
@@ -2955,7 +2995,7 @@ mod tests {
             .commands
             .iter()
             .find_map(|c| match c {
-                DrawCommand::FillRect { rect: r, color } if *color == crate::theme::CARET => {
+                DrawCommand::FillRect { rect: r, color } if *color == Theme::dark().caret => {
                     Some(r.pos.x)
                 }
                 _ => None,
@@ -3176,7 +3216,7 @@ mod tests {
 
         // Hovering the button recolors the icon to the accent (no background).
         ui.handle_input(InputEvent::PointerMoved(Vec2::new(20.0, 20.0)));
-        assert_eq!(image_tint(&ui), Some(crate::theme::ICON_HOVER));
+        assert_eq!(image_tint(&ui), Some(Theme::dark().icon_hover));
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub use event::Event;
 pub use input::{CursorHint, InputEvent, Key};
 pub use rect::Rect;
 pub use style::Style;
+pub use theme::Theme;
 pub use ui::Ui;
 pub use widget::{Mask, Orientation, WidgetId, WidgetKind};
 
@@ -35,7 +36,7 @@ pub mod prelude {
     //! style vocabulary.
     pub use crate::{
         Color, CursorHint, DrawCommand, DrawList, Event, ImageHandle, InputEvent, Key, Mask,
-        Orientation, Rect, Style, Ui, WidgetId, WidgetKind,
+        Orientation, Rect, Style, Theme, Ui, WidgetId, WidgetKind,
     };
     pub use taffy::prelude::*;
 }
