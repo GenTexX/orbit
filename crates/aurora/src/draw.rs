@@ -36,7 +36,13 @@ pub enum DrawCommand {
     Text { glyphs: Vec<Glyph>, color: Color },
     /// Draw a registered texture stretched to fill a rectangle (e.g. the
     /// engine's viewport). `handle` is resolved by the backend, not Aurora.
-    Image { rect: Rect, handle: ImageHandle },
+    /// `tint` multiplies the sampled texture - `Color::WHITE` is a straight
+    /// passthrough; a color recolors a white icon (e.g. an icon on hover).
+    Image {
+        rect: Rect,
+        handle: ImageHandle,
+        tint: Color,
+    },
     /// Push a clip rectangle. Following draws are clipped to the intersection of
     /// all active clips until the matching `PopClip`.
     PushClip { rect: Rect },

@@ -21,11 +21,12 @@ pub(crate) fn metrics_for(font_size: f32) -> Metrics {
 /// bundled DejaVu Sans), so the tick is a real vector glyph, not a filled box.
 pub(crate) const CHECK_MARK: &str = "\u{2714}";
 
-/// Metrics for the checkbox check glyph, sized so its line box exactly fills a
-/// `box_size` square - the box height then centers the glyph vertically by the
-/// font's own metrics, no magic offsets.
+/// Metrics for the checkbox check glyph. The font size is the box size itself
+/// (not the smaller size whose line box would fill the box), so the tick's ink
+/// fills roughly three-quarters of the box rather than reading as a small mark;
+/// emit_checkbox centers it by the resulting line height.
 pub(crate) fn checkmark_metrics(box_size: f32) -> Metrics {
-    metrics_for(box_size * FONT_SIZE / LINE_HEIGHT)
+    metrics_for(box_size)
 }
 
 /// Default text attributes (resolve to the bundled sans-serif font).

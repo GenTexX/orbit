@@ -151,6 +151,11 @@ pub(crate) struct Widget {
     /// newline instead of submitting, and the caret moves by line. Other kinds
     /// ignore it.
     pub multiline: bool,
+    /// Whether this widget's text is centered horizontally in its content box.
+    pub text_center: bool,
+    /// Whether this button is an "icon button" (no fill; its icon recolors on
+    /// hover/press). See [`crate::Style::icon_button`].
+    pub icon_button: bool,
     /// Whether this widget is a drag source (see [`crate::Style::draggable`]).
     pub draggable: bool,
     /// Whether this widget accepts drops (see [`crate::Style::drop_target`]).

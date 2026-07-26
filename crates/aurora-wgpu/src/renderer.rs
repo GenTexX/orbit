@@ -61,14 +61,15 @@ impl QuadInstance {
         }
     }
 
-    /// A registered image filling `rect`, untinted (opaque white).
-    fn image(rect: Rect) -> Self {
+    /// A registered image filling `rect`, multiplied by `tint` (opaque white
+    /// leaves it untouched; a color recolors a white icon).
+    fn image(rect: Rect, tint: Color) -> Self {
         Self {
             pos: rect.pos.to_array(),
             size: rect.size.to_array(),
             uv_min: [0.0, 0.0],
             uv_max: [1.0, 1.0],
-            color: [1.0, 1.0, 1.0, 1.0],
+            color: [tint.r, tint.g, tint.b, tint.a],
         }
     }
 }
@@ -556,12 +557,12 @@ impl Renderer {
                         }
                     }
                 }
-                DrawCommand::Image { rect, handle } => {
+                DrawCommand::Image { rect, handle, tint } => {
                     // Flush pending atlas quads first so this image draws in
                     // its correct position in the paint order, not after them.
                     flush(&instances, &mut ops, &mut batch_start, scissor);
                     if let Scissor::Rect(r) = scissor {
-                        image_instances.push(QuadInstance::image(*rect));
+                        image_instances.push(QuadInstance::image(*rect, *tint));
                         ops.push(Op::Image {
                             rect: r,
                             handle: *handle,

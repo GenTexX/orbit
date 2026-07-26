@@ -30,6 +30,9 @@ pub(crate) const FOCUS: Color = Color::rgb(0.30, 0.55, 0.90);
 pub(crate) const CARET: Color = Color::rgb(0.90, 0.92, 0.96);
 /// Placeholder text shown, dimmed, in an empty field.
 pub(crate) const PLACEHOLDER: Color = Color::rgb(0.45, 0.47, 0.53);
+/// Accent an icon-button's icon takes on hover/press (the theme highlight),
+/// instead of the button drawing a background.
+pub(crate) const ICON_HOVER: Color = Color::rgb(0.45, 0.70, 1.0);
 /// The text-selection highlight (drawn behind the selected glyphs).
 pub(crate) const SELECTION: Color = Color::rgba(0.30, 0.55, 0.90, 0.40);
 

@@ -82,6 +82,10 @@ pub struct Ui {
     focused: Option<WidgetId>,
     /// Caret position in the focused input, as a byte offset into its text.
     caret: usize,
+    /// Horizontal scroll (px) of the focused single-line field, so its caret
+    /// stays visible as text runs past the field's width. Recomputed each layout;
+    /// 0 for multiline fields (which wrap) and reset on focus change.
+    focused_hscroll: f32,
     /// The fixed end of a selection (the caret is the moving end), or `None`
     /// for no selection. The selected range is `min..max` of the two.
     selection_anchor: Option<usize>,
@@ -115,6 +119,7 @@ impl Ui {
             drag: None,
             focused: None,
             caret: 0,
+            focused_hscroll: 0.0,
             selection_anchor: None,
             shift: false,
             caret_on: true,
@@ -367,6 +372,15 @@ impl Ui {
         self.caret_on = on;
     }
 
+    /// Seed the pointer position without synthesizing a full move. An app that
+    /// rebuilds its UI (discarding the old `Ui` and its retained pointer state)
+    /// calls this on the fresh `Ui` before [`layout`](Self::layout), so the
+    /// end-of-layout hover refresh knows where the cursor is - otherwise hover
+    /// (and click-again-without-moving) is dead until the next real move.
+    pub fn set_cursor(&mut self, pos: Vec2) {
+        self.cursor = Some(pos);
+    }
+
     /// Tell Aurora whether shift is held (the app tracks OS modifiers). While
     /// set, movement keys extend the selection instead of collapsing it.
     pub fn set_shift(&mut self, shift: bool) {
@@ -524,6 +538,8 @@ impl Ui {
             placeholder: style.placeholder.unwrap_or_default(),
             font_size: style.font_size.unwrap_or(text::FONT_SIZE),
             multiline: style.multiline,
+            text_center: style.text_center,
+            icon_button: style.icon_button,
             draggable: style.draggable,
             drop_target: style.drop_target,
             flat: style.flat,
@@ -587,6 +603,9 @@ impl Ui {
         // Shape placeholder text now that fields have their widths (needed to
         // wrap), so emit can draw it while a field is empty.
         self.shape_placeholders();
+        // Now the focused field's width and caret x are known, so keep its caret
+        // in view (scrolling long single-line content horizontally).
+        self.update_hscroll();
         // Layout may have moved widgets under a stationary pointer, so refresh
         // what is hovered from the last known cursor position.
         self.update_hover();
@@ -800,6 +819,11 @@ impl Ui {
         match self.hovered {
             Some(id) if matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) => {
                 self.focused = Some(id);
+                // A field starts unscrolled; reset before mapping the click so
+                // caret_at_x reads the right (zero) scroll for a new field.
+                if previous != Some(id) {
+                    self.focused_hscroll = 0.0;
+                }
                 self.caret = self.caret_at_x(id, self.cursor);
                 // Anchor a selection at the press point; a drag before release
                 // extends it, a plain click leaves anchor == caret (no
@@ -919,7 +943,14 @@ impl Ui {
         // none yet); a plain movement collapses it.
         if matches!(
             key,
-            Key::Left | Key::Right | Key::Up | Key::Down | Key::Home | Key::End
+            Key::Left
+                | Key::Right
+                | Key::WordLeft
+                | Key::WordRight
+                | Key::Up
+                | Key::Down
+                | Key::Home
+                | Key::End
         ) {
             let caret = self.caret.min(self.text_len(id));
             if self.shift {
@@ -958,6 +989,8 @@ impl Ui {
         match key {
             Key::Left => self.caret = prev_boundary(s, caret),
             Key::Right => self.caret = next_boundary(s, caret),
+            Key::WordLeft => self.caret = prev_word_boundary(s, caret),
+            Key::WordRight => self.caret = next_word_boundary(s, caret),
             Key::Home => self.caret = 0,
             Key::End => self.caret = s.len(),
             Key::Backspace if caret > 0 => {
@@ -1051,7 +1084,8 @@ impl Ui {
             return text_len;
         };
         let origin = self.content_origin.get(id).copied().unwrap_or(Vec2::ZERO);
-        let local = cursor - origin;
+        // Undo the field's horizontal scroll so the click maps to text coords.
+        let local = cursor - origin + Vec2::new(self.hscroll_of(id), 0.0);
         if self.widgets[id].multiline {
             if let WidgetKind::TextInput(s) = &self.widgets[id].kind
                 && let Some(c) = buffer.hit(local.x.max(0.0), local.y.max(0.0))
@@ -1074,6 +1108,56 @@ impl Ui {
     /// The x offset (within the content box) of the caret, from the shaped text.
     fn caret_x_offset(&self, id: WidgetId) -> f32 {
         self.x_offset_at(id, self.caret)
+    }
+
+    /// The focused single-line field's horizontal scroll: 0 for it, so ignore.
+    /// Recompute [`focused_hscroll`](Self::focused_hscroll) so the caret stays in
+    /// view. Called after layout, when the field's width and shaped text (hence
+    /// caret x) are known. Multiline fields wrap, so they never scroll.
+    fn update_hscroll(&mut self) {
+        let Some(id) = self.focused else {
+            self.focused_hscroll = 0.0;
+            return;
+        };
+        if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) || self.widgets[id].multiline
+        {
+            self.focused_hscroll = 0.0;
+            return;
+        }
+        let (Some(rect), Some(origin)) = (self.rect(id), self.content_origin.get(id).copied())
+        else {
+            return;
+        };
+        let left_pad = origin.x - rect.pos.x;
+        let content_w = (rect.size.x - 2.0 * left_pad).max(1.0);
+        let caret_x = self.caret_x_offset(id);
+        let total_w = self
+            .buffers
+            .get(id)
+            .map(|b| b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max))
+            .unwrap_or(0.0);
+        // Keep a little context past the caret. Scroll from the last value so the
+        // text only shifts when the caret would leave the visible window.
+        let margin = 6.0;
+        let mut h = self.focused_hscroll;
+        if caret_x - h < 0.0 {
+            h = caret_x;
+        } else if caret_x - h > content_w - margin {
+            h = caret_x - content_w + margin;
+        }
+        // Never scroll past the end (so a short field shows from the start).
+        let max_scroll = (total_w - content_w + margin).max(0.0);
+        self.focused_hscroll = h.clamp(0.0, max_scroll);
+    }
+
+    /// The focused single-line field's current horizontal scroll (0 for other
+    /// or multiline fields), applied to its text, selection, caret, and clicks.
+    fn hscroll_of(&self, id: WidgetId) -> f32 {
+        if self.focused == Some(id) && !self.widgets[id].multiline {
+            self.focused_hscroll
+        } else {
+            0.0
+        }
     }
 
     /// The x offset (within the content box) of byte offset `byte` in `id`'s
@@ -1138,6 +1222,9 @@ impl Ui {
         self.focused = Some(id);
         self.caret = self.text_len(id);
         self.selection_anchor = Some(0);
+        // The new field starts unscrolled; layout re-derives its scroll to keep
+        // the (end-of-text) caret in view.
+        self.focused_hscroll = 0.0;
     }
 
     /// The byte length of a text input's contents (0 for other kinds).
@@ -1359,11 +1446,15 @@ impl Ui {
     }
 
     /// The interaction state of `id` for shading: pressed only while the pointer
-    /// is both armed on it and still over it.
+    /// is both armed on it and still over it. A widget also counts as hovered
+    /// when the pointer is over one of its interactive children (e.g. a tree row
+    /// stays highlighted while the cursor is on its eye toggle), so moving onto a
+    /// nested control does not flicker the parent's highlight off.
     fn interaction(&self, id: WidgetId) -> Interaction {
-        if self.pressed == Some(id) && self.hovered == Some(id) {
+        let hovered_here = self.hovered.is_some_and(|h| self.is_within(h, id));
+        if self.pressed == Some(id) && hovered_here {
             Interaction::Pressed
-        } else if self.hovered == Some(id) {
+        } else if hovered_here {
             Interaction::Hovered
         } else {
             Interaction::Idle
@@ -1407,6 +1498,7 @@ impl Ui {
             WidgetKind::Image(handle) => list.commands.push(DrawCommand::Image {
                 rect,
                 handle: *handle,
+                tint: self.image_tint(id, widget),
             }),
             WidgetKind::Slider { value, min, max } => {
                 self.emit_slider(id, rect, *value, *min, *max, list)
@@ -1521,9 +1613,28 @@ impl Ui {
         }
     }
 
+    /// The tint for an image: its foreground (white by default = passthrough),
+    /// but the theme accent when it sits inside an icon-button that is hovered or
+    /// pressed - so the icon recolors instead of the button drawing a background.
+    fn image_tint(&self, id: WidgetId, widget: &Widget) -> Color {
+        if let Some(button) = self.interactive_ancestor(id)
+            && self.widgets[button].icon_button
+            && self.interaction(button) != Interaction::Idle
+        {
+            return theme::ICON_HOVER;
+        }
+        widget.foreground
+    }
+
     /// A button: a state-shaded fill (its style background, or the theme default)
     /// under its caption.
     fn emit_button(&self, id: WidgetId, rect: Rect, widget: &Widget, list: &mut DrawList) {
+        // An icon button draws no fill at all; its child icon shows hover/press
+        // by recoloring (see image_tint). Any caption still draws.
+        if widget.icon_button {
+            self.emit_text(id, widget.foreground, list);
+            return;
+        }
         if widget.flat {
             // A flat button (list/tree row): its own background when idle
             // (transparent draws nothing). A row with a background (selected)
@@ -1578,7 +1689,7 @@ impl Ui {
                 rect.pos.x + (rect.size.x - run.line_w) * 0.5,
                 rect.pos.y + (rect.size.y - line_h) * 0.5,
             );
-            self.emit_buffer(buffer, origin, theme::CHECKBOX_MARK, list);
+            self.emit_buffer(buffer, origin, theme::CHECKBOX_MARK, None, list);
         }
     }
 
@@ -1629,18 +1740,20 @@ impl Ui {
 
         // Clip the text, selection, and caret so long content stays in-field.
         list.commands.push(DrawCommand::PushClip { rect });
+        // The content-box origin, shifted left by the field's horizontal scroll
+        // so a long single-line field keeps its caret in view.
+        let base = self.content_origin.get(id).copied().unwrap_or(rect.pos);
+        let origin = base - Vec2::new(self.hscroll_of(id), 0.0);
         // While the field is empty, show its placeholder (dimmed) in place of
         // the text - it does not take focus, a caret, or a selection.
         let empty = matches!(&widget.kind, WidgetKind::TextInput(s) if s.is_empty());
         if empty && let Some(buffer) = self.placeholder_buffers.get(id) {
-            let origin = self.content_origin.get(id).copied().unwrap_or(rect.pos);
-            self.emit_buffer(buffer, origin, theme::PLACEHOLDER, list);
+            self.emit_buffer(buffer, base, theme::PLACEHOLDER, None, list);
         }
         // The selection highlight, behind the text.
         if focused {
             let (lo, hi) = self.selection_bounds(id);
             if lo != hi {
-                let origin = self.content_origin.get(id).copied().unwrap_or(rect.pos);
                 if widget.multiline {
                     self.emit_multiline_selection(id, lo, hi, origin, list);
                 } else {
@@ -1656,9 +1769,10 @@ impl Ui {
                 }
             }
         }
-        self.emit_text(id, widget.foreground, list);
+        if let Some(buffer) = self.buffers.get(id) {
+            self.emit_buffer(buffer, origin, widget.foreground, None, list);
+        }
         if focused && self.caret_on {
-            let origin = self.content_origin.get(id).copied().unwrap_or(rect.pos);
             let caret = if widget.multiline {
                 self.multiline_caret(id).map(|(cx, top)| {
                     let line_h = text::metrics_for(widget.font_size).line_height;
@@ -1700,6 +1814,13 @@ impl Ui {
         };
         let (start, end) = (byte_to_cursor(s, lo), byte_to_cursor(s, hi));
         for run in buffer.layout_runs() {
+            // highlight() only tests "between the cursors"; for a run OUTSIDE the
+            // selected line range that wrongly reports the whole line selected,
+            // so skip those runs (else selecting one line highlights every line
+            // below it to the end of the text).
+            if run.line_i < start.line || run.line_i > end.line {
+                continue;
+            }
             for (x, w) in run.highlight(start, end) {
                 list.commands.push(DrawCommand::FillRect {
                     rect: Rect::new(
@@ -1724,25 +1845,46 @@ impl Ui {
     }
 
     /// Emit a text command for a text-bearing widget from its shaped buffer,
-    /// positioned at the widget's content-box origin.
+    /// positioned at the widget's content-box origin (centered horizontally if
+    /// the widget asks for it).
     fn emit_text(&self, id: WidgetId, color: Color, list: &mut DrawList) {
         let Some(buffer) = self.buffers.get(id) else {
             return;
         };
         let origin = self.content_origin.get(id).copied().unwrap_or(Vec2::ZERO);
-        self.emit_buffer(buffer, origin, color, list);
+        // For centering, the content-box width: the field width minus the left
+        // inset on both sides (padding is symmetric for the labels that use it).
+        let center_width = if self.widgets[id].text_center {
+            self.rect(id).map(|rect| {
+                let pad_left = origin.x - rect.pos.x;
+                (rect.size.x - 2.0 * pad_left).max(0.0)
+            })
+        } else {
+            None
+        };
+        self.emit_buffer(buffer, origin, color, center_width, list);
     }
 
     /// Emit a `Text` command for a shaped `buffer` drawn from `origin` (its
     /// content-box top-left), in `color`. Shared by the main text and the
-    /// placeholder.
-    fn emit_buffer(&self, buffer: &Buffer, origin: Vec2, color: Color, list: &mut DrawList) {
+    /// placeholder. When `center_width` is set, each line is centered within
+    /// that width (its own run width subtracted).
+    fn emit_buffer(
+        &self,
+        buffer: &Buffer,
+        origin: Vec2,
+        color: Color,
+        center_width: Option<f32>,
+        list: &mut DrawList,
+    ) {
         let mut glyphs = Vec::new();
         for run in buffer.layout_runs() {
+            // Center this line by shifting its pen x by half the slack.
+            let x0 = origin.x + center_width.map_or(0.0, |w| ((w - run.line_w) * 0.5).max(0.0));
             for glyph in run.glyphs {
                 // Bake the content origin and the run's baseline into the pen
                 // position; the backend adds each glyph's bitmap bearing.
-                let physical = glyph.physical((origin.x, origin.y + run.line_y), 1.0);
+                let physical = glyph.physical((x0, origin.y + run.line_y), 1.0);
                 glyphs.push(Glyph {
                     cache_key: physical.cache_key,
                     x: physical.x as f32,
@@ -1812,6 +1954,34 @@ fn next_boundary(s: &str, i: usize) -> usize {
     s[i..].chars().next().map_or(i, |c| i + c.len_utf8())
 }
 
+/// The previous word boundary at or before `i`: skip any whitespace to the left,
+/// then the run of word characters, landing at the word's start (ctrl+left).
+fn prev_word_boundary(s: &str, i: usize) -> usize {
+    let is_ws = |j: usize| s[..j].chars().next_back().is_some_and(char::is_whitespace);
+    let mut j = i;
+    while j > 0 && is_ws(j) {
+        j = prev_boundary(s, j);
+    }
+    while j > 0 && !is_ws(j) {
+        j = prev_boundary(s, j);
+    }
+    j
+}
+
+/// The next word boundary at or after `i`: skip the run of word characters, then
+/// the whitespace after it, landing at the next word's start (ctrl+right).
+fn next_word_boundary(s: &str, i: usize) -> usize {
+    let is_ws = |j: usize| s[j..].chars().next().is_some_and(char::is_whitespace);
+    let mut j = i;
+    while j < s.len() && !is_ws(j) {
+        j = next_boundary(s, j);
+    }
+    while j < s.len() && is_ws(j) {
+        j = next_boundary(s, j);
+    }
+    j
+}
+
 /// taffy measure function: shape a text-bearing leaf and return its size. Called
 /// only for leaf nodes without a definite style size.
 fn measure_widget(
@@ -1860,11 +2030,22 @@ fn measure_widget(
         }
     };
 
+    // A single-line text input never wraps and never reports its text width: it
+    // stays one line and scrolls horizontally instead (see focused_hscroll), so
+    // long text neither folds onto a hidden second line nor grows the field out
+    // of its container. Labels, buttons, and text areas measure to their content.
+    let single_line =
+        matches!(widgets[id].kind, WidgetKind::TextInput(_)) && !widgets[id].multiline;
+
     // Wrap to a known width if taffy gives one, else the available width.
-    let wrap_width = known.width.or(match available.width {
-        AvailableSpace::Definite(w) => Some(w),
-        AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
-    });
+    let wrap_width = if single_line {
+        None
+    } else {
+        known.width.or(match available.width {
+            AvailableSpace::Definite(w) => Some(w),
+            AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
+        })
+    };
 
     // Shape at this widget's font size, so headings and captions measure (and
     // later draw) larger or smaller than the UI default.
@@ -1879,6 +2060,15 @@ fn measure_widget(
         borrowed.set_size(wrap_width, None);
         borrowed.set_text(content, &text::default_attrs(), Shaping::Advanced, None);
         borrowed.shape_until_scroll(false);
+    }
+
+    if single_line {
+        // Intrinsic width 0: the style's width or grow drives the field's size;
+        // its text is not part of that, so typing never resizes it.
+        return Size {
+            width: 0.0,
+            height: metrics.line_height,
+        };
     }
 
     let mut width = 0.0f32;
@@ -1929,6 +2119,106 @@ mod tests {
         let r = ui.rect(root).unwrap();
         assert_eq!(r.pos, Vec2::ZERO);
         assert_eq!(r.size, Vec2::new(200.0, 100.0));
+    }
+
+    #[test]
+    fn clicking_a_text_area_line_places_the_caret_on_that_line() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(300.0, 200.0).padding(10.0));
+        let area = ui.text_area(root, "aa\nbb\ncc", Style::new().width(200.0));
+        ui.layout(Vec2::new(300.0, 200.0)).unwrap();
+
+        // The content box top-left (no field padding here; the root pads 10).
+        let rect = ui.rect(area).unwrap();
+        // Click near the start of line 1 ("bb"): x just inside, y in the second
+        // 20px line band.
+        let click = Vec2::new(rect.pos.x + 2.0, rect.pos.y + 20.0 + 10.0);
+        click_at(&mut ui, click);
+        // Select the two chars to the right; if the caret really landed at the
+        // start of line 1, that selects "bb" (not "" as an end-of-text caret would).
+        ui.set_shift(true);
+        ui.handle_input(InputEvent::Key(Key::Right));
+        ui.handle_input(InputEvent::Key(Key::Right));
+        assert_eq!(ui.selected_text().as_deref(), Some("bb"));
+    }
+
+    #[test]
+    fn dragging_across_text_area_lines_selects_the_span() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(360.0, 200.0).padding(16.0));
+        // A caption above it, like the controls example (so the field is not at
+        // the origin - exercises the content-origin offset).
+        ui.label(root, "Notes:", Style::new());
+        let area = ui.text_area(
+            root,
+            "aaaa\nbbbb\ncccc",
+            Style::new().width(320.0).padding(6.0),
+        );
+        ui.layout(Vec2::new(360.0, 200.0)).unwrap();
+
+        let rect = ui.rect(area).unwrap();
+        let content = rect.pos + Vec2::splat(6.0);
+        // Press mid-line-0, drag to mid-line-1, release.
+        ui.handle_input(InputEvent::PointerMoved(content + Vec2::new(10.0, 10.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerMoved(content + Vec2::new(14.0, 30.0)));
+        ui.handle_input(InputEvent::PointerReleased);
+
+        let sel = ui.selected_text().unwrap_or_default();
+        // The selection should span from inside line 0 across the newline into
+        // line 1 - it must contain the break and not be empty/degenerate.
+        assert!(
+            sel.contains('\n') && sel.len() >= 3,
+            "expected a cross-line selection, got {sel:?}"
+        );
+    }
+
+    #[test]
+    fn text_area_selection_highlight_sits_on_the_selected_line() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(360.0, 200.0).padding(16.0));
+        ui.label(root, "Notes:", Style::new());
+        let area = ui.text_area(
+            root,
+            "aaaaaaaa\nbbbbbbbb\ncccccccc",
+            Style::new().width(320.0).padding(6.0),
+        );
+        ui.layout(Vec2::new(360.0, 200.0)).unwrap();
+
+        let rect = ui.rect(area).unwrap();
+        let content = rect.pos + Vec2::splat(6.0);
+        // Drag across the first half of line 0.
+        ui.handle_input(InputEvent::PointerMoved(content + Vec2::new(2.0, 10.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerMoved(content + Vec2::new(40.0, 10.0)));
+        ui.handle_input(InputEvent::PointerReleased);
+        ui.layout(Vec2::new(360.0, 200.0)).unwrap();
+
+        // The one selection highlight must sit on line 0 (top band) and start at
+        // its left edge - not at the end of the text.
+        let sel: Vec<Rect> = ui
+            .draw_list()
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::FillRect { rect, color } if *color == crate::theme::SELECTION => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sel.len(), 1, "one line selected -> one highlight: {sel:?}");
+        let h = sel[0];
+        assert!(
+            (h.pos.y - content.y).abs() < 5.0,
+            "highlight should be on line 0 (y~{}), got {h:?}",
+            content.y
+        );
+        assert!(
+            (h.pos.x - content.x).abs() < 3.0,
+            "highlight should start at the line's left (x~{}), got {h:?}",
+            content.x
+        );
     }
 
     #[test]
@@ -2213,6 +2503,31 @@ mod tests {
         ui.layout(Vec2::new(200.0, 200.0)).unwrap();
         // Margin pushes the box in from the container's edges (no padding here).
         assert_eq!(ui.rect(child).unwrap().pos, Vec2::new(15.0, 4.0));
+    }
+
+    #[test]
+    fn text_center_offsets_a_short_caption_from_the_left() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 100.0));
+        let button = ui.button(root, "X", Style::new().size(80.0, 24.0).text_center());
+        ui.layout(Vec2::new(200.0, 100.0)).unwrap();
+
+        let rect = ui.rect(button).unwrap();
+        let gx = ui
+            .draw_list()
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                DrawCommand::Text { glyphs, .. } if !glyphs.is_empty() => Some(glyphs[0].x),
+                _ => None,
+            })
+            .unwrap();
+        // A single narrow "X" centered in an 80px button starts well right of the
+        // left edge, not at ~0 as a left-aligned caption would.
+        assert!(
+            gx > rect.pos.x + 20.0,
+            "centered glyph x {gx} not centered in {rect:?}"
+        );
     }
 
     #[test]
@@ -2514,6 +2829,84 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_word_navigation_moves_and_selects_by_word() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(320.0, 60.0));
+        let field = ui.text_input(root, "hello world foo", Style::new().size(300.0, 24.0));
+        ui.layout(Vec2::new(320.0, 60.0)).unwrap();
+        click_at(&mut ui, Vec2::new(10.0, 12.0));
+        ui.handle_input(InputEvent::Key(Key::End));
+
+        // Shift+WordLeft from the end selects the last word, then the next.
+        ui.set_shift(true);
+        ui.handle_input(InputEvent::Key(Key::WordLeft));
+        assert_eq!(ui.selected_text().as_deref(), Some("foo"));
+        ui.handle_input(InputEvent::Key(Key::WordLeft));
+        assert_eq!(ui.selected_text().as_deref(), Some("world foo"));
+
+        // Plain WordRight (no shift) collapses the selection and moves by word.
+        ui.set_shift(false);
+        ui.handle_input(InputEvent::Key(Key::WordRight));
+        assert_eq!(ui.selected_text(), None);
+        // From the start of "world", WordRight lands at the start of "foo"; typing
+        // there proves the caret position.
+        ui.handle_input(InputEvent::Text('!'));
+        assert_eq!(text_of(&ui, field), "hello world !foo");
+    }
+
+    #[test]
+    fn a_single_line_field_does_not_grow_with_its_text() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().row().size(200.0, 40.0));
+        // A grow field with very long text: it must fill the row, not stretch to
+        // the text's width (which would push it out of the container).
+        let field = ui.text_input(root, "x".repeat(300), Style::new().grow(1.0).height(24.0));
+        ui.layout(Vec2::new(200.0, 40.0)).unwrap();
+        let w = ui.rect(field).unwrap().size.x;
+        assert!(
+            w <= 200.0,
+            "single-line field grew to {w}px; its text should not size it"
+        );
+    }
+
+    #[test]
+    fn a_long_single_line_field_scrolls_to_keep_the_caret_visible() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(140.0, 40.0));
+        let field = ui.text_input(root, "", Style::new().size(100.0, 24.0).padding(4.0));
+        ui.layout(Vec2::new(140.0, 40.0)).unwrap();
+        click_at(&mut ui, Vec2::new(10.0, 12.0)); // focus
+
+        // Type well past the field's width.
+        for _ in 0..40 {
+            ui.handle_input(InputEvent::Text('W'));
+        }
+        ui.layout(Vec2::new(140.0, 40.0)).unwrap();
+
+        let rect = ui.rect(field).unwrap();
+        let caret_x = ui
+            .draw_list()
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                DrawCommand::FillRect { rect: r, color } if *color == crate::theme::CARET => {
+                    Some(r.pos.x)
+                }
+                _ => None,
+            })
+            .expect("a caret is drawn in a focused field");
+        // The caret stays inside the field (the text scrolled), near the right.
+        assert!(
+            caret_x >= rect.pos.x && caret_x <= rect.max().x,
+            "caret x {caret_x} escaped the field {rect:?}"
+        );
+        assert!(
+            caret_x > rect.pos.x + rect.size.x * 0.5,
+            "the field should have scrolled the caret toward the right edge"
+        );
+    }
+
+    #[test]
     fn a_numeric_input_rejects_non_numeric_edits() {
         let mut ui = Ui::new();
         let root = ui.root_panel(Style::new().size(200.0, 60.0));
@@ -2687,6 +3080,40 @@ mod tests {
     }
 
     #[test]
+    fn an_icon_button_recolors_its_icon_on_hover() {
+        let mut registry: slotmap::SlotMap<crate::draw::ImageHandle, ()> =
+            slotmap::SlotMap::with_key();
+        let handle = registry.insert(());
+
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(100.0, 100.0));
+        let button = ui.button(root, "", Style::new().size(40.0, 40.0).icon_button());
+        ui.image(button, handle, Style::new().size(24.0, 24.0));
+        ui.layout(Vec2::new(100.0, 100.0)).unwrap();
+
+        let image_tint = |ui: &Ui| {
+            ui.draw_list().commands.iter().find_map(|c| match c {
+                DrawCommand::Image { tint, .. } => Some(*tint),
+                _ => None,
+            })
+        };
+        // Idle: the icon is untinted (white passthrough) and the button draws
+        // no fill (only the image command, no FillRect).
+        assert_eq!(image_tint(&ui), Some(Color::WHITE));
+        assert!(
+            !ui.draw_list()
+                .commands
+                .iter()
+                .any(|c| matches!(c, DrawCommand::FillRect { .. })),
+            "an icon button draws no background"
+        );
+
+        // Hovering the button recolors the icon to the accent (no background).
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(20.0, 20.0)));
+        assert_eq!(image_tint(&ui), Some(crate::theme::ICON_HOVER));
+    }
+
+    #[test]
     fn an_image_widget_fills_its_rect_and_emits_its_handle() {
         // A backend mints ImageHandle values via its own registry; a bare
         // SlotMap stands in for that here since Ui never constructs one itself.
@@ -2709,6 +3136,7 @@ mod tests {
             vec![DrawCommand::Image {
                 rect: ui.rect(viewport).unwrap(),
                 handle,
+                tint: Color::WHITE,
             }]
         );
     }

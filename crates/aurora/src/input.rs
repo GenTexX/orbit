@@ -41,6 +41,10 @@ pub enum Key {
     Left,
     /// Move the caret one character right.
     Right,
+    /// Move the caret to the previous word boundary (ctrl+left).
+    WordLeft,
+    /// Move the caret to the next word boundary (ctrl+right).
+    WordRight,
     /// Move the caret up one visual line (multiline fields).
     Up,
     /// Move the caret down one visual line (multiline fields).

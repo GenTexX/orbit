@@ -43,6 +43,12 @@ pub struct Style {
     pub font_size: Option<f32>,
     /// Whether a text input is multi-line (a text area). Ignored by other kinds.
     pub multiline: bool,
+    /// Center this widget's text horizontally within its content box (labels and
+    /// button captions). The default is left-aligned.
+    pub text_center: bool,
+    /// Render an interactive button as an "icon button": no fill at all; a child
+    /// icon recolors on hover/press instead of the button drawing a background.
+    pub icon_button: bool,
     /// Whether this widget is a drag source: pressing and moving past a small
     /// threshold starts a drag carrying this widget (see `Event::DragStarted`).
     pub draggable: bool,
@@ -66,6 +72,8 @@ impl Default for Style {
             mask: Mask::None,
             font_size: None,
             multiline: false,
+            text_center: false,
+            icon_button: false,
             draggable: false,
             drop_target: false,
         }
@@ -311,6 +319,21 @@ impl Style {
     /// added).
     pub fn multiline(mut self) -> Self {
         self.multiline = true;
+        self
+    }
+
+    /// Make this button an "icon button": it draws no fill; its child icon
+    /// recolors on hover/press instead (see the visibility eye). The button
+    /// stays interactive.
+    pub fn icon_button(mut self) -> Self {
+        self.icon_button = true;
+        self
+    }
+
+    /// Center this widget's text horizontally in its content box (e.g. a short
+    /// button caption like an "X"/"Y" axis label). Default is left-aligned.
+    pub fn text_center(mut self) -> Self {
+        self.text_center = true;
         self
     }
 
