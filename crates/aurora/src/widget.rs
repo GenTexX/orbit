@@ -156,6 +156,11 @@ pub(crate) struct Widget {
     /// Whether this button is an "icon button" (no fill; its icon recolors on
     /// hover/press). See [`crate::Style::icon_button`].
     pub icon_button: bool,
+    /// Background corner radius in px (0 = square).
+    pub corner_radius: f32,
+    /// Background border width in px (0 = none) and its color.
+    pub border_width: f32,
+    pub border_color: Color,
     /// Whether this widget is a drag source (see [`crate::Style::draggable`]).
     pub draggable: bool,
     /// Whether this widget accepts drops (see [`crate::Style::drop_target`]).

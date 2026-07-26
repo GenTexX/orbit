@@ -540,6 +540,9 @@ impl Ui {
             multiline: style.multiline,
             text_center: style.text_center,
             icon_button: style.icon_button,
+            corner_radius: style.corner_radius,
+            border_width: style.border_width,
+            border_color: style.border_color,
             draggable: style.draggable,
             drop_target: style.drop_target,
             flat: style.flat,
@@ -1487,9 +1490,9 @@ impl Ui {
 
         // The widget's own visuals, by kind.
         match &widget.kind {
-            WidgetKind::Panel => self.fill_background(rect, widget.background, list),
+            WidgetKind::Panel => self.fill_widget_bg(id, rect, widget.background, list),
             WidgetKind::Label(_) => {
-                self.fill_background(rect, widget.background, list);
+                self.fill_widget_bg(id, rect, widget.background, list);
                 self.emit_text(id, widget.foreground, list);
             }
             WidgetKind::Button(_) => self.emit_button(id, rect, widget, list),
@@ -1550,6 +1553,14 @@ impl Ui {
                 match cmd {
                     DrawCommand::FillRect { color, .. } | DrawCommand::Text { color, .. } => {
                         *color = color.fade(theme::DISABLED_FADE);
+                    }
+                    DrawCommand::RoundedRect {
+                        color,
+                        border_color,
+                        ..
+                    } => {
+                        *color = color.fade(theme::DISABLED_FADE);
+                        *border_color = border_color.fade(theme::DISABLED_FADE);
                     }
                     _ => {}
                 }
@@ -1613,6 +1624,27 @@ impl Ui {
         }
     }
 
+    /// Emit a widget's background fill styled by its corner radius and border
+    /// (a `RoundedRect` when either is set, else a plain fill). Skips a fully
+    /// transparent fill that also has no border.
+    fn fill_widget_bg(&self, id: WidgetId, rect: Rect, color: Color, list: &mut DrawList) {
+        let w = &self.widgets[id];
+        let has_border = w.border_width > 0.0 && w.border_color.a > 0.0;
+        if w.corner_radius > 0.0 || has_border {
+            if color.a > 0.0 || has_border {
+                list.commands.push(DrawCommand::RoundedRect {
+                    rect,
+                    color,
+                    radius: w.corner_radius,
+                    border_width: if has_border { w.border_width } else { 0.0 },
+                    border_color: w.border_color,
+                });
+            }
+        } else {
+            self.fill_background(rect, color, list);
+        }
+    }
+
     /// The tint for an image: its foreground (white by default = passthrough),
     /// but the theme accent when it sits inside an icon-button that is hovered or
     /// pressed - so the icon recolors instead of the button drawing a background.
@@ -1648,7 +1680,7 @@ impl Ui {
                 Interaction::Pressed if bg.a > 0.0 => bg.darken(0.06),
                 Interaction::Pressed => theme::ROW_PRESSED,
             };
-            self.fill_background(rect, color, list);
+            self.fill_widget_bg(id, rect, color, list);
             self.emit_text(id, widget.foreground, list);
             return;
         }
@@ -1662,7 +1694,7 @@ impl Ui {
             Interaction::Hovered => base.lighten(0.08),
             Interaction::Pressed => base.darken(0.12),
         };
-        list.commands.push(DrawCommand::FillRect { rect, color });
+        self.fill_widget_bg(id, rect, color, list);
         self.emit_text(id, widget.foreground, list);
     }
 
@@ -1673,10 +1705,7 @@ impl Ui {
             Interaction::Hovered => theme::CHECKBOX_BOX.lighten(0.12),
             Interaction::Pressed => theme::CHECKBOX_BOX.darken(0.10),
         };
-        list.commands.push(DrawCommand::FillRect {
-            rect,
-            color: box_color,
-        });
+        self.fill_widget_bg(id, rect, box_color, list);
         // When checked, draw the check glyph centered in the box: horizontally
         // by its advance, vertically by the box height (the glyph's line box was
         // sized to the box in measure, so the font's metrics center it).
@@ -1709,7 +1738,7 @@ impl Ui {
         list.commands.push(DrawCommand::FillRect { rect, color });
     }
 
-    /// A text input: a field fill (with an accent frame when focused), its text
+    /// A text input: a field fill (with an accent border when focused), its text
     /// clipped to the field, and a caret when focused.
     fn emit_text_input(&self, id: WidgetId, rect: Rect, widget: &Widget, list: &mut DrawList) {
         let focused = self.focused == Some(id);
@@ -1718,20 +1747,21 @@ impl Ui {
         } else {
             theme::FIELD
         };
-        if focused {
-            // An accent frame: an outer accent rect with the fill inset inside it.
-            let border = 1.5;
-            list.commands.push(DrawCommand::FillRect {
+        // The border is the focus accent when focused, else the field's own
+        // style border. A rounded or bordered field draws as one RoundedRect.
+        let (border_w, border_c) = if focused {
+            (widget.border_width.max(1.5), theme::FOCUS)
+        } else {
+            (widget.border_width, widget.border_color)
+        };
+        let has_border = border_w > 0.0 && border_c.a > 0.0;
+        if widget.corner_radius > 0.0 || has_border {
+            list.commands.push(DrawCommand::RoundedRect {
                 rect,
-                color: theme::FOCUS,
-            });
-            let inner = Rect::new(
-                rect.pos + Vec2::splat(border),
-                (rect.size - Vec2::splat(2.0 * border)).max(Vec2::ZERO),
-            );
-            list.commands.push(DrawCommand::FillRect {
-                rect: inner,
                 color: fill,
+                radius: widget.corner_radius,
+                border_width: if has_border { border_w } else { 0.0 },
+                border_color: border_c,
             });
         } else {
             list.commands
@@ -2852,6 +2882,42 @@ mod tests {
         // there proves the caret position.
         ui.handle_input(InputEvent::Text('!'));
         assert_eq!(text_of(&ui, field), "hello world !foo");
+    }
+
+    #[test]
+    fn a_rounded_bordered_style_emits_a_rounded_rect() {
+        let mut ui = Ui::new();
+        ui.root_panel(
+            Style::new()
+                .size(80.0, 40.0)
+                .background(Color::rgb(0.2, 0.2, 0.2))
+                .corner_radius(8.0)
+                .border(2.0, Color::WHITE),
+        );
+        ui.layout(Vec2::new(80.0, 40.0)).unwrap();
+        assert!(
+            ui.draw_list().commands.iter().any(|c| matches!(c,
+                DrawCommand::RoundedRect { radius, border_width, .. }
+                    if (*radius - 8.0).abs() < 1e-6 && (*border_width - 2.0).abs() < 1e-6)),
+            "a rounded, bordered background should emit a RoundedRect"
+        );
+
+        // A plain background still takes the fast FillRect path (unchanged).
+        let mut plain = Ui::new();
+        plain.root_panel(
+            Style::new()
+                .size(40.0, 40.0)
+                .background(Color::rgb(0.1, 0.1, 0.1)),
+        );
+        plain.layout(Vec2::new(40.0, 40.0)).unwrap();
+        assert!(
+            plain
+                .draw_list()
+                .commands
+                .iter()
+                .all(|c| !matches!(c, DrawCommand::RoundedRect { .. })),
+            "a plain background should not emit a RoundedRect"
+        );
     }
 
     #[test]

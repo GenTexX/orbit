@@ -49,6 +49,12 @@ pub struct Style {
     /// Render an interactive button as an "icon button": no fill at all; a child
     /// icon recolors on hover/press instead of the button drawing a background.
     pub icon_button: bool,
+    /// Corner radius in px for this widget's background (0 = square corners).
+    pub corner_radius: f32,
+    /// Border width in px around this widget's background (0 = no border).
+    pub border_width: f32,
+    /// Border color (drawn when `border_width` > 0).
+    pub border_color: Color,
     /// Whether this widget is a drag source: pressing and moving past a small
     /// threshold starts a drag carrying this widget (see `Event::DragStarted`).
     pub draggable: bool,
@@ -74,6 +80,9 @@ impl Default for Style {
             multiline: false,
             text_center: false,
             icon_button: false,
+            corner_radius: 0.0,
+            border_width: 0.0,
+            border_color: Color::TRANSPARENT,
             draggable: false,
             drop_target: false,
         }
@@ -327,6 +336,19 @@ impl Style {
     /// stays interactive.
     pub fn icon_button(mut self) -> Self {
         self.icon_button = true;
+        self
+    }
+
+    /// Round this widget's background corners to `radius` px (anti-aliased).
+    pub fn corner_radius(mut self, radius: f32) -> Self {
+        self.corner_radius = radius;
+        self
+    }
+
+    /// Draw a `width`-px border in `color` around this widget's background.
+    pub fn border(mut self, width: f32, color: Color) -> Self {
+        self.border_width = width;
+        self.border_color = color;
         self
     }
 

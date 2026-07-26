@@ -25,12 +25,22 @@ struct QuadInstance {
     uv_min: [f32; 2],
     uv_max: [f32; 2],
     color: [f32; 4],
+    /// Border color, used only when `border` > 0 (quad pipeline only).
+    border_color: [f32; 4],
+    /// Corner radius in px (0 = square) and border width in px (0 = none). The
+    /// image pipeline ignores both; the quad shader evaluates a rounded-rect SDF
+    /// when either is set.
+    radius: f32,
+    border: f32,
 }
 
 impl QuadInstance {
     fn layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
-            0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2, 4 => Float32x4];
+        // The quad shader reads all eight; the image shader reads only 0..=4 and
+        // ignores the border/shape attributes, which is allowed.
+        const ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
+            0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2, 4 => Float32x4,
+            5 => Float32x4, 6 => Float32, 7 => Float32];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<QuadInstance>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
@@ -46,6 +56,37 @@ impl QuadInstance {
             uv_min: white_uv,
             uv_max: white_uv,
             color: [color.r, color.g, color.b, color.a],
+            border_color: [0.0; 4],
+            radius: 0.0,
+            border: 0.0,
+        }
+    }
+
+    /// A rounded and/or bordered fill: like [`fill`](Self::fill) but the shader
+    /// rounds the corners to `radius` and paints the outer `border` px (if any)
+    /// in `border_color`.
+    fn rounded(
+        rect: Rect,
+        color: Color,
+        radius: f32,
+        border: f32,
+        border_color: Color,
+        white_uv: [f32; 2],
+    ) -> Self {
+        Self {
+            pos: rect.pos.to_array(),
+            size: rect.size.to_array(),
+            uv_min: white_uv,
+            uv_max: white_uv,
+            color: [color.r, color.g, color.b, color.a],
+            border_color: [
+                border_color.r,
+                border_color.g,
+                border_color.b,
+                border_color.a,
+            ],
+            radius,
+            border,
         }
     }
 
@@ -58,6 +99,9 @@ impl QuadInstance {
             uv_min: entry.uv_min,
             uv_max: entry.uv_max,
             color: [color.r, color.g, color.b, color.a],
+            border_color: [0.0; 4],
+            radius: 0.0,
+            border: 0.0,
         }
     }
 
@@ -70,6 +114,9 @@ impl QuadInstance {
             uv_min: [0.0, 0.0],
             uv_max: [1.0, 1.0],
             color: [tint.r, tint.g, tint.b, tint.a],
+            border_color: [0.0; 4],
+            radius: 0.0,
+            border: 0.0,
         }
     }
 }
@@ -547,6 +594,22 @@ impl Renderer {
             match cmd {
                 DrawCommand::FillRect { rect, color } => {
                     instances.push(QuadInstance::fill(*rect, *color, white_uv));
+                }
+                DrawCommand::RoundedRect {
+                    rect,
+                    color,
+                    radius,
+                    border_width,
+                    border_color,
+                } => {
+                    instances.push(QuadInstance::rounded(
+                        *rect,
+                        *color,
+                        *radius,
+                        *border_width,
+                        *border_color,
+                        white_uv,
+                    ));
                 }
                 DrawCommand::Text { glyphs, color } => {
                     for g in glyphs {

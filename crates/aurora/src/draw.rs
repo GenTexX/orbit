@@ -32,6 +32,16 @@ pub struct Glyph {
 pub enum DrawCommand {
     /// Fill an axis-aligned rectangle with a solid color.
     FillRect { rect: Rect, color: Color },
+    /// Fill a rectangle with rounded corners and/or a border. `radius` is the
+    /// corner radius in px (0 = square); `border_width` the border thickness in
+    /// px (0 = no border), painted in `border_color`. Corners are anti-aliased.
+    RoundedRect {
+        rect: Rect,
+        color: Color,
+        radius: f32,
+        border_width: f32,
+        border_color: Color,
+    },
     /// Draw a run of glyphs in one color (a shaped line of text).
     Text { glyphs: Vec<Glyph>, color: Color },
     /// Draw a registered texture stretched to fill a rectangle (e.g. the
