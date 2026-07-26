@@ -68,6 +68,10 @@ pub struct Ui {
     /// A shaped check-glyph buffer per checkbox (its main buffer holds the label
     /// caption instead), produced during measure and drawn when checked.
     check_buffers: SecondaryMap<WidgetId, Buffer>,
+    /// Vertical scroll (px) of each multi-line text area whose content overflows
+    /// its height - kept up to date to hold the caret in view, and adjusted by
+    /// the wheel over the field.
+    text_vscroll: SecondaryMap<WidgetId, f32>,
     /// Vertical scroll offset per scroll container, in pixels (0 = top).
     scroll_offsets: SecondaryMap<WidgetId, f32>,
     /// Content height per scroll container from the last layout, for clamping
@@ -123,6 +127,7 @@ impl Ui {
             buffers: SecondaryMap::new(),
             placeholder_buffers: SecondaryMap::new(),
             check_buffers: SecondaryMap::new(),
+            text_vscroll: SecondaryMap::new(),
             scroll_offsets: SecondaryMap::new(),
             scroll_content: SecondaryMap::new(),
             popups: Vec::new(),
@@ -583,6 +588,7 @@ impl Ui {
             multiline: style.multiline,
             text_center: style.text_center,
             icon_button: style.icon_button,
+            ellipsis: style.ellipsis,
             corner_radius: style.corner_radius,
             border_width: style.border_width,
             border_color: style.border_color,
@@ -661,6 +667,9 @@ impl Ui {
         // Now the focused field's width and caret x are known, so keep its caret
         // in view (scrolling long single-line content horizontally).
         self.update_hscroll();
+        self.update_vscroll();
+        // Truncate any overflowing ellipsis text now that widths are known.
+        self.ellipsize();
         // Layout may have moved widgets under a stationary pointer, so refresh
         // what is hovered from the last known cursor position.
         self.update_hover();
@@ -702,6 +711,71 @@ impl Ui {
             borrowed.set_size(Some(width.max(1.0)), None);
             borrowed.set_text(&text, &text::attrs_for(weight), Shaping::Advanced, None);
             borrowed.shape_until_scroll(false);
+        }
+    }
+
+    /// Truncate the text of any ellipsis widget whose (already shaped) text is
+    /// wider than its content box, replacing the overflow with a trailing "...".
+    /// Runs after layout, when each widget's width is known; re-shapes only the
+    /// widgets that actually overflow.
+    fn ellipsize(&mut self) {
+        let jobs: Vec<(WidgetId, String, f32, f32, FontWeight)> = self
+            .widgets
+            .iter()
+            .filter(|(_, w)| w.ellipsis)
+            .filter_map(|(id, w)| {
+                let content = match &w.kind {
+                    WidgetKind::Label(t) | WidgetKind::Button(t) | WidgetKind::TextInput(t) => {
+                        t.clone()
+                    }
+                    _ => return None,
+                };
+                let rect = self.rect(id)?;
+                let origin = self.content_origin.get(id).copied()?;
+                let left_pad = origin.x - rect.pos.x;
+                let content_w = (rect.size.x - 2.0 * left_pad).max(0.0);
+                Some((id, content, content_w, w.font_size, w.font_weight))
+            })
+            .collect();
+        let buffers = &mut self.buffers;
+        let font_system = &mut self.font_system;
+        for (id, full, content_w, font_size, weight) in jobs {
+            let Some(buffer) = buffers.get_mut(id) else {
+                continue;
+            };
+            let metrics = text::metrics_for(font_size);
+            let attrs = text::attrs_for(weight);
+            let shaped_w = |buffer: &mut Buffer, fs: &mut FontSystem, s: &str| -> f32 {
+                let mut b = buffer.borrow_with(fs);
+                b.set_metrics(metrics);
+                b.set_size(None, None);
+                b.set_text(s, &attrs, Shaping::Advanced, None);
+                b.shape_until_scroll(false);
+                b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
+            };
+            // Already shaped full text (from measure) fits: nothing to do.
+            if buffer.layout_runs().map(|r| r.line_w).fold(0.0, f32::max) <= content_w {
+                continue;
+            }
+            // Char-boundary byte offsets, plus the end. Binary-search the longest
+            // prefix whose "prefix..." fits (fits is monotonic in prefix length).
+            let bounds: Vec<usize> = full
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(full.len()))
+                .collect();
+            let with_ellipsis = |k: usize| format!("{}...", &full[..bounds[k]]);
+            let (mut lo, mut hi) = (0usize, bounds.len() - 1);
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                if shaped_w(buffer, font_system, &with_ellipsis(mid)) <= content_w {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            // Leave the buffer shaped as the chosen truncation.
+            shaped_w(buffer, font_system, &with_ellipsis(lo));
         }
     }
 
@@ -850,13 +924,22 @@ impl Ui {
         self.scroll_offsets.insert(id, t * max_offset);
     }
 
-    /// Apply a wheel delta to the scroll container under the cursor.
+    /// Apply a wheel delta to whatever is under the cursor: an overflowing text
+    /// area scrolls its own content; otherwise the nearest scroll container does.
     fn scroll_under_cursor(&mut self, delta: f32) {
-        let Some(target) = self
-            .cursor
-            .and_then(|p| self.hit_test(p))
-            .and_then(|id| self.scroll_ancestor(id))
-        else {
+        let Some(hit) = self.cursor.and_then(|p| self.hit_test(p)) else {
+            return;
+        };
+        // A text area under the cursor scrolls itself first.
+        if let Some((view_h, content_h)) = self.text_area_extent(hit)
+            && content_h > view_h
+        {
+            let max = content_h - view_h;
+            let v = (self.vscroll_of(hit) + delta).clamp(0.0, max);
+            self.text_vscroll.insert(hit, v);
+            return;
+        }
+        let Some(target) = self.scroll_ancestor(hit) else {
             return;
         };
         let content = self.scroll_content.get(target).copied().unwrap_or(0.0);
@@ -1245,8 +1328,8 @@ impl Ui {
             return text_len;
         };
         let origin = self.content_origin.get(id).copied().unwrap_or(Vec2::ZERO);
-        // Undo the field's horizontal scroll so the click maps to text coords.
-        let local = cursor - origin + Vec2::new(self.hscroll_of(id), 0.0);
+        // Undo the field's scroll so the click maps to text coordinates.
+        let local = cursor - origin + Vec2::new(self.hscroll_of(id), self.vscroll_of(id));
         if self.widgets[id].multiline {
             if let WidgetKind::TextInput(s) = &self.widgets[id].kind
                 && let Some(c) = buffer.hit(local.x.max(0.0), local.y.max(0.0))
@@ -1319,6 +1402,58 @@ impl Ui {
         } else {
             0.0
         }
+    }
+
+    /// A multi-line text area's visible content height and its total (shaped)
+    /// content height, if it is a text area with a laid-out rect.
+    fn text_area_extent(&self, id: WidgetId) -> Option<(f32, f32)> {
+        if !self.widgets[id].multiline {
+            return None;
+        }
+        let rect = self.rect(id)?;
+        let origin = self.content_origin.get(id).copied()?;
+        let top_pad = origin.y - rect.pos.y;
+        let view_h = (rect.size.y - 2.0 * top_pad).max(1.0);
+        let line_h = text::metrics_for(self.widgets[id].font_size).line_height;
+        let lines = self
+            .buffers
+            .get(id)
+            .map_or(1, |b| b.layout_runs().count().max(1));
+        let content_h = lines as f32 * line_h;
+        Some((view_h, content_h))
+    }
+
+    /// A text area's current vertical scroll (0 for other kinds), clamped to its
+    /// content. Applied to its text, selection, caret, and click mapping.
+    fn vscroll_of(&self, id: WidgetId) -> f32 {
+        let Some((view_h, content_h)) = self.text_area_extent(id) else {
+            return 0.0;
+        };
+        let max = (content_h - view_h).max(0.0);
+        self.text_vscroll
+            .get(id)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, max)
+    }
+
+    /// Keep the focused text area's caret line in view by scrolling vertically
+    /// (recomputed each layout, when the field's height and caret line are known).
+    fn update_vscroll(&mut self) {
+        let Some(id) = self.focused else { return };
+        let Some((view_h, content_h)) = self.text_area_extent(id) else {
+            return;
+        };
+        let caret_top = self.multiline_caret(id).map_or(0.0, |(_, top)| top);
+        let line_h = text::metrics_for(self.widgets[id].font_size).line_height;
+        let mut v = self.text_vscroll.get(id).copied().unwrap_or(0.0);
+        if caret_top < v {
+            v = caret_top;
+        } else if caret_top + line_h > v + view_h {
+            v = caret_top + line_h - view_h;
+        }
+        let max = (content_h - view_h).max(0.0);
+        self.text_vscroll.insert(id, v.clamp(0.0, max));
     }
 
     /// The x offset (within the content box) of byte offset `byte` in `id`'s
@@ -1994,10 +2129,11 @@ impl Ui {
 
         // Clip the text, selection, and caret so long content stays in-field.
         list.commands.push(DrawCommand::PushClip { rect });
-        // The content-box origin, shifted left by the field's horizontal scroll
-        // so a long single-line field keeps its caret in view.
+        // The content-box origin, shifted by the field's scroll: left for a long
+        // single-line field, up for an overflowing text area - so its caret stays
+        // in view. (Only one axis is ever non-zero.)
         let base = self.content_origin.get(id).copied().unwrap_or(rect.pos);
-        let origin = base - Vec2::new(self.hscroll_of(id), 0.0);
+        let origin = base - Vec2::new(self.hscroll_of(id), self.vscroll_of(id));
         // While the field is empty, show its placeholder (dimmed) in place of
         // the text - it does not take focus, a caret, or a selection.
         let empty = matches!(&widget.kind, WidgetKind::TextInput(s) if s.is_empty());
@@ -2343,15 +2479,17 @@ fn measure_widget(
         }
     };
 
-    // A single-line text input never wraps and never reports its text width: it
-    // stays one line and scrolls horizontally instead (see focused_hscroll), so
-    // long text neither folds onto a hidden second line nor grows the field out
-    // of its container. Labels, buttons, and text areas measure to their content.
-    let single_line =
-        matches!(widgets[id].kind, WidgetKind::TextInput(_)) && !widgets[id].multiline;
+    // Widgets that stay one line and do not report their text width: a
+    // single-line text input (it scrolls horizontally instead) and an
+    // ellipsizing label/button (it truncates to its allotted width post-layout).
+    // Long text then neither folds onto a hidden second line nor grows the widget
+    // out of its container. Other labels, buttons, and text areas measure to
+    // their content.
+    let one_line = (matches!(widgets[id].kind, WidgetKind::TextInput(_)) && !widgets[id].multiline)
+        || widgets[id].ellipsis;
 
     // Wrap to a known width if taffy gives one, else the available width.
-    let wrap_width = if single_line {
+    let wrap_width = if one_line {
         None
     } else {
         known.width.or(match available.width {
@@ -2376,9 +2514,9 @@ fn measure_widget(
         borrowed.shape_until_scroll(false);
     }
 
-    if single_line {
-        // Intrinsic width 0: the style's width or grow drives the field's size;
-        // its text is not part of that, so typing never resizes it.
+    if one_line {
+        // Intrinsic width 0: the style's width or grow drives the widget's size;
+        // its text is not part of that, so it never resizes to fit long text.
         return Size {
             width: 0.0,
             height: metrics.line_height,
@@ -2455,6 +2593,36 @@ mod tests {
         ui.handle_input(InputEvent::Key(Key::Right));
         ui.handle_input(InputEvent::Key(Key::Right));
         assert_eq!(ui.selected_text().as_deref(), Some("bb"));
+    }
+
+    #[test]
+    fn a_fixed_height_text_area_scrolls_to_the_caret_and_on_wheel() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(240.0, 240.0));
+        // A short (60px) text area holding 8 lines - more than fit.
+        let area = ui.text_area(
+            root,
+            "l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7",
+            Style::new().size(200.0, 60.0).padding(4.0),
+        );
+        ui.layout(Vec2::new(240.0, 240.0)).unwrap();
+        assert_eq!(ui.vscroll_of(area), 0.0);
+
+        // Focus, then move the caret to the last line: the area scrolls down.
+        click_at(&mut ui, Vec2::new(10.0, 10.0));
+        for _ in 0..8 {
+            ui.handle_input(InputEvent::Key(Key::Down));
+        }
+        ui.layout(Vec2::new(240.0, 240.0)).unwrap();
+        assert!(
+            ui.vscroll_of(area) > 0.0,
+            "the area should scroll to keep the caret in view"
+        );
+
+        // Wheel up past the top over the area clamps back to zero.
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(100.0, 30.0)));
+        ui.handle_input(InputEvent::Scroll(-1000.0));
+        assert_eq!(ui.vscroll_of(area), 0.0);
     }
 
     #[test]
@@ -2859,6 +3027,38 @@ mod tests {
         let s = ui.rect(small).unwrap().size;
         let b = ui.rect(big).unwrap().size;
         assert!(b.y > s.y, "small={s:?} big={b:?}");
+    }
+
+    #[test]
+    fn an_ellipsis_label_stays_one_line_and_fits_its_width() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(300.0, 200.0));
+        let long = "This is a very long label that will not fit in eighty px";
+        let ell = ui.label(root, long, Style::new().width(80.0).ellipsis());
+        // Same text and width without ellipsis wraps onto several lines.
+        let wrapped = ui.label(root, long, Style::new().width(80.0));
+        ui.layout(Vec2::new(300.0, 200.0)).unwrap();
+
+        let ell_rect = ui.rect(ell).unwrap();
+        // The ellipsis label is a single line (much shorter than the wrapped one).
+        assert!(
+            ell_rect.size.y < ui.rect(wrapped).unwrap().size.y,
+            "ellipsis should keep the label to one line"
+        );
+        // Its glyphs fit within the 80px width (the text was truncated).
+        let mut max_x = 0.0f32;
+        for cmd in &ui.draw_list().commands {
+            if let DrawCommand::Text { glyphs, .. } = cmd {
+                for g in glyphs {
+                    max_x = max_x.max(g.x);
+                }
+            }
+        }
+        assert!(
+            max_x <= ell_rect.max().x + 1.0,
+            "truncated glyphs ({max_x}) should fit within {}",
+            ell_rect.max().x
+        );
     }
 
     #[test]

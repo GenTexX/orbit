@@ -364,13 +364,15 @@ fn build_ui(light: bool) -> (Ui, Ids) {
     ui.button(disabled_row, "Save", label(text).padding(8.0).disabled());
 
     // A multi-line text area: Enter inserts a newline, Up/Down move by line,
-    // Home/End act on the line, and a selection highlights each line. It grows
-    // as lines are added.
-    ui.label(root, "Notes (text area):", label(dim));
+    // Home/End act on the line, and a selection highlights each line. Fixed
+    // height, so it scrolls (wheel, or the caret) when the text overflows.
+    ui.label(root, "Notes (text area, scrolls):", label(dim));
     ui.text_area(
         root,
-        "A multi-line text area.\nEnter adds a newline.\nUp/Down move by line.",
-        Style::new().width(320.0).padding(6.0).foreground(text),
+        "A multi-line text area.\nEnter adds a newline.\nUp/Down move by line.\n\
+         Home/End act on the line.\nType more lines and it scrolls\nto keep the \
+         caret in view.\nOr use the mouse wheel.",
+        Style::new().size(320.0, 72.0).padding(6.0).foreground(text),
     );
 
     // A slider with a live value readout.
