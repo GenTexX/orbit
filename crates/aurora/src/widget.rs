@@ -171,6 +171,9 @@ pub(crate) struct Widget {
     /// Whether this button is an "icon button" (no fill; its icon recolors on
     /// hover/press). See [`crate::Style::icon_button`].
     pub icon_button: bool,
+    /// Whether this widget's text truncates with a trailing "..." when it does
+    /// not fit the widget's width. See [`crate::Style::ellipsis`].
+    pub ellipsis: bool,
     /// Background corner radius in px (0 = square).
     pub corner_radius: f32,
     /// Background border width in px (0 = none) and its color.

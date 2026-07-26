@@ -51,6 +51,9 @@ pub struct Style {
     /// Render an interactive button as an "icon button": no fill at all; a child
     /// icon recolors on hover/press instead of the button drawing a background.
     pub icon_button: bool,
+    /// Truncate this widget's text with a trailing "..." when it does not fit
+    /// the widget's width (a single line; needs a fixed or grow width).
+    pub ellipsis: bool,
     /// Corner radius in px for this widget's background (0 = square corners).
     pub corner_radius: f32,
     /// Border width in px around this widget's background (0 = no border).
@@ -83,6 +86,7 @@ impl Default for Style {
             multiline: false,
             text_center: false,
             icon_button: false,
+            ellipsis: false,
             corner_radius: 0.0,
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
@@ -350,6 +354,14 @@ impl Style {
     /// stays interactive.
     pub fn icon_button(mut self) -> Self {
         self.icon_button = true;
+        self
+    }
+
+    /// Truncate this widget's text with a trailing "..." when it overflows the
+    /// widget's width, keeping it on one line. Needs a constrained width (a fixed
+    /// `width`/`size`, or `grow` inside a bounded parent).
+    pub fn ellipsis(mut self) -> Self {
+        self.ellipsis = true;
         self
     }
 

@@ -847,7 +847,7 @@ fn add_tree_row(
     ui.label(
         row,
         scene.node(node).name.clone(),
-        Style::new().grow(1.0).foreground(if visible {
+        Style::new().grow(1.0).ellipsis().foreground(if visible {
             theme.heading
         } else {
             theme.subhead
@@ -970,7 +970,7 @@ fn build_inspector(
     ui.label(
         panel,
         scene.node(node).name.clone(),
-        Style::new().foreground(theme.heading),
+        Style::new().foreground(theme.heading).ellipsis(),
     );
 
     // The node's own transform first: it is what viewport drags edit, so its
@@ -1243,11 +1243,16 @@ fn build_file_explorer(
                 Style::new()
                     .padding(2.0)
                     .foreground(theme.heading)
+                    .ellipsis()
                     .draggable(),
             );
             rows.file_rows.push((row, name));
         } else {
-            ui.label(panel, name, Style::new().foreground(theme.subhead));
+            ui.label(
+                panel,
+                name,
+                Style::new().foreground(theme.subhead).ellipsis(),
+            );
         }
     }
     panel
