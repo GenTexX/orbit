@@ -1,11 +1,12 @@
 //! controls - an interactive aurora-wgpu demo showcasing every input widget:
 //! a button, a checkbox, a plain text field (with a placeholder), masked fields
 //! (integer/decimal/hex), a disabled field and button, a multi-line text area,
-//! and a slider - all wired to real pointer and keyboard input. Click the button
-//! to bump a counter; toggle the checkbox to show an accent box; click a field
-//! and type; Tab moves between fields; shift+arrows extend a selection and
-//! ctrl+a/c/x/v select-all/copy/cut/paste; in the text area Enter adds a newline
-//! and Up/Down move by line. Press F2 to toggle the light/dark theme.
+//! an ellipsis line, and a slider - all wired to real pointer and keyboard
+//! input. Click the button to bump a counter; toggle the checkbox to show an
+//! accent box; click a field and type; Tab moves between fields; shift+arrows
+//! extend a selection and ctrl+a/c/x/v select-all/copy/cut/paste; in the text
+//! area Enter adds a newline and Up/Down move by line. Resize the window to
+//! watch the ellipsis line truncate. Press F2 to toggle the light/dark theme.
 //! Run with: `cargo run -p aurora-wgpu --example controls`.
 
 use std::sync::Arc;
@@ -374,6 +375,33 @@ fn build_ui(light: bool) -> (Ui, Ids) {
          caret in view.\nOr use the mouse wheel.",
         Style::new().size(320.0, 72.0).padding(6.0).foreground(text),
     );
+
+    // Single lines that truncate with a trailing "..." when they do not fit.
+    // The first box is a fixed 220px, so it is always truncated; the second
+    // fills the window (grow), so resizing narrower truncates it live and
+    // widening restores more of the text. The full string is the same for both.
+    ui.label(
+        root,
+        "Ellipsis (fixed width, then resize the window):",
+        label(dim),
+    );
+    let long = "This single line of text is truncated with a trailing ellipsis \
+                when it is too wide to fit the width of its container.";
+    let ellipsis_border = Color::rgb(0.45, 0.55, 0.75);
+    let ellipsis_box = |ui: &mut Ui, width: Option<f32>| {
+        let mut style = Style::new()
+            .row()
+            .padding(6.0)
+            .corner_radius(4.0)
+            .border(1.0, ellipsis_border);
+        if let Some(w) = width {
+            style = style.width(w);
+        }
+        let boxed = ui.panel(root, style);
+        ui.label(boxed, long, label(text).grow(1.0).ellipsis());
+    };
+    ellipsis_box(&mut ui, Some(220.0));
+    ellipsis_box(&mut ui, None);
 
     // A slider with a live value readout.
     let slider_row = ui.panel(root, Style::new().row().gap(8.0).align_center());

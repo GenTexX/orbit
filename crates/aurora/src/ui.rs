@@ -3062,6 +3062,49 @@ mod tests {
     }
 
     #[test]
+    fn a_grow_ellipsis_label_truncates_to_its_share_of_a_row() {
+        // The scene-tree layout: a grow ellipsis name between fixed-width
+        // siblings, inside a vertical-scroll column. The name must take its
+        // bounded share of the row (not force the row wider) and truncate.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(200.0, 200.0));
+        let scroll = ui.panel(root, Style::new().column().scroll().grow(1.0));
+        let row = ui.button(scroll, "", Style::new().row());
+        ui.panel(row, Style::new().width(16.0));
+        let long = "A very long node name that should be truncated with dots";
+        let name = ui.label(row, long, Style::new().grow(1.0).ellipsis());
+        ui.panel(row, Style::new().width(24.0));
+        ui.layout(Vec2::new(200.0, 200.0)).unwrap();
+
+        let r = ui.rect(name).unwrap();
+        assert!(
+            (140.0..=170.0).contains(&r.size.x),
+            "name should get its bounded share of the 200px row, got {}",
+            r.size.x
+        );
+        let mut glyphs = 0;
+        let mut max_x = 0.0f32;
+        for cmd in &ui.draw_list().commands {
+            if let DrawCommand::Text { glyphs: gs, .. } = cmd {
+                for g in gs {
+                    glyphs += 1;
+                    max_x = max_x.max(g.x);
+                }
+            }
+        }
+        assert!(
+            glyphs > 0 && glyphs < long.len(),
+            "name should be truncated (drew {glyphs} of {})",
+            long.len()
+        );
+        assert!(
+            max_x <= r.max().x + 1.0,
+            "truncated glyphs ({max_x}) should fit within {}",
+            r.max().x
+        );
+    }
+
+    #[test]
     fn bold_text_measures_wider_than_normal() {
         let mut ui = Ui::new();
         // A row so each label sizes to its own content width (the main axis).
