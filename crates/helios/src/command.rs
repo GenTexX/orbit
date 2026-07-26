@@ -153,6 +153,10 @@ pub struct History {
     /// [`begin_group`](Self::begin_group) and [`end_group`](Self::end_group)
     /// undoes as a single step.
     group: Option<Vec<Edit>>,
+    /// Open-group nesting depth. Groups nest (a duplicate that opens its own
+    /// group can be called inside a larger grouped op); only the outermost pair
+    /// records the buffered edits as one [`Edit::Batch`].
+    group_depth: u32,
 }
 
 impl History {
@@ -185,17 +189,28 @@ impl History {
     }
 
     /// Begin coalescing the edits that follow into a single undo step. Pair with
-    /// [`end_group`](Self::end_group). Groups do not nest (a second call while a
-    /// group is open discards the edits buffered so far in debug builds).
+    /// [`end_group`](Self::end_group). Groups nest: a grouped op (say a subtree
+    /// duplicate) can be run inside a larger grouped op, and only the outermost
+    /// pair records the batch, so the whole thing still undoes in one step.
     pub fn begin_group(&mut self) {
-        debug_assert!(self.group.is_none(), "history groups do not nest");
-        self.group = Some(Vec::new());
+        if self.group_depth == 0 {
+            self.group = Some(Vec::new());
+        }
+        self.group_depth += 1;
     }
 
-    /// Close the current group, recording its buffered edits as one undoable
-    /// [`Edit::Batch`]. A group with a single edit is recorded as that edit;
-    /// an empty group records nothing. A no-op if no group is open.
+    /// Close the innermost group. When the outermost group closes, its buffered
+    /// edits are recorded as one undoable [`Edit::Batch`] (a single-edit group
+    /// is recorded as that edit; an empty group records nothing). A no-op if no
+    /// group is open.
     pub fn end_group(&mut self, _scene: &mut Scene) {
+        if self.group_depth == 0 {
+            return;
+        }
+        self.group_depth -= 1;
+        if self.group_depth > 0 {
+            return;
+        }
         let Some(mut buffer) = self.group.take() else {
             return;
         };
@@ -568,6 +583,33 @@ mod tests {
         history.end_group(&mut scene);
         assert!(history.undo(&mut scene));
         assert_eq!(scene.parent(a), None);
+        assert!(!history.can_undo());
+    }
+
+    #[test]
+    fn nested_groups_collapse_into_one_undo_step() {
+        let (mut scene, root) = scene_with_root();
+        let mut history = History::new();
+
+        // An outer group wrapping an inner grouped op (like an alt-drag that
+        // duplicates - itself grouped - and then reparents the copy).
+        history.begin_group();
+        history.begin_group();
+        let a = history.add_node(&mut scene, root, Node::new("a"));
+        let b = history.add_node(&mut scene, root, Node::new("b"));
+        history.end_group(&mut scene); // inner: buffers, records nothing yet
+        assert!(
+            !history.can_undo(),
+            "nothing recorded until the outer closes"
+        );
+        history.set_name(&mut scene, a, "renamed".to_string());
+        history.end_group(&mut scene); // outer: records the whole thing as one
+
+        assert_eq!(scene.children(root), &[a, b]);
+        assert_eq!(scene.node(a).name, "renamed");
+        // One undo reverts every edit from both nesting levels.
+        assert!(history.undo(&mut scene));
+        assert!(scene.children(root).is_empty());
         assert!(!history.can_undo());
     }
 
