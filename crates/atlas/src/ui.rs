@@ -23,6 +23,9 @@ const ROW_SELECTED: Color = Color::rgb(0.20, 0.28, 0.42);
 /// The drop-target highlight while dragging a tree row to reparent it.
 const ROW_DROP: Color = Color::rgb(0.18, 0.40, 0.30);
 const MENU_BG: Color = Color::rgb(0.16, 0.17, 0.22);
+/// Background for an inspector section "card" (lighter than the panel), so
+/// components read as separated blocks.
+const CARD_BG: Color = Color::rgb(0.17, 0.18, 0.23);
 const MODE_ACTIVE: Color = Color::rgb(0.24, 0.40, 0.62);
 /// The engine axis palette (matches the viewport gizmo): X red, Y green. Used
 /// for the inspector's Vec2 x/y labels so a field's axes read consistently.
@@ -189,6 +192,23 @@ pub struct TreeView {
     pub drop_target: Option<DropSpot>,
 }
 
+/// A collapsible section of the inspector: the selected node's transform, or one
+/// of its components (by index).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InspectorSection {
+    Transform,
+    Component(usize),
+}
+
+/// The inspector's editor state kept across shell rebuilds: which sections are
+/// collapsed. Keyed by `(node, section)` so collapse is per node - collapsing a
+/// component on one entity does not fold it on another (which may not even have
+/// it). Cheap to clone at each rebuild (the same pattern as [`TreeView`]).
+#[derive(Debug, Clone, Default)]
+pub struct InspectorView {
+    pub collapsed: HashSet<(NodeId, InspectorSection)>,
+}
+
 /// Maps widget handles back to the domain data they represent, so the app can
 /// react to Aurora events without Aurora knowing about `Scene`/`NodeId`.
 #[derive(Default)]
@@ -200,6 +220,8 @@ pub struct EditorRows {
     pub tree_toggles: Vec<(WidgetId, NodeId)>,
     /// A clicked eye icon toggles this node's visibility.
     pub eye_toggles: Vec<(WidgetId, NodeId)>,
+    /// A clicked inspector section header collapses/expands that section.
+    pub section_toggles: Vec<(WidgetId, InspectorSection)>,
     /// A submitted field row commits its current text to
     /// `(node, component index, field name)`.
     pub field_rows: Vec<(WidgetId, NodeId, usize, &'static str)>,
@@ -331,6 +353,7 @@ pub fn build_editor_ui(
     gizmo_mode: GizmoMode,
     icons: Option<&Icons>,
     tree: &TreeView,
+    inspector: &InspectorView,
 ) -> (Ui, EditorRows) {
     let mut ui = Ui::new();
     let mut rows = EditorRows::default();
@@ -383,6 +406,8 @@ pub fn build_editor_ui(
         scene,
         selected,
         sizes.inspector_width,
+        icons,
+        inspector,
         &mut rows,
     );
     ui.set_splitter_target(splitter_3, inspector_panel);
@@ -595,7 +620,7 @@ fn build_scene_tree(
             .column()
             .width(width)
             .padding(10.0)
-            .gap(1.0)
+            .gap(TREE_ROW_GAP)
             .scroll()
             .background(PANEL_BG),
     );
@@ -621,6 +646,12 @@ fn build_scene_tree(
 /// The width of a disclosure column / indent step, and the chevron glyph size.
 const TREE_DISCLOSURE: f32 = 16.0;
 const TREE_CHEVRON: f32 = 14.0;
+/// The vertical gap between tree rows; the reparent line straddles it so an
+/// "after"/"before" pair on the two sides of a boundary draw as one line.
+const TREE_ROW_GAP: f32 = 1.0;
+/// The visibility eye is drawn a touch larger than the chevron, in a slightly
+/// wider column, so it reads clearly.
+const TREE_EYE: f32 = 18.0;
 
 #[allow(clippy::too_many_arguments)]
 fn add_tree_row(
@@ -698,18 +729,18 @@ fn add_tree_row(
     // An eye toggle at the row's right edge: open when visible, struck through
     // when hidden. Clicking it toggles visibility (it does not select the row,
     // being its own interactive child).
+    // An icon button: no background on hover, the eye recolors to the accent.
     let eye = ui.button(
         row,
         "",
-        Style::new().flat().padding(1.0).width(TREE_DISCLOSURE),
+        Style::new()
+            .icon_button()
+            .padding(2.0)
+            .width(TREE_EYE + 6.0),
     );
     if let Some(icons) = icons {
         let glyph = if visible { Icon::Eye } else { Icon::EyeOff };
-        ui.image(
-            eye,
-            icons.get(glyph),
-            Style::new().size(TREE_CHEVRON, TREE_CHEVRON),
-        );
+        ui.image(eye, icons.get(glyph), Style::new().size(TREE_EYE, TREE_EYE));
     }
     rows.eye_toggles.push((eye, node));
     rows.tree_rows.push((row, node));
@@ -747,7 +778,14 @@ pub fn add_reparent_line(ui: &mut Ui, rows: &EditorRows, spot: DropSpot) {
     let Some(rect) = ui.rect(id) else {
         return;
     };
-    let y = if after { rect.max().y } else { rect.pos.y };
+    // Sit the line on the boundary between rows (half a row-gap outside the
+    // edge), so "after this row" and "before the next" land on the *same* line
+    // instead of two lines a gap apart.
+    let y = if after {
+        rect.max().y + TREE_ROW_GAP * 0.5
+    } else {
+        rect.pos.y - TREE_ROW_GAP * 0.5
+    };
     // Hit-transparent so the cursor passes through the line to the row beneath
     // it - otherwise the 2px line steals the hover and the drop spot flickers.
     ui.popup(
@@ -759,14 +797,18 @@ pub fn add_reparent_line(ui: &mut Ui, rows: &EditorRows, spot: DropSpot) {
     );
 }
 
-/// The docked inspector panel: the selected node's reflected component fields
-/// as editable rows (label + text input), one per field.
+/// The docked inspector panel: the selected node's transform and reflected
+/// component fields as editable rows, grouped into collapsible section cards.
+// A handful of small view inputs; named arguments read clearer than a struct.
+#[allow(clippy::too_many_arguments)]
 fn build_inspector(
     ui: &mut Ui,
     parent: WidgetId,
     scene: &Scene,
     selected: Option<NodeId>,
     width: f32,
+    icons: Option<&Icons>,
+    inspector: &InspectorView,
     rows: &mut EditorRows,
 ) -> WidgetId {
     let panel = ui.panel(
@@ -775,7 +817,7 @@ fn build_inspector(
             .column()
             .width(width)
             .padding(10.0)
-            .gap(6.0)
+            .gap(8.0)
             .scroll()
             .background(PANEL_BG),
     );
@@ -797,30 +839,51 @@ fn build_inspector(
 
     // The node's own transform first: it is what viewport drags edit, so its
     // rows double as a live readout while dragging.
-    ui.label(panel, "Transform", Style::new().foreground(SUBHEAD));
-    let t = scene.node(node).transform;
-    add_vec2_field(
+    if let Some(card) = add_inspector_section(
         ui,
         panel,
-        "position",
-        t.translation,
-        FieldRef::Position(node),
+        "Transform",
+        node,
+        InspectorSection::Transform,
+        inspector,
+        icons,
         rows,
-    );
-    // Rotation is a single scalar, edited in degrees (stored radians).
-    let input = add_value_row(
-        ui,
-        panel,
-        "rotation",
-        &Value::F32(t.rotation.to_degrees()),
-        true,
-    );
-    rows.transform_rows.push((input, node, "rotation"));
-    add_vec2_field(ui, panel, "scale", t.scale, FieldRef::Scale(node), rows);
+    ) {
+        let t = scene.node(node).transform;
+        add_vec2_field(
+            ui,
+            card,
+            "position",
+            t.translation,
+            FieldRef::Position(node),
+            rows,
+        );
+        // Rotation is a single scalar, edited in degrees (stored radians).
+        let input = add_value_row(
+            ui,
+            card,
+            "rotation",
+            &Value::F32(t.rotation.to_degrees()),
+            true,
+        );
+        rows.transform_rows.push((input, node, "rotation"));
+        add_vec2_field(ui, card, "scale", t.scale, FieldRef::Scale(node), rows);
+    }
 
     for (i, component) in scene.node(node).components.iter().enumerate() {
         let reflect = component.as_reflect();
-        ui.label(panel, reflect.type_name(), Style::new().foreground(SUBHEAD));
+        let Some(card) = add_inspector_section(
+            ui,
+            panel,
+            reflect.type_name(),
+            node,
+            InspectorSection::Component(i),
+            inspector,
+            icons,
+            rows,
+        ) else {
+            continue;
+        };
         for &field in reflect.field_names() {
             let Some(value) = reflect.get(field) else {
                 continue;
@@ -835,10 +898,10 @@ fn build_inspector(
                         index: i,
                         field,
                     };
-                    add_vec2_field(ui, panel, field, v, r, rows);
+                    add_vec2_field(ui, card, field, v, r, rows);
                 }
                 Value::Color(c) => {
-                    let row = ui.panel(panel, Style::new().row().gap(6.0).align_center());
+                    let row = ui.panel(card, Style::new().row().gap(6.0).align_center());
                     ui.label(row, field, Style::new().width(70.0));
                     let swatch = ui.button(
                         row,
@@ -859,13 +922,59 @@ fn build_inspector(
                 }
                 _ => {
                     let numeric = matches!(value, Value::F32(_));
-                    let input = add_value_row(ui, panel, field, &value, numeric);
+                    let input = add_value_row(ui, card, field, &value, numeric);
                     rows.field_rows.push((input, node, i, field));
                 }
             }
         }
     }
     panel
+}
+
+/// Add a collapsible inspector section as a "card" (its own lighter background,
+/// separating it from its neighbors) with a clickable header - a disclosure
+/// chevron plus the title. Records the header in `section_toggles`. Returns the
+/// card to add the section's fields into when expanded, or `None` when collapsed
+/// (so the caller skips building them).
+#[allow(clippy::too_many_arguments)]
+fn add_inspector_section(
+    ui: &mut Ui,
+    panel: WidgetId,
+    title: &str,
+    node: NodeId,
+    section: InspectorSection,
+    inspector: &InspectorView,
+    icons: Option<&Icons>,
+    rows: &mut EditorRows,
+) -> Option<WidgetId> {
+    let collapsed = inspector.collapsed.contains(&(node, section));
+    let card = ui.panel(
+        panel,
+        Style::new()
+            .column()
+            .gap(6.0)
+            .padding(8.0)
+            .background(CARD_BG),
+    );
+    // One flat header row: the chevron is decoration inside it (not its own
+    // button, so it has no separate hover); clicking anywhere on the header
+    // toggles the section.
+    let header = ui.button(card, "", Style::new().row().gap(6.0).align_center().flat());
+    if let Some(icons) = icons {
+        let chevron = if collapsed {
+            Icon::ChevronRight
+        } else {
+            Icon::ChevronDown
+        };
+        ui.image(
+            header,
+            icons.get(chevron),
+            Style::new().size(TREE_CHEVRON, TREE_CHEVRON),
+        );
+    }
+    ui.label(header, title, Style::new().grow(1.0).foreground(HEADING));
+    rows.section_toggles.push((header, section));
+    (!collapsed).then_some(card)
 }
 
 /// One labeled, editable inspector row; returns the text input's id. `numeric`
@@ -908,7 +1017,8 @@ fn add_vec2_field(
                 .width(24.0)
                 .padding(4.0)
                 .background(color)
-                .foreground(HEADING),
+                .foreground(HEADING)
+                .text_center(),
         );
         rows.scrub_labels.push((label, field, axis));
         let input = ui.numeric_input(
@@ -1097,6 +1207,7 @@ mod tests {
                 GizmoMode::Select,
                 None,
                 tree,
+                &InspectorView::default(),
             )
             .1
         };
@@ -1140,11 +1251,74 @@ mod tests {
             GizmoMode::Select,
             None,
             &TreeView::default(),
+            &InspectorView::default(),
         );
         // One eye toggle per row (root and A), each mapped to its node.
         assert_eq!(rows.eye_toggles.len(), rows.tree_rows.len());
         assert!(rows.eye_toggles.iter().any(|(_, n)| *n == root));
         assert!(rows.eye_toggles.iter().any(|(_, n)| *n == a));
+    }
+
+    #[test]
+    fn collapsing_an_inspector_section_hides_its_fields() {
+        let (scene, handle) = demo_scene();
+        let sprite = scene.children(scene.root())[0];
+        let dir = std::env::temp_dir();
+        let build = |inspector: &InspectorView| {
+            build_editor_ui(
+                &scene,
+                Some(sprite),
+                handle,
+                &dir,
+                PanelSizes::default(),
+                None,
+                GizmoMode::Select,
+                None,
+                &TreeView::default(),
+                inspector,
+            )
+            .1
+        };
+
+        // Expanded: the Transform section has its rotation row, the Sprite its
+        // fields, and both sections offer a collapse toggle.
+        let rows = build(&InspectorView::default());
+        assert!(
+            rows.transform_rows
+                .iter()
+                .any(|(_, n, f)| *n == sprite && *f == "rotation")
+        );
+        assert!(!rows.field_rows.is_empty(), "sprite fields present");
+        assert!(
+            rows.section_toggles
+                .iter()
+                .any(|(_, s)| *s == InspectorSection::Transform)
+        );
+        assert!(
+            rows.section_toggles
+                .iter()
+                .any(|(_, s)| *s == InspectorSection::Component(0))
+        );
+
+        // Collapse the Transform section (for this node): its rows vanish, the
+        // component's stay.
+        let mut collapsed = HashSet::new();
+        collapsed.insert((sprite, InspectorSection::Transform));
+        let rows = build(&InspectorView { collapsed });
+        assert!(
+            rows.transform_rows.is_empty(),
+            "collapsed transform builds no field rows"
+        );
+        assert!(
+            !rows.field_rows.is_empty(),
+            "the component is still expanded"
+        );
+        // Its header toggle remains, to expand it again.
+        assert!(
+            rows.section_toggles
+                .iter()
+                .any(|(_, s)| *s == InspectorSection::Transform)
+        );
     }
 
     #[test]
@@ -1165,6 +1339,7 @@ mod tests {
             GizmoMode::Select,
             None,
             &TreeView::default(),
+            &InspectorView::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -1174,9 +1349,10 @@ mod tests {
             .find(|(_, n)| *n == sprite)
             .expect("the sprite has a row");
         let rect = ui.rect(row_id).unwrap();
-        // Move the cursor over the row's name (right of the disclosure column).
+        // Move the cursor over the row's name (the middle of the row - right of
+        // the disclosure column, left of the eye toggle at the far edge).
         ui.handle_input(aurora::InputEvent::PointerMoved(
-            rect.pos + Vec2::new(rect.size.x - 20.0, rect.size.y * 0.5),
+            rect.pos + Vec2::new(rect.size.x * 0.5, rect.size.y * 0.5),
         ));
         assert_eq!(
             ui.hovered(),
@@ -1200,6 +1376,7 @@ mod tests {
             GizmoMode::Select,
             None,
             &TreeView::default(),
+            &InspectorView::default(),
         );
 
         // Three Vec2 fields (position, scale, sprite size) -> two axes each.
@@ -1248,6 +1425,7 @@ mod tests {
             GizmoMode::Select,
             None,
             &TreeView::default(),
+            &InspectorView::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -1279,6 +1457,7 @@ mod tests {
             GizmoMode::Select,
             None,
             &TreeView::default(),
+            &InspectorView::default(),
         );
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
         assert_eq!(
@@ -1302,6 +1481,7 @@ mod tests {
             GizmoMode::Rotate,
             None,
             &TreeView::default(),
+            &InspectorView::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -1345,6 +1525,7 @@ mod tests {
             GizmoMode::Select,
             None,
             &TreeView::default(),
+            &InspectorView::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -1378,6 +1559,7 @@ mod tests {
             GizmoMode::Select,
             None,
             &TreeView::default(),
+            &InspectorView::default(),
         );
         // The sprite's tint is a Color field, so the inspector has one swatch.
         assert_eq!(rows.color_swatches.len(), 1);
@@ -1431,6 +1613,7 @@ mod tests {
             GizmoMode::Select,
             None,
             &TreeView::default(),
+            &InspectorView::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -1455,6 +1638,7 @@ mod tests {
             GizmoMode::Select,
             None,
             &TreeView::default(),
+            &InspectorView::default(),
         );
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
         assert_eq!(ui2.scroll_offset(rows2.tree_panel.unwrap()), 90.0);
@@ -1479,6 +1663,7 @@ mod tests {
             GizmoMode::Select,
             None,
             &TreeView::default(),
+            &InspectorView::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
         let viewport = rows.viewport.unwrap();

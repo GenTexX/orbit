@@ -35,9 +35,10 @@ use crate::color::Hsva;
 use crate::icons::Icons;
 use crate::textures::TextureCache;
 use crate::ui::{
-    Axis, ColorPickerView, ColorTarget, ContextMenu, DropSpot, EditorRows, FieldRef, MenuAction,
-    PanelSizes, TreeView, build_color_picker, build_editor_ui, capture_panel_sizes, field_color,
-    field_vec2, parse_value, resolve_drop, set_field_color, set_field_vec2, with_axis,
+    Axis, ColorPickerView, ColorTarget, ContextMenu, DropSpot, EditorRows, FieldRef,
+    InspectorSection, InspectorView, MenuAction, PanelSizes, TreeView, build_color_picker,
+    build_editor_ui, capture_panel_sizes, field_color, field_vec2, parse_value, resolve_drop,
+    set_field_color, set_field_vec2, with_axis,
 };
 use crate::viewport::{Drag, EditorCamera, GizmoHit, GizmoMode};
 
@@ -186,6 +187,9 @@ struct State {
     picker_alpha: ImageHandle,
     /// Collapsed scene-tree nodes (editor state, kept across shell rebuilds).
     tree_collapsed: HashSet<NodeId>,
+    /// Collapsed inspector sections per node (editor state, kept across shell
+    /// rebuilds).
+    inspector_collapsed: HashSet<(NodeId, InspectorSection)>,
     /// An in-progress reparent drag: the row being dragged and the current
     /// drop target under the cursor.
     reparent: Option<ReparentDrag>,
@@ -281,7 +285,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if !state.handle_shortcut(&event) && !state.handle_mode_key(&event) {
-                    for ev in translate_key(&event) {
+                    for ev in translate_key(&event, state.modifiers.control_key()) {
                         state.ui.handle_input(ev);
                     }
                 }
@@ -363,6 +367,7 @@ impl State {
             GizmoMode::default(),
             Some(&icons),
             &TreeView::default(),
+            &InspectorView::default(),
         );
 
         Ok(Self {
@@ -403,6 +408,7 @@ impl State {
             picker_hue,
             picker_alpha,
             tree_collapsed: HashSet::new(),
+            inspector_collapsed: HashSet::new(),
             reparent: None,
         })
     }
@@ -805,6 +811,21 @@ impl State {
         self.dirty = true;
     }
 
+    /// The inspector's editor state for a rebuild: the collapsed-sections set.
+    fn inspector_view(&self) -> InspectorView {
+        InspectorView {
+            collapsed: self.inspector_collapsed.clone(),
+        }
+    }
+
+    /// Collapse or expand an inspector section of `node`.
+    fn toggle_section(&mut self, node: NodeId, section: InspectorSection) {
+        if !self.inspector_collapsed.remove(&(node, section)) {
+            self.inspector_collapsed.insert((node, section));
+        }
+        self.dirty = true;
+    }
+
     /// The scene-tree row node under the cursor, if any (a drop target). Reads
     /// the interactive widget under the cursor (the row button, not the label
     /// child a raw hit-test would return) with a fresh query, not the retained
@@ -829,14 +850,22 @@ impl State {
         }
     }
 
-    /// The drop spot under the cursor: the top/bottom quarter of a row inserts
+    /// The drop spot for the cursor: the top/bottom quarter of a row inserts
     /// before/after it (reordering siblings), the middle drops into it as a
-    /// child.
+    /// child. Snaps to the row nearest the cursor's y (not strictly the one hit),
+    /// so the 1px gaps between rows - and the insertion line drawn over an edge -
+    /// are never dead zones during a drag.
     fn drop_spot_at_cursor(&self) -> Option<DropSpot> {
-        let node = self.tree_row_at_cursor()?;
-        let id = self.rows.tree_rows.iter().find(|(_, n)| *n == node)?.0;
-        let rect = self.ui.rect(id)?;
-        let rel = ((self.cursor.y - rect.pos.y) / rect.size.y.max(1.0)).clamp(0.0, 1.0);
+        let cy = self.cursor.y;
+        // Vertical distance from the cursor to a row's rect (0 when inside it).
+        let dist = |r: &aurora::Rect| (r.pos.y - cy).max(cy - r.max().y).max(0.0);
+        let (node, rect) = self
+            .rows
+            .tree_rows
+            .iter()
+            .filter_map(|&(w, n)| self.ui.rect(w).map(|r| (n, r)))
+            .min_by(|(_, a), (_, b)| dist(a).total_cmp(&dist(b)))?;
+        let rel = ((cy - rect.pos.y) / rect.size.y.max(1.0)).clamp(0.0, 1.0);
         Some(if rel < 0.28 {
             DropSpot::Before(node)
         } else if rel > 0.72 {
@@ -1300,6 +1329,7 @@ impl State {
                 self.gizmo_mode,
                 Some(&self.icons),
                 &self.tree_view(),
+                &self.inspector_view(),
             );
             self.ui = ui;
             self.rows = rows;
@@ -1317,6 +1347,11 @@ impl State {
                 build_color_picker(&mut self.ui, &view, &mut self.rows);
             }
             self.dirty = false;
+            // The fresh Ui has no cursor, so its layout-time hover refresh would
+            // find nothing hovered. Seed the cursor so hover (and clicking the
+            // same spot again, e.g. an eye toggle) survives the rebuild without
+            // the user having to nudge the mouse first.
+            self.ui.set_cursor(self.cursor);
         }
 
         self.apply_cursor();
@@ -1483,6 +1518,21 @@ impl State {
                         .set_visible(&mut self.project.scene, node, !now);
                     self.dirty = true;
                 }
+                AuroraEvent::Clicked(id)
+                    if self.rows.section_toggles.iter().any(|(w, _)| *w == id) =>
+                {
+                    let section = self
+                        .rows
+                        .section_toggles
+                        .iter()
+                        .find(|(w, _)| *w == id)
+                        .map(|(_, s)| *s)
+                        .expect("guarded by the match arm");
+                    // Sections belong to the selected node (the only one shown).
+                    if let Some(node) = self.selected {
+                        self.toggle_section(node, section);
+                    }
+                }
                 AuroraEvent::Clicked(id) => {
                     if let Some(&(_, node)) =
                         self.rows.tree_rows.iter().find(|(widget, _)| *widget == id)
@@ -1623,11 +1673,14 @@ fn build_viewport_target(
 }
 
 /// Map a winit key press to Aurora input: a named editing key, or the typed
-/// text as a run of character events.
-fn translate_key(event: &winit::event::KeyEvent) -> Vec<InputEvent> {
+/// text as a run of character events. `ctrl` upgrades the arrow keys to
+/// word-wise motion (ctrl+left/right).
+fn translate_key(event: &winit::event::KeyEvent, ctrl: bool) -> Vec<InputEvent> {
     let named = match &event.logical_key {
         WinitKey::Named(NamedKey::Backspace) => Some(Key::Backspace),
         WinitKey::Named(NamedKey::Delete) => Some(Key::Delete),
+        WinitKey::Named(NamedKey::ArrowLeft) if ctrl => Some(Key::WordLeft),
+        WinitKey::Named(NamedKey::ArrowRight) if ctrl => Some(Key::WordRight),
         WinitKey::Named(NamedKey::ArrowLeft) => Some(Key::Left),
         WinitKey::Named(NamedKey::ArrowRight) => Some(Key::Right),
         WinitKey::Named(NamedKey::ArrowUp) => Some(Key::Up),
