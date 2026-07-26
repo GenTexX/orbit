@@ -85,6 +85,9 @@ pub struct Ui {
     pressed: Option<WidgetId>,
     /// An armed or live drag from a draggable widget (first-class drag-and-drop).
     drag: Option<DragState>,
+    /// A scrollbar-thumb drag in progress: the scroll container and the cursor's
+    /// y offset from the thumb's top when grabbed.
+    scrollbar_drag: Option<(WidgetId, f32)>,
     /// The focused text input, which receives keyboard input.
     focused: Option<WidgetId>,
     /// Caret position in the focused input, as a byte offset into its text.
@@ -127,6 +130,7 @@ impl Ui {
             hovered: None,
             pressed: None,
             drag: None,
+            scrollbar_drag: None,
             focused: None,
             caret: 0,
             focused_hscroll: 0.0,
@@ -771,6 +775,79 @@ impl Ui {
         None
     }
 
+    /// A scroll container's scrollbar geometry, if its content overflows:
+    /// `(thumb rect, track top y, travel)` where `travel` is how far the thumb
+    /// can move. `None` when there is nothing to scroll. Shared by the scrollbar
+    /// drawing and its hit-testing so they always agree.
+    fn scrollbar_metrics(&self, id: WidgetId) -> Option<(Rect, f32, f32)> {
+        if !self.widgets[id].scroll {
+            return None;
+        }
+        let rect = self.rect(id)?;
+        let content = self.scroll_content.get(id).copied()?;
+        if content <= rect.size.y {
+            return None;
+        }
+        let track = rect.size.y - 2.0 * theme::SCROLLBAR_INSET;
+        let thumb_h = (track * rect.size.y / content).max(theme::SCROLLBAR_MIN_THUMB);
+        let travel = (track - thumb_h).max(0.0);
+        let max_offset = content - rect.size.y;
+        let t = (self.scroll_offset(id) / max_offset).clamp(0.0, 1.0);
+        let track_top = rect.pos.y + theme::SCROLLBAR_INSET;
+        let thumb = Rect::new(
+            Vec2::new(
+                rect.max().x - theme::SCROLLBAR_INSET - theme::SCROLLBAR_WIDTH,
+                track_top + t * travel,
+            ),
+            Vec2::new(theme::SCROLLBAR_WIDTH, thumb_h),
+        );
+        Some((thumb, track_top, travel))
+    }
+
+    /// The scroll container whose scrollbar thumb is under `point`, with its
+    /// thumb rect - what a press hit-tests against to start a thumb drag.
+    fn scrollbar_thumb_at(&self, point: Vec2) -> Option<(WidgetId, Rect)> {
+        let container = self
+            .hit_test(point)
+            .and_then(|id| self.scroll_ancestor(id))?;
+        let (thumb, ..) = self.scrollbar_metrics(container)?;
+        thumb.contains(point).then_some((container, thumb))
+    }
+
+    /// The scroll container whose scrollbar track (its right-edge column, minus
+    /// the thumb) is under `point` - a click there jumps the thumb to it.
+    fn scrollbar_track_at(&self, point: Vec2) -> Option<WidgetId> {
+        let container = self
+            .hit_test(point)
+            .and_then(|id| self.scroll_ancestor(id))?;
+        let (thumb, ..) = self.scrollbar_metrics(container)?;
+        let rect = self.rect(container)?;
+        let column_left = rect.max().x - theme::SCROLLBAR_INSET - theme::SCROLLBAR_WIDTH;
+        let in_column = point.x >= column_left
+            && point.x <= rect.max().x
+            && point.y >= rect.pos.y
+            && point.y <= rect.max().y;
+        (in_column && !thumb.contains(point)).then_some(container)
+    }
+
+    /// Set a scroll container's offset so its thumb's top sits at `thumb_top`
+    /// (clamped to the track) - used while dragging or clicking the scrollbar.
+    fn scroll_to_thumb_top(&mut self, id: WidgetId, thumb_top: f32) {
+        let (Some((_, track_top, travel)), Some(rect)) =
+            (self.scrollbar_metrics(id), self.rect(id))
+        else {
+            return;
+        };
+        let content = self.scroll_content.get(id).copied().unwrap_or(0.0);
+        let max_offset = (content - rect.size.y).max(0.0);
+        let t = if travel > 0.0 {
+            ((thumb_top - track_top) / travel).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.scroll_offsets.insert(id, t * max_offset);
+    }
+
     /// Apply a wheel delta to the scroll container under the cursor.
     fn scroll_under_cursor(&mut self, delta: f32) {
         let Some(target) = self
@@ -795,6 +872,12 @@ impl Ui {
             InputEvent::PointerMoved(p) => {
                 let delta = self.cursor.map(|c| p - c).unwrap_or(Vec2::ZERO);
                 self.cursor = Some(p);
+                // A scrollbar-thumb drag moves the offset and consumes the move.
+                if let Some((container, grab_dy)) = self.scrollbar_drag {
+                    self.scroll_to_thumb_top(container, p.y - grab_dy);
+                    self.update_hover();
+                    return;
+                }
                 self.drag_splitter(delta);
                 if let Some(id) = self.pressed {
                     self.drag_slider(id);
@@ -815,6 +898,23 @@ impl Ui {
                 self.hovered = None;
             }
             InputEvent::PointerPressed => {
+                // A press on a scroll container's scrollbar grabs it (over the
+                // thumb) or jumps it there (in the track), then drags - and
+                // consumes the press, so nothing beneath the bar is clicked.
+                if let Some(p) = self.cursor {
+                    if let Some((container, thumb)) = self.scrollbar_thumb_at(p) {
+                        self.scrollbar_drag = Some((container, p.y - thumb.pos.y));
+                        return;
+                    }
+                    if let Some(container) = self.scrollbar_track_at(p) {
+                        // Center the thumb on the click, then drag from its middle.
+                        if let Some((thumb, ..)) = self.scrollbar_metrics(container) {
+                            self.scroll_to_thumb_top(container, p.y - thumb.size.y * 0.5);
+                            self.scrollbar_drag = Some((container, thumb.size.y * 0.5));
+                        }
+                        return;
+                    }
+                }
                 // Arm the widget under the pointer; a release over the same one
                 // is a click.
                 self.pressed = self.hovered;
@@ -834,6 +934,11 @@ impl Ui {
                 }
             }
             InputEvent::PointerReleased => {
+                // End any scrollbar drag (it consumed the press, so nothing else
+                // to do on release).
+                if self.scrollbar_drag.take().is_some() {
+                    return;
+                }
                 // A live drag resolves to a drop (over a target, or a cancel);
                 // it also suppressed the click by clearing `pressed` when it went
                 // live, so the activation below only fires for a plain click.
@@ -971,12 +1076,16 @@ impl Ui {
             return;
         };
         let multiline = self.widgets[id].multiline;
-        // Enter inserts a newline in a text area, otherwise it commits the edit.
+        // Enter inserts a newline in a text area; in a single-line field it
+        // commits and advances to the next input (Enter moves to the next row,
+        // like Tab). focus_step also commits the field it leaves, which is
+        // harmless here - the app's field commits are idempotent.
         if key == Key::Enter {
             if multiline {
                 self.insert_newline();
             } else {
                 self.events.push(Event::Submitted(id));
+                self.focus_step(1);
             }
             return;
         }
@@ -1612,26 +1721,23 @@ impl Ui {
             list.commands.push(DrawCommand::PopClip);
         }
 
-        // A scrollbar thumb over scrolling content: its length mirrors the
-        // visible fraction, its position the scrolled fraction.
-        if widget.scroll
-            && let Some(&content) = self.scroll_content.get(id)
-            && content > rect.size.y
-        {
-            let track = rect.size.y - 2.0 * theme::SCROLLBAR_INSET;
-            let thumb_h = (track * rect.size.y / content).max(theme::SCROLLBAR_MIN_THUMB);
-            let max_offset = content - rect.size.y;
-            let t = (self.scroll_offset(id) / max_offset).clamp(0.0, 1.0);
-            let thumb_y = rect.pos.y + theme::SCROLLBAR_INSET + t * (track - thumb_h);
-            list.commands.push(DrawCommand::FillRect {
-                rect: Rect::new(
-                    Vec2::new(
-                        rect.max().x - theme::SCROLLBAR_INSET - theme::SCROLLBAR_WIDTH,
-                        thumb_y,
-                    ),
-                    Vec2::new(theme::SCROLLBAR_WIDTH, thumb_h),
-                ),
-                color: self.theme.scrollbar_thumb,
+        // A scrollbar thumb over scrolling content (its length mirrors the
+        // visible fraction, its position the scrolled fraction). It brightens
+        // while hovered or dragged, so it reads as grabbable.
+        if let Some((thumb, ..)) = self.scrollbar_metrics(id) {
+            let active = self.scrollbar_drag.map(|(c, _)| c) == Some(id)
+                || self.cursor.is_some_and(|p| thumb.contains(p));
+            let color = if active {
+                self.theme.scrollbar_thumb.lighten(0.25)
+            } else {
+                self.theme.scrollbar_thumb
+            };
+            list.commands.push(DrawCommand::RoundedRect {
+                rect: thumb,
+                color,
+                radius: theme::SCROLLBAR_WIDTH * 0.5,
+                border_width: 0.0,
+                border_color: Color::TRANSPARENT,
             });
         }
 
@@ -3301,6 +3407,25 @@ mod tests {
     }
 
     #[test]
+    fn enter_commits_a_single_line_field_and_advances_to_the_next() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(200.0, 200.0));
+        let a = ui.text_input(root, "aaa", Style::new().size(200.0, 24.0));
+        let b = ui.text_input(root, "bbb", Style::new().size(200.0, 24.0));
+        ui.layout(Vec2::new(200.0, 200.0)).unwrap();
+
+        click_at(&mut ui, Vec2::new(10.0, 12.0)); // focus the first
+        assert_eq!(ui.focused(), Some(a));
+        ui.drain_events();
+
+        ui.handle_input(InputEvent::Key(Key::Enter));
+        // Enter commits `a` and moves focus to the next field, selected whole.
+        assert!(ui.drain_events().contains(&Event::Submitted(a)));
+        assert_eq!(ui.focused(), Some(b));
+        assert_eq!(ui.selected_text().as_deref(), Some("bbb"));
+    }
+
+    #[test]
     fn shift_arrows_extend_a_selection_and_typing_replaces_it() {
         let (mut ui, field) = ui_with_field("hello");
         click_at(&mut ui, Vec2::new(180.0, 12.0)); // caret at end (5)
@@ -3627,7 +3752,7 @@ mod tests {
         ui.layout(Vec2::new(200.0, 400.0)).unwrap();
         assert_eq!(ui.scroll_offset(scroller), 0.0);
 
-        // The overflow draws a scrollbar thumb (a fill on the right edge).
+        // The overflow draws a scrollbar thumb (a rounded fill on the right edge).
         ui.handle_input(InputEvent::Scroll(50.0));
         ui.layout(Vec2::new(200.0, 400.0)).unwrap();
         let thumbs = ui
@@ -3635,11 +3760,45 @@ mod tests {
             .commands
             .iter()
             .filter(|c| {
-                matches!(c, DrawCommand::FillRect { rect, .. }
+                matches!(c, DrawCommand::RoundedRect { rect, .. }
                     if rect.pos.x > 190.0 && rect.size.x < 10.0)
             })
             .count();
         assert_eq!(thumbs, 1);
+    }
+
+    #[test]
+    fn dragging_the_scrollbar_thumb_scrolls_the_container() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 400.0));
+        // 100px window over 300px of content -> the thumb can travel.
+        let scroller = ui.panel(root, Style::new().column().size(200.0, 100.0).scroll());
+        ui.panel(scroller, Style::new().size(200.0, 300.0));
+        ui.layout(Vec2::new(200.0, 400.0)).unwrap();
+        assert_eq!(ui.scroll_offset(scroller), 0.0);
+
+        // Find the thumb (a rounded fill on the right edge) and grab its middle.
+        let thumb = ui
+            .draw_list()
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                DrawCommand::RoundedRect { rect, .. } if rect.pos.x > 190.0 => Some(*rect),
+                _ => None,
+            })
+            .expect("a thumb is drawn");
+        let grab = Vec2::new(thumb.pos.x + 2.0, thumb.pos.y + thumb.size.y * 0.5);
+        ui.handle_input(InputEvent::PointerMoved(grab));
+        ui.handle_input(InputEvent::PointerPressed);
+        // Drag the thumb to the bottom of the track: the container scrolls to end.
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(grab.x, 400.0)));
+        assert_eq!(ui.scroll_offset(scroller), 200.0); // content(300) - height(100)
+        ui.handle_input(InputEvent::PointerReleased);
+        // Drag back to the top.
+        ui.handle_input(InputEvent::PointerMoved(grab));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(grab.x, 0.0)));
+        assert_eq!(ui.scroll_offset(scroller), 0.0);
     }
 
     #[test]
