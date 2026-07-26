@@ -44,6 +44,12 @@ pub enum Edit {
     },
     /// Toggle a node's visibility (show/hide).
     SetVisible { node: NodeId, old: bool, new: bool },
+    /// Rename a node.
+    SetName {
+        node: NodeId,
+        old: String,
+        new: String,
+    },
     /// Replace one reflected field of one component on a node.
     SetField {
         node: NodeId,
@@ -52,6 +58,10 @@ pub enum Edit {
         old: Value,
         new: Value,
     },
+    /// A group of edits applied and undone as one unit (a multi-node delete,
+    /// a duplicate that adds a whole subtree, a paste). Reverting a batch
+    /// undoes its edits in reverse, so the scene retraces its steps exactly.
+    Batch(Vec<Edit>),
 }
 
 impl Edit {
@@ -74,6 +84,7 @@ impl Edit {
             }
             Edit::SetTransform { node, new, .. } => scene.node_mut(*node).transform = *new,
             Edit::SetVisible { node, new, .. } => scene.node_mut(*node).visible = *new,
+            Edit::SetName { node, new, .. } => scene.node_mut(*node).name = new.clone(),
             Edit::SetField {
                 node,
                 component,
@@ -81,6 +92,11 @@ impl Edit {
                 new,
                 ..
             } => set_field(scene, *node, *component, field, new.clone()),
+            Edit::Batch(edits) => {
+                for edit in edits {
+                    edit.apply(scene);
+                }
+            }
         }
     }
 
@@ -103,6 +119,7 @@ impl Edit {
             }
             Edit::SetTransform { node, old, .. } => scene.node_mut(*node).transform = *old,
             Edit::SetVisible { node, old, .. } => scene.node_mut(*node).visible = *old,
+            Edit::SetName { node, old, .. } => scene.node_mut(*node).name = old.clone(),
             Edit::SetField {
                 node,
                 component,
@@ -110,6 +127,11 @@ impl Edit {
                 old,
                 ..
             } => set_field(scene, *node, *component, field, old.clone()),
+            Edit::Batch(edits) => {
+                for edit in edits.iter().rev() {
+                    edit.revert(scene);
+                }
+            }
         }
     }
 }
@@ -126,6 +148,11 @@ fn set_field(scene: &mut Scene, node: NodeId, component: usize, field: &str, val
 pub struct History {
     done: Vec<Edit>,
     undone: Vec<Edit>,
+    /// When `Some`, [`push`](Self::push) applies each edit immediately but
+    /// collects it here instead of recording it, so a run of edits between
+    /// [`begin_group`](Self::begin_group) and [`end_group`](Self::end_group)
+    /// undoes as a single step.
+    group: Option<Vec<Edit>>,
 }
 
 impl History {
@@ -146,6 +173,37 @@ impl History {
 
     fn push(&mut self, scene: &mut Scene, edit: Edit) {
         edit.apply(scene);
+        match &mut self.group {
+            // Inside a group: buffer the edit; the group is recorded as one
+            // `Edit::Batch` when it closes.
+            Some(buffer) => buffer.push(edit),
+            None => {
+                self.done.push(edit);
+                self.undone.clear();
+            }
+        }
+    }
+
+    /// Begin coalescing the edits that follow into a single undo step. Pair with
+    /// [`end_group`](Self::end_group). Groups do not nest (a second call while a
+    /// group is open discards the edits buffered so far in debug builds).
+    pub fn begin_group(&mut self) {
+        debug_assert!(self.group.is_none(), "history groups do not nest");
+        self.group = Some(Vec::new());
+    }
+
+    /// Close the current group, recording its buffered edits as one undoable
+    /// [`Edit::Batch`]. A group with a single edit is recorded as that edit;
+    /// an empty group records nothing. A no-op if no group is open.
+    pub fn end_group(&mut self, _scene: &mut Scene) {
+        let Some(mut buffer) = self.group.take() else {
+            return;
+        };
+        let edit = match buffer.len() {
+            0 => return,
+            1 => buffer.pop().expect("length checked"),
+            _ => Edit::Batch(buffer),
+        };
         self.done.push(edit);
         self.undone.clear();
     }
@@ -176,8 +234,22 @@ impl History {
 
     /// Add `node` as the last child of `parent`, returning its handle. Undoable.
     pub fn add_node(&mut self, scene: &mut Scene, parent: NodeId, node: Node) -> NodeId {
-        let child = scene.insert_detached(node);
         let index = scene.children(parent).len();
+        self.add_node_at(scene, parent, node, index)
+    }
+
+    /// Add `node` under `parent` at `index` (clamped to the child count),
+    /// returning its handle. Undoable. Lets a duplicate or paste land right
+    /// beside its original rather than always at the end.
+    pub fn add_node_at(
+        &mut self,
+        scene: &mut Scene,
+        parent: NodeId,
+        node: Node,
+        index: usize,
+    ) -> NodeId {
+        let child = scene.insert_detached(node);
+        let index = index.min(scene.children(parent).len());
         self.push(
             scene,
             Edit::Link {
@@ -259,6 +331,23 @@ impl History {
                 node,
                 old,
                 new: visible,
+            },
+        );
+    }
+
+    /// Rename `node`. Undoable; a no-op that records nothing when the name is
+    /// unchanged.
+    pub fn set_name(&mut self, scene: &mut Scene, node: NodeId, name: String) {
+        let old = scene.node(node).name.clone();
+        if old == name {
+            return;
+        }
+        self.push(
+            scene,
+            Edit::SetName {
+                node,
+                old,
+                new: name,
             },
         );
     }
@@ -408,6 +497,78 @@ mod tests {
         // Reparenting a node into its own subtree is refused.
         history.reparent(&mut scene, root, a, 0);
         assert_eq!(scene.parent(root), None);
+    }
+
+    #[test]
+    fn set_name_renames_and_undoes() {
+        let (mut scene, root) = scene_with_root();
+        let mut history = History::new();
+        let node = history.add_node(&mut scene, root, Node::new("old"));
+
+        history.set_name(&mut scene, node, "new".to_string());
+        assert_eq!(scene.node(node).name, "new");
+        // Renaming to the current name records nothing (no phantom edit).
+        history.set_name(&mut scene, node, "new".to_string());
+
+        history.undo(&mut scene);
+        assert_eq!(scene.node(node).name, "old");
+    }
+
+    #[test]
+    fn add_node_at_inserts_at_the_index() {
+        let (mut scene, root) = scene_with_root();
+        let mut history = History::new();
+        let a = history.add_node(&mut scene, root, Node::new("a"));
+        let c = history.add_node(&mut scene, root, Node::new("c"));
+        // Insert "b" between a and c.
+        let b = history.add_node_at(&mut scene, root, Node::new("b"), 1);
+        assert_eq!(scene.children(root), &[a, b, c]);
+
+        history.undo(&mut scene);
+        assert_eq!(scene.children(root), &[a, c]);
+    }
+
+    #[test]
+    fn a_group_undoes_and_redoes_as_one_step() {
+        let (mut scene, root) = scene_with_root();
+        let mut history = History::new();
+
+        history.begin_group();
+        let a = history.add_node(&mut scene, root, Node::new("a"));
+        let b = history.add_node(&mut scene, root, Node::new("b"));
+        history.set_name(&mut scene, a, "renamed".to_string());
+        history.end_group(&mut scene);
+        assert_eq!(scene.children(root), &[a, b]);
+        assert_eq!(scene.node(a).name, "renamed");
+
+        // One undo reverts the whole group (both adds and the rename).
+        assert!(history.undo(&mut scene));
+        assert!(scene.children(root).is_empty());
+        assert!(!history.can_undo());
+
+        // One redo replays it.
+        assert!(history.redo(&mut scene));
+        assert_eq!(scene.children(root), &[a, b]);
+        assert_eq!(scene.node(a).name, "renamed");
+    }
+
+    #[test]
+    fn an_empty_or_single_group_records_cleanly() {
+        let (mut scene, root) = scene_with_root();
+        let mut history = History::new();
+
+        // An empty group records nothing.
+        history.begin_group();
+        history.end_group(&mut scene);
+        assert!(!history.can_undo());
+
+        // A single-edit group records just that edit (one undo suffices).
+        history.begin_group();
+        let a = history.add_node(&mut scene, root, Node::new("a"));
+        history.end_group(&mut scene);
+        assert!(history.undo(&mut scene));
+        assert_eq!(scene.parent(a), None);
+        assert!(!history.can_undo());
     }
 
     #[test]

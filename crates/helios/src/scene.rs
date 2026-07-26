@@ -122,9 +122,13 @@ impl Scene {
     // or re-saved (it is not walked from the root); harmless for an editor.
 
     /// Insert a node into the arena without attaching it to the tree, returning
-    /// its handle. The caller links it (see [`link`](Self::link)).
+    /// its handle. Both tree links are cleared: a detached node has no parent and
+    /// no children until the caller rebuilds them (see [`link`](Self::link)), so
+    /// a node cloned from an existing one does not carry over stale child
+    /// handles. The caller links it and, for a subtree, its children.
     pub(crate) fn insert_detached(&mut self, mut node: Node) -> NodeId {
         node.parent = None;
+        node.children.clear();
         self.nodes.insert(node)
     }
 
