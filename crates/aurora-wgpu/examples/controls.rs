@@ -260,12 +260,17 @@ fn build_ui() -> (Ui, Ids) {
             .font_size(20.0),
     );
 
-    // A button next to a live counter label.
+    // A button next to a live counter label. Rounded, with a subtle border, to
+    // show off corner_radius()/border().
     let button_row = ui.panel(root, Style::new().row().gap(10.0));
     let button = ui.button(
         button_row,
         "Click me",
-        Style::new().padding(8.0).foreground(Color::WHITE),
+        Style::new()
+            .padding(8.0)
+            .foreground(Color::WHITE)
+            .corner_radius(6.0)
+            .border(1.0, Color::rgb(0.45, 0.55, 0.75)),
     );
     let clicks_label = ui.label(button_row, "Clicks: 0", Style::new().padding(8.0));
 
@@ -284,11 +289,13 @@ fn build_ui() -> (Ui, Ids) {
         Style::new()
             .size(240.0, 28.0)
             .padding(6.0)
+            .corner_radius(4.0)
             .placeholder("type a name..."),
     );
 
-    // Masked inputs: each rejects any keystroke that would break its mask.
-    let field = |px: f32| Style::new().size(px, 28.0).padding(6.0);
+    // Masked inputs: each rejects any keystroke that would break its mask. The
+    // fields are rounded (corner_radius) to show the rounded-rect rendering.
+    let field = |px: f32| Style::new().size(px, 28.0).padding(6.0).corner_radius(4.0);
     for (caption, mask, hint) in [
         ("Integer:", Mask::Integer, "-1234"),
         ("Decimal:", Mask::Decimal, "-3.14"),
@@ -336,7 +343,13 @@ fn build_ui() -> (Ui, Ids) {
     let slider_label = ui.label(slider_row, "50", Style::new().padding(6.0));
 
     // The box the checkbox reveals (transparent until toggled on).
-    let accent = ui.panel(root, Style::new().size(220.0, 44.0));
+    let accent = ui.panel(
+        root,
+        Style::new()
+            .size(220.0, 44.0)
+            .corner_radius(10.0)
+            .border(2.0, Color::rgb(0.30, 0.55, 0.90)),
+    );
 
     (
         ui,

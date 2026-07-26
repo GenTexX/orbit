@@ -26,6 +26,11 @@ const MENU_BG: Color = Color::rgb(0.16, 0.17, 0.22);
 /// Background for an inspector section "card" (lighter than the panel), so
 /// components read as separated blocks.
 const CARD_BG: Color = Color::rgb(0.17, 0.18, 0.23);
+/// A subtle 1px outline separating a card from the panel behind it.
+const CARD_BORDER: Color = Color::rgb(0.24, 0.26, 0.32);
+/// Corner radius for section cards, and for controls (buttons and fields).
+const CARD_RADIUS: f32 = 6.0;
+const CONTROL_RADIUS: f32 = 4.0;
 const MODE_ACTIVE: Color = Color::rgb(0.24, 0.40, 0.62);
 /// The engine axis palette (matches the viewport gizmo): X red, Y green. Used
 /// for the inspector's Vec2 x/y labels so a field's axes read consistently.
@@ -502,7 +507,14 @@ fn toolbar_button(
 ) -> WidgetId {
     match icon {
         Some(handle) => {
-            let button = ui.button(bar, "", Style::new().padding(5.0).background(background));
+            let button = ui.button(
+                bar,
+                "",
+                Style::new()
+                    .padding(5.0)
+                    .background(background)
+                    .corner_radius(CONTROL_RADIUS),
+            );
             ui.image(button, handle, Style::new().size(18.0, 18.0));
             button
         }
@@ -512,7 +524,8 @@ fn toolbar_button(
             Style::new()
                 .padding(6.0)
                 .background(background)
-                .foreground(HEADING),
+                .foreground(HEADING)
+                .corner_radius(CONTROL_RADIUS),
         ),
     }
 }
@@ -537,6 +550,8 @@ fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, rows: &mut EditorRows) {
             .gap(2.0)
             .padding(4.0)
             .background(MENU_BG)
+            .corner_radius(CARD_RADIUS)
+            .border(1.0, CARD_BORDER)
             .clip(),
     );
     for (label, action) in &menu.items {
@@ -547,7 +562,8 @@ fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, rows: &mut EditorRows) {
                 .width(150.0)
                 .padding(6.0)
                 .background(MENU_BG)
-                .foreground(HEADING),
+                .foreground(HEADING)
+                .corner_radius(CONTROL_RADIUS),
         );
         rows.menu_items.push((item, *action));
     }
@@ -570,6 +586,8 @@ pub fn build_color_picker(ui: &mut Ui, view: &ColorPickerView, rows: &mut Editor
             .gap(6.0)
             .padding(8.0)
             .background(MENU_BG)
+            .corner_radius(CARD_RADIUS)
+            .border(1.0, CARD_BORDER)
             .clip(),
     );
     let top = ui.panel(popup, Style::new().row().gap(6.0));
@@ -585,14 +603,19 @@ pub fn build_color_picker(ui: &mut Ui, view: &ColorPickerView, rows: &mut Editor
     let hex = ui.text_input(
         bottom,
         color::to_hex(view.rgba),
-        Style::new().grow(1.0).padding(4.0).placeholder("#RRGGBBAA"),
+        Style::new()
+            .grow(1.0)
+            .padding(4.0)
+            .corner_radius(CONTROL_RADIUS)
+            .placeholder("#RRGGBBAA"),
     );
     let [r, g, b, a] = view.rgba;
     ui.panel(
         bottom,
         Style::new()
             .size(28.0, 24.0)
-            .background(Color::rgba(r, g, b, a)),
+            .background(Color::rgba(r, g, b, a))
+            .corner_radius(CONTROL_RADIUS),
     );
 
     rows.picker_popup = Some(popup);
@@ -909,7 +932,8 @@ fn build_inspector(
                         Style::new()
                             .width(48.0)
                             .padding(6.0)
-                            .background(Color::rgba(c[0], c[1], c[2], c[3])),
+                            .background(Color::rgba(c[0], c[1], c[2], c[3]))
+                            .corner_radius(CONTROL_RADIUS),
                     );
                     rows.color_swatches.push((
                         swatch,
@@ -954,7 +978,9 @@ fn add_inspector_section(
             .column()
             .gap(6.0)
             .padding(8.0)
-            .background(CARD_BG),
+            .background(CARD_BG)
+            .corner_radius(CARD_RADIUS)
+            .border(1.0, CARD_BORDER),
     );
     // One flat header row: the chevron is decoration inside it (not its own
     // button, so it has no separate hover); clicking anywhere on the header
@@ -988,7 +1014,10 @@ fn add_value_row(
 ) -> WidgetId {
     let row = ui.panel(panel, Style::new().row().gap(6.0).align_center());
     ui.label(row, label, Style::new().width(70.0));
-    let style = Style::new().grow(1.0).padding(4.0);
+    let style = Style::new()
+        .grow(1.0)
+        .padding(4.0)
+        .corner_radius(CONTROL_RADIUS);
     if numeric {
         ui.numeric_input(row, value_to_text(value), style)
     } else {
@@ -1018,13 +1047,17 @@ fn add_vec2_field(
                 .padding(4.0)
                 .background(color)
                 .foreground(HEADING)
-                .text_center(),
+                .text_center()
+                .corner_radius(CONTROL_RADIUS),
         );
         rows.scrub_labels.push((label, field, axis));
         let input = ui.numeric_input(
             row,
             value_to_text(&Value::F32(axis_of(v, axis))),
-            Style::new().grow(1.0).padding(4.0),
+            Style::new()
+                .grow(1.0)
+                .padding(4.0)
+                .corner_radius(CONTROL_RADIUS),
         );
         rows.vec_inputs.push((input, field, axis));
     }
