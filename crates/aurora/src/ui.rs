@@ -65,6 +65,9 @@ pub struct Ui {
     /// A shaped buffer for each placeholder-bearing text input, produced after
     /// layout and drawn (dimmed) only while the input's own text is empty.
     placeholder_buffers: SecondaryMap<WidgetId, Buffer>,
+    /// A shaped check-glyph buffer per checkbox (its main buffer holds the label
+    /// caption instead), produced during measure and drawn when checked.
+    check_buffers: SecondaryMap<WidgetId, Buffer>,
     /// Vertical scroll offset per scroll container, in pixels (0 = top).
     scroll_offsets: SecondaryMap<WidgetId, f32>,
     /// Content height per scroll container from the last layout, for clamping
@@ -116,6 +119,7 @@ impl Ui {
             font_system: text::make_font_system(),
             buffers: SecondaryMap::new(),
             placeholder_buffers: SecondaryMap::new(),
+            check_buffers: SecondaryMap::new(),
             scroll_offsets: SecondaryMap::new(),
             scroll_content: SecondaryMap::new(),
             popups: Vec::new(),
@@ -174,9 +178,24 @@ impl Ui {
         self.add(WidgetKind::Button(text.into()), style, Some(parent))
     }
 
-    /// Add a checkbox under `parent`, initially `checked` or not.
-    pub fn checkbox(&mut self, parent: WidgetId, checked: bool, style: Style) -> WidgetId {
-        self.add(WidgetKind::Checkbox(checked), style, Some(parent))
+    /// Add a checkbox under `parent`, initially `checked` or not, with a caption
+    /// `label` beside the box (pass `""` for a bare box). Clicking anywhere on
+    /// the widget - box or caption - toggles it.
+    pub fn checkbox(
+        &mut self,
+        parent: WidgetId,
+        checked: bool,
+        label: impl Into<String>,
+        style: Style,
+    ) -> WidgetId {
+        self.add(
+            WidgetKind::Checkbox {
+                checked,
+                label: label.into(),
+            },
+            style,
+            Some(parent),
+        )
     }
 
     /// Add a single-line text input under `parent`, holding initial `text`.
@@ -595,6 +614,7 @@ impl Ui {
         // buffers + font_system) while taffy computes layout.
         let widgets = &self.widgets;
         let buffers = &mut self.buffers;
+        let check_buffers = &mut self.check_buffers;
         let font_system = &mut self.font_system;
         self.taffy.compute_layout_with_measure(
             root_node,
@@ -603,7 +623,15 @@ impl Ui {
                 height: AvailableSpace::Definite(available.y),
             },
             |known, avail, _node, ctx, _style| {
-                measure_widget(known, avail, ctx, widgets, buffers, font_system)
+                measure_widget(
+                    known,
+                    avail,
+                    ctx,
+                    widgets,
+                    buffers,
+                    check_buffers,
+                    font_system,
+                )
             },
         )?;
 
@@ -1457,7 +1485,7 @@ impl Ui {
     fn activate(&mut self, id: WidgetId) {
         let event = match &mut self.widgets[id].kind {
             WidgetKind::Button(_) => Some(Event::Clicked(id)),
-            WidgetKind::Checkbox(checked) => {
+            WidgetKind::Checkbox { checked, .. } => {
                 *checked = !*checked;
                 Some(Event::Toggled {
                     id,
@@ -1554,7 +1582,9 @@ impl Ui {
                 self.emit_text(id, widget.foreground, list);
             }
             WidgetKind::Button(_) => self.emit_button(id, rect, widget, list),
-            WidgetKind::Checkbox(checked) => self.emit_checkbox(id, rect, *checked, list),
+            WidgetKind::Checkbox { checked, .. } => {
+                self.emit_checkbox(id, rect, *checked, widget, list)
+            }
             WidgetKind::TextInput(_) => self.emit_text_input(id, rect, widget, list),
             WidgetKind::Image(handle) => list.commands.push(DrawCommand::Image {
                 rect,
@@ -1757,26 +1787,54 @@ impl Ui {
     }
 
     /// A checkbox: a state-shaded box, with an inset accent square when checked.
-    fn emit_checkbox(&self, id: WidgetId, rect: Rect, checked: bool, list: &mut DrawList) {
+    fn emit_checkbox(
+        &self,
+        id: WidgetId,
+        rect: Rect,
+        checked: bool,
+        widget: &Widget,
+        list: &mut DrawList,
+    ) {
         let box_color = match self.interaction(id) {
             Interaction::Idle => self.theme.checkbox_box,
             Interaction::Hovered => self.theme.checkbox_box.lighten(0.12),
             Interaction::Pressed => self.theme.checkbox_box.darken(0.10),
         };
-        self.fill_widget_bg(id, rect, box_color, list);
-        // When checked, draw the check glyph centered in the box: horizontally
-        // by its advance, vertically by the box height (the glyph's line box was
-        // sized to the box in measure, so the font's metrics center it).
+        // A fixed, slightly-rounded square box at the left, vertically centered
+        // in the widget's rect (which may be taller when it stretches in a row) -
+        // so the box always reads square, not stretched.
+        let size = theme::CHECKBOX_SIZE;
+        let box_rect = Rect::new(
+            Vec2::new(rect.pos.x, rect.pos.y + (rect.size.y - size) * 0.5),
+            Vec2::splat(size),
+        );
+        list.commands.push(DrawCommand::RoundedRect {
+            rect: box_rect,
+            color: box_color,
+            radius: theme::CHECKBOX_RADIUS,
+            border_width: 0.0,
+            border_color: Color::TRANSPARENT,
+        });
+        // The check glyph, centered in the box (from its own buffer).
         if checked
-            && let Some(buffer) = self.buffers.get(id)
+            && let Some(buffer) = self.check_buffers.get(id)
             && let Some(run) = buffer.layout_runs().next()
         {
-            let line_h = text::checkmark_metrics(theme::CHECKBOX_SIZE).line_height;
+            let line_h = text::checkmark_metrics(size).line_height;
             let origin = Vec2::new(
-                rect.pos.x + (rect.size.x - run.line_w) * 0.5,
-                rect.pos.y + (rect.size.y - line_h) * 0.5,
+                box_rect.pos.x + (size - run.line_w) * 0.5,
+                box_rect.pos.y + (size - line_h) * 0.5,
             );
             self.emit_buffer(buffer, origin, self.theme.checkbox_mark, None, list);
+        }
+        // The caption, to the right of the box, vertically centered.
+        if let Some(buffer) = self.buffers.get(id) {
+            let line_h = text::metrics_for(widget.font_size).line_height;
+            let origin = Vec2::new(
+                box_rect.max().x + theme::CHECKBOX_GAP,
+                rect.pos.y + (rect.size.y - line_h) * 0.5,
+            );
+            self.emit_buffer(buffer, origin, widget.foreground, None, list);
         }
     }
 
@@ -2112,6 +2170,7 @@ fn measure_widget(
     ctx: Option<&mut WidgetId>,
     widgets: &SlotMap<WidgetId, Widget>,
     buffers: &mut SecondaryMap<WidgetId, Buffer>,
+    check_buffers: &mut SecondaryMap<WidgetId, Buffer>,
     font_system: &mut FontSystem,
 ) -> Size<f32> {
     let Some(&mut id) = ctx else {
@@ -2119,27 +2178,50 @@ fn measure_widget(
     };
     let content = match &widgets[id].kind {
         WidgetKind::Label(t) | WidgetKind::Button(t) | WidgetKind::TextInput(t) => t.as_str(),
-        // A checkbox has a fixed intrinsic size. Shape the check glyph into its
-        // buffer (drawn only when checked, see emit_checkbox) so the tick is a
-        // real glyph rather than a filled square.
-        WidgetKind::Checkbox(_) => {
-            let metrics = text::checkmark_metrics(theme::CHECKBOX_SIZE);
-            if !buffers.contains_key(id) {
-                buffers.insert(id, Buffer::new(font_system, metrics));
+        // A checkbox is a fixed-size box plus an optional caption. Shape the
+        // check glyph into check_buffers (drawn when checked) and the caption
+        // into the main buffer; measure to box + gap + caption width.
+        WidgetKind::Checkbox { label, .. } => {
+            let box_metrics = text::checkmark_metrics(theme::CHECKBOX_SIZE);
+            if !check_buffers.contains_key(id) {
+                check_buffers.insert(id, Buffer::new(font_system, box_metrics));
             }
-            let mut borrowed = buffers[id].borrow_with(font_system);
-            borrowed.set_metrics(metrics);
-            borrowed.set_size(None, None);
-            borrowed.set_text(
-                text::CHECK_MARK,
-                &text::default_attrs(),
-                Shaping::Advanced,
-                None,
-            );
-            borrowed.shape_until_scroll(false);
+            {
+                let mut borrowed = check_buffers[id].borrow_with(font_system);
+                borrowed.set_metrics(box_metrics);
+                borrowed.set_size(None, None);
+                borrowed.set_text(
+                    text::CHECK_MARK,
+                    &text::default_attrs(),
+                    Shaping::Advanced,
+                    None,
+                );
+                borrowed.shape_until_scroll(false);
+            }
+            let mut label_w = 0.0f32;
+            let mut line_h = theme::CHECKBOX_SIZE;
+            if !label.is_empty() {
+                let metrics = text::metrics_for(widgets[id].font_size);
+                line_h = line_h.max(metrics.line_height);
+                if !buffers.contains_key(id) {
+                    buffers.insert(id, Buffer::new(font_system, metrics));
+                }
+                let mut borrowed = buffers[id].borrow_with(font_system);
+                borrowed.set_metrics(metrics);
+                borrowed.set_size(None, None);
+                borrowed.set_text(label, &text::default_attrs(), Shaping::Advanced, None);
+                borrowed.shape_until_scroll(false);
+                label_w = borrowed.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
+            }
+            let width = theme::CHECKBOX_SIZE
+                + if label_w > 0.0 {
+                    theme::CHECKBOX_GAP + label_w.ceil()
+                } else {
+                    0.0
+                };
             return Size {
-                width: theme::CHECKBOX_SIZE,
-                height: theme::CHECKBOX_SIZE,
+                width,
+                height: line_h,
             };
         }
         // Panels, images, sliders, and splitters have no intrinsic content
@@ -2673,12 +2755,12 @@ mod tests {
     fn a_checked_checkbox_draws_the_check_glyph() {
         let mut ui = Ui::new();
         let root = ui.root_panel(Style::new().size(60.0, 60.0).row());
-        let on = ui.checkbox(root, true, Style::new());
-        let off = ui.checkbox(root, false, Style::new());
+        let on = ui.checkbox(root, true, "", Style::new());
+        let off = ui.checkbox(root, false, "", Style::new());
         ui.layout(Vec2::new(60.0, 60.0)).unwrap();
 
-        // The checked box emits a check-colored Text glyph run; the box fill is
-        // a FillRect, so a Text command is unambiguously the mark.
+        // The checked box emits a check-colored Text glyph run (the box itself
+        // is a RoundedRect), so a Text command is unambiguously the mark.
         let cmds = ui.draw_list().commands;
         let mark = |c: &DrawCommand| {
             matches!(c, DrawCommand::Text { color, glyphs }
@@ -2688,6 +2770,30 @@ mod tests {
         // Sanity: exactly one mark (only the checked box), and both boxes exist.
         assert_eq!(cmds.iter().filter(|c| mark(c)).count(), 1);
         assert!(ui.rect(on).unwrap().size.x > 0.0 && ui.rect(off).unwrap().size.x > 0.0);
+    }
+
+    #[test]
+    fn clicking_a_checkbox_caption_toggles_it() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(240.0, 40.0));
+        let cb = ui.checkbox(root, false, "Show grid", Style::new());
+        ui.layout(Vec2::new(240.0, 40.0)).unwrap();
+
+        // The widget is wider than the box (box + gap + caption); click on the
+        // caption area, well to the right of the box, and it still toggles.
+        let rect = ui.rect(cb).unwrap();
+        assert!(rect.size.x > 40.0, "the caption should widen the checkbox");
+        click_at(
+            &mut ui,
+            Vec2::new(rect.max().x - 6.0, rect.pos.y + rect.size.y * 0.5),
+        );
+        assert_eq!(
+            ui.drain_events(),
+            vec![Event::Toggled {
+                id: cb,
+                checked: true
+            }]
+        );
     }
 
     #[test]
@@ -2759,7 +2865,7 @@ mod tests {
     fn clicking_a_checkbox_toggles_it_and_emits() {
         let mut ui = Ui::new();
         let root = ui.root_panel(Style::new().size(100.0, 100.0));
-        let cb = ui.checkbox(root, false, Style::new());
+        let cb = ui.checkbox(root, false, "Enabled", Style::new());
         ui.layout(Vec2::new(100.0, 100.0)).unwrap();
 
         // The checkbox has an intrinsic 18x18 box at the origin.
@@ -2771,7 +2877,10 @@ mod tests {
                 checked: true
             }]
         );
-        assert!(matches!(ui.kind(cb), WidgetKind::Checkbox(true)));
+        assert!(matches!(
+            ui.kind(cb),
+            WidgetKind::Checkbox { checked: true, .. }
+        ));
 
         click_at(&mut ui, Vec2::new(9.0, 9.0));
         assert_eq!(
@@ -2781,7 +2890,10 @@ mod tests {
                 checked: false
             }]
         );
-        assert!(matches!(ui.kind(cb), WidgetKind::Checkbox(false)));
+        assert!(matches!(
+            ui.kind(cb),
+            WidgetKind::Checkbox { checked: false, .. }
+        ));
     }
 
     #[test]

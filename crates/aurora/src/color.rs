@@ -4,7 +4,7 @@
 //! photon's, so the GUI stays independent of the engine and reusable elsewhere.
 
 /// An RGBA color with components in `0.0..=1.0`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Color {
     pub r: f32,
     pub g: f32,

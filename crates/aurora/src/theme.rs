@@ -13,7 +13,7 @@ use crate::color::Color;
 /// [`Ui::set_theme`](crate::Ui::set_theme); [`Theme::dark`] is the default and
 /// [`Theme::light`] a bundled alternative. Per-widget overrides still come from
 /// each widget's [`Style`](crate::Style).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Theme {
     /// Button fill (when a button's style sets no background).
     pub button: Color,
@@ -99,8 +99,12 @@ impl Default for Theme {
     }
 }
 
-/// The intrinsic side length of a checkbox, in pixels.
+/// The side length of a checkbox's box, in pixels.
 pub(crate) const CHECKBOX_SIZE: f32 = 18.0;
+/// The corner radius of the checkbox box (a little rounded).
+pub(crate) const CHECKBOX_RADIUS: f32 = 4.0;
+/// The gap between the checkbox box and its caption, in pixels.
+pub(crate) const CHECKBOX_GAP: f32 = 8.0;
 
 /// The smallest a splitter will resize its target down to, in pixels.
 pub(crate) const SPLITTER_MIN_TARGET: f32 = 40.0;

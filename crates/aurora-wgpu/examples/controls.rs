@@ -306,10 +306,8 @@ fn build_ui(light: bool) -> (Ui, Ids) {
     );
     let clicks_label = ui.label(button_row, "Clicks: 0", label(text).padding(8.0));
 
-    // A checkbox next to its caption.
-    let check_row = ui.panel(root, Style::new().row().gap(8.0).padding(4.0));
-    let checkbox = ui.checkbox(check_row, false, Style::new());
-    ui.label(check_row, "Show accent box", label(text).padding(2.0));
+    // A checkbox with a caption (clicking the caption toggles it too).
+    let checkbox = ui.checkbox(root, false, "Show accent box", label(text).padding(4.0));
 
     // An editable text field next to its caption. Click it and type. A
     // placeholder shows while it is empty; Tab moves between the fields.

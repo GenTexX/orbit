@@ -22,8 +22,9 @@ pub enum WidgetKind {
     Label(String),
     /// A clickable button with a text caption.
     Button(String),
-    /// A boolean toggle.
-    Checkbox(bool),
+    /// A boolean toggle: a checkable box and an optional caption beside it.
+    /// Clicking anywhere on the widget (box or caption) toggles it.
+    Checkbox { checked: bool, label: String },
     /// A single-line editable text field, holding its current text.
     TextInput(String),
     /// A registered texture (e.g. the engine's viewport), drawn to fill this
@@ -114,7 +115,7 @@ impl WidgetKind {
         matches!(
             self,
             WidgetKind::Button(_)
-                | WidgetKind::Checkbox(_)
+                | WidgetKind::Checkbox { .. }
                 | WidgetKind::TextInput(_)
                 | WidgetKind::Slider { .. }
                 | WidgetKind::Splitter { .. }

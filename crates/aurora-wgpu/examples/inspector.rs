@@ -263,10 +263,9 @@ fn build_ui() -> (Ui, Ids) {
     );
     fields.push((field_row(&mut ui, inspector, "Name", "Player"), "Player"));
 
-    // A checkbox row and a reset button.
+    // A checkbox (with a clickable caption) and a reset button.
     let visible_row = ui.panel(inspector, Style::new().row().gap(8.0).align_center());
-    let visible = ui.checkbox(visible_row, true, Style::new());
-    ui.label(visible_row, "Visible", Style::new());
+    let visible = ui.checkbox(visible_row, true, "Visible", Style::new());
 
     let reset = ui.button(
         inspector,
