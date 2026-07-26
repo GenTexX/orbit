@@ -191,8 +191,13 @@ struct State {
     /// Collapsed inspector sections per node (editor state, kept across shell
     /// rebuilds).
     inspector_collapsed: HashSet<(NodeId, InspectorSection)>,
-    /// The editor's color theme (F2 toggles dark/light).
+    /// The editor's color theme, loaded from the user's settings file and
+    /// hot-reloaded when it changes.
     theme: EditorTheme,
+    /// The settings file's mtime when the theme was last loaded, and the last
+    /// time it was polled - the theme hot-reloads when the file changes.
+    settings_mtime: Option<std::time::SystemTime>,
+    settings_poll: std::time::Instant,
     /// An in-progress reparent drag: the row being dragged and the current
     /// drop target under the cursor.
     reparent: Option<ReparentDrag>,
@@ -417,6 +422,8 @@ impl State {
             tree_collapsed: HashSet::new(),
             inspector_collapsed: HashSet::new(),
             theme,
+            settings_mtime: settings::modified(),
+            settings_poll: std::time::Instant::now(),
             reparent: None,
         })
     }
@@ -587,6 +594,28 @@ impl State {
                 }
             }
             Err(err) => tracing::error!("pick failed: {err}"),
+        }
+    }
+
+    /// Hot-reload the theme when the user's settings file changes. Polls the
+    /// file's mtime a few times a second (cheap) and rebuilds the shell if the
+    /// theme changed, so hand-edits to `settings.ron` apply live.
+    fn poll_settings(&mut self) {
+        if self.settings_poll.elapsed() < std::time::Duration::from_millis(400) {
+            return;
+        }
+        self.settings_poll = std::time::Instant::now();
+        let mtime = settings::modified();
+        if mtime == self.settings_mtime {
+            return;
+        }
+        self.settings_mtime = mtime;
+        if let Some(loaded) = settings::read()
+            && loaded.theme != self.theme
+        {
+            self.theme = loaded.theme;
+            self.dirty = true;
+            tracing::info!("reloaded theme from settings");
         }
     }
 
@@ -1314,6 +1343,7 @@ impl State {
 
     fn draw(&mut self) -> Result<()> {
         profiling::scope!("editor_frame");
+        self.poll_settings();
         self.react();
         // Whether this frame rebuilds the shell. The insertion-line overlay is
         // added post-layout onto the popup layer, so it only exists on frames

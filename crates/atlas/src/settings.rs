@@ -4,9 +4,10 @@
 //! Settings are a user-level concern, not a project one - they live in the
 //! user's config directory, never in a project. On first run the defaults are
 //! written out so the file exists and can be edited by hand; the editor reads it
-//! at startup. Editing colors there recolors the whole editor next launch.
+//! at startup and hot-reloads it (polling its mtime) so edits apply live.
 
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -35,37 +36,45 @@ fn settings_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("settings.ron"))
 }
 
-/// Load the user's settings. If the file does not exist yet, write the defaults
-/// so there is something to edit, then return them. A parse error logs a warning
-/// and falls back to the defaults (the file is left as-is for the user to fix).
-pub fn load() -> Settings {
-    let Some(path) = settings_path() else {
-        return Settings::default();
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => match ron::from_str::<Settings>(&text) {
-            Ok(settings) => settings,
-            Err(err) => {
-                tracing::warn!(
-                    "settings at {} are invalid: {err}; using defaults",
-                    path.display()
-                );
-                Settings::default()
-            }
-        },
-        Err(_) => {
-            let settings = Settings::default();
-            if let Err(err) = save(&settings) {
-                tracing::warn!(
-                    "could not write default settings to {}: {err}",
-                    path.display()
-                );
-            } else {
-                tracing::info!("wrote default settings to {}", path.display());
-            }
-            settings
+/// Read and parse the settings file, or `None` if it is missing or invalid (an
+/// invalid file logs a warning and is left as-is for the user to fix). Never
+/// writes - used for hot-reload polling.
+pub fn read() -> Option<Settings> {
+    let path = settings_path()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    match ron::from_str::<Settings>(&text) {
+        Ok(settings) => Some(settings),
+        Err(err) => {
+            tracing::warn!("settings at {} are invalid: {err}", path.display());
+            None
         }
     }
+}
+
+/// The settings file's last-modified time, if it exists (for change detection).
+pub fn modified() -> Option<SystemTime> {
+    let path = settings_path()?;
+    std::fs::metadata(&path).ok()?.modified().ok()
+}
+
+/// Load the user's settings for startup. If the file does not exist yet, write
+/// the defaults so there is something to edit, then return them. An invalid file
+/// falls back to the defaults (and is left as-is for the user to fix).
+pub fn load() -> Settings {
+    if let Some(settings) = read() {
+        return settings;
+    }
+    let settings = Settings::default();
+    // Only write defaults when the file is genuinely absent, never clobbering an
+    // invalid one the user is mid-edit on.
+    let absent = settings_path().is_some_and(|p| !p.exists());
+    if absent {
+        match save(&settings) {
+            Ok(()) => tracing::info!("wrote default settings"),
+            Err(err) => tracing::warn!("could not write default settings: {err}"),
+        }
+    }
+    settings
 }
 
 /// Write `settings` to the user's settings file (creating the config directory).
@@ -80,4 +89,27 @@ pub fn save(settings: &Settings) -> std::io::Result<()> {
     let text = ron::ser::to_string_pretty(settings, pretty)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::write(path, text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_round_trip_through_ron() {
+        let settings = Settings {
+            theme: EditorTheme::light(),
+        };
+        let pretty = ron::ser::PrettyConfig::default();
+        let text = ron::ser::to_string_pretty(&settings, pretty).unwrap();
+        let back: Settings = ron::from_str(&text).unwrap();
+        assert_eq!(back.theme, EditorTheme::light());
+    }
+
+    #[test]
+    fn an_empty_settings_file_falls_back_to_defaults() {
+        // #[serde(default)] fills the theme from EditorTheme::default() (dark).
+        let back: Settings = ron::from_str("()").unwrap();
+        assert_eq!(back.theme, EditorTheme::dark());
+    }
 }
