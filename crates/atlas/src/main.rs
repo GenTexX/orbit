@@ -39,7 +39,7 @@ use crate::ui::{
     Axis, ColorPickerView, ColorTarget, ContextMenu, DropSpot, EditorRows, EditorTheme, FieldRef,
     InspectorSection, InspectorView, MenuAction, PanelSizes, TreeView, build_color_picker,
     build_editor_ui, capture_panel_sizes, field_color, field_vec2, parse_value, resolve_drop,
-    set_field_color, set_field_vec2, with_axis,
+    set_field_color, set_field_vec2, visible_nodes, with_axis,
 };
 use crate::viewport::{Drag, EditorCamera, GizmoHit, GizmoMode};
 
@@ -49,6 +49,10 @@ use crate::viewport::{Drag, EditorCamera, GizmoHit, GizmoMode};
 const SV: usize = 150;
 const HUE_W: usize = 18;
 const ALPHA_H: usize = 16;
+
+/// Two tree-row clicks within this window count as a double-click (start a
+/// rename), matching a typical desktop double-click speed.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Which of the color picker's gradients a press is dragging.
 #[derive(Debug, Clone, Copy)]
@@ -67,6 +71,73 @@ struct ColorPicker {
     hsva: Hsva,
     anchor: Vec2,
     drag: Option<PickerDrag>,
+}
+
+/// The scene-tree selection: the nodes picked, in the order they were added,
+/// plus the shift-range anchor. The last node added is the "primary" - the one
+/// the inspector shows and the gizmo edits - so a plain click, which selects a
+/// single node, makes that node primary.
+#[derive(Debug, Clone, Default)]
+struct Selection {
+    nodes: Vec<NodeId>,
+    /// The pivot a shift-click ranges from (the last plain/ctrl click).
+    anchor: Option<NodeId>,
+}
+
+impl Selection {
+    /// The node the inspector and gizmo act on: the most recently added.
+    fn primary(&self) -> Option<NodeId> {
+        self.nodes.last().copied()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    fn contains(&self, node: NodeId) -> bool {
+        self.nodes.contains(&node)
+    }
+
+    fn as_set(&self) -> HashSet<NodeId> {
+        self.nodes.iter().copied().collect()
+    }
+
+    /// Select exactly `node` (a plain click), making it the primary and the
+    /// range anchor.
+    fn select_one(&mut self, node: NodeId) {
+        self.nodes.clear();
+        self.nodes.push(node);
+        self.anchor = Some(node);
+    }
+
+    /// Toggle `node` in the selection (a ctrl-click), moving the anchor to it.
+    fn toggle(&mut self, node: NodeId) {
+        if let Some(pos) = self.nodes.iter().position(|&n| n == node) {
+            self.nodes.remove(pos);
+        } else {
+            self.nodes.push(node);
+        }
+        self.anchor = Some(node);
+    }
+
+    /// Replace the selection with `range` (a shift-click), keeping the anchor
+    /// and making the clicked node - passed last in `range` - the primary.
+    fn select_range(&mut self, range: Vec<NodeId>) {
+        self.nodes = range;
+    }
+
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.anchor = None;
+    }
+
+    /// Drop `node` from the selection (e.g. after it is deleted).
+    fn remove(&mut self, node: NodeId) {
+        self.nodes.retain(|&n| n != node);
+        if self.anchor == Some(node) {
+            self.anchor = None;
+        }
+    }
 }
 
 /// An in-progress inspector label drag-scrub: adjusting one component of a
@@ -136,7 +207,25 @@ struct State {
     project: Project,
     project_dir: PathBuf,
     history: History,
-    selected: Option<NodeId>,
+    selection: Selection,
+    /// The node being inline-renamed in the tree, if any.
+    renaming: Option<NodeId>,
+    /// Set when a rename field was just created, so the next rebuilt shell
+    /// focuses it (and selects its text) once.
+    focus_rename: bool,
+    /// The scene-tree search text (read back from the search box each frame);
+    /// filters which nodes the tree shows.
+    tree_filter: String,
+    /// Set when the search text changed, so the rebuilt shell re-focuses the
+    /// search box at its preserved caret (it refilters, and so rebuilds, on
+    /// every keystroke).
+    refocus_filter: bool,
+    /// The node clipboard: subtrees captured by copy/cut, instantiated by
+    /// paste. Independent of the OS text clipboard.
+    node_clip: Vec<actions::NodeSubtree>,
+    /// The last tree-row click (widget and when), to detect a double-click as
+    /// two clicks on the same row in quick succession (starts a rename).
+    last_click: Option<(aurora::WidgetId, std::time::Instant)>,
     scene_target: SceneTarget,
     viewport_handle: ImageHandle,
     ui: aurora::Ui,
@@ -292,7 +381,10 @@ impl ApplicationHandler for App {
                 state.ui.set_shift(m.state().shift_key());
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if !state.handle_shortcut(&event) && !state.handle_mode_key(&event) {
+                if !state.handle_shortcut(&event)
+                    && !state.handle_editor_key(&event)
+                    && !state.handle_mode_key(&event)
+                {
                     for ev in translate_key(&event, state.modifiers.control_key()) {
                         state.ui.handle_input(ev);
                     }
@@ -370,6 +462,7 @@ impl State {
         let theme = settings::load().theme;
         let (ui, rows) = build_editor_ui(
             &project.scene,
+            &HashSet::new(),
             None,
             viewport_handle,
             &project_dir,
@@ -378,6 +471,8 @@ impl State {
             GizmoMode::default(),
             Some(&icons),
             &TreeView::default(),
+            "",
+            None,
             &InspectorView::default(),
             &theme,
         );
@@ -391,7 +486,13 @@ impl State {
             project,
             project_dir,
             history: History::new(),
-            selected: None,
+            selection: Selection::default(),
+            renaming: None,
+            focus_rename: false,
+            tree_filter: String::new(),
+            refocus_filter: false,
+            node_clip: Vec::new(),
+            last_click: None,
             scene_target,
             viewport_handle,
             ui,
@@ -496,7 +597,7 @@ impl State {
 
         // Gizmo handles first: they float outside the sprite, so they must win
         // over picking (which only sees sprite pixels).
-        if let Some(sel) = self.selected
+        if let Some(sel) = self.selection.primary()
             && let Some(g) = viewport::gizmo(scene, sel, self.camera.zoom)
             && let Some(hit) = viewport::hit_gizmo(&g, world, self.gizmo_mode)
         {
@@ -579,8 +680,16 @@ impl State {
         );
         match picked {
             Ok(Some(index)) => {
-                let node = draws[index].node;
-                self.selected = Some(node);
+                let mut node = draws[index].node;
+                // Alt-drag duplicates: leave the original in place and drag a
+                // fresh copy (which starts exactly on top of it).
+                if self.modifiers.alt_key()
+                    && let Some(copy) =
+                        actions::duplicate_node(&mut self.project.scene, &mut self.history, node)
+                {
+                    node = copy;
+                }
+                self.selection.select_one(node);
                 self.drag = Some(Drag::Move {
                     node,
                     original: self.project.scene.node(node).transform,
@@ -589,7 +698,8 @@ impl State {
                 self.dirty = true;
             }
             Ok(None) => {
-                if self.selected.take().is_some() {
+                if !self.selection.is_empty() {
+                    self.selection.clear();
                     self.dirty = true;
                 }
             }
@@ -657,10 +767,16 @@ impl State {
         if let Some(&(_, node)) =
             hit.and_then(|id| self.rows.tree_rows.iter().find(|(w, _)| *w == id))
         {
-            self.selected = Some(node);
+            // Right-clicking a node outside the selection selects just it;
+            // right-clicking one already selected keeps the whole selection, so
+            // Duplicate/Delete act on all of it.
+            if !self.selection.contains(node) {
+                self.selection.select_one(node);
+            }
             let items = vec![
-                ("Duplicate".to_string(), MenuAction::DuplicateNode(node)),
-                ("Delete".to_string(), MenuAction::DeleteNode(node)),
+                ("Rename".to_string(), MenuAction::RenameNode(node)),
+                ("Duplicate".to_string(), MenuAction::DuplicateSelection),
+                ("Delete".to_string(), MenuAction::DeleteSelection),
             ];
             self.context_menu = Some(ContextMenu {
                 anchor: self.cursor,
@@ -709,22 +825,11 @@ impl State {
     /// Perform a context-menu action (a menu item was clicked), then close it.
     fn run_menu_action(&mut self, action: MenuAction) {
         match action {
-            MenuAction::DeleteNode(node) => {
-                if node != self.project.scene.root() {
-                    self.history.remove_node(&mut self.project.scene, node);
-                    if self.selected == Some(node) {
-                        self.selected = None;
-                    }
-                }
-            }
-            MenuAction::DuplicateNode(node) => {
-                if let Some(parent) = self.project.scene.parent(node) {
-                    let mut copy = self.project.scene.node(node).clone();
-                    copy.name = format!("{} copy", copy.name);
-                    let new = self.history.add_node(&mut self.project.scene, parent, copy);
-                    self.selected = Some(new);
-                }
-            }
+            // Delete/Duplicate act on the whole selection (open_context_menu
+            // ensures the right-clicked node is part of it).
+            MenuAction::DeleteSelection => self.delete_selection(),
+            MenuAction::DuplicateSelection => self.duplicate_selection(),
+            MenuAction::RenameNode(node) => self.start_rename(node),
             MenuAction::AddSpriteAt(world) => {
                 let node = actions::spawn_sprite(
                     &mut self.project.scene,
@@ -733,11 +838,165 @@ impl State {
                     "assets/sprite.png",
                     self.texture_size,
                 );
-                self.selected = Some(node);
+                self.selection.select_one(node);
             }
         }
         self.context_menu = None;
         self.dirty = true;
+    }
+
+    /// The selection in scene order (root first), skipping the scene root (which
+    /// cannot be deleted, duplicated, or copied). The order matters so a
+    /// multi-node op reads naturally and duplicates land in a sensible order.
+    fn actionable_selection(&self) -> Vec<NodeId> {
+        let root = self.project.scene.root();
+        visible_nodes(&self.project.scene, &self.tree_view(), "")
+            .into_iter()
+            .filter(|&n| n != root && self.selection.contains(n))
+            .collect()
+    }
+
+    /// Delete every selected node (each with its subtree), as one undo step.
+    /// The scene root is never deleted. Clears the selection afterward.
+    fn delete_selection(&mut self) {
+        let targets = self.actionable_selection();
+        if targets.is_empty() {
+            return;
+        }
+        self.cancel_rename();
+        self.history.begin_group();
+        for node in targets {
+            self.history.remove_node(&mut self.project.scene, node);
+            self.selection.remove(node);
+        }
+        self.history.end_group(&mut self.project.scene);
+        self.selection.clear();
+        self.dirty = true;
+    }
+
+    /// Deep-duplicate every selected node beside its original, as one undo step,
+    /// and select the new copies (the last becomes primary).
+    fn duplicate_selection(&mut self) {
+        let targets = self.actionable_selection();
+        if targets.is_empty() {
+            return;
+        }
+        self.cancel_rename();
+        self.history.begin_group();
+        let mut copies = Vec::new();
+        for node in targets {
+            if let Some(copy) =
+                actions::duplicate_node(&mut self.project.scene, &mut self.history, node)
+            {
+                copies.push(copy);
+            }
+        }
+        self.history.end_group(&mut self.project.scene);
+        if !copies.is_empty() {
+            self.selection.select_range(copies);
+            self.dirty = true;
+        }
+    }
+
+    /// Copy every selected subtree into the node clipboard (independent of the
+    /// OS text clipboard). A no-op if nothing (other than the root) is selected.
+    fn copy_selection(&mut self) {
+        let targets = self.actionable_selection();
+        if targets.is_empty() {
+            return;
+        }
+        self.node_clip = targets
+            .iter()
+            .map(|&n| actions::capture_subtree(&self.project.scene, n))
+            .collect();
+    }
+
+    /// Paste the node clipboard under the primary selection's parent (as a
+    /// sibling after it), or under the scene root when nothing is selected.
+    /// Selects the pasted roots. One undo step.
+    fn paste_clipboard(&mut self) {
+        if self.node_clip.is_empty() {
+            return;
+        }
+        let scene = &self.project.scene;
+        let (parent, mut index) = match self.selection.primary() {
+            Some(node) => match scene.parent(node) {
+                Some(parent) => {
+                    let after = scene.children(parent).iter().position(|&c| c == node);
+                    (
+                        parent,
+                        after.map_or(scene.children(parent).len(), |p| p + 1),
+                    )
+                }
+                None => (node, scene.children(node).len()),
+            },
+            None => {
+                let root = scene.root();
+                (root, scene.children(root).len())
+            }
+        };
+        self.cancel_rename();
+        self.history.begin_group();
+        let clip = std::mem::take(&mut self.node_clip);
+        let mut pasted = Vec::new();
+        for tree in &clip {
+            let new = actions::paste_subtree(
+                &mut self.project.scene,
+                &mut self.history,
+                tree,
+                parent,
+                index,
+            );
+            pasted.push(new);
+            index += 1;
+        }
+        self.history.end_group(&mut self.project.scene);
+        self.node_clip = clip;
+        if !pasted.is_empty() {
+            self.selection.select_range(pasted);
+            self.dirty = true;
+        }
+    }
+
+    /// Select every node in the scene (ctrl+a with no field focused).
+    fn select_all_nodes(&mut self) {
+        let all = visible_nodes(&self.project.scene, &self.tree_view(), "");
+        if !all.is_empty() {
+            self.selection.select_range(all);
+            self.dirty = true;
+        }
+    }
+
+    /// Start an inline rename of `node` (its tree row becomes an edit field,
+    /// focused and selected on the next rebuilt shell). The scene root can be
+    /// renamed like any node.
+    fn start_rename(&mut self, node: NodeId) {
+        self.selection.select_one(node);
+        self.renaming = Some(node);
+        self.focus_rename = true;
+        self.dirty = true;
+    }
+
+    /// Commit the inline rename to `name` through the history (one undo step),
+    /// then leave rename mode. Empty or whitespace-only names are rejected (the
+    /// edit is cancelled, keeping the old name).
+    fn commit_rename(&mut self, node: NodeId, name: String) {
+        let name = name.trim().to_string();
+        if !name.is_empty() {
+            self.history.set_name(&mut self.project.scene, node, name);
+        }
+        self.renaming = None;
+        self.focus_rename = false;
+        self.dirty = true;
+    }
+
+    /// Leave rename mode without committing (Escape, or a delete/paste that
+    /// supersedes it). A no-op when not renaming.
+    fn cancel_rename(&mut self) {
+        if self.renaming.take().is_some() {
+            self.focus_rename = false;
+            self.dirty = true;
+        }
     }
 
     /// Coalesce `draws` (already in paint order) into runs of consecutive
@@ -848,6 +1107,52 @@ impl State {
         self.dirty = true;
     }
 
+    /// React to a click on tree row `id` (its `node`): plain click selects just
+    /// it, ctrl-click toggles it, shift-click ranges from the anchor; a second
+    /// click on the same row in quick succession starts an inline rename.
+    fn click_tree_row(&mut self, id: aurora::WidgetId, node: NodeId) {
+        let now = std::time::Instant::now();
+        let double = self
+            .last_click
+            .is_some_and(|(w, t)| w == id && now.duration_since(t) < DOUBLE_CLICK);
+        self.last_click = Some((id, now));
+        if double {
+            self.start_rename(node);
+            return;
+        }
+        if self.modifiers.shift_key() {
+            self.select_tree_range(node);
+        } else if self.modifiers.control_key() {
+            self.selection.toggle(node);
+        } else {
+            self.selection.select_one(node);
+        }
+        self.dirty = true;
+    }
+
+    /// Select the range of visible rows between the anchor and `node` (a
+    /// shift-click), leaving the anchor fixed for a subsequent shift-click and
+    /// making `node` the primary (so the inspector follows the click).
+    fn select_tree_range(&mut self, node: NodeId) {
+        let order = visible_nodes(&self.project.scene, &self.tree_view(), &self.tree_filter);
+        let anchor = self.selection.anchor.unwrap_or(node);
+        let (Some(a), Some(b)) = (
+            order.iter().position(|&n| n == anchor),
+            order.iter().position(|&n| n == node),
+        ) else {
+            self.selection.select_one(node);
+            return;
+        };
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let mut range = order[lo..=hi].to_vec();
+        // The clicked node goes last so it becomes primary.
+        if range.last() != Some(&node) {
+            range.reverse();
+        }
+        self.selection.select_range(range);
+        self.selection.anchor = Some(anchor);
+    }
+
     /// The inspector's editor state for a rebuild: the collapsed-sections set.
     fn inspector_view(&self) -> InspectorView {
         InspectorView {
@@ -934,12 +1239,28 @@ impl State {
         let Some(drag) = self.reparent.take() else {
             return;
         };
-        if let Some(spot) = drag.target
-            && let Some((parent, index)) = resolve_drop(&self.project.scene, drag.source, spot)
-        {
+        let Some(spot) = drag.target else {
+            return;
+        };
+        if self.modifiers.alt_key() {
+            // Alt-drag drops a duplicate at the target, leaving the original in
+            // place. Duplicate first (the copy lands beside its original), then
+            // move the copy to the drop spot - one undo step for the pair.
+            self.history.begin_group();
+            if let Some(copy) =
+                actions::duplicate_node(&mut self.project.scene, &mut self.history, drag.source)
+                && let Some((parent, index)) = resolve_drop(&self.project.scene, copy, spot)
+            {
+                self.history
+                    .reparent(&mut self.project.scene, copy, parent, index);
+                self.selection.select_one(copy);
+            }
+            self.history.end_group(&mut self.project.scene);
+            self.dirty = true;
+        } else if let Some((parent, index)) = resolve_drop(&self.project.scene, drag.source, spot) {
             self.history
                 .reparent(&mut self.project.scene, drag.source, parent, index);
-            self.selected = Some(drag.source);
+            self.selection.select_one(drag.source);
             self.dirty = true;
         }
     }
@@ -1158,24 +1479,109 @@ impl State {
             self.save_project();
             return true;
         }
+        // With a text field focused, ctrl+a/c/x/v edit its text (and only text).
         if self.ui.focused().is_some() {
             return self.clipboard_shortcut(c);
         }
-        let changed = if c.eq_ignore_ascii_case("z") {
-            if self.modifiers.shift_key() {
+        // No field focused: ctrl combos act on the scene and the selection.
+        if c.eq_ignore_ascii_case("z") {
+            let changed = if self.modifiers.shift_key() {
                 self.history.redo(&mut self.project.scene)
             } else {
                 self.history.undo(&mut self.project.scene)
+            };
+            if changed {
+                self.after_history_change();
             }
-        } else if c.eq_ignore_ascii_case("y") {
-            self.history.redo(&mut self.project.scene)
-        } else {
+            return true;
+        }
+        if c.eq_ignore_ascii_case("y") {
+            if self.history.redo(&mut self.project.scene) {
+                self.after_history_change();
+            }
+            return true;
+        }
+        if c.eq_ignore_ascii_case("d") {
+            self.duplicate_selection();
+            return true;
+        }
+        if c.eq_ignore_ascii_case("c") {
+            self.copy_selection();
+            return true;
+        }
+        if c.eq_ignore_ascii_case("x") {
+            self.copy_selection();
+            self.delete_selection();
+            return true;
+        }
+        if c.eq_ignore_ascii_case("v") {
+            self.paste_clipboard();
+            return true;
+        }
+        if c.eq_ignore_ascii_case("a") {
+            self.select_all_nodes();
+            return true;
+        }
+        false
+    }
+
+    /// Named keys that drive editor commands: Delete removes the selection, F2
+    /// renames the primary, Escape cancels a rename or clears the selection.
+    /// Returns whether the key was handled (so it is not also typed into a
+    /// focused field). While a field is focused the keys keep their text-editing
+    /// meaning - except Escape, which still cancels an in-progress rename.
+    fn handle_editor_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        let WinitKey::Named(named) = &event.logical_key else {
             return false;
         };
-        if changed {
-            self.dirty = true;
+        match named {
+            NamedKey::Escape => {
+                if self.renaming.is_some() {
+                    self.cancel_rename();
+                    return true;
+                }
+                if self.ui.focused().is_some() {
+                    return false;
+                }
+                if !self.selection.is_empty() {
+                    self.selection.clear();
+                    self.dirty = true;
+                }
+                true
+            }
+            NamedKey::Delete if self.ui.focused().is_none() => {
+                self.delete_selection();
+                true
+            }
+            NamedKey::F2 if self.ui.focused().is_none() => {
+                if let Some(node) = self.selection.primary() {
+                    self.start_rename(node);
+                }
+                true
+            }
+            _ => false,
         }
-        true
+    }
+
+    /// After an undo/redo: leave any rename, drop selected nodes the edit
+    /// detached from the tree, and rebuild the shell.
+    fn after_history_change(&mut self) {
+        self.cancel_rename();
+        let scene = &self.project.scene;
+        let root = scene.root();
+        // A detached node (undone add) has no parent; only the root legitimately
+        // has none, so this keeps just the nodes still in the tree.
+        self.selection
+            .nodes
+            .retain(|&n| n == root || scene.parent(n).is_some());
+        if self
+            .selection
+            .anchor
+            .is_some_and(|a| !self.selection.contains(a))
+        {
+            self.selection.anchor = self.selection.primary();
+        }
+        self.dirty = true;
     }
 
     /// ctrl+a/c/x/v on the focused text field, backed by the OS clipboard.
@@ -1242,7 +1648,7 @@ impl State {
             &path,
             self.texture_size,
         );
-        self.selected = Some(node);
+        self.selection.select_one(node);
         self.dirty = true;
     }
 
@@ -1259,7 +1665,7 @@ impl State {
             "assets/sprite.png",
             self.texture_size,
         );
-        self.selected = Some(node);
+        self.selection.select_one(node);
         self.dirty = true;
     }
 
@@ -1278,7 +1684,10 @@ impl State {
             Ok(project) => {
                 self.project = project;
                 self.history = History::new();
-                self.selected = None;
+                self.selection.clear();
+                self.renaming = None;
+                self.tree_filter.clear();
+                self.node_clip.clear();
                 self.dirty = true;
                 tracing::info!("project loaded from {}", self.project_dir.display());
             }
@@ -1317,15 +1726,34 @@ impl State {
         });
     }
 
+    /// Read the search box's live text back into `tree_filter`; when it changed,
+    /// mark the shell dirty (to refilter the tree) and remember to re-focus the
+    /// box at its caret after the rebuild.
+    fn sync_tree_filter(&mut self) {
+        let Some(field) = self.rows.tree_filter else {
+            return;
+        };
+        if let WidgetKind::TextInput(text) = self.ui.kind(field)
+            && *text != self.tree_filter
+        {
+            self.tree_filter = text.clone();
+            self.refocus_filter = true;
+            self.dirty = true;
+        }
+    }
+
     /// Refresh the status bar readouts in place (no shell rebuild).
     fn update_status_bar(&mut self) {
         let cursor = match (self.over_viewport(), self.cursor_world()) {
             (true, Some(w)) => format!("x {:.0}, y {:.0}", w.x, w.y),
             _ => "x -, y -".to_string(),
         };
-        let selected = match self.selected {
-            Some(node) => self.project.scene.node(node).name.clone(),
-            None => "nothing selected".to_string(),
+        let selected = match (self.selection.nodes.len(), self.selection.primary()) {
+            (0, _) | (_, None) => "nothing selected".to_string(),
+            (1, Some(node)) => self.project.scene.node(node).name.clone(),
+            (n, Some(node)) => {
+                format!("{} +{} more", self.project.scene.node(node).name, n - 1)
+            }
         };
         let zoom = format!("zoom {:.0}%", self.camera.zoom * 100.0);
         let fps = format!("{:.0} fps", self.last_fps);
@@ -1345,6 +1773,7 @@ impl State {
         profiling::scope!("editor_frame");
         self.poll_settings();
         self.react();
+        self.sync_tree_filter();
         // Whether this frame rebuilds the shell. The insertion-line overlay is
         // added post-layout onto the popup layer, so it only exists on frames
         // that (re)build - on still frames the previous frame's line persists
@@ -1354,13 +1783,18 @@ impl State {
         // click's selection and making the held-still insertion line flicker.
         let rebuilt = self.dirty;
         if self.dirty {
+            // Capture the search box's caret before discarding the old Ui, so it
+            // can be restored after the rebuild (the box refilters, and so
+            // rebuilds, on every keystroke - see refocus_filter below).
+            let filter_caret = self.ui.caret_offset();
             // Splitter drags live only in the widget tree; read the panels'
             // current sizes back before discarding it, or a rebuild would snap
             // every panel to its default (a real bug the first time).
             self.panel_sizes = capture_panel_sizes(&self.ui, &self.rows, self.panel_sizes);
             let (ui, rows) = build_editor_ui(
                 &self.project.scene,
-                self.selected,
+                &self.selection.as_set(),
+                self.selection.primary(),
                 self.viewport_handle,
                 &self.project_dir,
                 self.panel_sizes,
@@ -1368,6 +1802,8 @@ impl State {
                 self.gizmo_mode,
                 Some(&self.icons),
                 &self.tree_view(),
+                &self.tree_filter,
+                self.renaming,
                 &self.inspector_view(),
                 &self.theme,
             );
@@ -1392,6 +1828,23 @@ impl State {
             // same spot again, e.g. an eye toggle) survives the rebuild without
             // the user having to nudge the mouse first.
             self.ui.set_cursor(self.cursor);
+            // Focus an inline rename field the moment it appears, selecting its
+            // text so the first keystroke replaces the old name.
+            if self.focus_rename
+                && let Some((field, _)) = self.rows.rename_field
+            {
+                self.ui.focus(field);
+                self.focus_rename = false;
+            }
+            // Restore focus to the search box at its preserved caret, so typing
+            // a query is not interrupted by the per-keystroke rebuild.
+            if self.refocus_filter
+                && let Some(field) = self.rows.tree_filter
+            {
+                let offset = filter_caret.unwrap_or(self.tree_filter.len());
+                self.ui.focus_caret(field, offset);
+                self.refocus_filter = false;
+            }
         }
 
         self.apply_cursor();
@@ -1460,7 +1913,7 @@ impl State {
         {
             overlay.push(guide);
         }
-        if let Some(sel) = self.selected
+        if let Some(sel) = self.selection.primary()
             && let Some(g) = viewport::gizmo(&self.project.scene, sel, self.camera.zoom)
         {
             overlay.extend(viewport::gizmo_sprites(
@@ -1568,8 +2021,8 @@ impl State {
                         .find(|(w, _)| *w == id)
                         .map(|(_, s)| *s)
                         .expect("guarded by the match arm");
-                    // Sections belong to the selected node (the only one shown).
-                    if let Some(node) = self.selected {
+                    // Sections belong to the primary node (the only one shown).
+                    if let Some(node) = self.selection.primary() {
                         self.toggle_section(node, section);
                     }
                 }
@@ -1577,11 +2030,21 @@ impl State {
                     if let Some(&(_, node)) =
                         self.rows.tree_rows.iter().find(|(widget, _)| *widget == id)
                     {
-                        self.selected = Some(node);
-                        self.dirty = true;
+                        self.click_tree_row(id, node);
                     }
                 }
                 AuroraEvent::Submitted(id) => {
+                    // A finished inline rename commits first (before the field
+                    // helpers, which would not recognize the rename widget).
+                    if let Some((field, node)) = self.rows.rename_field
+                        && field == id
+                    {
+                        if let WidgetKind::TextInput(text) = self.ui.kind(id) {
+                            let text = text.clone();
+                            self.commit_rename(node, text);
+                        }
+                        continue;
+                    }
                     self.commit_field(id);
                     self.commit_transform_field(id);
                     self.commit_vec_input(id);

@@ -282,6 +282,11 @@ pub struct EditorRows {
     pub tree_rows: Vec<(WidgetId, NodeId)>,
     /// A clicked disclosure triangle collapses/expands this node.
     pub tree_toggles: Vec<(WidgetId, NodeId)>,
+    /// The scene-tree search box; its live text filters the tree by name.
+    pub tree_filter: Option<WidgetId>,
+    /// The inline rename field (a text input over a tree row) and the node it
+    /// renames, present only while a rename is in progress.
+    pub rename_field: Option<(WidgetId, NodeId)>,
     /// A clicked eye icon toggles this node's visibility.
     pub eye_toggles: Vec<(WidgetId, NodeId)>,
     /// A clicked inspector section header collapses/expands that section.
@@ -339,10 +344,12 @@ pub struct EditorRows {
 /// An action offered by a right-click context menu (built on Aurora popups).
 #[derive(Debug, Clone, Copy)]
 pub enum MenuAction {
-    /// Delete this node (and, since delete detaches, its subtree with it).
-    DeleteNode(NodeId),
-    /// Add a childless copy of this node beside it.
-    DuplicateNode(NodeId),
+    /// Delete the current selection (all selected nodes, with their subtrees).
+    DeleteSelection,
+    /// Deep-copy the current selection, each new subtree beside its original.
+    DuplicateSelection,
+    /// Start an inline rename of this node.
+    RenameNode(NodeId),
     /// Spawn a new sprite at this world position (viewport menu).
     AddSpriteAt(Vec2),
 }
@@ -409,7 +416,8 @@ pub fn capture_panel_sizes(ui: &Ui, rows: &EditorRows, prior: PanelSizes) -> Pan
 #[allow(clippy::too_many_arguments)]
 pub fn build_editor_ui(
     scene: &Scene,
-    selected: Option<NodeId>,
+    selected: &HashSet<NodeId>,
+    primary: Option<NodeId>,
     viewport_handle: ImageHandle,
     project_dir: &Path,
     sizes: PanelSizes,
@@ -417,6 +425,8 @@ pub fn build_editor_ui(
     gizmo_mode: GizmoMode,
     icons: Option<&Icons>,
     tree: &TreeView,
+    filter: &str,
+    renaming: Option<NodeId>,
     inspector: &InspectorView,
     theme: &EditorTheme,
 ) -> (Ui, EditorRows) {
@@ -437,8 +447,11 @@ pub fn build_editor_ui(
         main,
         scene,
         selected,
+        primary,
         sizes.tree_width,
         tree,
+        filter,
+        renaming,
         icons,
         theme,
         &mut rows,
@@ -477,7 +490,7 @@ pub fn build_editor_ui(
         &mut ui,
         main,
         scene,
-        selected,
+        primary,
         sizes.inspector_width,
         icons,
         inspector,
@@ -727,9 +740,12 @@ fn build_scene_tree(
     ui: &mut Ui,
     parent: WidgetId,
     scene: &Scene,
-    selected: Option<NodeId>,
+    selected: &HashSet<NodeId>,
+    primary: Option<NodeId>,
     width: f32,
     tree: &TreeView,
+    filter: &str,
+    renaming: Option<NodeId>,
     icons: Option<&Icons>,
     theme: &EditorTheme,
     rows: &mut EditorRows,
@@ -752,19 +768,84 @@ fn build_scene_tree(
             .font_size(PANEL_TITLE)
             .bold(),
     );
-    add_tree_row(
-        ui,
+    // A search box: its live text (read back by the app each frame) filters the
+    // tree to nodes whose name matches, keeping their ancestors for context.
+    let search = ui.text_input(
         panel,
-        scene,
-        scene.root(),
-        0,
+        filter,
+        Style::new()
+            .foreground(theme.heading)
+            .padding(5.0)
+            .corner_radius(4.0)
+            .border(1.0, theme.row_selected)
+            .placeholder("Search..."),
+    );
+    rows.tree_filter = Some(search);
+
+    let query = filter.trim().to_lowercase();
+    let ctx = TreeCtx {
         selected,
+        primary,
         tree,
+        query: &query,
+        renaming,
         icons,
         theme,
-        rows,
-    );
+    };
+    add_tree_row(ui, panel, scene, scene.root(), 0, &ctx, rows);
     panel
+}
+
+/// Whether `node` or any of its descendants has `query` (already lowercased) in
+/// its name. An empty query matches everything. Drives the search filter: a
+/// non-matching node is still shown when a descendant matches, so the path to a
+/// match stays visible.
+pub fn subtree_matches(scene: &Scene, node: NodeId, query: &str) -> bool {
+    if query.is_empty() || scene.node(node).name.to_lowercase().contains(query) {
+        return true;
+    }
+    scene
+        .children(node)
+        .iter()
+        .any(|&c| subtree_matches(scene, c, query))
+}
+
+/// The nodes the tree shows, top to bottom, honoring collapse and the search
+/// filter (`filter` is matched case-insensitively). This is the exact order the
+/// tree lays rows out in, so it is what shift-click range selection walks.
+pub fn visible_nodes(scene: &Scene, tree: &TreeView, filter: &str) -> Vec<NodeId> {
+    fn walk(scene: &Scene, node: NodeId, tree: &TreeView, query: &str, out: &mut Vec<NodeId>) {
+        out.push(node);
+        let filtering = !query.is_empty();
+        let collapsed = !filtering && tree.collapsed.contains(&node);
+        if collapsed {
+            return;
+        }
+        for &child in scene.children(node) {
+            if filtering && !subtree_matches(scene, child, query) {
+                continue;
+            }
+            walk(scene, child, tree, query, out);
+        }
+    }
+    let query = filter.trim().to_lowercase();
+    let mut out = Vec::new();
+    walk(scene, scene.root(), tree, &query, &mut out);
+    out
+}
+
+/// The read-only tree state `add_tree_row` needs, bundled so the recursion
+/// passes one reference instead of a long argument list.
+struct TreeCtx<'a> {
+    selected: &'a HashSet<NodeId>,
+    primary: Option<NodeId>,
+    tree: &'a TreeView,
+    /// The lowercased search query (empty when not filtering).
+    query: &'a str,
+    /// The node being inline-renamed, if any (its row shows an edit field).
+    renaming: Option<NodeId>,
+    icons: Option<&'a Icons>,
+    theme: &'a EditorTheme,
 }
 
 /// The width of a disclosure column / indent step, and the chevron glyph size.
@@ -777,24 +858,24 @@ const TREE_ROW_GAP: f32 = 1.0;
 /// wider column, so it reads clearly.
 const TREE_EYE: f32 = 18.0;
 
-#[allow(clippy::too_many_arguments)]
 fn add_tree_row(
     ui: &mut Ui,
     parent: WidgetId,
     scene: &Scene,
     node: NodeId,
     depth: u32,
-    selected: Option<NodeId>,
-    tree: &TreeView,
-    icons: Option<&Icons>,
-    theme: &EditorTheme,
+    ctx: &TreeCtx,
     rows: &mut EditorRows,
 ) {
-    // Selected wins the highlight; an Into-drop target tints green.
-    let background = if selected == Some(node) {
-        theme.row_selected
-    } else if tree.drop_target == Some(DropSpot::Into(node)) {
+    let theme = ctx.theme;
+    // Any selected node is highlighted; the primary (the one the inspector
+    // shows) reads a touch brighter. An Into-drop target tints green over both.
+    let background = if ctx.tree.drop_target == Some(DropSpot::Into(node)) {
         theme.row_drop
+    } else if ctx.primary == Some(node) {
+        theme.row_selected.lighten(0.12)
+    } else if ctx.selected.contains(&node) {
+        theme.row_selected
     } else {
         Color::TRANSPARENT
     };
@@ -817,7 +898,9 @@ fn add_tree_row(
         ui.panel(row, Style::new().width(depth as f32 * TREE_DISCLOSURE));
     }
     let has_children = !scene.children(node).is_empty();
-    let collapsed = tree.collapsed.contains(&node);
+    // While a search is active the tree is force-expanded so matches show.
+    let filtering = !ctx.query.is_empty();
+    let collapsed = !filtering && ctx.tree.collapsed.contains(&node);
     if has_children {
         // A flat button holding the disclosure triangle; clicking it toggles
         // collapse. The chevron image is decoration (present when icons are).
@@ -826,7 +909,7 @@ fn add_tree_row(
             "",
             Style::new().flat().padding(1.0).width(TREE_DISCLOSURE),
         );
-        if let Some(icons) = icons {
+        if let Some(icons) = ctx.icons {
             let chevron = if collapsed {
                 icons.get(Icon::ChevronRight)
             } else {
@@ -842,17 +925,32 @@ fn add_tree_row(
     } else {
         ui.panel(row, Style::new().width(TREE_DISCLOSURE));
     }
-    // A hidden node's name is muted, so the tree reads its state at a glance.
+    // While renaming this node, its name is an inline edit field; otherwise a
+    // label (a hidden node's name is muted, so the tree reads its state).
     let visible = scene.node(node).visible;
-    ui.label(
-        row,
-        scene.node(node).name.clone(),
-        Style::new().grow(1.0).ellipsis().foreground(if visible {
-            theme.heading
-        } else {
-            theme.subhead
-        }),
-    );
+    if ctx.renaming == Some(node) {
+        let field = ui.text_input(
+            row,
+            scene.node(node).name.clone(),
+            Style::new()
+                .grow(1.0)
+                .padding(1.0)
+                .foreground(theme.heading)
+                .corner_radius(3.0)
+                .border(1.0, theme.row_selected.lighten(0.2)),
+        );
+        rows.rename_field = Some((field, node));
+    } else {
+        ui.label(
+            row,
+            scene.node(node).name.clone(),
+            Style::new().grow(1.0).ellipsis().foreground(if visible {
+                theme.heading
+            } else {
+                theme.subhead
+            }),
+        );
+    }
     // An eye toggle at the row's right edge: open when visible, struck through
     // when hidden. Clicking it toggles visibility (it does not select the row,
     // being its own interactive child).
@@ -865,7 +963,7 @@ fn add_tree_row(
             .padding(2.0)
             .width(TREE_EYE + 6.0),
     );
-    if let Some(icons) = icons {
+    if let Some(icons) = ctx.icons {
         let glyph = if visible { Icon::Eye } else { Icon::EyeOff };
         ui.image(eye, icons.get(glyph), Style::new().size(TREE_EYE, TREE_EYE));
     }
@@ -874,18 +972,11 @@ fn add_tree_row(
 
     if has_children && !collapsed {
         for &child in scene.children(node) {
-            add_tree_row(
-                ui,
-                parent,
-                scene,
-                child,
-                depth + 1,
-                selected,
-                tree,
-                icons,
-                theme,
-                rows,
-            );
+            // Under a search, skip whole branches with no match inside them.
+            if filtering && !subtree_matches(scene, child, ctx.query) {
+                continue;
+            }
+            add_tree_row(ui, parent, scene, child, depth + 1, ctx, rows);
         }
     }
 }
@@ -1319,6 +1410,42 @@ mod tests {
     use super::*;
     use helios::{Component, Node, SpriteComponent, Transform};
 
+    /// Build the shell the way the tests did before multi-select: a single
+    /// optional selection, no search filter, no rename in progress. Keeps the
+    /// test call sites terse while exercising the real `build_editor_ui`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_editor_ui_test(
+        scene: &Scene,
+        selected: Option<NodeId>,
+        viewport_handle: ImageHandle,
+        project_dir: &Path,
+        sizes: PanelSizes,
+        menu: Option<&ContextMenu>,
+        gizmo_mode: GizmoMode,
+        icons: Option<&Icons>,
+        tree: &TreeView,
+        inspector: &InspectorView,
+        theme: &EditorTheme,
+    ) -> (Ui, EditorRows) {
+        let set: HashSet<NodeId> = selected.into_iter().collect();
+        build_editor_ui(
+            scene,
+            &set,
+            selected,
+            viewport_handle,
+            project_dir,
+            sizes,
+            menu,
+            gizmo_mode,
+            icons,
+            tree,
+            "",
+            None,
+            inspector,
+            theme,
+        )
+    }
+
     fn demo_scene() -> (Scene, ImageHandle) {
         let mut scene = Scene::new("Root");
         let root = scene.root();
@@ -1333,6 +1460,42 @@ mod tests {
         let mut registry: slotmap::SlotMap<ImageHandle, ()> = slotmap::SlotMap::with_key();
         let handle = registry.insert(());
         (scene, handle)
+    }
+
+    #[test]
+    fn visible_nodes_honors_collapse_and_the_search_filter() {
+        // Root -> [Alpha -> [Beta], Gamma]
+        let mut scene = Scene::new("Root");
+        let root = scene.root();
+        let alpha = scene.add_child(root, Node::new("Alpha"));
+        let beta = scene.add_child(alpha, Node::new("Beta"));
+        let gamma = scene.add_child(root, Node::new("Gamma"));
+
+        // Fully expanded, no filter: every node, in depth-first order.
+        let all = visible_nodes(&scene, &TreeView::default(), "");
+        assert_eq!(all, vec![root, alpha, beta, gamma]);
+
+        // Collapsing Alpha hides Beta but not Gamma.
+        let mut collapsed = HashSet::new();
+        collapsed.insert(alpha);
+        let view = TreeView {
+            collapsed,
+            drop_target: None,
+        };
+        assert_eq!(visible_nodes(&scene, &view, ""), vec![root, alpha, gamma]);
+
+        // A search for "beta" keeps Beta and its ancestors (Root, Alpha) for
+        // context, drops the non-matching Gamma, and ignores the collapse.
+        assert_eq!(
+            visible_nodes(&scene, &view, "beta"),
+            vec![root, alpha, beta]
+        );
+        // Case-insensitive. A match shows its ancestors for context but not its
+        // non-matching descendants, so "alpha" shows Root and Alpha, not Beta.
+        assert_eq!(
+            visible_nodes(&scene, &TreeView::default(), "ALPHA"),
+            vec![root, alpha]
+        );
     }
 
     #[test]
@@ -1384,7 +1547,7 @@ mod tests {
         let dir = std::env::temp_dir();
 
         let build = |tree: &TreeView| {
-            build_editor_ui(
+            build_editor_ui_test(
                 &scene,
                 None,
                 handle,
@@ -1426,7 +1589,7 @@ mod tests {
         let (scene, handle) = demo_scene();
         let dir = std::env::temp_dir();
         let build = |theme: &EditorTheme| {
-            let (mut ui, _) = build_editor_ui(
+            let (mut ui, _) = build_editor_ui_test(
                 &scene,
                 None,
                 handle,
@@ -1463,7 +1626,7 @@ mod tests {
         let mut reg: slotmap::SlotMap<ImageHandle, ()> = slotmap::SlotMap::with_key();
         let handle = reg.insert(());
         let dir = std::env::temp_dir();
-        let (_, rows) = build_editor_ui(
+        let (_, rows) = build_editor_ui_test(
             &scene,
             None,
             handle,
@@ -1488,7 +1651,7 @@ mod tests {
         let sprite = scene.children(scene.root())[0];
         let dir = std::env::temp_dir();
         let build = |inspector: &InspectorView| {
-            build_editor_ui(
+            build_editor_ui_test(
                 &scene,
                 Some(sprite),
                 handle,
@@ -1553,7 +1716,7 @@ mod tests {
         let (scene, handle) = demo_scene();
         let sprite = scene.children(scene.root())[0];
         let dir = std::env::temp_dir();
-        let (mut ui, rows) = build_editor_ui(
+        let (mut ui, rows) = build_editor_ui_test(
             &scene,
             None,
             handle,
@@ -1591,7 +1754,7 @@ mod tests {
         let (scene, handle) = demo_scene();
         let node = scene.children(scene.root())[0];
         let dir = std::env::temp_dir();
-        let (_ui, rows) = build_editor_ui(
+        let (_ui, rows) = build_editor_ui_test(
             &scene,
             Some(node),
             handle,
@@ -1641,7 +1804,7 @@ mod tests {
         let dir = std::env::temp_dir(); // no project files needed for this test
 
         let sizes = PanelSizes::default();
-        let (mut ui, rows) = build_editor_ui(
+        let (mut ui, rows) = build_editor_ui_test(
             &scene,
             None,
             handle,
@@ -1674,7 +1837,7 @@ mod tests {
         // Rebuild the shell (what a tree-row click triggers) with captured sizes.
         let captured = capture_panel_sizes(&ui, &rows, sizes);
         assert_eq!(captured.tree_width, sizes.tree_width + 50.0);
-        let (mut ui2, rows2) = build_editor_ui(
+        let (mut ui2, rows2) = build_editor_ui_test(
             &scene,
             None,
             handle,
@@ -1699,7 +1862,7 @@ mod tests {
     fn the_toolbar_records_mode_buttons_and_highlights_the_active_one() {
         let (scene, handle) = demo_scene();
         let dir = std::env::temp_dir();
-        let (mut ui, rows) = build_editor_ui(
+        let (mut ui, rows) = build_editor_ui_test(
             &scene,
             None,
             handle,
@@ -1737,15 +1900,14 @@ mod tests {
     fn a_context_menu_builds_a_popup_of_action_items() {
         let (scene, handle) = demo_scene();
         let dir = std::env::temp_dir();
-        let node = scene.children(scene.root())[0];
         let menu = ContextMenu {
             anchor: Vec2::new(300.0, 200.0),
             items: vec![
-                ("Duplicate".to_string(), MenuAction::DuplicateNode(node)),
-                ("Delete".to_string(), MenuAction::DeleteNode(node)),
+                ("Duplicate".to_string(), MenuAction::DuplicateSelection),
+                ("Delete".to_string(), MenuAction::DeleteSelection),
             ],
         };
-        let (mut ui, rows) = build_editor_ui(
+        let (mut ui, rows) = build_editor_ui_test(
             &scene,
             None,
             handle,
@@ -1780,7 +1942,7 @@ mod tests {
         let (scene, handle) = demo_scene();
         let node = scene.children(scene.root())[0];
         let dir = std::env::temp_dir();
-        let (_ui, rows) = build_editor_ui(
+        let (_ui, rows) = build_editor_ui_test(
             &scene,
             Some(node),
             handle,
@@ -1835,7 +1997,7 @@ mod tests {
         let dir = std::env::temp_dir();
 
         let sizes = PanelSizes::default();
-        let (mut ui, rows) = build_editor_ui(
+        let (mut ui, rows) = build_editor_ui_test(
             &scene,
             None,
             handle,
@@ -1861,7 +2023,7 @@ mod tests {
         // Rebuild with captured state: the offset carries over.
         let captured = capture_panel_sizes(&ui, &rows, sizes);
         assert_eq!(captured.tree_scroll, 90.0);
-        let (mut ui2, rows2) = build_editor_ui(
+        let (mut ui2, rows2) = build_editor_ui_test(
             &scene,
             None,
             handle,
@@ -1887,7 +2049,7 @@ mod tests {
         let (scene, handle) = demo_scene();
         let dir = std::env::temp_dir();
 
-        let (mut ui, rows) = build_editor_ui(
+        let (mut ui, rows) = build_editor_ui_test(
             &scene,
             None,
             handle,

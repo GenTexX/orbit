@@ -35,9 +35,158 @@ pub fn spawn_sprite(
     history.add_node(scene, root, node)
 }
 
+/// Deep-clone the subtree rooted at `src` as a new sibling right after it,
+/// through the history as one undo step (the whole subtree, plus the " copy"
+/// rename of the new root). Returns the new root, or `None` for the scene root
+/// (which has no parent to be a sibling of).
+pub fn duplicate_node(scene: &mut Scene, history: &mut History, src: NodeId) -> Option<NodeId> {
+    let parent = scene.parent(src)?;
+    let index = scene.children(parent).iter().position(|&c| c == src)? + 1;
+    history.begin_group();
+    let new = clone_into(scene, history, src, parent, index);
+    let name = format!("{} copy", scene.node(new).name);
+    history.set_name(scene, new, name);
+    history.end_group(scene);
+    Some(new)
+}
+
+/// Recursively clone the subtree at `src` under `parent` at `index`, creating a
+/// fresh node for each (new handles, same names/transforms/components), and
+/// return the new subtree root. Each link is an edit on the open history group.
+fn clone_into(
+    scene: &mut Scene,
+    history: &mut History,
+    src: NodeId,
+    parent: NodeId,
+    index: usize,
+) -> NodeId {
+    // Clone the node's data; `insert_detached` (via `add_node_at`) drops the
+    // stale parent/child handles, and we rebuild the children as we recurse.
+    let node = scene.node(src).clone();
+    let children = scene.children(src).to_vec();
+    let new = history.add_node_at(scene, parent, node, index);
+    for child in children {
+        let at = scene.children(new).len();
+        clone_into(scene, history, child, new, at);
+    }
+    new
+}
+
+/// A detached copy of a node and its subtree, independent of any scene - the
+/// unit the editor's node clipboard holds so copy/paste survives across scene
+/// edits (and, unlike a bare `NodeId`, refers to no live node).
+#[derive(Debug, Clone)]
+pub struct NodeSubtree {
+    node: Node,
+    children: Vec<NodeSubtree>,
+}
+
+/// Capture the subtree rooted at `src` into a detached [`NodeSubtree`] (for the
+/// node clipboard). Copies names, transforms, and components; drops the live
+/// parent/child handles, which [`paste_subtree`] rebuilds.
+pub fn capture_subtree(scene: &Scene, src: NodeId) -> NodeSubtree {
+    let node = scene.node(src).clone();
+    let children = scene
+        .children(src)
+        .iter()
+        .map(|&c| capture_subtree(scene, c))
+        .collect();
+    NodeSubtree { node, children }
+}
+
+/// Instantiate a captured [`NodeSubtree`] under `parent` at `index`, through the
+/// history as one undo step. Returns the new subtree root.
+pub fn paste_subtree(
+    scene: &mut Scene,
+    history: &mut History,
+    tree: &NodeSubtree,
+    parent: NodeId,
+    index: usize,
+) -> NodeId {
+    history.begin_group();
+    let new = instantiate(scene, history, tree, parent, index);
+    history.end_group(scene);
+    new
+}
+
+fn instantiate(
+    scene: &mut Scene,
+    history: &mut History,
+    tree: &NodeSubtree,
+    parent: NodeId,
+    index: usize,
+) -> NodeId {
+    let new = history.add_node_at(scene, parent, tree.node.clone(), index);
+    for child in &tree.children {
+        let at = scene.children(new).len();
+        instantiate(scene, history, child, new, at);
+    }
+    new
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A root with `parent -> child -> grandchild`, for the subtree tests.
+    fn nested_scene() -> (Scene, History, NodeId) {
+        let mut scene = Scene::new("Root");
+        let mut history = History::new();
+        let root = scene.root();
+        let parent = history.add_node(&mut scene, root, Node::new("Parent"));
+        let child = history.add_node(&mut scene, parent, Node::new("Child"));
+        history.add_node(&mut scene, child, Node::new("Grandchild"));
+        (scene, history, parent)
+    }
+
+    #[test]
+    fn duplicate_deep_clones_the_subtree_beside_the_original() {
+        let (mut scene, mut history, parent) = nested_scene();
+        let root = scene.root();
+
+        let copy = duplicate_node(&mut scene, &mut history, parent).unwrap();
+        // The copy lands right after the original, as a new sibling.
+        assert_eq!(scene.children(root), &[parent, copy]);
+        assert_eq!(scene.node(copy).name, "Parent copy");
+        // Fresh handles all the way down, but the same shape.
+        let orig_child = scene.children(parent)[0];
+        let copy_child = scene.children(copy)[0];
+        assert_ne!(orig_child, copy_child);
+        assert_eq!(scene.node(copy_child).name, "Child");
+        assert_eq!(scene.children(copy_child).len(), 1);
+        assert_eq!(scene.node(scene.children(copy_child)[0]).name, "Grandchild");
+
+        // The whole duplicate is one undo step.
+        assert!(history.undo(&mut scene));
+        assert_eq!(scene.children(root), &[parent]);
+    }
+
+    #[test]
+    fn copy_then_paste_round_trips_the_subtree() {
+        let (mut scene, mut history, parent) = nested_scene();
+        let root = scene.root();
+
+        let clip = capture_subtree(&scene, parent);
+        // Paste under the root as a new last child.
+        let at = scene.children(root).len();
+        let pasted = paste_subtree(&mut scene, &mut history, &clip, root, at);
+
+        assert_eq!(scene.children(root), &[parent, pasted]);
+        assert_ne!(pasted, parent);
+        assert_eq!(scene.node(pasted).name, "Parent");
+        let pasted_child = scene.children(pasted)[0];
+        assert_eq!(scene.node(pasted_child).name, "Child");
+        assert_eq!(scene.children(pasted_child).len(), 1);
+
+        // The captured clip is independent: pasting again yields another copy.
+        let again = paste_subtree(&mut scene, &mut history, &clip, root, 3);
+        assert_ne!(again, pasted);
+        assert_eq!(scene.children(root).len(), 3);
+
+        // Each paste is its own undo step.
+        assert!(history.undo(&mut scene));
+        assert_eq!(scene.children(root), &[parent, pasted]);
+    }
 
     #[test]
     fn spawn_places_the_sprite_at_the_world_point_and_is_undoable() {
