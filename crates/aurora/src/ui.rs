@@ -456,6 +456,41 @@ impl Ui {
         }
     }
 
+    /// Focus a text input programmatically and select all of its text, so the
+    /// next keystroke replaces it - what an inline rename field wants the moment
+    /// it appears. A no-op on a non-input widget. Does not emit a `Submitted`
+    /// for any previously focused field (the app drives this, not a click).
+    pub fn focus(&mut self, id: WidgetId) {
+        if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
+            return;
+        }
+        self.focused = Some(id);
+        self.focused_hscroll = 0.0;
+        self.selection_anchor = Some(0);
+        self.caret = self.text_len(id);
+    }
+
+    /// Focus a text input and place the caret at byte `offset` (clamped to the
+    /// text length), with no selection. Lets the app preserve a live-typed
+    /// caret across a shell rebuild - e.g. a search box that refilters (and so
+    /// rebuilds) on every keystroke. A no-op on a non-input widget.
+    pub fn focus_caret(&mut self, id: WidgetId, offset: usize) {
+        if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
+            return;
+        }
+        self.focused = Some(id);
+        self.focused_hscroll = 0.0;
+        self.selection_anchor = None;
+        self.caret = offset.min(self.text_len(id));
+    }
+
+    /// The caret's byte offset in the focused input, or `None` if no input is
+    /// focused (so the app can capture it before a rebuild, then restore it via
+    /// [`focus_caret`](Self::focus_caret)).
+    pub fn caret_offset(&self) -> Option<usize> {
+        self.focused.map(|_| self.caret)
+    }
+
     /// Delete the focused input's selection, if any; returns whether it did.
     /// The app uses this for cut (after reading [`selected_text`](Self::selected_text)).
     pub fn delete_selection(&mut self) -> bool {
@@ -3027,6 +3062,32 @@ mod tests {
         let s = ui.rect(small).unwrap().size;
         let b = ui.rect(big).unwrap().size;
         assert!(b.y > s.y, "small={s:?} big={b:?}");
+    }
+
+    #[test]
+    fn programmatic_focus_selects_all_and_focus_caret_preserves_the_caret() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(200.0, 80.0));
+        let field = ui.text_input(root, "hello", Style::new().size(180.0, 24.0));
+        let label = ui.label(root, "not a field", Style::new());
+        ui.layout(Vec2::new(200.0, 80.0)).unwrap();
+
+        // focus() selects the whole field, so typing would replace it.
+        ui.focus(field);
+        assert_eq!(ui.focused(), Some(field));
+        assert_eq!(ui.selected_text().as_deref(), Some("hello"));
+        assert_eq!(ui.caret_offset(), Some(5));
+
+        // focus_caret() places the caret with no selection (clamped to length).
+        ui.focus_caret(field, 3);
+        assert_eq!(ui.caret_offset(), Some(3));
+        assert_eq!(ui.selected_text(), None);
+        ui.focus_caret(field, 99);
+        assert_eq!(ui.caret_offset(), Some(5));
+
+        // Both are no-ops on a non-input widget (focus stays on the field).
+        ui.focus(label);
+        assert_eq!(ui.focused(), Some(field));
     }
 
     #[test]
