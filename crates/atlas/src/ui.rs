@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use aurora::{Color, ImageHandle, Orientation, Style, Ui, WidgetId};
+use aurora::{Color, ImageHandle, Orientation, Style, Theme, Ui, WidgetId};
 use glam::Vec2;
 use helios::{NodeId, Scene, Value};
 
@@ -13,29 +13,88 @@ use crate::color;
 use crate::icons::{Icon, Icons};
 use crate::viewport::GizmoMode;
 
-const PANEL_BG: Color = Color::rgb(0.13, 0.14, 0.18);
-const ROOT_BG: Color = Color::rgb(0.08, 0.08, 0.10);
-const HEADING: Color = Color::rgb(0.96, 0.97, 1.0);
-const SUBHEAD: Color = Color::rgb(0.55, 0.60, 0.72);
 /// Font size for a panel's title (larger than the default UI text).
 const PANEL_TITLE: f32 = 17.0;
-const ROW_SELECTED: Color = Color::rgb(0.20, 0.28, 0.42);
-/// The drop-target highlight while dragging a tree row to reparent it.
-const ROW_DROP: Color = Color::rgb(0.18, 0.40, 0.30);
-const MENU_BG: Color = Color::rgb(0.16, 0.17, 0.22);
-/// Background for an inspector section "card" (lighter than the panel), so
-/// components read as separated blocks.
-const CARD_BG: Color = Color::rgb(0.17, 0.18, 0.23);
-/// A subtle 1px outline separating a card from the panel behind it.
-const CARD_BORDER: Color = Color::rgb(0.24, 0.26, 0.32);
 /// Corner radius for section cards, and for controls (buttons and fields).
 const CARD_RADIUS: f32 = 6.0;
 const CONTROL_RADIUS: f32 = 4.0;
-const MODE_ACTIVE: Color = Color::rgb(0.24, 0.40, 0.62);
-/// The engine axis palette (matches the viewport gizmo): X red, Y green. Used
-/// for the inspector's Vec2 x/y labels so a field's axes read consistently.
-const AXIS_X_BG: Color = Color::rgb(0.90, 0.32, 0.32);
-const AXIS_Y_BG: Color = Color::rgb(0.35, 0.70, 0.38);
+
+/// The editor's full color palette: the aurora widget [`Theme`] plus atlas's own
+/// surface, text, and accent colors. Swapped as a unit so the whole editor
+/// recolors at once (see [`build_editor_ui`]). Loaded from the user's settings
+/// file and editable there (see the `settings` module).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EditorTheme {
+    /// The palette aurora's built-in widgets draw with.
+    pub aurora: Theme,
+    /// Docked-panel background, and the darker window/root background behind it.
+    pub panel_bg: Color,
+    pub root_bg: Color,
+    /// Primary and secondary text.
+    pub heading: Color,
+    pub subhead: Color,
+    /// Selected tree-row fill, and the reparent drop-line/into highlight.
+    pub row_selected: Color,
+    pub row_drop: Color,
+    /// Menu / popup surface.
+    pub menu_bg: Color,
+    /// Inspector card fill and its 1px outline.
+    pub card_bg: Color,
+    pub card_border: Color,
+    /// The active gizmo-mode toolbar button.
+    pub mode_active: Color,
+    /// Engine axis palette (X red, Y green) for the inspector's Vec2 labels.
+    pub axis_x: Color,
+    pub axis_y: Color,
+}
+
+impl EditorTheme {
+    /// The default dark editor theme.
+    pub fn dark() -> Self {
+        Self {
+            aurora: Theme::dark(),
+            panel_bg: Color::rgb(0.13, 0.14, 0.18),
+            root_bg: Color::rgb(0.08, 0.08, 0.10),
+            heading: Color::rgb(0.96, 0.97, 1.0),
+            subhead: Color::rgb(0.55, 0.60, 0.72),
+            row_selected: Color::rgb(0.20, 0.28, 0.42),
+            row_drop: Color::rgb(0.18, 0.40, 0.30),
+            menu_bg: Color::rgb(0.16, 0.17, 0.22),
+            card_bg: Color::rgb(0.17, 0.18, 0.23),
+            card_border: Color::rgb(0.24, 0.26, 0.32),
+            mode_active: Color::rgb(0.24, 0.40, 0.62),
+            axis_x: Color::rgb(0.90, 0.32, 0.32),
+            axis_y: Color::rgb(0.35, 0.70, 0.38),
+        }
+    }
+
+    /// A bundled light editor theme - a preset a user can copy into their
+    /// settings file (the editor loads whatever theme that file holds).
+    #[allow(dead_code)]
+    pub fn light() -> Self {
+        Self {
+            aurora: Theme::light(),
+            panel_bg: Color::rgb(0.90, 0.91, 0.94),
+            root_bg: Color::rgb(0.82, 0.83, 0.86),
+            heading: Color::rgb(0.10, 0.12, 0.16),
+            subhead: Color::rgb(0.38, 0.42, 0.50),
+            row_selected: Color::rgb(0.72, 0.80, 0.94),
+            row_drop: Color::rgb(0.55, 0.82, 0.66),
+            menu_bg: Color::rgb(0.95, 0.96, 0.98),
+            card_bg: Color::rgb(0.85, 0.86, 0.90),
+            card_border: Color::rgb(0.72, 0.74, 0.80),
+            mode_active: Color::rgb(0.62, 0.76, 0.96),
+            axis_x: Color::rgb(0.85, 0.30, 0.30),
+            axis_y: Color::rgb(0.28, 0.62, 0.34),
+        }
+    }
+}
+
+impl Default for EditorTheme {
+    fn default() -> Self {
+        Self::dark()
+    }
+}
 
 /// One axis of a 2D value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,13 +418,15 @@ pub fn build_editor_ui(
     icons: Option<&Icons>,
     tree: &TreeView,
     inspector: &InspectorView,
+    theme: &EditorTheme,
 ) -> (Ui, EditorRows) {
     let mut ui = Ui::new();
+    ui.set_theme(theme.aurora);
     let mut rows = EditorRows::default();
 
     // The three-way dock fills the window (no full-width strip above it - the
     // toolbar sits over the viewport, in the center column).
-    let root = ui.root_panel(Style::new().fill().column().background(ROOT_BG));
+    let root = ui.root_panel(Style::new().fill().column().background(theme.root_bg));
     // `main` clips (Overflow::Hidden): this is what lets the scroll panels
     // inside it stay window-sized instead of ballooning the row to their tall
     // content - see aurora's nested-row scroll test.
@@ -379,6 +440,7 @@ pub fn build_editor_ui(
         sizes.tree_width,
         tree,
         icons,
+        theme,
         &mut rows,
     );
     let splitter_1 = ui.splitter(main, Orientation::Vertical, 1.0, Style::new().width(4.0));
@@ -387,7 +449,7 @@ pub fn build_editor_ui(
     // Center: the toolbar directly above the viewport, then a resizable
     // file-explorer strip below (Godot's viewport-toolbar layout).
     let center = ui.panel(main, Style::new().column().grow(1.0));
-    build_toolbar(&mut ui, center, gizmo_mode, icons, &mut rows);
+    build_toolbar(&mut ui, center, gizmo_mode, icons, theme, &mut rows);
     // A drop target so a PNG dragged from the file explorer can land here.
     let viewport = ui.image(
         center,
@@ -400,8 +462,14 @@ pub fn build_editor_ui(
         -1.0,
         Style::new().height(4.0),
     );
-    let files_panel =
-        build_file_explorer(&mut ui, center, project_dir, sizes.files_height, &mut rows);
+    let files_panel = build_file_explorer(
+        &mut ui,
+        center,
+        project_dir,
+        sizes.files_height,
+        theme,
+        &mut rows,
+    );
     ui.set_splitter_target(splitter_2, files_panel);
 
     let splitter_3 = ui.splitter(main, Orientation::Vertical, -1.0, Style::new().width(4.0));
@@ -413,16 +481,17 @@ pub fn build_editor_ui(
         sizes.inspector_width,
         icons,
         inspector,
+        theme,
         &mut rows,
     );
     ui.set_splitter_target(splitter_3, inspector_panel);
 
-    build_status_bar(&mut ui, root, &mut rows);
+    build_status_bar(&mut ui, root, theme, &mut rows);
 
     // A right-click context menu floats above everything on Aurora's popup
     // layer, so it is built last and dismissed by the app on a click outside.
     if let Some(menu) = menu {
-        build_context_menu(&mut ui, menu, &mut rows);
+        build_context_menu(&mut ui, menu, theme, &mut rows);
     }
 
     // Restore the scroll positions captured from the previous shell.
@@ -439,7 +508,7 @@ pub fn build_editor_ui(
 
 /// The status bar along the bottom: live readouts the app refreshes in place
 /// each frame (set_label), so no shell rebuild is ever needed for them.
-fn build_status_bar(ui: &mut Ui, parent: WidgetId, rows: &mut EditorRows) {
+fn build_status_bar(ui: &mut Ui, parent: WidgetId, theme: &EditorTheme, rows: &mut EditorRows) {
     let bar = ui.panel(
         parent,
         Style::new()
@@ -447,9 +516,10 @@ fn build_status_bar(ui: &mut Ui, parent: WidgetId, rows: &mut EditorRows) {
             .gap(18.0)
             .padding(4.0)
             .align_center()
-            .background(PANEL_BG),
+            .background(theme.panel_bg),
     );
-    let readout = |ui: &mut Ui, text: &str| ui.label(bar, text, Style::new().foreground(SUBHEAD));
+    let readout =
+        |ui: &mut Ui, text: &str| ui.label(bar, text, Style::new().foreground(theme.subhead));
     rows.status_cursor = Some(readout(ui, "x -, y -"));
     rows.status_zoom = Some(readout(ui, "zoom 100%"));
     rows.status_selected = Some(readout(ui, "nothing selected"));
@@ -465,6 +535,7 @@ fn build_toolbar(
     parent: WidgetId,
     mode: GizmoMode,
     icons: Option<&Icons>,
+    theme: &EditorTheme,
     rows: &mut EditorRows,
 ) {
     let bar = ui.panel(
@@ -474,7 +545,7 @@ fn build_toolbar(
             .gap(4.0)
             .padding(5.0)
             .align_center()
-            .background(PANEL_BG),
+            .background(theme.panel_bg),
     );
     let icon = |id: Icon| icons.map(|i| i.get(id));
     rows.add_sprite = Some(toolbar_button(
@@ -482,16 +553,35 @@ fn build_toolbar(
         bar,
         "Add Sprite",
         icon(Icon::Add),
-        PANEL_BG,
+        theme.panel_bg,
+        theme,
     ));
-    rows.save = Some(toolbar_button(ui, bar, "Save", icon(Icon::Save), PANEL_BG));
-    rows.load = Some(toolbar_button(ui, bar, "Load", icon(Icon::Load), PANEL_BG));
+    rows.save = Some(toolbar_button(
+        ui,
+        bar,
+        "Save",
+        icon(Icon::Save),
+        theme.panel_bg,
+        theme,
+    ));
+    rows.load = Some(toolbar_button(
+        ui,
+        bar,
+        "Load",
+        icon(Icon::Load),
+        theme.panel_bg,
+        theme,
+    ));
 
     // A spacer pushes the mode switches to the right edge of the bar.
     ui.panel(bar, Style::new().grow(1.0));
     for m in GizmoMode::ALL {
-        let background = if m == mode { MODE_ACTIVE } else { PANEL_BG };
-        let button = toolbar_button(ui, bar, m.label(), icon(mode_icon(m)), background);
+        let background = if m == mode {
+            theme.mode_active
+        } else {
+            theme.panel_bg
+        };
+        let button = toolbar_button(ui, bar, m.label(), icon(mode_icon(m)), background, theme);
         rows.mode_buttons.push((button, m));
     }
 }
@@ -504,6 +594,7 @@ fn toolbar_button(
     caption: &str,
     icon: Option<ImageHandle>,
     background: Color,
+    theme: &EditorTheme,
 ) -> WidgetId {
     match icon {
         Some(handle) => {
@@ -524,7 +615,7 @@ fn toolbar_button(
             Style::new()
                 .padding(6.0)
                 .background(background)
-                .foreground(HEADING)
+                .foreground(theme.heading)
                 .corner_radius(CONTROL_RADIUS),
         ),
     }
@@ -542,16 +633,16 @@ fn mode_icon(mode: GizmoMode) -> Icon {
 
 /// A right-click context menu on Aurora's popup layer: a floating column of
 /// action buttons anchored at the click.
-fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, rows: &mut EditorRows) {
+fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, theme: &EditorTheme, rows: &mut EditorRows) {
     let popup = ui.popup(
         menu.anchor,
         Style::new()
             .column()
             .gap(2.0)
             .padding(4.0)
-            .background(MENU_BG)
+            .background(theme.menu_bg)
             .corner_radius(CARD_RADIUS)
-            .border(1.0, CARD_BORDER)
+            .border(1.0, theme.card_border)
             .clip(),
     );
     for (label, action) in &menu.items {
@@ -561,8 +652,8 @@ fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, rows: &mut EditorRows) {
             Style::new()
                 .width(150.0)
                 .padding(6.0)
-                .background(MENU_BG)
-                .foreground(HEADING)
+                .background(theme.menu_bg)
+                .foreground(theme.heading)
                 .corner_radius(CONTROL_RADIUS),
         );
         rows.menu_items.push((item, *action));
@@ -578,16 +669,21 @@ const PICKER_ALPHA_H: f32 = 16.0;
 /// Build the open color picker on Aurora's popup layer: an SV square + hue bar
 /// (as gradient images the app keeps updated), an alpha bar, and a hex field
 /// with a preview swatch. The regions are recorded for the app's drag routing.
-pub fn build_color_picker(ui: &mut Ui, view: &ColorPickerView, rows: &mut EditorRows) {
+pub fn build_color_picker(
+    ui: &mut Ui,
+    view: &ColorPickerView,
+    theme: &EditorTheme,
+    rows: &mut EditorRows,
+) {
     let popup = ui.popup(
         view.anchor,
         Style::new()
             .column()
             .gap(6.0)
             .padding(8.0)
-            .background(MENU_BG)
+            .background(theme.menu_bg)
             .corner_radius(CARD_RADIUS)
-            .border(1.0, CARD_BORDER)
+            .border(1.0, theme.card_border)
             .clip(),
     );
     let top = ui.panel(popup, Style::new().row().gap(6.0));
@@ -635,6 +731,7 @@ fn build_scene_tree(
     width: f32,
     tree: &TreeView,
     icons: Option<&Icons>,
+    theme: &EditorTheme,
     rows: &mut EditorRows,
 ) -> WidgetId {
     let panel = ui.panel(
@@ -645,12 +742,14 @@ fn build_scene_tree(
             .padding(10.0)
             .gap(TREE_ROW_GAP)
             .scroll()
-            .background(PANEL_BG),
+            .background(theme.panel_bg),
     );
     ui.label(
         panel,
         "Scene",
-        Style::new().foreground(HEADING).font_size(PANEL_TITLE),
+        Style::new()
+            .foreground(theme.heading)
+            .font_size(PANEL_TITLE),
     );
     add_tree_row(
         ui,
@@ -661,6 +760,7 @@ fn build_scene_tree(
         selected,
         tree,
         icons,
+        theme,
         rows,
     );
     panel
@@ -686,13 +786,14 @@ fn add_tree_row(
     selected: Option<NodeId>,
     tree: &TreeView,
     icons: Option<&Icons>,
+    theme: &EditorTheme,
     rows: &mut EditorRows,
 ) {
     // Selected wins the highlight; an Into-drop target tints green.
     let background = if selected == Some(node) {
-        ROW_SELECTED
+        theme.row_selected
     } else if tree.drop_target == Some(DropSpot::Into(node)) {
-        ROW_DROP
+        theme.row_drop
     } else {
         Color::TRANSPARENT
     };
@@ -745,9 +846,11 @@ fn add_tree_row(
     ui.label(
         row,
         scene.node(node).name.clone(),
-        Style::new()
-            .grow(1.0)
-            .foreground(if visible { HEADING } else { SUBHEAD }),
+        Style::new().grow(1.0).foreground(if visible {
+            theme.heading
+        } else {
+            theme.subhead
+        }),
     );
     // An eye toggle at the row's right edge: open when visible, struck through
     // when hidden. Clicking it toggles visibility (it does not select the row,
@@ -779,6 +882,7 @@ fn add_tree_row(
                 selected,
                 tree,
                 icons,
+                theme,
                 rows,
             );
         }
@@ -789,7 +893,7 @@ fn add_tree_row(
 /// layer so it takes no layout space (an inline line would shift the rows and
 /// make the detected drop spot flicker). Call after layout, then lay out once
 /// more so the line popup is positioned. A no-op for an Into spot.
-pub fn add_reparent_line(ui: &mut Ui, rows: &EditorRows, spot: DropSpot) {
+pub fn add_reparent_line(ui: &mut Ui, rows: &EditorRows, spot: DropSpot, color: Color) {
     let (node, after) = match spot {
         DropSpot::Before(n) => (n, false),
         DropSpot::After(n) => (n, true),
@@ -815,7 +919,7 @@ pub fn add_reparent_line(ui: &mut Ui, rows: &EditorRows, spot: DropSpot) {
         Vec2::new(rect.pos.x, y - 1.0),
         Style::new()
             .size(rect.size.x.max(1.0), 2.0)
-            .background(ROW_DROP)
+            .background(color)
             .hit_transparent(),
     );
 }
@@ -832,6 +936,7 @@ fn build_inspector(
     width: f32,
     icons: Option<&Icons>,
     inspector: &InspectorView,
+    theme: &EditorTheme,
     rows: &mut EditorRows,
 ) -> WidgetId {
     let panel = ui.panel(
@@ -842,22 +947,28 @@ fn build_inspector(
             .padding(10.0)
             .gap(8.0)
             .scroll()
-            .background(PANEL_BG),
+            .background(theme.panel_bg),
     );
     ui.label(
         panel,
         "Inspector",
-        Style::new().foreground(HEADING).font_size(PANEL_TITLE),
+        Style::new()
+            .foreground(theme.heading)
+            .font_size(PANEL_TITLE),
     );
 
     let Some(node) = selected else {
-        ui.label(panel, "Nothing selected", Style::new().foreground(SUBHEAD));
+        ui.label(
+            panel,
+            "Nothing selected",
+            Style::new().foreground(theme.subhead),
+        );
         return panel;
     };
     ui.label(
         panel,
         scene.node(node).name.clone(),
-        Style::new().foreground(HEADING),
+        Style::new().foreground(theme.heading),
     );
 
     // The node's own transform first: it is what viewport drags edit, so its
@@ -870,6 +981,7 @@ fn build_inspector(
         InspectorSection::Transform,
         inspector,
         icons,
+        theme,
         rows,
     ) {
         let t = scene.node(node).transform;
@@ -879,6 +991,7 @@ fn build_inspector(
             "position",
             t.translation,
             FieldRef::Position(node),
+            theme,
             rows,
         );
         // Rotation is a single scalar, edited in degrees (stored radians).
@@ -888,9 +1001,18 @@ fn build_inspector(
             "rotation",
             &Value::F32(t.rotation.to_degrees()),
             true,
+            theme,
         );
         rows.transform_rows.push((input, node, "rotation"));
-        add_vec2_field(ui, card, "scale", t.scale, FieldRef::Scale(node), rows);
+        add_vec2_field(
+            ui,
+            card,
+            "scale",
+            t.scale,
+            FieldRef::Scale(node),
+            theme,
+            rows,
+        );
     }
 
     for (i, component) in scene.node(node).components.iter().enumerate() {
@@ -903,6 +1025,7 @@ fn build_inspector(
             InspectorSection::Component(i),
             inspector,
             icons,
+            theme,
             rows,
         ) else {
             continue;
@@ -921,11 +1044,15 @@ fn build_inspector(
                         index: i,
                         field,
                     };
-                    add_vec2_field(ui, card, field, v, r, rows);
+                    add_vec2_field(ui, card, field, v, r, theme, rows);
                 }
                 Value::Color(c) => {
                     let row = ui.panel(card, Style::new().row().gap(6.0).align_center());
-                    ui.label(row, field, Style::new().width(70.0));
+                    ui.label(
+                        row,
+                        field,
+                        Style::new().width(70.0).foreground(theme.heading),
+                    );
                     let swatch = ui.button(
                         row,
                         "",
@@ -946,7 +1073,7 @@ fn build_inspector(
                 }
                 _ => {
                     let numeric = matches!(value, Value::F32(_));
-                    let input = add_value_row(ui, card, field, &value, numeric);
+                    let input = add_value_row(ui, card, field, &value, numeric, theme);
                     rows.field_rows.push((input, node, i, field));
                 }
             }
@@ -969,6 +1096,7 @@ fn add_inspector_section(
     section: InspectorSection,
     inspector: &InspectorView,
     icons: Option<&Icons>,
+    theme: &EditorTheme,
     rows: &mut EditorRows,
 ) -> Option<WidgetId> {
     let collapsed = inspector.collapsed.contains(&(node, section));
@@ -978,9 +1106,9 @@ fn add_inspector_section(
             .column()
             .gap(6.0)
             .padding(8.0)
-            .background(CARD_BG)
+            .background(theme.card_bg)
             .corner_radius(CARD_RADIUS)
-            .border(1.0, CARD_BORDER),
+            .border(1.0, theme.card_border),
     );
     // One flat header row: the chevron is decoration inside it (not its own
     // button, so it has no separate hover); clicking anywhere on the header
@@ -998,7 +1126,11 @@ fn add_inspector_section(
             Style::new().size(TREE_CHEVRON, TREE_CHEVRON),
         );
     }
-    ui.label(header, title, Style::new().grow(1.0).foreground(HEADING));
+    ui.label(
+        header,
+        title,
+        Style::new().grow(1.0).foreground(theme.heading),
+    );
     rows.section_toggles.push((header, section));
     (!collapsed).then_some(card)
 }
@@ -1011,12 +1143,18 @@ fn add_value_row(
     label: &str,
     value: &Value,
     numeric: bool,
+    theme: &EditorTheme,
 ) -> WidgetId {
     let row = ui.panel(panel, Style::new().row().gap(6.0).align_center());
-    ui.label(row, label, Style::new().width(70.0));
+    ui.label(
+        row,
+        label,
+        Style::new().width(70.0).foreground(theme.heading),
+    );
     let style = Style::new()
         .grow(1.0)
         .padding(4.0)
+        .foreground(theme.heading)
         .corner_radius(CONTROL_RADIUS);
     if numeric {
         ui.numeric_input(row, value_to_text(value), style)
@@ -1034,10 +1172,11 @@ fn add_vec2_field(
     name: &str,
     v: Vec2,
     field: FieldRef,
+    theme: &EditorTheme,
     rows: &mut EditorRows,
 ) {
-    ui.label(panel, name, Style::new().foreground(SUBHEAD));
-    for (axis, caption, color) in [(Axis::X, "X", AXIS_X_BG), (Axis::Y, "Y", AXIS_Y_BG)] {
+    ui.label(panel, name, Style::new().foreground(theme.subhead));
+    for (axis, caption, color) in [(Axis::X, "X", theme.axis_x), (Axis::Y, "Y", theme.axis_y)] {
         let row = ui.panel(panel, Style::new().row().gap(4.0).align_center());
         let label = ui.button(
             row,
@@ -1046,7 +1185,7 @@ fn add_vec2_field(
                 .width(24.0)
                 .padding(4.0)
                 .background(color)
-                .foreground(HEADING)
+                .foreground(Color::WHITE)
                 .text_center()
                 .corner_radius(CONTROL_RADIUS),
         );
@@ -1057,6 +1196,7 @@ fn add_vec2_field(
             Style::new()
                 .grow(1.0)
                 .padding(4.0)
+                .foreground(theme.heading)
                 .corner_radius(CONTROL_RADIUS),
         );
         rows.vec_inputs.push((input, field, axis));
@@ -1069,6 +1209,7 @@ fn build_file_explorer(
     parent: WidgetId,
     project_dir: &Path,
     height: f32,
+    theme: &EditorTheme,
     rows: &mut EditorRows,
 ) -> WidgetId {
     let panel = ui.panel(
@@ -1079,12 +1220,14 @@ fn build_file_explorer(
             .padding(10.0)
             .gap(4.0)
             .scroll()
-            .background(PANEL_BG),
+            .background(theme.panel_bg),
     );
     ui.label(
         panel,
         "Files",
-        Style::new().foreground(HEADING).font_size(PANEL_TITLE),
+        Style::new()
+            .foreground(theme.heading)
+            .font_size(PANEL_TITLE),
     );
     for name in list_project_files(project_dir) {
         if name.ends_with(".png") {
@@ -1094,11 +1237,14 @@ fn build_file_explorer(
             let row = ui.button(
                 panel,
                 name.clone(),
-                Style::new().padding(2.0).foreground(HEADING).draggable(),
+                Style::new()
+                    .padding(2.0)
+                    .foreground(theme.heading)
+                    .draggable(),
             );
             rows.file_rows.push((row, name));
         } else {
-            ui.label(panel, name, Style::new().foreground(SUBHEAD));
+            ui.label(panel, name, Style::new().foreground(theme.subhead));
         }
     }
     panel
@@ -1241,6 +1387,7 @@ mod tests {
                 None,
                 tree,
                 &InspectorView::default(),
+                &EditorTheme::default(),
             )
             .1
         };
@@ -1267,6 +1414,40 @@ mod tests {
     }
 
     #[test]
+    fn the_editor_theme_colors_the_shell() {
+        let (scene, handle) = demo_scene();
+        let dir = std::env::temp_dir();
+        let build = |theme: &EditorTheme| {
+            let (mut ui, _) = build_editor_ui(
+                &scene,
+                None,
+                handle,
+                &dir,
+                PanelSizes::default(),
+                None,
+                GizmoMode::Select,
+                None,
+                &TreeView::default(),
+                &InspectorView::default(),
+                theme,
+            );
+            ui.layout(Vec2::new(1000.0, 700.0)).unwrap();
+            ui.draw_list().commands
+        };
+        let has_fill = |cmds: &[aurora::DrawCommand], want: Color| {
+            cmds.iter()
+                .any(|c| matches!(c, aurora::DrawCommand::FillRect { color, .. } if *color == want))
+        };
+        // Each theme paints its own root background; the other's does not appear.
+        let dark = build(&EditorTheme::dark());
+        assert!(has_fill(&dark, EditorTheme::dark().root_bg));
+        assert!(!has_fill(&dark, EditorTheme::light().root_bg));
+
+        let light = build(&EditorTheme::light());
+        assert!(has_fill(&light, EditorTheme::light().root_bg));
+    }
+
+    #[test]
     fn every_tree_row_has_an_eye_toggle() {
         let mut scene = Scene::new("Root");
         let root = scene.root();
@@ -1285,6 +1466,7 @@ mod tests {
             None,
             &TreeView::default(),
             &InspectorView::default(),
+            &EditorTheme::default(),
         );
         // One eye toggle per row (root and A), each mapped to its node.
         assert_eq!(rows.eye_toggles.len(), rows.tree_rows.len());
@@ -1309,6 +1491,7 @@ mod tests {
                 None,
                 &TreeView::default(),
                 inspector,
+                &EditorTheme::default(),
             )
             .1
         };
@@ -1373,6 +1556,7 @@ mod tests {
             None,
             &TreeView::default(),
             &InspectorView::default(),
+            &EditorTheme::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -1410,6 +1594,7 @@ mod tests {
             None,
             &TreeView::default(),
             &InspectorView::default(),
+            &EditorTheme::default(),
         );
 
         // Three Vec2 fields (position, scale, sprite size) -> two axes each.
@@ -1459,6 +1644,7 @@ mod tests {
             None,
             &TreeView::default(),
             &InspectorView::default(),
+            &EditorTheme::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -1491,6 +1677,7 @@ mod tests {
             None,
             &TreeView::default(),
             &InspectorView::default(),
+            &EditorTheme::default(),
         );
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
         assert_eq!(
@@ -1515,6 +1702,7 @@ mod tests {
             None,
             &TreeView::default(),
             &InspectorView::default(),
+            &EditorTheme::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -1527,11 +1715,12 @@ mod tests {
             let aurora::WidgetKind::Button(_) = ui.kind(*id) else {
                 panic!("mode entries are buttons");
             };
+            let theme = EditorTheme::default();
             let bg = ui.background(*id);
             if *m == GizmoMode::Rotate {
-                assert_eq!(bg, MODE_ACTIVE, "the active mode is highlighted");
+                assert_eq!(bg, theme.mode_active, "the active mode is highlighted");
             } else {
-                assert_eq!(bg, PANEL_BG, "inactive modes are not");
+                assert_eq!(bg, theme.panel_bg, "inactive modes are not");
             }
         }
     }
@@ -1559,6 +1748,7 @@ mod tests {
             None,
             &TreeView::default(),
             &InspectorView::default(),
+            &EditorTheme::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -1593,6 +1783,7 @@ mod tests {
             None,
             &TreeView::default(),
             &InspectorView::default(),
+            &EditorTheme::default(),
         );
         // The sprite's tint is a Color field, so the inspector has one swatch.
         assert_eq!(rows.color_swatches.len(), 1);
@@ -1610,7 +1801,7 @@ mod tests {
             hue: handle,
             alpha: handle,
         };
-        build_color_picker(&mut ui, &view, &mut rows);
+        build_color_picker(&mut ui, &view, &EditorTheme::default(), &mut rows);
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
         let popup = rows.picker_popup.unwrap();
@@ -1647,6 +1838,7 @@ mod tests {
             None,
             &TreeView::default(),
             &InspectorView::default(),
+            &EditorTheme::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
@@ -1672,6 +1864,7 @@ mod tests {
             None,
             &TreeView::default(),
             &InspectorView::default(),
+            &EditorTheme::default(),
         );
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
         assert_eq!(ui2.scroll_offset(rows2.tree_panel.unwrap()), 90.0);
@@ -1697,6 +1890,7 @@ mod tests {
             None,
             &TreeView::default(),
             &InspectorView::default(),
+            &EditorTheme::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
         let viewport = rows.viewport.unwrap();

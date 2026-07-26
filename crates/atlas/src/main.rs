@@ -8,6 +8,7 @@ mod actions;
 mod color;
 mod icons;
 mod project;
+mod settings;
 mod textures;
 mod ui;
 mod viewport;
@@ -35,7 +36,7 @@ use crate::color::Hsva;
 use crate::icons::Icons;
 use crate::textures::TextureCache;
 use crate::ui::{
-    Axis, ColorPickerView, ColorTarget, ContextMenu, DropSpot, EditorRows, FieldRef,
+    Axis, ColorPickerView, ColorTarget, ContextMenu, DropSpot, EditorRows, EditorTheme, FieldRef,
     InspectorSection, InspectorView, MenuAction, PanelSizes, TreeView, build_color_picker,
     build_editor_ui, capture_panel_sizes, field_color, field_vec2, parse_value, resolve_drop,
     set_field_color, set_field_vec2, with_axis,
@@ -190,6 +191,8 @@ struct State {
     /// Collapsed inspector sections per node (editor state, kept across shell
     /// rebuilds).
     inspector_collapsed: HashSet<(NodeId, InspectorSection)>,
+    /// The editor's color theme (F2 toggles dark/light).
+    theme: EditorTheme,
     /// An in-progress reparent drag: the row being dragged and the current
     /// drop target under the cursor.
     reparent: Option<ReparentDrag>,
@@ -357,6 +360,9 @@ impl State {
         let (scene_target, viewport_handle) =
             build_viewport_target(&mut gui, &engine, (size.width, size.height));
         let panel_sizes = PanelSizes::default();
+        // The editor theme comes from the user's settings file (~/.config/orbit),
+        // written with defaults on first run - see the `settings` module.
+        let theme = settings::load().theme;
         let (ui, rows) = build_editor_ui(
             &project.scene,
             None,
@@ -368,6 +374,7 @@ impl State {
             Some(&icons),
             &TreeView::default(),
             &InspectorView::default(),
+            &theme,
         );
 
         Ok(Self {
@@ -409,6 +416,7 @@ impl State {
             picker_alpha,
             tree_collapsed: HashSet::new(),
             inspector_collapsed: HashSet::new(),
+            theme,
             reparent: None,
         })
     }
@@ -1331,6 +1339,7 @@ impl State {
                 Some(&self.icons),
                 &self.tree_view(),
                 &self.inspector_view(),
+                &self.theme,
             );
             self.ui = ui;
             self.rows = rows;
@@ -1345,7 +1354,7 @@ impl State {
                     hue: self.picker_hue,
                     alpha: self.picker_alpha,
                 };
-                build_color_picker(&mut self.ui, &view, &mut self.rows);
+                build_color_picker(&mut self.ui, &view, &self.theme, &mut self.rows);
             }
             self.dirty = false;
             // The fresh Ui has no cursor, so its layout-time hover refresh would
@@ -1370,7 +1379,7 @@ impl State {
         // just rebuilt: a fresh Ui has no line yet, while a still frame keeps the
         // one from the last rebuild (adding again would stack duplicates).
         if rebuilt && let Some(spot) = self.reparent.and_then(|r| r.target) {
-            ui::add_reparent_line(&mut self.ui, &self.rows, spot);
+            ui::add_reparent_line(&mut self.ui, &self.rows, spot, self.theme.row_drop);
             self.ui.layout(window)?;
         }
 
