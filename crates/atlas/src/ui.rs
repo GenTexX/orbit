@@ -1385,13 +1385,15 @@ pub fn add_file_tooltip(
     }
 }
 
-/// One "Label: value" line in the file tooltip.
+/// One "Label: value" line in the file tooltip. The label is left at its natural
+/// width (no fixed width) so a longer one like "Modified:" never wraps - Aurora
+/// has no wrap-off control, and a too-narrow box wraps the word.
 fn tooltip_detail(ui: &mut Ui, parent: WidgetId, label: &str, value: String, theme: &EditorTheme) {
     let row = ui.panel(parent, Style::new().row().gap(6.0));
     ui.label(
         row,
         format!("{label}:"),
-        Style::new().width(58.0).foreground(theme.subhead),
+        Style::new().foreground(theme.subhead),
     );
     ui.label(row, value, Style::new().grow(1.0).foreground(theme.heading));
 }

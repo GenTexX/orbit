@@ -378,6 +378,10 @@ struct State {
     hover_file: Option<(PathBuf, std::time::Instant)>,
     /// The entry whose hover tooltip is currently shown (a rebuild adds it).
     tooltip_target: Option<PathBuf>,
+    /// Whether the left mouse button is currently held. While it is, the tooltip
+    /// logic is frozen: a tooltip appears via a rebuild, and rebuilding mid-press
+    /// would invalidate Aurora's retained drag state and kill a file drag.
+    pointer_down: bool,
 }
 
 /// A tree row being dragged to reparent it; `target` is the current valid drop
@@ -423,6 +427,10 @@ impl ApplicationHandler for App {
                 ..
             } => match (button, btn_state) {
                 (MouseButton::Left, ElementState::Pressed) => {
+                    // While the button is held the tooltip logic is frozen (see
+                    // update_file_tooltip): a rebuild here - even to hide a shown
+                    // tooltip - would re-id the widgets and break a file drag.
+                    state.pointer_down = true;
                     let hit = state.ui.hit_test(state.cursor);
                     // Keyboard focus follows the press: the shared shortcuts
                     // (delete/copy/rename) act on files when the press lands in
@@ -454,6 +462,7 @@ impl ApplicationHandler for App {
                     state.viewport_press();
                 }
                 (MouseButton::Left, ElementState::Released) => {
+                    state.pointer_down = false;
                     state.finish_reparent();
                     state.end_picker_drag();
                     state.end_scrub();
@@ -702,6 +711,7 @@ impl State {
             focus_file_rename: false,
             hover_file: None,
             tooltip_target: None,
+            pointer_down: false,
         })
     }
 
@@ -1150,6 +1160,11 @@ impl State {
     /// tooltip (a rebuild adds the popup post-layout). Hovering off hides it; an
     /// open menu suppresses it.
     fn update_file_tooltip(&mut self) {
+        // Frozen while a button is held: a tooltip change forces a rebuild, and
+        // rebuilding during a press/drag breaks the file drag (stale widget ids).
+        if self.pointer_down {
+            return;
+        }
         let hovered = if self.context_menu.is_some() {
             None
         } else {
