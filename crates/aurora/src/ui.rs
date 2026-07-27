@@ -117,6 +117,10 @@ pub struct Ui {
     events: Vec<Event>,
     /// The color palette the built-in widgets draw with (swap with `set_theme`).
     theme: Theme,
+    /// How many times the measure (text-shaping) function ran in the last
+    /// [`layout`](Self::layout) - a diagnostic for how much re-shaping a change
+    /// triggers (see [`last_measure_count`](Self::last_measure_count)).
+    last_measure_count: u32,
 }
 
 impl Ui {
@@ -150,6 +154,7 @@ impl Ui {
             caret_on: true,
             events: Vec::new(),
             theme: Theme::default(),
+            last_measure_count: 0,
         }
     }
 
@@ -405,18 +410,54 @@ impl Ui {
         }
     }
 
-    /// Replace a text input's contents (e.g. an editor populating a field). It
-    /// is re-shaped on the next [`layout`](Self::layout); the caret is clamped
-    /// if this field is focused. A no-op on non-input widgets.
+    /// Replace a text input's contents (e.g. an editor populating a field). The
+    /// caret is clamped if this field is focused. A no-op on non-input widgets.
+    ///
+    /// A single-line field's layout box does not depend on its text (it reports
+    /// intrinsic width 0 and a fixed height - see `measure_widget`), so its
+    /// render buffer is re-shaped in place here and the layout is left untouched.
+    /// That matters for live readouts: a field buried in a deep tree would
+    /// otherwise mark the whole path to the root dirty, and re-resolving that
+    /// flexbox re-measures much of the tree every frame (thousands of shapes
+    /// during a viewport drag). A multi-line field's height does depend on its
+    /// text, so it still invalidates and re-shapes on the next layout.
     pub fn set_text_input(&mut self, id: WidgetId, text: impl Into<String>) {
-        if let WidgetKind::TextInput(s) = &mut self.widgets[id].kind {
-            *s = text.into();
-            let len = s.len();
-            if self.focused == Some(id) {
-                self.caret = self.caret.min(len);
-            }
+        let WidgetKind::TextInput(s) = &mut self.widgets[id].kind else {
+            return;
+        };
+        *s = text.into();
+        let len = s.len();
+        if self.focused == Some(id) {
+            self.caret = self.caret.min(len);
+        }
+        // A single-line, non-ellipsis field: re-shape its buffer without a
+        // relayout. (Before the first layout the buffer does not exist yet, so
+        // fall back to invalidating - a one-time cost, not a per-frame one.)
+        if !self.widgets[id].multiline
+            && !self.widgets[id].ellipsis
+            && self.buffers.contains_key(id)
+        {
+            self.reshape_field(id);
+        } else {
             self.invalidate_text(id);
         }
+    }
+
+    /// Re-shape a single-line field's render buffer to its current text, without
+    /// touching the layout (its box is text-independent). Mirrors the one-line
+    /// path of `measure_widget`.
+    fn reshape_field(&mut self, id: WidgetId) {
+        let metrics = text::metrics_for(self.widgets[id].font_size);
+        let attrs = text::attrs_for(self.widgets[id].font_weight);
+        let WidgetKind::TextInput(text) = &self.widgets[id].kind else {
+            return;
+        };
+        let text = text.clone();
+        let mut borrowed = self.buffers[id].borrow_with(&mut self.font_system);
+        borrowed.set_metrics(metrics);
+        borrowed.set_size(None, None);
+        borrowed.set_text(&text, &attrs, Shaping::Advanced, None);
+        borrowed.shape_until_scroll(false);
     }
 
     /// Set whether the caret is in its visible blink phase. Apps that want a
@@ -668,6 +709,7 @@ impl Ui {
         let buffers = &mut self.buffers;
         let check_buffers = &mut self.check_buffers;
         let font_system = &mut self.font_system;
+        let mut measures = 0u32;
         self.taffy.compute_layout_with_measure(
             root_node,
             Size {
@@ -675,6 +717,7 @@ impl Ui {
                 height: AvailableSpace::Definite(available.y),
             },
             |known, avail, _node, ctx, _style| {
+                measures += 1;
                 measure_widget(
                     known,
                     avail,
@@ -686,6 +729,7 @@ impl Ui {
                 )
             },
         )?;
+        self.last_measure_count = measures;
 
         self.rects.clear();
         self.content_origin.clear();
@@ -1194,6 +1238,14 @@ impl Ui {
     /// The focused text input, if any.
     pub fn focused(&self) -> Option<WidgetId> {
         self.focused
+    }
+
+    /// How many times the measure (text-shaping) function ran during the last
+    /// [`layout`](Self::layout). A diagnostic: it should stay small when only a
+    /// few widgets' text changed; a large count means a change is defeating
+    /// taffy's per-node measure cache and re-shaping much of the tree.
+    pub fn last_measure_count(&self) -> u32 {
+        self.last_measure_count
     }
 
     /// Insert a typed character at the caret in the focused input.
@@ -3078,6 +3130,37 @@ mod tests {
         let s = ui.rect(small).unwrap().size;
         let b = ui.rect(big).unwrap().size;
         assert!(b.y > s.y, "small={s:?} big={b:?}");
+    }
+
+    #[test]
+    fn updating_a_single_line_field_reshapes_without_a_relayout() {
+        // A live readout (e.g. the inspector during a viewport drag) updates a
+        // field every frame; that must not re-measure the tree, or a deep field
+        // would re-shape thousands of nodes per frame. A single-line field's box
+        // is text-independent, so its buffer re-shapes in place with no relayout;
+        // a text area's height depends on its text, so it does relayout.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(300.0, 300.0));
+        let field = ui.text_input(root, "abc", Style::new().size(120.0, 24.0));
+        let area = ui.text_area(root, "one\ntwo", Style::new().size(120.0, 60.0));
+        ui.layout(Vec2::new(300.0, 300.0)).unwrap();
+        ui.layout(Vec2::new(300.0, 300.0)).unwrap();
+        assert_eq!(ui.last_measure_count(), 0, "cached when nothing changed");
+
+        ui.set_text_input(field, "a much longer value than before");
+        ui.layout(Vec2::new(300.0, 300.0)).unwrap();
+        assert_eq!(
+            ui.last_measure_count(),
+            0,
+            "a single-line field update must not trigger a relayout"
+        );
+
+        ui.set_text_input(area, "one\ntwo\nthree\nfour\nfive");
+        ui.layout(Vec2::new(300.0, 300.0)).unwrap();
+        assert!(
+            ui.last_measure_count() > 0,
+            "a multi-line field's height can change, so it relayouts"
+        );
     }
 
     #[test]
