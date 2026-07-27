@@ -92,6 +92,11 @@ pub struct Ui {
     /// A scrollbar-thumb drag in progress: the scroll container and the cursor's
     /// y offset from the thumb's top when grabbed.
     scrollbar_drag: Option<(WidgetId, f32)>,
+    /// The live size of a splitter's target during a drag, accumulated across
+    /// pointer moves so several moves in one frame (before the next layout
+    /// refreshes the cached rect) each count. `None` when no splitter is being
+    /// dragged; seeded from the target's laid-out size on the first move.
+    splitter_size: Option<f32>,
     /// The focused text input, which receives keyboard input.
     focused: Option<WidgetId>,
     /// Caret position in the focused input, as a byte offset into its text.
@@ -136,6 +141,7 @@ impl Ui {
             pressed: None,
             drag: None,
             scrollbar_drag: None,
+            splitter_size: None,
             focused: None,
             caret: 0,
             focused_hscroll: 0.0,
@@ -1018,6 +1024,9 @@ impl Ui {
                 self.hovered = None;
             }
             InputEvent::PointerPressed => {
+                // A fresh press starts any splitter drag from the target's
+                // current laid-out size (see drag_splitter's accumulator).
+                self.splitter_size = None;
                 // A press on a scroll container's scrollbar grabs it (over the
                 // thumb) or jumps it there (in the track), then drags - and
                 // consumes the press, so nothing beneath the bar is clicked.
@@ -1054,6 +1063,8 @@ impl Ui {
                 }
             }
             InputEvent::PointerReleased => {
+                // End any splitter drag's size accumulator.
+                self.splitter_size = None;
                 // End any scrollbar drag (it consumed the press, so nothing else
                 // to do on release).
                 if self.scrollbar_drag.take().is_some() {
@@ -1163,15 +1174,20 @@ impl Ui {
         let Some(rect) = self.rect(target) else {
             return;
         };
+        // Accumulate into `splitter_size` rather than re-reading `rect` each
+        // move: the cached rect only refreshes on the next layout, so several
+        // moves in one frame would otherwise all add to the same stale size and
+        // only the last increment would stick (badly damping a fast drag).
+        let (axis_delta, current) = match orientation {
+            Orientation::Vertical => (delta.x, rect.size.x),
+            Orientation::Horizontal => (delta.y, rect.size.y),
+        };
+        let base = self.splitter_size.unwrap_or(current);
+        let size = (base + axis_delta * sign).max(theme::SPLITTER_MIN_TARGET);
+        self.splitter_size = Some(size);
         match orientation {
-            Orientation::Vertical => {
-                let width = (rect.size.x + delta.x * sign).max(theme::SPLITTER_MIN_TARGET);
-                self.set_width(target, width);
-            }
-            Orientation::Horizontal => {
-                let height = (rect.size.y + delta.y * sign).max(theme::SPLITTER_MIN_TARGET);
-                self.set_height(target, height);
-            }
+            Orientation::Vertical => self.set_width(target, size),
+            Orientation::Horizontal => self.set_height(target, size),
         }
     }
 
@@ -3062,6 +3078,38 @@ mod tests {
         let s = ui.rect(small).unwrap().size;
         let b = ui.rect(big).unwrap().size;
         assert!(b.y > s.y, "small={s:?} big={b:?}");
+    }
+
+    #[test]
+    fn a_splitter_drag_tracks_the_pointer_across_many_moves_in_one_frame() {
+        // A high-polling mouse sends several PointerMoved events between two
+        // layouts; the splitter must resize by their total, not just the last
+        // one's delta (the regression: reading the stale laid-out rect each
+        // move made only the final increment stick, badly damping the drag).
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().row().size(400.0, 200.0));
+        let left = ui.panel(root, Style::new().width(100.0));
+        let splitter = ui.splitter(root, Orientation::Vertical, 1.0, Style::new().width(4.0));
+        ui.set_splitter_target(splitter, left);
+        ui.panel(root, Style::new().grow(1.0));
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+
+        // Grab the splitter, then drag it 100px right in five 20px moves with no
+        // layout between (one frame).
+        let bar = Vec2::new(102.0, 100.0);
+        ui.handle_input(InputEvent::PointerMoved(bar));
+        ui.handle_input(InputEvent::PointerPressed);
+        for i in 1..=5 {
+            ui.handle_input(InputEvent::PointerMoved(
+                bar + Vec2::new(20.0 * i as f32, 0.0),
+            ));
+        }
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        assert_eq!(
+            ui.rect(left).unwrap().size.x,
+            200.0,
+            "left grows by the full 100px drag, not one 20px increment"
+        );
     }
 
     #[test]
