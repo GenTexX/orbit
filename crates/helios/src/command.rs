@@ -142,6 +142,11 @@ fn set_field(scene: &mut Scene, node: NodeId, component: usize, field: &str, val
     }
 }
 
+/// The deepest the undo stack grows before the oldest steps are dropped. Deep
+/// enough that a normal session never hits it; a bound so a very long one cannot
+/// grow memory without limit.
+const MAX_UNDO_DEPTH: usize = 500;
+
 /// An undo/redo history of [`Edit`]s applied to a Scene. Applying a fresh edit
 /// clears the redo stack, as usual.
 #[derive(Debug, Default)]
@@ -196,12 +201,24 @@ impl History {
             // Inside a group: buffer the edit; the group is recorded as one
             // `Edit::Batch` when it closes.
             Some(buffer) => buffer.push(edit),
-            None => {
-                self.done.push(edit);
-                self.undone.clear();
-                self.revision += 1;
-            }
+            None => self.record_done(edit),
         }
+    }
+
+    /// Record a completed edit: push it onto the undo stack, clear the redo
+    /// stack, and bump the revision - bounding the stack to [`MAX_UNDO_DEPTH`] so
+    /// a long session cannot grow it without limit (a `Batch` or `SetField` can
+    /// hold whole subtrees / cloned values). Dropping the oldest steps only loses
+    /// the ability to undo that far back; the monotonic revision is untouched, so
+    /// dirty tracking still works.
+    fn record_done(&mut self, edit: Edit) {
+        self.done.push(edit);
+        if self.done.len() > MAX_UNDO_DEPTH {
+            let overflow = self.done.len() - MAX_UNDO_DEPTH;
+            self.done.drain(..overflow);
+        }
+        self.undone.clear();
+        self.revision += 1;
     }
 
     /// Begin coalescing the edits that follow into a single undo step. Pair with
@@ -235,9 +252,7 @@ impl History {
             1 => buffer.pop().expect("length checked"),
             _ => Edit::Batch(buffer),
         };
-        self.done.push(edit);
-        self.undone.clear();
-        self.revision += 1;
+        self.record_done(edit);
     }
 
     /// Undo the most recent edit. Returns `false` if there was nothing to undo.
@@ -415,6 +430,12 @@ impl History {
         else {
             return false;
         };
+        // Setting a field to the value it already holds records nothing (no
+        // phantom undo step, no revision bump that would falsely mark the
+        // project modified) - matching set_name / set_visible / reparent.
+        if old == value {
+            return true;
+        }
         self.push(
             scene,
             Edit::SetField {
@@ -522,6 +543,44 @@ mod tests {
 
         history.undo(&mut scene); // undo set_transform
         assert_eq!(scene.node(node).transform.translation, Vec2::ZERO);
+    }
+
+    #[test]
+    fn the_undo_stack_is_bounded_to_the_cap() {
+        let (mut scene, root) = scene_with_root();
+        let mut history = History::new();
+        let node = history.add_node(&mut scene, root, Node::new("n0"));
+        // Far more distinct edits than the cap (each rename is a real edit).
+        for i in 1..MAX_UNDO_DEPTH + 50 {
+            history.set_name(&mut scene, node, format!("n{i}"));
+        }
+        // Undo everything available: the stack kept exactly the cap's worth, the
+        // oldest steps were dropped rather than growing memory forever.
+        let mut undos = 0;
+        while history.undo(&mut scene) {
+            undos += 1;
+        }
+        assert_eq!(undos, MAX_UNDO_DEPTH);
+    }
+
+    #[test]
+    fn setting_a_field_to_its_current_value_records_nothing() {
+        let (mut scene, root) = scene_with_root();
+        let mut history = History::new();
+        let mut node = Node::new("sprite");
+        node.components
+            .push(Component::Sprite(SpriteComponent::default()));
+        let node = history.add_node(&mut scene, root, node);
+        history.set_field(&mut scene, node, 0, "texture", Value::Asset("a.png".into()));
+        let rev = history.revision();
+
+        // Re-setting the same value is a no-op: no revision bump, nothing to undo
+        // back to (the previous undo is the real texture change, not a phantom).
+        assert!(history.set_field(&mut scene, node, 0, "texture", Value::Asset("a.png".into())));
+        assert_eq!(history.revision(), rev, "no phantom edit recorded");
+        history.undo(&mut scene);
+        let Component::Sprite(s) = &scene.node(node).components[0];
+        assert_eq!(s.texture, "", "the one real edit undoes to the default");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! scene-to-sprites (it is a rendering concern, per CONTEXT's Engine); this is
 //! still CPU-only - it produces the list, photon draws it.
 
-use glam::Vec2;
+use glam::{Affine2, Vec2};
 use photon::{Color, Sprite};
 
 use crate::component::{Component, SpriteComponent};
@@ -41,53 +41,59 @@ impl Scene {
     /// (consecutive same-texture sprites) while keeping painter's order.
     pub fn sprite_draws(&self) -> Vec<SpriteDraw> {
         let mut out = Vec::new();
-        self.collect_sprites(self.root(), &mut out);
+        self.collect_sprites(self.root(), Affine2::IDENTITY, &mut out);
         out
     }
 
-    fn collect_sprites(&self, id: NodeId, out: &mut Vec<SpriteDraw>) {
+    /// Walk the subtree in pre-order, threading each node's world transform down
+    /// as `parent_world` and composing the local once per node - so the whole
+    /// extraction is O(nodes), not O(nodes x depth) as it would be if each sprite
+    /// re-derived its world transform by walking back up to the root.
+    fn collect_sprites(&self, id: NodeId, parent_world: Affine2, out: &mut Vec<SpriteDraw>) {
         // A hidden node hides its whole subtree: skip its sprites and children.
-        if !self.node(id).visible {
+        let node = self.node(id);
+        if !node.visible {
             return;
         }
-        for component in &self.node(id).components {
+        let world = parent_world * node.transform.to_affine();
+        for component in &node.components {
             // Exhaustive so a new component kind (e.g. Camera) forces a decision
             // here rather than being silently non-drawable.
             match component {
                 Component::Sprite(sprite) => out.push(SpriteDraw {
                     node: id,
                     texture: sprite.texture.clone(),
-                    sprite: self.build_sprite(id, sprite),
+                    sprite: build_sprite(world, sprite),
                 }),
             }
         }
         for &child in self.children(id) {
-            self.collect_sprites(child, out);
+            self.collect_sprites(child, world, out);
         }
     }
+}
 
-    /// Turn a node's Sprite component into a photon `Sprite` placed by the node's
-    /// world transform. The node's origin is the sprite's CENTER (ADR 0019);
-    /// photon's `Sprite` anchors at its top-left and rotates about it, so the
-    /// corner sits half a rotated, scaled size up-left of the origin - this is
-    /// the one place that offset lives.
-    ///
-    /// The world affine is decomposed into scale/rotation/translation, which is
-    /// exact for translate/rotate/uniform-scale - everything the editor does. A
-    /// sheared affine (a non-uniformly-scaled parent with a rotated child) has no
-    /// exact photon `Sprite`; it is approximated. If that ever matters, photon's
-    /// `Sprite` can grow a raw-affine constructor (ADR 0012's mat3x2 already
-    /// carries a full affine) without changing callers here.
-    fn build_sprite(&self, id: NodeId, sprite: &SpriteComponent) -> Sprite {
-        let (scale, angle, translation) = self.world_transform(id).to_scale_angle_translation();
-        let size = scale * sprite.size;
-        let position = translation - Vec2::from_angle(angle).rotate(size * 0.5);
-        let [r, g, b, a] = sprite.tint;
-        let mut placed = Sprite::new(position, size);
-        placed.rotation = angle;
-        placed.tint = Color::new(r, g, b, a);
-        placed
-    }
+/// Place a node's Sprite component in the world at `world` (its node's world
+/// affine). The node's origin is the sprite's CENTER (ADR 0019); photon's
+/// `Sprite` anchors at its top-left and rotates about it, so the corner sits
+/// half a rotated, scaled size up-left of the origin - this is the one place
+/// that offset lives.
+///
+/// The world affine is decomposed into scale/rotation/translation, which is
+/// exact for translate/rotate/uniform-scale - everything the editor does. A
+/// sheared affine (a non-uniformly-scaled parent with a rotated child) has no
+/// exact photon `Sprite`; it is approximated. If that ever matters, photon's
+/// `Sprite` can grow a raw-affine constructor (ADR 0012's mat3x2 already carries
+/// a full affine) without changing callers here.
+fn build_sprite(world: Affine2, sprite: &SpriteComponent) -> Sprite {
+    let (scale, angle, translation) = world.to_scale_angle_translation();
+    let size = scale * sprite.size;
+    let position = translation - Vec2::from_angle(angle).rotate(size * 0.5);
+    let [r, g, b, a] = sprite.tint;
+    let mut placed = Sprite::new(position, size);
+    placed.rotation = angle;
+    placed.tint = Color::new(r, g, b, a);
+    placed
 }
 
 #[cfg(test)]
