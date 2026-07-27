@@ -1,0 +1,17 @@
+[package]
+name = "prism"
+version.workspace = true
+edition.workspace = true
+
+# prism: a live-theming tool for atlas. It edits the theme document in the
+# shared settings file; a running atlas hot-reloads it, so colors change live.
+
+[dependencies]
+aurora = { version = "0.1.0", path = "../aurora" }
+aurora-wgpu = { version = "0.1.0", path = "../aurora-wgpu" }
+glam = "0.33.2"
+ron = "0.12.2"
+serde = { version = "1.0.229", features = ["derive"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+winit = "0.30.13"

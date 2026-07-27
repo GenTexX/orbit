@@ -9,6 +9,7 @@ members = [
     "crates/helios",
     "crates/voyager",
     "crates/atlas",
+    "crates/prism",
     "crates/sandbox",
 ]
 
