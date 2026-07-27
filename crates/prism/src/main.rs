@@ -12,6 +12,7 @@
 
 mod color;
 mod model;
+mod tokens;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -93,7 +94,11 @@ struct Rows {
     add_color: Option<WidgetId>,
     add_scalar: Option<WidgetId>,
     scroll: Option<WidgetId>,
+    /// The bottom help line, and each token row's description (shown on hover).
+    help: Option<WidgetId>,
+    token_rows: Vec<(WidgetId, &'static str)>,
     /// Picker sub-widgets (present only while the picker is open).
+    pk_card: Option<WidgetId>,
     pk_sv: Option<WidgetId>,
     pk_hue: Option<WidgetId>,
     pk_alpha: Option<WidgetId>,
@@ -243,6 +248,10 @@ impl ApplicationHandler for App {
                     if let Some(s) = state.rows.scroll {
                         state.ui.set_scroll_offset(s, scroll);
                     }
+                    // The fresh Ui has no cursor, so nothing reads as hovered and
+                    // the next click would not land; seed it so hover/click work
+                    // without needing a mouse nudge first.
+                    state.ui.set_cursor(state.cursor);
                     state.dirty = false;
                 }
                 if state.save_pending && state.last_save.elapsed().as_millis() >= 120 {
@@ -253,6 +262,8 @@ impl ApplicationHandler for App {
                     .ui
                     .layout(Vec2::new(size.width as f32, size.height as f32))
                     .unwrap();
+                // With rects laid out, refresh the help line from the hovered row.
+                state.update_help();
                 let list = state.ui.draw_list();
                 let clear = Color::rgb(0.06, 0.065, 0.08);
                 if let Err(err) = state
@@ -282,6 +293,19 @@ impl State {
         }
         self.ui = ui;
         self.rows = rows;
+    }
+
+    /// Show the description of the token row under the cursor in the help line.
+    fn update_help(&mut self) {
+        let Some(help) = self.rows.help else { return };
+        let doc = self
+            .rows
+            .token_rows
+            .iter()
+            .find(|(row, _)| self.ui.rect(*row).is_some_and(|r| within(r, self.cursor)))
+            .map(|(_, doc)| *doc)
+            .unwrap_or("Hover a token to see what it affects.");
+        self.ui.set_label(help, doc);
     }
 
     fn react(&mut self) {
@@ -381,14 +405,11 @@ impl State {
             self.dirty = true;
             return;
         }
-        // Toggle a token between a variable reference and a literal.
+        // Toggle a token between a variable reference and a literal. The literal
+        // keeps the token's declared KIND (a scalar token never becomes a color),
+        // even when it was referencing a variable of the wrong kind.
         if let Some((_, token)) = self.rows.toggles.iter().find(|(w, _)| *w == id).cloned() {
             let next = match self.doc.tokens.get(&token) {
-                Some(Bind::Var(_)) | None => Bind::Lit(
-                    self.doc
-                        .resolved(&token)
-                        .unwrap_or(Value::Color(0.5, 0.5, 0.5, 1.0)),
-                ),
                 Some(Bind::Lit(_)) => Bind::Var(
                     self.doc
                         .variables
@@ -397,6 +418,9 @@ impl State {
                         .cloned()
                         .unwrap_or_default(),
                 ),
+                Some(Bind::Var(_)) | None => {
+                    Bind::Lit(literal_for(&token, self.doc.resolved(&token)))
+                }
             };
             self.doc.tokens.insert(token, next);
             self.save_pending = true;
@@ -407,17 +431,31 @@ impl State {
     /// A left press while the picker is open: if it landed on a gradient, start a
     /// drag there and apply it.
     fn press_picker(&mut self) {
-        let Some(region) = self
-            .picker
-            .as_ref()
-            .and_then(|_| self.region_at(self.cursor))
-        else {
+        if self.picker.is_none() {
             return;
-        };
-        if let Some(p) = self.picker.as_mut() {
-            p.drag = Some(region);
         }
-        self.drag_picker();
+        let hit = self.ui.hit_test(self.cursor);
+        let inside = self
+            .rows
+            .pk_card
+            .is_some_and(|c| hit == Some(c) || hit.is_some_and(|h| self.ui.is_within(h, c)));
+        if inside {
+            // A press on a gradient starts (and applies) a drag.
+            if let Some(region) = self.region_at(self.cursor) {
+                if let Some(p) = self.picker.as_mut() {
+                    p.drag = Some(region);
+                }
+                self.drag_picker();
+            }
+            return;
+        }
+        // Outside the popup: a press on a color swatch opens/switches on release,
+        // so leave it; any other outside press dismisses the picker.
+        let on_swatch = self.rows.swatches.iter().any(|(w, _)| Some(*w) == hit);
+        if !on_swatch {
+            self.picker = None;
+            self.dirty = true;
+        }
     }
 
     /// Apply the active gradient drag from the cursor.
@@ -567,6 +605,22 @@ fn text_of(ui: &Ui, id: WidgetId) -> String {
     }
 }
 
+/// A literal for `token` of its declared kind, keeping `resolved` when it already
+/// matches (so a scalar token's literal is always a scalar, never a color).
+fn literal_for(token: &str, resolved: Option<Value>) -> Value {
+    match (tokens::kind_of(token), resolved) {
+        (tokens::Kind::Scalar, Some(v @ Value::Scalar(_))) => v,
+        (tokens::Kind::Color, Some(v @ Value::Color(..))) => v,
+        (tokens::Kind::Scalar, _) => Value::Scalar(4.0),
+        (tokens::Kind::Color, _) => Value::Color(0.5, 0.5, 0.5, 1.0),
+    }
+}
+
+/// The display group a token belongs to (unknown tokens go under "Other").
+fn group_of(token: &str) -> &'static str {
+    tokens::spec(token).map(|s| s.group).unwrap_or("Other")
+}
+
 fn translate_key(event: &winit::event::KeyEvent, ctrl: bool) -> Vec<InputEvent> {
     let named = match &event.logical_key {
         WinitKey::Named(NamedKey::Backspace) => Some(Key::Backspace),
@@ -636,11 +690,54 @@ fn build_ui(doc: &ThemeDoc) -> (Ui, Rows) {
     }
 
     section(&mut ui, scroll, "Tokens");
-    for (name, bind) in &doc.tokens {
-        build_token(&mut ui, scroll, name, bind, doc, &mut rows);
+    // Group tokens by their registry group (in a fixed order), with any unknown
+    // token under "Other".
+    let groups = tokens::GROUPS
+        .iter()
+        .copied()
+        .chain(std::iter::once("Other"));
+    for group in groups {
+        let mut members: Vec<(&String, &Bind)> = doc
+            .tokens
+            .iter()
+            .filter(|(name, _)| group_of(name) == group)
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        members.sort_by_key(|(name, _)| name.as_str());
+        group_header(&mut ui, scroll, group);
+        for (name, bind) in members {
+            build_token(&mut ui, scroll, name, bind, doc, &mut rows);
+        }
     }
 
+    // A fixed help line at the bottom shows the hovered token's description.
+    let help = ui.label(
+        root,
+        "Hover a token to see what it affects.".to_string(),
+        Style::new()
+            .padding_x(10.0)
+            .padding_y(5.0)
+            .background(CARD)
+            .foreground(DIM)
+            .ellipsis(),
+    );
+    rows.help = Some(help);
+
     (ui, rows)
+}
+
+/// A small group sub-header inside the token list.
+fn group_header(ui: &mut Ui, parent: WidgetId, title: &str) {
+    ui.label(
+        parent,
+        title.to_string(),
+        Style::new()
+            .font_size(13.0)
+            .foreground(TEXT)
+            .margin_top(6.0),
+    );
 }
 
 fn section(ui: &mut Ui, parent: WidgetId, title: &str) {
@@ -720,6 +817,9 @@ fn build_token(
             .background(CARD)
             .corner_radius(4.0),
     );
+    if let Some(spec) = tokens::spec(name) {
+        rows.token_rows.push((row, spec.doc));
+    }
     ui.label(
         row,
         name.to_string(),
@@ -727,13 +827,16 @@ fn build_token(
     );
 
     let is_var = matches!(bind, Bind::Var(_));
+    let is_color = tokens::kind_of(name) == tokens::Kind::Color;
+    // A leading preview keyed on the token's KIND (not the bind), so a scalar
+    // token never shows a color swatch: color tokens get a swatch (a button when
+    // it is an editable literal), scalar tokens get their resolved number.
     match bind {
         Bind::Lit(Value::Color(r, g, b, a)) => {
             let sw = swatch_button(ui, row, Color::rgba(*r, *g, *b, *a), 20.0);
             rows.swatches.push((sw, Target::Token(name.to_string())));
         }
-        _ => {
-            // A non-editable preview swatch of the resolved value (or grey).
+        _ if is_color => {
             let c = match doc.resolved(name) {
                 Some(Value::Color(r, g, b, a)) => Color::rgba(r, g, b, a),
                 _ => Color::rgb(0.25, 0.26, 0.30),
@@ -745,6 +848,14 @@ fn build_token(
                     .background(c)
                     .corner_radius(3.0),
             );
+        }
+        _ => {
+            // Scalar token: show the resolved number instead of a swatch.
+            let n = match doc.resolved(name) {
+                Some(Value::Scalar(s)) => format!("{s}"),
+                _ => "-".to_string(),
+            };
+            ui.label(row, n, Style::new().width(20.0).foreground(DIM));
         }
     }
 
@@ -787,6 +898,7 @@ fn build_picker(ui: &mut Ui, picker: &Picker, imgs: [ImageHandle; 3], rows: &mut
             .corner_radius(6.0)
             .border(1.0, Color::rgb(0.28, 0.30, 0.36)),
     );
+    rows.pk_card = Some(pop);
     let top = ui.panel(pop, Style::new().row().gap(6.0));
     rows.pk_sv = Some(ui.image(top, sv, Style::new().size(SV as f32, SV as f32)));
     rows.pk_hue = Some(ui.image(top, hue, Style::new().size(HUE_W as f32, SV as f32)));
