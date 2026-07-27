@@ -211,6 +211,7 @@ theme_tokens! {
     "card_radius": Scalar => card_radius,
     "control_radius": Scalar => control_radius,
     "inset_radius": Scalar => inset_radius,
+    "splitter_width": Scalar => splitter_width,
 }
 
 impl ThemeDoc {

@@ -71,6 +71,8 @@ pub struct EditorTheme {
     pub card_radius: f32,
     pub control_radius: f32,
     pub inset_radius: f32,
+    /// Thickness of the draggable dividers between docked panels.
+    pub splitter_width: f32,
 }
 
 fn default_console_warn() -> Color {
@@ -113,6 +115,7 @@ impl EditorTheme {
             card_radius: 6.0,
             control_radius: 4.0,
             inset_radius: 3.0,
+            splitter_width: 2.0,
         }
     }
 
@@ -141,6 +144,7 @@ impl EditorTheme {
             card_radius: 6.0,
             control_radius: 4.0,
             inset_radius: 3.0,
+            splitter_width: 2.0,
         }
     }
 }
@@ -643,9 +647,6 @@ fn apply_sizing(style: Style, sizing: Sizing) -> Style {
     }
 }
 
-/// The divider thickness between two docked nodes.
-const DOCK_SPLITTER: f32 = 4.0;
-
 /// Recursively build a dock node under `parent`, sized by `sizing`. A split
 /// emits its two children with a draggable divider between; a leaf emits a tab
 /// group. Returns the node's root widget.
@@ -668,16 +669,17 @@ fn build_dock_node(
             first,
             second,
         } => {
+            let sw = ctx.theme.splitter_width;
             let (row_style, orientation, splitter_style) = match dir {
                 SplitDir::Row => (
                     Style::new().row(),
                     Orientation::Vertical,
-                    Style::new().width(DOCK_SPLITTER),
+                    Style::new().width(sw),
                 ),
                 SplitDir::Column => (
                     Style::new().column(),
                     Orientation::Horizontal,
-                    Style::new().height(DOCK_SPLITTER),
+                    Style::new().height(sw),
                 ),
             };
             let container = ui.panel(parent, apply_sizing(row_style.clip(), sizing));
@@ -931,7 +933,7 @@ fn build_toolbar(
             .gap(4.0)
             .padding(5.0)
             .align_center()
-            .background(theme.bar_bg),
+            .background(theme.panel_bg),
     );
     let icon = |id: Icon| icons.map(|i| i.get(id));
     rows.add_sprite = Some(toolbar_button(
@@ -939,7 +941,7 @@ fn build_toolbar(
         bar,
         "Add Sprite",
         icon(Icon::Add),
-        theme.bar_bg,
+        theme.panel_bg,
         theme,
     ));
     rows.save = Some(toolbar_button(
@@ -947,7 +949,7 @@ fn build_toolbar(
         bar,
         "Save",
         icon(Icon::Save),
-        theme.bar_bg,
+        theme.panel_bg,
         theme,
     ));
     rows.load = Some(toolbar_button(
@@ -955,14 +957,18 @@ fn build_toolbar(
         bar,
         "Load",
         icon(Icon::Load),
-        theme.bar_bg,
+        theme.panel_bg,
         theme,
     ));
 
     // View toggles: highlighted (mode_active) when on, so their state reads at a
     // glance, like the gizmo-mode buttons.
     let toggle_bg = |on: bool| {
-        if on { theme.mode_active } else { theme.bar_bg }
+        if on {
+            theme.mode_active
+        } else {
+            theme.panel_bg
+        }
     };
     rows.grid = Some(toolbar_button(
         ui,
@@ -995,7 +1001,7 @@ fn build_toolbar(
         let background = if m == mode {
             theme.mode_active
         } else {
-            theme.bar_bg
+            theme.panel_bg
         };
         let button = toolbar_button(ui, bar, m.label(), icon(mode_icon(m)), background, theme);
         rows.mode_buttons.push((button, m));
@@ -1006,7 +1012,7 @@ fn build_toolbar(
         bar,
         "Settings",
         icon(Icon::Settings),
-        theme.bar_bg,
+        theme.panel_bg,
         theme,
     ));
 }
@@ -2042,9 +2048,14 @@ fn add_inspector_section(
         Style::new().grow(1.0).foreground(theme.heading),
     );
     rows.section_toggles.push((header, section));
-    // The fields live in a padded body below the header (the card itself has no
-    // padding, so the header bar can reach the edges).
-    (!collapsed).then(|| ui.panel(card, Style::new().column().gap(6.0).padding(8.0)))
+    if collapsed {
+        return None;
+    }
+    // A separator gives the header a bottom border, dividing it from the body;
+    // the fields then live in a padded body (the card has no padding, so the
+    // header bar reaches the edges).
+    ui.panel(card, Style::new().height(1.0).background(theme.card_border));
+    Some(ui.panel(card, Style::new().column().gap(6.0).padding(8.0)))
 }
 
 /// One labeled, editable inspector row; returns the text input's id. `numeric`
@@ -2186,7 +2197,7 @@ fn build_file_explorer(
             .align_center()
             .gap(4.0)
             .padding(5.0)
-            .background(theme.bar_bg),
+            .background(theme.panel_bg),
     );
     let crumbs = ui.panel(
         bar,
@@ -2220,7 +2231,11 @@ fn build_file_explorer(
     }
     let icon = |id: Icon| ctx.icons.map(|i| i.get(id));
     let active = |on: bool| {
-        if on { theme.mode_active } else { theme.bar_bg }
+        if on {
+            theme.mode_active
+        } else {
+            theme.panel_bg
+        }
     };
     rows.file_view_list = Some(toolbar_button(
         ui,
@@ -2243,7 +2258,7 @@ fn build_file_explorer(
         bar,
         "Refresh",
         icon(Icon::Refresh),
-        theme.bar_bg,
+        theme.panel_bg,
         theme,
     ));
 
@@ -2274,7 +2289,9 @@ fn build_file_explorer(
         body,
         Orientation::Vertical,
         1.0,
-        Style::new().width(3.0).background(theme.card_border),
+        Style::new()
+            .width(theme.splitter_width)
+            .background(theme.card_border),
     );
     ui.set_splitter_target(splitter, tree);
     let contents = ui.panel(
@@ -3362,7 +3379,7 @@ mod tests {
             if *m == GizmoMode::Rotate {
                 assert_eq!(bg, theme.mode_active, "the active mode is highlighted");
             } else {
-                assert_eq!(bg, theme.bar_bg, "inactive modes blend into the bar");
+                assert_eq!(bg, theme.panel_bg, "inactive modes blend into the toolbar");
             }
         }
     }
