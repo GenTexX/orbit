@@ -2557,6 +2557,11 @@ impl State {
         if let Some(id) = self.rows.file_tree_scroll {
             let offset = self.ui.scroll_offset(id);
             self.explorer.set_tree_scroll(offset);
+            // Capture the tree's width back from its splitter so a resize sticks
+            // across rebuilds (mirrors how the dock captures its splitter sizes).
+            if let Some(rect) = self.ui.rect(id) {
+                self.explorer.set_tree_width(rect.size.x);
+            }
         }
         if let Some(id) = self.rows.file_contents
             && let Some(rect) = self.ui.rect(id)
@@ -3103,7 +3108,9 @@ impl State {
         phase = std::time::Instant::now();
 
         profiling::scope!("scene_render");
-        let clear = PhotonColor::new(0.02, 0.02, 0.05, 1.0);
+        // A neutral, Godot-like gray (linear; it sRGB-encodes to ~0.25 on screen)
+        // rather than a dark blue, so sprites sit on a calm mid-gray backdrop.
+        let clear = PhotonColor::new(0.052, 0.052, 0.055, 1.0);
         let camera = self.camera.camera(Vec2::new(w as f32, h as f32));
         // Draw the scene as per-texture runs, so each sprite shows the texture
         // it names (consecutive same-texture sprites batch, order preserved).

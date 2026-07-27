@@ -51,20 +51,20 @@ impl Theme {
     /// The default dark theme.
     pub const fn dark() -> Self {
         Self {
-            button: Color::rgb(0.26, 0.28, 0.34),
+            button: Color::rgb(0.19, 0.21, 0.26),
             row_hover: Color::rgba(1.0, 1.0, 1.0, 0.06),
             row_pressed: Color::rgba(1.0, 1.0, 1.0, 0.11),
-            checkbox_box: Color::rgb(0.20, 0.21, 0.26),
+            checkbox_box: Color::rgb(0.14, 0.15, 0.19),
             checkbox_mark: Color::rgb(0.40, 0.70, 1.0),
-            field: Color::rgb(0.10, 0.11, 0.14),
+            field: Color::rgb(0.06, 0.065, 0.085),
             focus: Color::rgb(0.30, 0.55, 0.90),
             caret: Color::rgb(0.90, 0.92, 0.96),
-            placeholder: Color::rgb(0.45, 0.47, 0.53),
+            placeholder: Color::rgb(0.42, 0.44, 0.50),
             icon_hover: Color::rgb(0.45, 0.70, 1.0),
             selection: Color::rgba(0.30, 0.55, 0.90, 0.40),
-            slider_track: Color::rgb(0.20, 0.21, 0.26),
+            slider_track: Color::rgb(0.14, 0.15, 0.19),
             slider_fill: Color::rgb(0.30, 0.55, 0.90),
-            splitter: Color::rgb(0.18, 0.19, 0.23),
+            splitter: Color::rgb(0.12, 0.13, 0.16),
             scrollbar_thumb: Color::rgba(0.75, 0.78, 0.85, 0.45),
             disabled_fade: 0.38,
         }

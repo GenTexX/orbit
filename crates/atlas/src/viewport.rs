@@ -39,10 +39,11 @@ const GUIDE_ALPHA: f32 = 0.55;
 /// Editor grid metrics. Lines are 1 screen-px; the origin axes a touch thicker.
 const GRID_LINE_PX: f32 = 1.0;
 const GRID_AXIS_PX: f32 = 1.5;
-/// Faint neutral grid over the scene: minor lines barely there, major lines a
-/// little brighter (both drawn on the tintable white overlay, so alpha is all).
-const GRID_MINOR: Color = Color::new(1.0, 1.0, 1.0, 0.05);
-const GRID_MAJOR: Color = Color::new(1.0, 1.0, 1.0, 0.12);
+/// Faint grid over the scene: dark lines that just darken the (light gray)
+/// viewport - minor barely there, major a little stronger - so the grid reads as
+/// a subtle guide rather than dominating the scene.
+const GRID_MINOR: Color = Color::new(0.0, 0.0, 0.0, 0.10);
+const GRID_MAJOR: Color = Color::new(0.0, 0.0, 0.0, 0.22);
 /// Adaptive spacing target: the on-screen gap between major lines is kept at or
 /// above this, so the grid never gets denser than this as the view zooms out.
 const GRID_MIN_PX: f32 = 48.0;

@@ -45,6 +45,15 @@ pub struct EditorTheme {
     /// Docked-panel background, and the darker window/root background behind it.
     pub panel_bg: Color,
     pub root_bg: Color,
+    /// Bars (toolbar, the file-explorer breadcrumb bar): a distinct dark so a
+    /// bar reads as a strip, not part of the panel body. A serde default so
+    /// settings files written before it existed still load.
+    #[serde(default = "default_bar_bg")]
+    pub bar_bg: Color,
+    /// An inspector section's title header bar (darker than the card body). A
+    /// serde default so older settings files still load.
+    #[serde(default = "default_header_bg")]
+    pub header_bg: Color,
     /// Primary and secondary text.
     pub heading: Color,
     pub subhead: Color,
@@ -80,21 +89,31 @@ fn default_scrim() -> Color {
     Color::rgba(0.0, 0.0, 0.0, 0.5)
 }
 
+fn default_bar_bg() -> Color {
+    Color::rgb(0.062, 0.066, 0.082)
+}
+
+fn default_header_bg() -> Color {
+    Color::rgb(0.078, 0.082, 0.105)
+}
+
 impl EditorTheme {
     /// The default dark editor theme.
     pub fn dark() -> Self {
         Self {
             aurora: Theme::dark(),
-            panel_bg: Color::rgb(0.13, 0.14, 0.18),
-            root_bg: Color::rgb(0.08, 0.08, 0.10),
-            heading: Color::rgb(0.96, 0.97, 1.0),
-            subhead: Color::rgb(0.55, 0.60, 0.72),
-            row_selected: Color::rgb(0.20, 0.28, 0.42),
+            panel_bg: Color::rgb(0.095, 0.10, 0.122),
+            root_bg: Color::rgb(0.038, 0.04, 0.05),
+            bar_bg: default_bar_bg(),
+            header_bg: default_header_bg(),
+            heading: Color::rgb(0.95, 0.96, 1.0),
+            subhead: Color::rgb(0.52, 0.57, 0.68),
+            row_selected: Color::rgb(0.19, 0.27, 0.42),
             row_drop: Color::rgb(0.18, 0.40, 0.30),
-            menu_bg: Color::rgb(0.16, 0.17, 0.22),
-            card_bg: Color::rgb(0.17, 0.18, 0.23),
-            card_border: Color::rgb(0.24, 0.26, 0.32),
-            mode_active: Color::rgb(0.24, 0.40, 0.62),
+            menu_bg: Color::rgb(0.11, 0.12, 0.15),
+            card_bg: Color::rgb(0.128, 0.135, 0.165),
+            card_border: Color::rgb(0.20, 0.22, 0.27),
+            mode_active: Color::rgb(0.22, 0.38, 0.60),
             axis_x: Color::rgb(0.90, 0.32, 0.32),
             axis_y: Color::rgb(0.35, 0.70, 0.38),
             console_warn: default_console_warn(),
@@ -110,6 +129,8 @@ impl EditorTheme {
             aurora: Theme::light(),
             panel_bg: Color::rgb(0.90, 0.91, 0.94),
             root_bg: Color::rgb(0.82, 0.83, 0.86),
+            bar_bg: Color::rgb(0.86, 0.87, 0.90),
+            header_bg: Color::rgb(0.80, 0.82, 0.86),
             heading: Color::rgb(0.10, 0.12, 0.16),
             subhead: Color::rgb(0.38, 0.42, 0.50),
             row_selected: Color::rgb(0.72, 0.80, 0.94),
@@ -684,9 +705,6 @@ fn build_dock_node(
     }
 }
 
-/// The tab-bar height and per-tab horizontal padding.
-const TAB_BAR_PAD: f32 = 4.0;
-
 /// Build a tab group under `parent`: a tab bar (one draggable button per pane)
 /// above the active pane's content. Returns the group's root widget.
 fn build_group(
@@ -706,37 +724,28 @@ fn build_group(
             sizing,
         ),
     );
-    // The tab bar.
-    let bar = ui.panel(
-        group,
-        Style::new()
-            .row()
-            .gap(2.0)
-            .padding(TAB_BAR_PAD)
-            .background(theme.root_bg),
-    );
+    // The tab bar: tabs sit flush (no gap) on a darker strip. The active tab
+    // takes the content's background so it merges into the pane below it with no
+    // seam; inactive tabs are flat (just their text on the strip).
+    let bar = ui.panel(group, Style::new().row().background(theme.bar_bg));
     let active = active.min(panes.len().saturating_sub(1));
     for (i, &pane) in panes.iter().enumerate() {
         let selected = i == active;
-        let tab = ui.button(
-            bar,
-            pane.title(),
-            Style::new()
-                .padding_x(8.0)
-                .padding_y(3.0)
-                .corner_radius(CONTROL_RADIUS)
-                .foreground(if selected {
-                    theme.heading
-                } else {
-                    theme.subhead
-                })
-                .background(if selected {
-                    theme.panel_bg
-                } else {
-                    Color::TRANSPARENT
-                })
-                .draggable(),
-        );
+        let base = Style::new()
+            .padding_x(12.0)
+            .padding_y(6.0)
+            .foreground(if selected {
+                theme.heading
+            } else {
+                theme.subhead
+            })
+            .draggable();
+        let style = if selected {
+            base.background(theme.panel_bg)
+        } else {
+            base.flat()
+        };
+        let tab = ui.button(bar, pane.title(), style);
         rows.dock_tabs.push((tab, pane));
     }
     // The active pane's content fills the rest of the group.
@@ -924,7 +933,7 @@ fn build_toolbar(
             .gap(4.0)
             .padding(5.0)
             .align_center()
-            .background(theme.panel_bg),
+            .background(theme.bar_bg),
     );
     let icon = |id: Icon| icons.map(|i| i.get(id));
     rows.add_sprite = Some(toolbar_button(
@@ -932,7 +941,7 @@ fn build_toolbar(
         bar,
         "Add Sprite",
         icon(Icon::Add),
-        theme.panel_bg,
+        theme.bar_bg,
         theme,
     ));
     rows.save = Some(toolbar_button(
@@ -940,7 +949,7 @@ fn build_toolbar(
         bar,
         "Save",
         icon(Icon::Save),
-        theme.panel_bg,
+        theme.bar_bg,
         theme,
     ));
     rows.load = Some(toolbar_button(
@@ -948,18 +957,14 @@ fn build_toolbar(
         bar,
         "Load",
         icon(Icon::Load),
-        theme.panel_bg,
+        theme.bar_bg,
         theme,
     ));
 
     // View toggles: highlighted (mode_active) when on, so their state reads at a
     // glance, like the gizmo-mode buttons.
     let toggle_bg = |on: bool| {
-        if on {
-            theme.mode_active
-        } else {
-            theme.panel_bg
-        }
+        if on { theme.mode_active } else { theme.bar_bg }
     };
     rows.grid = Some(toolbar_button(
         ui,
@@ -992,7 +997,7 @@ fn build_toolbar(
         let background = if m == mode {
             theme.mode_active
         } else {
-            theme.panel_bg
+            theme.bar_bg
         };
         let button = toolbar_button(ui, bar, m.label(), icon(mode_icon(m)), background, theme);
         rows.mode_buttons.push((button, m));
@@ -1003,7 +1008,7 @@ fn build_toolbar(
         bar,
         "Settings",
         icon(Icon::Settings),
-        theme.panel_bg,
+        theme.bar_bg,
         theme,
     ));
 }
@@ -1909,6 +1914,13 @@ fn add_asset_field(
     );
     rows.asset_fields.push((row, node, component, field));
 
+    // The field name, left, so the asset row reads label <-> value like the rest.
+    ui.label(
+        row,
+        field,
+        Style::new().width(70.0).foreground(theme.heading),
+    );
+
     // A preview: the asset's decoded thumbnail if we have it, else a file icon.
     match thumbnails.get(&explorer.resolve_relative(path)) {
         Some(handle) => {
@@ -1997,16 +2009,23 @@ fn add_inspector_section(
         panel,
         Style::new()
             .column()
-            .gap(6.0)
-            .padding(8.0)
             .background(theme.card_bg)
-            .corner_radius(CARD_RADIUS)
             .border(1.0, theme.card_border),
     );
-    // One flat header row: the chevron is decoration inside it (not its own
-    // button, so it has no separate hover); clicking anywhere on the header
-    // toggles the section.
-    let header = ui.button(card, "", Style::new().row().gap(6.0).align_center().flat());
+    // A distinct darker header bar spanning the card, holding the section title
+    // (and a disclosure chevron). Clicking anywhere on the bar toggles the
+    // section - it is the button, so its whole width is the hit area.
+    let header = ui.button(
+        card,
+        "",
+        Style::new()
+            .row()
+            .gap(6.0)
+            .align_center()
+            .padding_x(8.0)
+            .padding_y(6.0)
+            .background(theme.header_bg),
+    );
     if let Some(icons) = icons {
         let chevron = if collapsed {
             Icon::ChevronRight
@@ -2025,7 +2044,9 @@ fn add_inspector_section(
         Style::new().grow(1.0).foreground(theme.heading),
     );
     rows.section_toggles.push((header, section));
-    (!collapsed).then_some(card)
+    // The fields live in a padded body below the header (the card itself has no
+    // padding, so the header bar can reach the edges).
+    (!collapsed).then(|| ui.panel(card, Style::new().column().gap(6.0).padding(8.0)))
 }
 
 /// One labeled, editable inspector row; returns the text input's id. `numeric`
@@ -2075,15 +2096,22 @@ fn add_vec2_field(
     theme: &EditorTheme,
     rows: &mut EditorRows,
 ) {
-    ui.label(panel, name, Style::new().foreground(theme.subhead));
+    // One row: the field name, then a colored X/Y scrub label + numeric input
+    // per axis - the same label <-> input shape as the scalar rows, just with
+    // two value cells sharing the space.
+    let row = ui.panel(panel, Style::new().row().gap(6.0).align_center());
+    ui.label(
+        row,
+        name,
+        Style::new().width(70.0).foreground(theme.heading),
+    );
     for (axis, caption, color) in [(Axis::X, "X", theme.axis_x), (Axis::Y, "Y", theme.axis_y)] {
-        let row = ui.panel(panel, Style::new().row().gap(4.0).align_center());
         let label = ui.button(
             row,
             caption,
             Style::new()
-                .width(24.0)
-                .padding(4.0)
+                .width(18.0)
+                .padding_y(4.0)
                 .background(color)
                 .foreground(Color::WHITE)
                 .text_center()
@@ -2105,8 +2133,6 @@ fn add_vec2_field(
 
 /// The file-explorer pane's content: the project's PNG and scene files, filling
 /// `parent` (a dock group's content area).
-/// Fixed width of the folder-tree column (the contents pane takes the rest).
-const FILE_TREE_W: f32 = 190.0;
 /// The folder icon in a tree row.
 const FILE_TREE_ICON: f32 = 17.0;
 /// The icon/thumbnail size in a list-view row.
@@ -2162,7 +2188,7 @@ fn build_file_explorer(
             .align_center()
             .gap(4.0)
             .padding(5.0)
-            .background(theme.panel_bg),
+            .background(theme.bar_bg),
     );
     let crumbs = ui.panel(
         bar,
@@ -2196,11 +2222,7 @@ fn build_file_explorer(
     }
     let icon = |id: Icon| ctx.icons.map(|i| i.get(id));
     let active = |on: bool| {
-        if on {
-            theme.mode_active
-        } else {
-            theme.panel_bg
-        }
+        if on { theme.mode_active } else { theme.bar_bg }
     };
     rows.file_view_list = Some(toolbar_button(
         ui,
@@ -2223,7 +2245,7 @@ fn build_file_explorer(
         bar,
         "Refresh",
         icon(Icon::Refresh),
-        theme.panel_bg,
+        theme.bar_bg,
         theme,
     ));
 
@@ -2234,7 +2256,7 @@ fn build_file_explorer(
         body,
         Style::new()
             .column()
-            .width(FILE_TREE_W)
+            .width(ex.tree_width())
             .gap(TREE_ROW_GAP)
             .padding(4.0)
             .scroll()
@@ -2247,7 +2269,16 @@ fn build_file_explorer(
     // not snap to the top on rebuilds; the app captures it back each frame.
     ui.set_scroll_offset(tree, ex.tree_scroll());
     rows.file_tree_scroll = Some(tree);
-    ui.panel(body, Style::new().width(1.0).background(theme.card_border));
+    // A draggable splitter (in place of a static divider) resizes the tree; the
+    // tree sits before it, so dragging right widens it. The app captures the new
+    // width back into the explorer each frame so it survives rebuilds.
+    let splitter = ui.splitter(
+        body,
+        Orientation::Vertical,
+        1.0,
+        Style::new().width(3.0).background(theme.card_border),
+    );
+    ui.set_splitter_target(splitter, tree);
     let contents = ui.panel(
         body,
         Style::new()
@@ -3333,7 +3364,7 @@ mod tests {
             if *m == GizmoMode::Rotate {
                 assert_eq!(bg, theme.mode_active, "the active mode is highlighted");
             } else {
-                assert_eq!(bg, theme.panel_bg, "inactive modes are not");
+                assert_eq!(bg, theme.bar_bg, "inactive modes blend into the bar");
             }
         }
     }

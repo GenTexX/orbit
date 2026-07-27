@@ -278,11 +278,19 @@ pub struct FileExplorer {
     /// rebuilds that a selection or a landing thumbnail trigger. Transient - not
     /// persisted across restarts.
     tree_scroll: f32,
+    /// The folder tree's width in pixels, resizable via the splitter between the
+    /// tree and the contents. Like `tree_scroll` it lives here so it survives
+    /// shell rebuilds; also transient (not persisted across restarts).
+    tree_width: f32,
     /// The contents entry being inline-renamed, if any (its row shows an edit
     /// field instead of a label). Held here so the renderer sees it via the same
     /// reference the pane already threads.
     renaming: Option<PathBuf>,
 }
+
+/// The folder tree's default and minimum width in pixels.
+const TREE_WIDTH_DEFAULT: f32 = 190.0;
+const TREE_WIDTH_MIN: f32 = 110.0;
 
 impl FileExplorer {
     /// Scan `root` and open the explorer at it (root expanded, its own contents
@@ -300,8 +308,20 @@ impl FileExplorer {
             anchor: None,
             view: FileView::default(),
             tree_scroll: 0.0,
+            tree_width: TREE_WIDTH_DEFAULT,
             renaming: None,
         }
+    }
+
+    /// The folder tree's current width (fed into the tree panel each rebuild).
+    pub fn tree_width(&self) -> f32 {
+        self.tree_width
+    }
+
+    /// Set the folder tree's width (captured from the splitter each frame),
+    /// floored so it cannot collapse away.
+    pub fn set_tree_width(&mut self, width: f32) {
+        self.tree_width = width.max(TREE_WIDTH_MIN);
     }
 
     /// The contents entry currently being inline-renamed, if any.
