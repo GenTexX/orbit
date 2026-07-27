@@ -171,6 +171,30 @@ pub fn default_doc() -> ThemeDoc {
     ThemeDoc { variables, tokens }
 }
 
+/// Bring an older document up to date: add any themeable tokens it lacks (ones
+/// introduced after the file was written), each bound to its built-in default,
+/// so a theming tool can edit every token. Returns whether anything was added.
+/// When a missing token's default is a variable the document also lacks, that
+/// variable is re-added too, so the binding still resolves.
+pub fn backfill_missing_tokens(doc: &mut ThemeDoc) -> bool {
+    let dflt = default_doc();
+    let mut added = false;
+    for (name, bind) in &dflt.tokens {
+        if doc.tokens.contains_key(name) {
+            continue;
+        }
+        if let Bind::Var(var) = bind
+            && !doc.variables.contains_key(var)
+            && let Some(value) = dflt.variables.get(var)
+        {
+            doc.variables.insert(var.clone(), *value);
+        }
+        doc.tokens.insert(name.clone(), bind.clone());
+        added = true;
+    }
+    added
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +274,24 @@ mod tests {
         let back: ThemeDoc = ron::from_str(&text).unwrap();
         assert_eq!(back, doc);
         assert_eq!(resolve(&back), EditorTheme::dark());
+    }
+
+    #[test]
+    fn backfill_adds_missing_tokens_and_leaves_a_complete_doc_untouched() {
+        // A doc missing a token (an older file) gets it back, resolving to the
+        // built-in default; a doc that already has every token is unchanged.
+        let mut doc = default_doc();
+        doc.tokens.remove("tab_radius");
+        assert!(backfill_missing_tokens(&mut doc), "a token was added back");
+        assert_eq!(
+            resolve(&doc).tab_radius,
+            EditorTheme::dark().tab_radius,
+            "backfilled token resolves to its default"
+        );
+        assert_eq!(doc, default_doc(), "backfill restores the full default doc");
+        assert!(
+            !backfill_missing_tokens(&mut doc),
+            "a complete doc needs no backfill"
+        );
     }
 }

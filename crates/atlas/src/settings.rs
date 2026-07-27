@@ -6,14 +6,22 @@
 
 pub use spectrum::settings::{Settings, SnapSettings, modified, read, save};
 
-use crate::theme::default_doc;
+use crate::theme::{backfill_missing_tokens, default_doc};
 
 /// Load the user's settings for startup. If the file does not exist yet, write
 /// the defaults - including the full authored dark theme document - so there is
-/// something to edit. An invalid file falls back to the defaults (and is left
-/// as-is for the user to fix).
+/// something to edit. An older file is brought up to date: any themeable tokens
+/// added since it was written are backfilled (and the file re-saved) so a
+/// theming tool can edit them. An invalid file falls back to the defaults (and
+/// is left as-is for the user to fix).
 pub fn load() -> Settings {
-    if let Some(settings) = read() {
+    if let Some(mut settings) = read() {
+        if backfill_missing_tokens(&mut settings.theme) {
+            match save(&settings) {
+                Ok(()) => tracing::info!("added newly-introduced theme tokens to settings"),
+                Err(err) => tracing::warn!("could not update settings: {err}"),
+            }
+        }
         return settings;
     }
     let settings = Settings {
