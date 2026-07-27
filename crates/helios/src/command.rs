@@ -157,6 +157,13 @@ pub struct History {
     /// group can be called inside a larger grouped op); only the outermost pair
     /// records the buffered edits as one [`Edit::Batch`].
     group_depth: u32,
+    /// A counter bumped once per recorded edit and per undo/redo. It never
+    /// decreases, so comparing it to the value captured at the last save tells
+    /// an editor whether the scene has unsaved changes (see [`revision`]). A
+    /// no-op edit or an empty group records nothing and does not bump it.
+    ///
+    /// [`revision`]: Self::revision
+    revision: u64,
 }
 
 impl History {
@@ -175,6 +182,14 @@ impl History {
         !self.undone.is_empty()
     }
 
+    /// A monotonic counter bumped on every recorded edit and every undo/redo. An
+    /// editor captures this on save and compares it later: a difference means
+    /// unsaved changes. (It only increases, so undoing back to the saved scene
+    /// still reads as modified - deliberately conservative.)
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     fn push(&mut self, scene: &mut Scene, edit: Edit) {
         edit.apply(scene);
         match &mut self.group {
@@ -184,6 +199,7 @@ impl History {
             None => {
                 self.done.push(edit);
                 self.undone.clear();
+                self.revision += 1;
             }
         }
     }
@@ -221,6 +237,7 @@ impl History {
         };
         self.done.push(edit);
         self.undone.clear();
+        self.revision += 1;
     }
 
     /// Undo the most recent edit. Returns `false` if there was nothing to undo.
@@ -229,6 +246,7 @@ impl History {
             Some(edit) => {
                 edit.revert(scene);
                 self.undone.push(edit);
+                self.revision += 1;
                 true
             }
             None => false,
@@ -241,6 +259,7 @@ impl History {
             Some(edit) => {
                 edit.apply(scene);
                 self.done.push(edit);
+                self.revision += 1;
                 true
             }
             None => false,
@@ -611,6 +630,51 @@ mod tests {
         assert!(history.undo(&mut scene));
         assert!(scene.children(root).is_empty());
         assert!(!history.can_undo());
+    }
+
+    #[test]
+    fn the_revision_tracks_real_edits_and_undo_redo() {
+        let (mut scene, root) = scene_with_root();
+        let mut history = History::new();
+        assert_eq!(history.revision(), 0, "a fresh history is at revision 0");
+
+        let node = history.add_node(&mut scene, root, Node::new("a"));
+        assert_eq!(history.revision(), 1);
+        history.set_transform(
+            &mut scene,
+            node,
+            Transform::from_translation(Vec2::new(1.0, 0.0)),
+        );
+        assert_eq!(history.revision(), 2);
+
+        // A no-op edit records nothing and does not bump.
+        history.set_visible(&mut scene, node, true); // already visible
+        assert_eq!(
+            history.revision(),
+            2,
+            "a no-op edit does not bump the revision"
+        );
+
+        // A whole group is one bump; an empty group is none.
+        history.begin_group();
+        history.add_node(&mut scene, root, Node::new("b"));
+        history.add_node(&mut scene, root, Node::new("c"));
+        history.end_group(&mut scene);
+        assert_eq!(history.revision(), 3, "a group bumps once");
+        history.begin_group();
+        history.end_group(&mut scene);
+        assert_eq!(history.revision(), 3, "an empty group does not bump");
+
+        // Undo and redo each bump (so undoing never reads as 'saved' again).
+        assert!(history.undo(&mut scene));
+        assert_eq!(history.revision(), 4);
+        assert!(history.redo(&mut scene));
+        assert_eq!(history.revision(), 5);
+        // A no-op undo/redo (empty stack) does not bump.
+        while history.undo(&mut scene) {}
+        let r = history.revision();
+        assert!(!history.undo(&mut scene));
+        assert_eq!(history.revision(), r, "a no-op undo does not bump");
     }
 
     #[test]

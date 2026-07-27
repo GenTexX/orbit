@@ -332,6 +332,9 @@ pub struct EditorRows {
     pub status_zoom: Option<WidgetId>,
     pub status_selected: Option<WidgetId>,
     pub status_fps: Option<WidgetId>,
+    /// Shows "unsaved changes" (brighter) when the project has edits since the
+    /// last save, empty otherwise.
+    pub status_modified: Option<WidgetId>,
     /// The open context-menu popup (for dismiss-on-click-outside), and its
     /// clickable item rows mapped to the action each performs.
     pub menu_popup: Option<WidgetId>,
@@ -693,6 +696,8 @@ fn build_status_bar(ui: &mut Ui, parent: WidgetId, theme: &EditorTheme, rows: &m
     rows.status_zoom = Some(readout(ui, "zoom 100%"));
     rows.status_selected = Some(readout(ui, "nothing selected"));
     rows.status_fps = Some(readout(ui, "- fps"));
+    // Brighter than the neutral readouts so unsaved state stands out.
+    rows.status_modified = Some(ui.label(bar, "", Style::new().foreground(theme.heading)));
 }
 
 /// The toolbar directly above the viewport: the editor's actions on the left,

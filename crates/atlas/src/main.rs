@@ -57,6 +57,10 @@ const ALPHA_H: usize = 16;
 /// rename), matching a typical desktop double-click speed.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// The editor's base window title; prefixed with "* " when there are unsaved
+/// changes.
+const WINDOW_TITLE: &str = "Orbit - Atlas";
+
 /// Which of the color picker's gradients a press is dragging.
 #[derive(Debug, Clone, Copy)]
 enum PickerDrag {
@@ -271,6 +275,11 @@ struct State {
     pointer_time: std::time::Duration,
     /// The cursor icon currently applied to the window (set only on change).
     applied_cursor: aurora::CursorHint,
+    /// The history revision at the last save or load; the project has unsaved
+    /// changes when it differs from the live `history.revision()`.
+    saved_revision: u64,
+    /// The window title currently applied (set only on change, like the cursor).
+    applied_title: String,
     /// The open right-click context menu, if any (Aurora popup layer).
     context_menu: Option<ContextMenu>,
     /// The active transform tool (select/move/rotate/scale), chosen from the
@@ -427,7 +436,7 @@ impl State {
     fn new(event_loop: &ActiveEventLoop) -> Result<Self> {
         let window = Arc::new(
             event_loop
-                .create_window(Window::default_attributes().with_title("Orbit - Atlas"))
+                .create_window(Window::default_attributes().with_title(WINDOW_TITLE))
                 .context("create window")?,
         );
         let size = window.inner_size();
@@ -530,6 +539,8 @@ impl State {
             pointer_events: 0,
             pointer_time: std::time::Duration::ZERO,
             applied_cursor: aurora::CursorHint::Default,
+            saved_revision: 0,
+            applied_title: WINDOW_TITLE.to_string(),
             context_menu: None,
             gizmo_mode: GizmoMode::default(),
             clipboard: arboard::Clipboard::new()
@@ -1803,9 +1814,23 @@ impl State {
         self.dirty = true;
     }
 
+    /// Whether the project has edits since the last save or load.
+    fn is_modified(&self) -> bool {
+        self.history.revision() != self.saved_revision
+    }
+
+    /// The window title for the current state ("* " prefix when unsaved).
+    fn title(&self) -> String {
+        let mark = if self.is_modified() { "* " } else { "" };
+        format!("{mark}{WINDOW_TITLE}")
+    }
+
     fn save_project(&mut self) {
         match self.project.save(&self.project_dir) {
-            Ok(()) => tracing::info!("project saved to {}", self.project_dir.display()),
+            Ok(()) => {
+                self.saved_revision = self.history.revision();
+                tracing::info!("project saved to {}", self.project_dir.display());
+            }
             Err(err) => tracing::error!("save failed: {err}"),
         }
     }
@@ -1818,6 +1843,7 @@ impl State {
             Ok(project) => {
                 self.project = project;
                 self.history = History::new();
+                self.saved_revision = 0;
                 self.selection.clear();
                 self.renaming = None;
                 self.tree_filter.clear();
@@ -1901,15 +1927,27 @@ impl State {
         };
         let zoom = format!("zoom {:.0}%", self.camera.zoom * 100.0);
         let fps = format!("{:.0} fps", self.last_fps);
+        let modified = if self.is_modified() {
+            "unsaved changes"
+        } else {
+            ""
+        };
         for (id, text) in [
             (self.rows.status_cursor, cursor),
             (self.rows.status_zoom, zoom),
             (self.rows.status_selected, selected),
             (self.rows.status_fps, fps),
+            (self.rows.status_modified, modified.to_string()),
         ] {
             if let Some(id) = id {
                 self.ui.set_label(id, text);
             }
+        }
+        // Reflect unsaved state in the window title too (set only on change).
+        let title = self.title();
+        if title != self.applied_title {
+            self.window.set_title(&title);
+            self.applied_title = title;
         }
     }
 
