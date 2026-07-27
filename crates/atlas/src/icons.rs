@@ -270,18 +270,23 @@ fn arc_stroke(x: f32, y: f32, c: (f32, f32), r: f32, start: f32, sweep: f32, w: 
 }
 
 /// An arrowhead capping a circular arc at angle `a` on the circle of radius `r`
-/// about `c`, pointing along the arc's tangent (clockwise if `cw`), `len` long
-/// (its base half as wide again). Turns an [`arc_stroke`] into a rotate/refresh
-/// arrow with the head exactly on the ring.
+/// about `c`. Its base is radial - spanning the ring's stroke at `a` - and its
+/// tip runs `len` forward along the tangent (clockwise if `cw`), so the arc
+/// flows straight into the point instead of a head stuck on sideways. The arc
+/// should end at `a`; the head continues from there.
 fn arc_arrow(x: f32, y: f32, c: (f32, f32), r: f32, a: f32, cw: bool, len: f32) -> bool {
-    let tip = on_circle(c, r, a);
     // The clockwise tangent (increasing angle) is (-sin, cos); reverse for ccw.
-    let dir = if cw {
+    let tangent = if cw {
         (-a.sin(), a.cos())
     } else {
         (a.sin(), -a.cos())
     };
-    arrowhead(x, y, tip, dir, len, len * 0.7)
+    let half = len * 0.62; // base half-width, radial across the stroke
+    let inner = on_circle(c, r - half, a);
+    let outer = on_circle(c, r + half, a);
+    let mid = on_circle(c, r, a);
+    let tip = (mid.0 + tangent.0 * len, mid.1 + tangent.1 * len);
+    tri(x, y, inner, outer, tip)
 }
 
 /// A sharp arrowhead: a triangle with its `tip` pointing along `dir` (any
@@ -372,7 +377,7 @@ fn icon_rotate(x: f32, y: f32) -> bool {
     let gap = 0.1 * TAU; // ~36-degree opening at the top
     let start = -PI / 2.0 + gap; // just clockwise of the top
     let sweep = TAU - gap; // ~90% of the circle
-    arc_stroke(x, y, c, r, start, sweep, 0.08) || arc_arrow(x, y, c, r, start + sweep, true, 0.2)
+    arc_stroke(x, y, c, r, start, sweep, 0.08) || arc_arrow(x, y, c, r, start + sweep, true, 0.16)
 }
 
 /// A diagonal double-headed arrow (scale/resize), thin with bold heads.
@@ -432,23 +437,27 @@ fn icon_axes(x: f32, y: f32) -> bool {
         || arrowhead(x, y, (0.93, 0.82), (1.0, 0.0), 0.2, 0.14)
 }
 
-/// A horseshoe magnet (the snapping toggle): a thick U opening downward, its two
-/// pole faces squared off at the bottom.
+/// A horseshoe magnet (the snapping toggle): a thick U with short arms, then a
+/// small gap, then a square pole tip under each arm - the striped-pole look that
+/// says "magnet" rather than a plain U.
 fn icon_snap(x: f32, y: f32) -> bool {
     use std::f32::consts::PI;
-    let c = (0.5, 0.46);
+    let c = (0.5, 0.4);
     let r = 0.26; // mid-radius of the band
-    let t = 0.17; // band thickness
-    let foot = 0.8; // y of the pole faces
+    let t = 0.16; // band (and pole) width
+    let arm_end = 0.58; // arms stop here (short)
+    let pole_top = 0.64; // poles start below a small gap
+    let pole_bot = pole_top + t; // square poles (side = arm width)
+    let (lx, rx) = (c.0 - r, c.0 + r);
     // The curved back: the upper semicircle, from left (PI) clockwise over the
     // top to right (TAU).
     arc_stroke(x, y, c, r, PI, PI, t)
-        // The two legs down to the poles.
-        || rect(x, y, c.0 - r - t * 0.5, c.1, c.0 - r + t * 0.5, foot)
-        || rect(x, y, c.0 + r - t * 0.5, c.1, c.0 + r + t * 0.5, foot)
-        // Squared pole faces (a touch wider) so it reads as a magnet, not a U.
-        || rect(x, y, c.0 - r - t * 0.6, foot, c.0 - r + t * 0.6, foot + 0.09)
-        || rect(x, y, c.0 + r - t * 0.6, foot, c.0 + r + t * 0.6, foot + 0.09)
+        // Two short arms down from the arc ends.
+        || rect(x, y, lx - t * 0.5, c.1, lx + t * 0.5, arm_end)
+        || rect(x, y, rx - t * 0.5, c.1, rx + t * 0.5, arm_end)
+        // Square pole tips, arm-width, set off by the gap.
+        || rect(x, y, lx - t * 0.5, pole_top, lx + t * 0.5, pole_bot)
+        || rect(x, y, rx - t * 0.5, pole_top, rx + t * 0.5, pole_bot)
 }
 
 /// A closed folder: a back tab and the front body (a filled silhouette).
@@ -456,17 +465,16 @@ fn icon_folder(x: f32, y: f32) -> bool {
     rect(x, y, 0.12, 0.24, 0.46, 0.34) || rect(x, y, 0.12, 0.30, 0.88, 0.78)
 }
 
-/// An open folder (the selected directory): an upright back panel with a tab,
-/// and a front cover fanned open toward the viewer - a trapezoid narrow where it
-/// meets the back and wide at its base, so the "mouth" reads apart from the flat
-/// closed folders.
+/// An open folder (the selected directory): a tab and a thin back rim across the
+/// top, then a symmetric front pocket (a trapezoid narrowing toward its base) -
+/// the back-behind-front read that sets it apart from the flat closed folder,
+/// kept symmetric so it does not look lopsided.
 fn icon_folder_open(x: f32, y: f32) -> bool {
-    // Tab + upright back panel (its top edge shows above the fanned front).
-    rect(x, y, 0.1, 0.2, 0.4, 0.3)
-        || rect(x, y, 0.1, 0.28, 0.8, 0.46)
-        // The open front: narrow at the top (on the back panel), fanning wider
-        // toward the base - a folder tipped open toward you.
-        || poly(x, y, &[(0.24, 0.46), (0.9, 0.46), (0.98, 0.8), (0.04, 0.8)])
+    // Tab + a back rim: the top edge of the folder, showing behind the pocket.
+    rect(x, y, 0.14, 0.22, 0.44, 0.32)
+        || rect(x, y, 0.12, 0.3, 0.88, 0.42)
+        // The front pocket, symmetric: wider at the rim, tapering to the base.
+        || poly(x, y, &[(0.1, 0.42), (0.9, 0.42), (0.78, 0.78), (0.22, 0.78)])
 }
 
 /// The document "page" the file icons share: a thin rounded-rectangle outline.
@@ -511,8 +519,8 @@ fn icon_refresh(x: f32, y: f32) -> bool {
     let sweep = PI - gap; // each arc spans a little under a half-turn
     arc_stroke(x, y, c, r, start, sweep, w)
         || arc_stroke(x, y, c, r, start + PI, sweep, w)
-        || arc_arrow(x, y, c, r, start + sweep, true, 0.17)
-        || arc_arrow(x, y, c, r, start + PI + sweep, true, 0.17)
+        || arc_arrow(x, y, c, r, start + sweep, true, 0.15)
+        || arc_arrow(x, y, c, r, start + PI + sweep, true, 0.15)
 }
 
 /// Three stacked rows, each a leading dot and a line (the compact list view).
