@@ -331,9 +331,16 @@ pub fn gizmo_sprites(gizmo: &Gizmo, zoom: f32, mode: GizmoMode) -> Vec<Sprite> {
         ));
         sprites.push(handle(gizmo.rotate_center, ROTATE_HANDLE));
     }
+    // Gate each scale handle on its own hit, matching hit_gizmo (which tests
+    // ScaleX/ScaleY/ScaleCorner independently) and the per-axis Move handles
+    // above - so a mode that shows only some scale handles draws exactly those.
     if mode.shows(GizmoHit::ScaleX) {
         sprites.push(handle(gizmo.scale_x, AXIS_X));
+    }
+    if mode.shows(GizmoHit::ScaleY) {
         sprites.push(handle(gizmo.scale_y, AXIS_Y));
+    }
+    if mode.shows(GizmoHit::ScaleCorner) {
         sprites.push(handle(gizmo.scale_corner, SCALE_HANDLE));
     }
     sprites
@@ -606,8 +613,12 @@ impl Drag {
                 grab_proj_y,
                 ..
             } => {
-                let kx = ((world - pivot).dot(axis_x) / grab_proj_x).max(0.05);
-                let ky = ((world - pivot).dot(axis_y) / grab_proj_y).max(0.05);
+                // Guard the divisor like ScaleUniform: grab_proj_* is the grab's
+                // positive offset along each handle axis, ~0 only for a degenerate
+                // zero-extent sprite, where an unguarded divide gives +inf scale
+                // (.max(0.05) catches a NaN but not a positive infinity).
+                let kx = ((world - pivot).dot(axis_x) / grab_proj_x.max(1.0e-3)).max(0.05);
+                let ky = ((world - pivot).dot(axis_y) / grab_proj_y.max(1.0e-3)).max(0.05);
                 Transform {
                     scale: original.scale * Vec2::new(kx, ky),
                     ..original
@@ -622,7 +633,8 @@ impl Drag {
                 ..
             } => {
                 let proj = (world - pivot).dot(axis_world);
-                let k = (proj / grab_proj).max(0.05);
+                // Guard the divisor as in ScaleFree/ScaleUniform (see above).
+                let k = (proj / grab_proj.max(1.0e-3)).max(0.05);
                 let mut scale = original.scale;
                 if vertical {
                     scale.y *= k;
@@ -1222,6 +1234,38 @@ mod tests {
         let scaled = drag.apply(&scene, center + Vec2::new(40.0, 5.0));
         assert!((scaled.scale - Vec2::new(2.0, 0.5)).length() < EPS);
         assert!((scaled.translation - original.translation).length() < EPS);
+    }
+
+    #[test]
+    fn a_degenerate_zero_extent_scale_drag_stays_finite() {
+        // A zero-extent sprite makes grab_proj ~0; the drag must not divide by it
+        // into a NaN/infinite scale that would poison the transform.
+        let (scene, node) = scene_with_sprite(Vec2::new(100.0, 100.0), Vec2::ZERO);
+        let center = world_center(&scene, node);
+        let original = scene.node(node).transform;
+
+        let axis = Drag::ScaleAxis {
+            node,
+            original,
+            pivot: center,
+            axis_world: Vec2::X,
+            grab_proj: 0.0,
+            vertical: false,
+        };
+        let s = axis.apply(&scene, center + Vec2::new(40.0, 0.0));
+        assert!(s.scale.is_finite(), "axis scale must stay finite");
+
+        let free = Drag::ScaleFree {
+            node,
+            original,
+            pivot: center,
+            axis_x: Vec2::X,
+            axis_y: Vec2::Y,
+            grab_proj_x: 0.0,
+            grab_proj_y: 0.0,
+        };
+        let s = free.apply(&scene, center + Vec2::new(40.0, 5.0));
+        assert!(s.scale.is_finite(), "free scale must stay finite");
     }
 
     #[test]
