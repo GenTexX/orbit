@@ -20,6 +20,7 @@ use helios::{NodeId, Scene};
 use serde::{Deserialize, Serialize};
 
 use crate::dock::{DockNode, Pane};
+use crate::explorer::FileView;
 use crate::viewport::{EditorCamera, GizmoMode};
 
 /// The `.orbit` subdirectory of a project (holds machine-managed editor state).
@@ -75,6 +76,13 @@ pub struct EditorState {
     pub pane_scrolls: Vec<(Pane, f32)>,
     /// Collapsed scene-tree nodes, as child-index paths from the root.
     pub collapsed: Vec<Vec<usize>>,
+    /// File-explorer expanded folders, as project-relative paths.
+    pub explorer_expanded: Vec<String>,
+    /// The file-explorer's selected folder (project-relative), or `None` at the
+    /// project root.
+    pub explorer_selected: Option<String>,
+    /// The file-explorer's view mode (list or grid).
+    pub explorer_view: FileView,
 }
 
 impl Default for EditorState {
@@ -85,6 +93,9 @@ impl Default for EditorState {
             gizmo_mode: GizmoMode::default(),
             pane_scrolls: Vec::new(),
             collapsed: Vec::new(),
+            explorer_expanded: Vec::new(),
+            explorer_selected: None,
+            explorer_view: FileView::default(),
         }
     }
 }
@@ -191,6 +202,9 @@ mod tests {
             gizmo_mode: GizmoMode::Rotate,
             pane_scrolls: vec![(Pane::SceneTree, 40.0), (Pane::Console, 100.0)],
             collapsed: vec![vec![0], vec![1, 2]],
+            explorer_expanded: vec!["assets".to_string(), "assets/ui".to_string()],
+            explorer_selected: Some("scenes".to_string()),
+            explorer_view: FileView::Grid,
         };
         let text = ron::ser::to_string_pretty(&state, ron::ser::PrettyConfig::default()).unwrap();
         let back: EditorState = ron::from_str(&text).unwrap();

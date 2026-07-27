@@ -55,6 +55,22 @@ pub enum Icon {
     Axes,
     /// A horseshoe magnet (the snapping toggle).
     Snap,
+    /// A closed folder (a directory in the file explorer's tree).
+    Folder,
+    /// An open folder (the selected directory).
+    FolderOpen,
+    /// A page with a small picture (an image asset).
+    FileImage,
+    /// A page with a little node graph (a scene file).
+    FileScene,
+    /// A plain document with text lines (any other file).
+    FileGeneric,
+    /// A circular arrow (re-scan the project's files).
+    Refresh,
+    /// Stacked rows (the explorer's compact list view).
+    ViewList,
+    /// A 2x2 of squares (the explorer's grid/preview view).
+    ViewGrid,
 }
 
 /// An icon's coverage predicate over the normalized `[0, 1]` square.
@@ -77,6 +93,14 @@ const SPECS: &[(Icon, Predicate)] = &[
     (Icon::Grid, icon_grid),
     (Icon::Axes, icon_axes),
     (Icon::Snap, icon_snap),
+    (Icon::Folder, icon_folder),
+    (Icon::FolderOpen, icon_folder_open),
+    (Icon::FileImage, icon_file_image),
+    (Icon::FileScene, icon_file_scene),
+    (Icon::FileGeneric, icon_file_generic),
+    (Icon::Refresh, icon_refresh),
+    (Icon::ViewList, icon_view_list),
+    (Icon::ViewGrid, icon_view_grid),
 ];
 
 /// The registered icon images, looked up by [`Icon`].
@@ -194,6 +218,21 @@ fn arc(x: f32, y: f32, rin: f32, rout: f32, a0: f32, a1: f32) -> bool {
 /// A rectangle `[x0, x1] x [y0, y1]`.
 fn rect(x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> bool {
     (x0..=x1).contains(&x) && (y0..=y1).contains(&y)
+}
+
+/// A filled disc of radius `r` centered at `c` (unlike [`arc`], it can sit
+/// anywhere in the square, so interior symbols on a page icon can be placed).
+fn disc(x: f32, y: f32, c: (f32, f32), r: f32) -> bool {
+    (x - c.0).hypot(y - c.1) <= r
+}
+
+/// A thin rectangular outline (four capsule edges of width `w`): the "page" the
+/// file icons are drawn on, so their interior symbols read against empty space.
+fn frame(x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32, w: f32) -> bool {
+    line(x, y, (x0, y0), (x1, y0), w)
+        || line(x, y, (x0, y1), (x1, y1), w)
+        || line(x, y, (x0, y0), (x0, y1), w)
+        || line(x, y, (x1, y0), (x1, y1), w)
 }
 
 /// A sharp arrowhead: a triangle with its `tip` pointing along `dir` (any
@@ -338,6 +377,72 @@ fn icon_scale(x: f32, y: f32) -> bool {
     line(x, y, (0.26, 0.74), (0.74, 0.26), STROKE)
         || arrowhead(x, y, (0.16, 0.84), (-1.0, 1.0), 0.22, 0.12)
         || arrowhead(x, y, (0.84, 0.16), (1.0, -1.0), 0.22, 0.12)
+}
+
+/// A closed folder: a back tab and the front body (a filled silhouette).
+fn icon_folder(x: f32, y: f32) -> bool {
+    rect(x, y, 0.12, 0.24, 0.46, 0.34) || rect(x, y, 0.12, 0.30, 0.88, 0.78)
+}
+
+/// An open folder: the back panel plus a front flap swept open (a trapezoid),
+/// so the selected directory reads differently from the closed ones.
+fn icon_folder_open(x: f32, y: f32) -> bool {
+    // Back tab + a shallow back wall.
+    rect(x, y, 0.12, 0.22, 0.46, 0.32)
+        || rect(x, y, 0.12, 0.28, 0.88, 0.5)
+        // The open front, a trapezoid leaning down-right.
+        || poly(x, y, &[(0.14, 0.5), (0.98, 0.5), (0.82, 0.8), (0.02, 0.8)])
+}
+
+/// The document "page" the file icons share: a thin rounded-rectangle outline.
+fn page(x: f32, y: f32) -> bool {
+    frame(x, y, 0.24, 0.12, 0.76, 0.88, 0.05)
+}
+
+/// An image file: a page with a sun and a mountain (the universal picture mark).
+fn icon_file_image(x: f32, y: f32) -> bool {
+    page(x, y) || disc(x, y, (0.4, 0.34), 0.06) || tri(x, y, (0.3, 0.72), (0.5, 0.46), (0.7, 0.72))
+}
+
+/// A scene file: a page with a small node tree (one parent, two children) -
+/// exactly what a scene is.
+fn icon_file_scene(x: f32, y: f32) -> bool {
+    page(x, y)
+        || disc(x, y, (0.5, 0.32), 0.055)
+        || disc(x, y, (0.36, 0.62), 0.055)
+        || disc(x, y, (0.64, 0.62), 0.055)
+        || line(x, y, (0.5, 0.32), (0.36, 0.62), 0.035)
+        || line(x, y, (0.5, 0.32), (0.64, 0.62), 0.035)
+}
+
+/// A generic file: a page with three text lines.
+fn icon_file_generic(x: f32, y: f32) -> bool {
+    page(x, y)
+        || line(x, y, (0.34, 0.4), (0.66, 0.4), 0.05)
+        || line(x, y, (0.34, 0.54), (0.66, 0.54), 0.05)
+        || line(x, y, (0.34, 0.68), (0.58, 0.68), 0.05)
+}
+
+/// A circular refresh arrow: two opposing arcs, each arrowhead-capped, so it
+/// reads as "reload" and not the rotate tool.
+fn icon_refresh(x: f32, y: f32) -> bool {
+    use std::f32::consts::PI;
+    arc(x, y, 0.27, 0.34, 0.12 * PI, 0.82 * PI)
+        || arc(x, y, 0.27, 0.34, 1.12 * PI, 1.82 * PI)
+        || arrowhead(x, y, (0.19, 0.38), (0.7, -0.9), 0.16, 0.1)
+        || arrowhead(x, y, (0.81, 0.62), (-0.7, 0.9), 0.16, 0.1)
+}
+
+/// Three stacked rows, each a leading dot and a line (the compact list view).
+fn icon_view_list(x: f32, y: f32) -> bool {
+    let row = |cy: f32| disc(x, y, (0.23, cy), 0.055) || line(x, y, (0.36, cy), (0.84, cy), 0.08);
+    row(0.3) || row(0.5) || row(0.7)
+}
+
+/// A 2x2 of squares (the grid / large-preview view).
+fn icon_view_grid(x: f32, y: f32) -> bool {
+    let cell = |x0: f32, y0: f32| rect(x, y, x0, y0, x0 + 0.28, y0 + 0.28);
+    cell(0.16, 0.16) || cell(0.56, 0.16) || cell(0.16, 0.56) || cell(0.56, 0.56)
 }
 
 #[cfg(test)]

@@ -9,10 +9,12 @@ mod color;
 mod console;
 mod dock;
 mod editor_state;
+mod explorer;
 mod icons;
 mod project;
 mod settings;
 mod textures;
+mod thumbnails;
 mod ui;
 mod viewport;
 
@@ -42,7 +44,7 @@ use crate::textures::TextureCache;
 use crate::ui::{
     Axis, ColorPickerView, ColorTarget, ContextMenu, DropSpot, EditorRows, EditorTheme, FieldRef,
     InspectorSection, InspectorView, MenuAction, TreeView, axis_of, build_color_picker,
-    build_editor_ui, capture_dock_scrolls, capture_dock_sizes, field_color, field_vec2,
+    build_editor_ui, capture_dock_scrolls, capture_dock_sizes, field_color, field_vec2, grid_cols,
     parse_value, resolve_drop, set_field_color, set_field_vec2, value_to_text, visible_nodes,
     with_axis,
 };
@@ -348,6 +350,14 @@ struct State {
     /// An in-progress reparent drag: the row being dragged and the current
     /// drop target under the cursor.
     reparent: Option<ReparentDrag>,
+    /// The file explorer's model and view state (scanned project tree, expanded
+    /// folders, selected folder/file, view mode).
+    explorer: explorer::FileExplorer,
+    /// Decoded image thumbnails for the explorer's previews, keyed by path.
+    thumbnails: thumbnails::Thumbnails,
+    /// The explorer grid's column count, recomputed from the contents pane's
+    /// laid-out width each frame so the preview grid reflows with the pane.
+    explorer_cols: usize,
 }
 
 /// A tree row being dragged to reparent it; `target` is the current valid drop
@@ -547,12 +557,26 @@ impl State {
             .as_ref()
             .map(|s| editor_state::decode_collapsed(&project.scene, &s.collapsed))
             .unwrap_or_default();
+        // The file explorer scans the project directory; its expanded folders
+        // and selected folder are restored from the same per-project state.
+        let mut explorer = explorer::FileExplorer::new(&project_dir);
+        if let Some(s) = &saved {
+            explorer.restore(
+                &s.explorer_expanded,
+                s.explorer_selected.as_deref(),
+                s.explorer_view,
+            );
+        }
+        let thumbnails = thumbnails::Thumbnails::new();
+        let explorer_cols = 3;
         let (ui, rows) = build_editor_ui(
             &project.scene,
             &HashSet::new(),
             None,
             viewport_handle,
-            &project_dir,
+            &explorer,
+            &thumbnails,
+            explorer_cols,
             &dock,
             &pane_scrolls,
             None,
@@ -634,6 +658,9 @@ impl State {
             settings_mtime: settings::modified(),
             settings_poll: std::time::Instant::now(),
             reparent: None,
+            explorer,
+            thumbnails,
+            explorer_cols,
         })
     }
 
@@ -1923,6 +1950,9 @@ impl State {
             gizmo_mode: self.gizmo_mode,
             pane_scrolls,
             collapsed: editor_state::encode_collapsed(&self.project.scene, &self.tree_collapsed),
+            explorer_expanded: self.explorer.expanded_rel(),
+            explorer_selected: self.explorer.selected_rel(),
+            explorer_view: self.explorer.view(),
         }
     }
 
@@ -1995,11 +2025,75 @@ impl State {
                 // panics. Drop them; the new scene starts fully expanded.
                 self.tree_collapsed.clear();
                 self.inspector_collapsed.clear();
+                // Re-scan the files on disk and refresh cached previews in place
+                // (a reloaded project may have different files at the same paths).
+                self.explorer.rescan();
+                self.thumbnails.invalidate(&mut self.gui);
                 self.dirty = true;
                 tracing::info!("project loaded from {}", self.project_dir.display());
             }
             Err(err) => tracing::error!("load failed: {err}"),
         }
+    }
+
+    /// Decode a thumbnail for every previewable image in the folder the explorer
+    /// is showing (cached, so each decodes once). When a new preview lands, mark
+    /// the shell dirty so the next rebuild swaps its type icon for the image.
+    fn ensure_thumbnails(&mut self) {
+        // Nothing to preview when the Files pane is not built this frame (behind
+        // an inactive dock tab): skip the decode work entirely.
+        if self.rows.file_contents.is_none() {
+            return;
+        }
+        let paths: Vec<std::path::PathBuf> = self
+            .explorer
+            .contents()
+            .iter()
+            .filter(|e| !e.is_dir() && explorer::can_thumbnail(&e.path))
+            .map(|e| e.path.clone())
+            .collect();
+        for path in paths {
+            let had = self.thumbnails.get(&path).is_some();
+            self.thumbnails.ensure(&mut self.gui, &path);
+            if !had && self.thumbnails.get(&path).is_some() {
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Capture the explorer's live layout back into its state: the folder tree's
+    /// scroll (so it survives rebuilds) and the grid column count derived from
+    /// the contents pane's laid-out width (a change marks dirty so it reflows).
+    fn sync_explorer_view(&mut self) {
+        if let Some(id) = self.rows.file_tree_scroll {
+            let offset = self.ui.scroll_offset(id);
+            self.explorer.set_tree_scroll(offset);
+        }
+        if let Some(id) = self.rows.file_contents
+            && let Some(rect) = self.ui.rect(id)
+        {
+            let cols = grid_cols(rect.size.x);
+            if cols != self.explorer_cols {
+                self.explorer_cols = cols;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Show a folder's contents in the explorer (from a tree row, breadcrumb, or
+    /// a folder in the contents pane), rebuilding and persisting the view.
+    fn select_explorer_dir(&mut self, path: &std::path::Path) {
+        self.explorer.select_dir(path);
+        self.view_dirty = true;
+        self.dirty = true;
+    }
+
+    /// Switch the explorer's contents view (list or grid), rebuilding and
+    /// persisting the choice.
+    fn set_file_view(&mut self, view: explorer::FileView) {
+        self.explorer.set_view(view);
+        self.view_dirty = true;
+        self.dirty = true;
     }
 
     /// Log the frame rate once a second (the M3 "usable editor" health check).
@@ -2131,6 +2225,11 @@ impl State {
         self.poll_console();
         self.react();
         self.sync_tree_filter();
+        // Decode any newly visible previews and capture the explorer's live
+        // layout (tree scroll, grid columns); both can request a rebuild, so
+        // they run before `dirty` is read.
+        self.ensure_thumbnails();
+        self.sync_explorer_view();
         let t_react = fstart.elapsed();
         let mut phase = std::time::Instant::now();
         // Whether this frame rebuilds the shell. The insertion-line overlay is
@@ -2161,7 +2260,9 @@ impl State {
                 &self.selection.as_set(),
                 self.selection.primary(),
                 self.viewport_handle,
-                &self.project_dir,
+                &self.explorer,
+                &self.thumbnails,
+                self.explorer_cols,
                 &self.dock,
                 &self.pane_scrolls,
                 self.context_menu.as_ref(),
@@ -2401,6 +2502,71 @@ impl State {
                     self.snap.enabled = !self.snap.enabled;
                     self.dirty = true;
                     self.persist_view_prefs();
+                }
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.file_view_list => {
+                    self.set_file_view(explorer::FileView::List);
+                }
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.file_view_grid => {
+                    self.set_file_view(explorer::FileView::Grid);
+                }
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.file_refresh => {
+                    self.explorer.rescan();
+                    self.thumbnails.invalidate(&mut self.gui);
+                    self.dirty = true;
+                }
+                AuroraEvent::Clicked(id)
+                    if self.rows.file_tree_toggles.iter().any(|(w, _)| *w == id) =>
+                {
+                    let path = self
+                        .rows
+                        .file_tree_toggles
+                        .iter()
+                        .find(|(w, _)| *w == id)
+                        .map(|(_, p)| p.clone())
+                        .expect("guarded by the match arm");
+                    self.explorer.toggle_expand(&path);
+                    self.view_dirty = true;
+                    self.dirty = true;
+                }
+                AuroraEvent::Clicked(id)
+                    if self.rows.file_tree_rows.iter().any(|(w, _)| *w == id) =>
+                {
+                    let path = self
+                        .rows
+                        .file_tree_rows
+                        .iter()
+                        .find(|(w, _)| *w == id)
+                        .map(|(_, p)| p.clone())
+                        .expect("guarded by the match arm");
+                    self.select_explorer_dir(&path);
+                }
+                AuroraEvent::Clicked(id) if self.rows.file_crumbs.iter().any(|(w, _)| *w == id) => {
+                    let path = self
+                        .rows
+                        .file_crumbs
+                        .iter()
+                        .find(|(w, _)| *w == id)
+                        .map(|(_, p)| p.clone())
+                        .expect("guarded by the match arm");
+                    self.select_explorer_dir(&path);
+                }
+                AuroraEvent::Clicked(id)
+                    if self.rows.file_entries.iter().any(|(w, ..)| *w == id) =>
+                {
+                    let (path, is_dir) = self
+                        .rows
+                        .file_entries
+                        .iter()
+                        .find(|(w, ..)| *w == id)
+                        .map(|(_, p, d)| (p.clone(), *d))
+                        .expect("guarded by the match arm");
+                    if is_dir {
+                        self.select_explorer_dir(&path);
+                    } else {
+                        self.explorer.select_file(&path);
+                        self.view_dirty = true;
+                        self.dirty = true;
+                    }
                 }
                 AuroraEvent::Clicked(id)
                     if self.rows.mode_buttons.iter().any(|(w, _)| *w == id) =>

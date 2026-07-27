@@ -3,7 +3,7 @@
 //! (M3 step 6 - "the editor looks like an editor").
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::PathBuf;
 
 use aurora::{Color, ImageHandle, Orientation, Style, Theme, Ui, WidgetId};
 use glam::Vec2;
@@ -12,7 +12,9 @@ use helios::{NodeId, Scene, Value};
 use crate::color;
 use crate::console::LogLine;
 use crate::dock::{DockNode, Fixed, Pane, SplitDir};
+use crate::explorer::{Entry, FileExplorer, FileKind, FileView, TreeRow, can_thumbnail, classify};
 use crate::icons::{Icon, Icons};
+use crate::thumbnails::Thumbnails;
 use crate::viewport::GizmoMode;
 
 /// Corner radius for section cards, and for controls (buttons and fields).
@@ -327,9 +329,29 @@ pub struct EditorRows {
     /// this widget's laid-out rect each frame, so the scene draws 1:1 instead
     /// of stretching a window-sized texture into a smaller panel.
     pub viewport: Option<WidgetId>,
-    /// PNG rows in the file explorer, draggable into the viewport to spawn a
-    /// sprite: `(row widget, project-relative path)`.
+    /// Draggable image entries in the file explorer, dragged into the viewport
+    /// to spawn a sprite: `(entry widget, project-relative path)`. A subset of
+    /// `file_entries` (the image files); the same widget is in both.
     pub file_rows: Vec<(WidgetId, String)>,
+    /// Folder rows in the explorer's tree: a click shows that folder's contents.
+    pub file_tree_rows: Vec<(WidgetId, PathBuf)>,
+    /// Folder disclosure arrows in the tree: a click expands/collapses.
+    pub file_tree_toggles: Vec<(WidgetId, PathBuf)>,
+    /// Contents-pane entries (folders and files): a click navigates into a
+    /// folder or selects a file. `bool` is whether the entry is a directory.
+    pub file_entries: Vec<(WidgetId, PathBuf, bool)>,
+    /// Breadcrumb segments: a click jumps to that ancestor folder.
+    pub file_crumbs: Vec<(WidgetId, PathBuf)>,
+    /// The explorer's view toggles and refresh button.
+    pub file_view_list: Option<WidgetId>,
+    pub file_view_grid: Option<WidgetId>,
+    pub file_refresh: Option<WidgetId>,
+    /// The contents scroll panel, whose laid-out width sets the grid column
+    /// count (read back each frame, like the dock split sizes).
+    pub file_contents: Option<WidgetId>,
+    /// The folder-tree scroll panel, whose offset is captured each frame so the
+    /// tree does not jump to the top on every shell rebuild.
+    pub file_tree_scroll: Option<WidgetId>,
     /// The toolbar actions.
     pub add_sprite: Option<WidgetId>,
     pub save: Option<WidgetId>,
@@ -429,7 +451,9 @@ pub fn build_editor_ui(
     selected: &HashSet<NodeId>,
     primary: Option<NodeId>,
     viewport_handle: ImageHandle,
-    project_dir: &Path,
+    explorer: &FileExplorer,
+    thumbnails: &Thumbnails,
+    explorer_cols: usize,
     dock: &DockNode,
     scrolls: &HashMap<Pane, f32>,
     menu: Option<&ContextMenu>,
@@ -470,7 +494,9 @@ pub fn build_editor_ui(
         snap_enabled,
         icons,
         viewport_handle,
-        project_dir,
+        explorer,
+        thumbnails,
+        explorer_cols,
         scrolls,
         logs,
         console_follow,
@@ -505,7 +531,10 @@ struct PaneCtx<'a> {
     snap_enabled: bool,
     icons: Option<&'a Icons>,
     viewport_handle: ImageHandle,
-    project_dir: &'a Path,
+    explorer: &'a FileExplorer,
+    thumbnails: &'a Thumbnails,
+    /// The grid view's column count (from the contents pane's width last frame).
+    explorer_cols: usize,
     scrolls: &'a HashMap<Pane, f32>,
     logs: &'a [LogLine],
     /// Whether the console pane should stick to the newest line (the user has
@@ -681,13 +710,7 @@ fn build_pane(ui: &mut Ui, parent: WidgetId, pane: Pane, ctx: &PaneCtx, rows: &m
             ctx.theme,
             rows,
         )),
-        Pane::Files => Some(build_file_explorer(
-            ui,
-            parent,
-            ctx.project_dir,
-            ctx.theme,
-            rows,
-        )),
+        Pane::Files => Some(build_file_explorer(ui, parent, ctx, rows)),
         Pane::Viewport => {
             build_viewport_pane(ui, parent, ctx, rows);
             None
@@ -1571,65 +1594,388 @@ fn add_vec2_field(
 
 /// The file-explorer pane's content: the project's PNG and scene files, filling
 /// `parent` (a dock group's content area).
+/// Fixed width of the folder-tree column (the contents pane takes the rest).
+const FILE_TREE_W: f32 = 190.0;
+/// The folder icon in a tree row.
+const FILE_TREE_ICON: f32 = 15.0;
+/// The icon/thumbnail size in a list-view row.
+const FILE_LIST_ICON: f32 = 22.0;
+/// A grid cell's width, its thumbnail size, and the gap between cells.
+const FILE_GRID_CELL: f32 = 84.0;
+const FILE_GRID_THUMB: f32 = 64.0;
+const FILE_GRID_GAP: f32 = 6.0;
+
+/// The number of grid columns that fit in a contents pane `width` px wide (at
+/// least one). `main` reads the pane's laid-out width back each frame and feeds
+/// it here so the preview grid reflows with the pane.
+pub fn grid_cols(width: f32) -> usize {
+    // The contents panel pads by 6 on each side; N cells need N*cell + (N-1)*gap.
+    let inner = (width - 12.0).max(0.0);
+    let cols = ((inner + FILE_GRID_GAP) / (FILE_GRID_CELL + FILE_GRID_GAP)).floor();
+    (cols as usize).clamp(1, 8)
+}
+
+/// The file-explorer pane: a bar (breadcrumbs + view toggles + refresh) over a
+/// folder tree (left) and the selected folder's contents (right, as a list or a
+/// thumbnail grid). Returns the contents scroll panel, so the pane machinery
+/// persists its scroll like every other pane.
 fn build_file_explorer(
     ui: &mut Ui,
     parent: WidgetId,
-    project_dir: &Path,
-    theme: &EditorTheme,
+    ctx: &PaneCtx,
     rows: &mut EditorRows,
 ) -> WidgetId {
-    let panel = ui.panel(
-        parent,
+    let theme = ctx.theme;
+    let ex = ctx.explorer;
+    let pane = ui.panel(parent, Style::new().column().grow(1.0));
+
+    // The bar: breadcrumbs on the left, view toggles + refresh on the right.
+    let bar = ui.panel(
+        pane,
+        Style::new()
+            .row()
+            .align_center()
+            .gap(4.0)
+            .padding(5.0)
+            .background(theme.panel_bg),
+    );
+    let crumbs = ui.panel(
+        bar,
+        Style::new().row().align_center().gap(1.0).grow(1.0).clip(),
+    );
+    let trail = ex.breadcrumbs();
+    let last = trail.len().saturating_sub(1);
+    for (i, (name, path)) in trail.into_iter().enumerate() {
+        let fg = if i == last {
+            theme.heading
+        } else {
+            theme.subhead
+        };
+        let crumb = ui.button(
+            crumbs,
+            name,
+            Style::new()
+                .flat()
+                .padding_x(3.0)
+                .padding_y(1.0)
+                .foreground(fg),
+        );
+        rows.file_crumbs.push((crumb, path));
+        if i != last {
+            ui.label(
+                crumbs,
+                "/".to_string(),
+                Style::new().foreground(theme.subhead),
+            );
+        }
+    }
+    let icon = |id: Icon| ctx.icons.map(|i| i.get(id));
+    let active = |on: bool| {
+        if on {
+            theme.mode_active
+        } else {
+            theme.panel_bg
+        }
+    };
+    rows.file_view_list = Some(toolbar_button(
+        ui,
+        bar,
+        "List",
+        icon(Icon::ViewList),
+        active(ex.view() == FileView::List),
+        theme,
+    ));
+    rows.file_view_grid = Some(toolbar_button(
+        ui,
+        bar,
+        "Grid",
+        icon(Icon::ViewGrid),
+        active(ex.view() == FileView::Grid),
+        theme,
+    ));
+    rows.file_refresh = Some(toolbar_button(
+        ui,
+        bar,
+        "Refresh",
+        icon(Icon::Refresh),
+        theme.panel_bg,
+        theme,
+    ));
+
+    // The body: folder tree | divider | contents. It clips so the two scroll
+    // panes inside stay pane-sized instead of ballooning to their content.
+    let body = ui.panel(pane, Style::new().row().grow(1.0).clip());
+    let tree = ui.panel(
+        body,
+        Style::new()
+            .column()
+            .width(FILE_TREE_W)
+            .gap(TREE_ROW_GAP)
+            .padding(4.0)
+            .scroll()
+            .background(theme.root_bg),
+    );
+    for row in ex.tree_rows() {
+        build_folder_row(ui, tree, &row, ctx, rows);
+    }
+    // Restore the tree's scroll (kept in the model, not pane_scrolls) so it does
+    // not snap to the top on rebuilds; the app captures it back each frame.
+    ui.set_scroll_offset(tree, ex.tree_scroll());
+    rows.file_tree_scroll = Some(tree);
+    ui.panel(body, Style::new().width(1.0).background(theme.card_border));
+    let contents = ui.panel(
+        body,
         Style::new()
             .column()
             .grow(1.0)
-            .padding(10.0)
-            .gap(4.0)
+            .padding(6.0)
+            .gap(3.0)
             .scroll(),
     );
-    for name in list_project_files(project_dir) {
-        if name.ends_with(".png") {
-            // A PNG row is a draggable button: drag it onto the viewport (a
-            // drop target) to spawn a sprite there. Aurora runs the drag and
-            // emits Event::Dropped; a plain click does nothing yet.
-            let row = ui.button(
-                panel,
-                name.clone(),
-                Style::new()
-                    .padding(2.0)
-                    .foreground(theme.heading)
-                    .ellipsis()
-                    .draggable(),
-            );
-            rows.file_rows.push((row, name));
-        } else {
-            ui.label(
-                panel,
-                name,
-                Style::new().foreground(theme.subhead).ellipsis(),
-            );
-        }
-    }
-    panel
+    build_contents(ui, contents, ctx, rows);
+    rows.file_contents = Some(contents);
+    contents
 }
 
-/// The project's `.png` and `.ron` files under `assets/` and `scenes/`, sorted.
-fn list_project_files(dir: &Path) -> Vec<String> {
-    let mut names = Vec::new();
-    for sub in ["assets", "scenes"] {
-        let Ok(entries) = std::fs::read_dir(dir.join(sub)) else {
-            continue;
+/// One folder row in the tree: indent, a disclosure arrow (if it has
+/// sub-folders), a folder icon, and the name. The whole row selects the folder.
+fn build_folder_row(
+    ui: &mut Ui,
+    parent: WidgetId,
+    row: &TreeRow,
+    ctx: &PaneCtx,
+    rows: &mut EditorRows,
+) {
+    let theme = ctx.theme;
+    let background = if row.selected {
+        theme.row_selected
+    } else {
+        Color::TRANSPARENT
+    };
+    let r = ui.button(
+        parent,
+        "",
+        Style::new()
+            .row()
+            .gap(4.0)
+            .align_center()
+            .padding(3.0)
+            .flat()
+            .background(background),
+    );
+    if row.depth > 0 {
+        ui.panel(r, Style::new().width(row.depth as f32 * TREE_DISCLOSURE));
+    }
+    if row.has_children {
+        let toggle = ui.button(
+            r,
+            "",
+            Style::new().flat().padding(1.0).width(TREE_DISCLOSURE),
+        );
+        if let Some(icons) = ctx.icons {
+            let chevron = if row.expanded {
+                Icon::ChevronDown
+            } else {
+                Icon::ChevronRight
+            };
+            ui.image(
+                toggle,
+                icons.get(chevron),
+                Style::new().size(TREE_CHEVRON, TREE_CHEVRON),
+            );
+        }
+        rows.file_tree_toggles.push((toggle, row.path.clone()));
+    } else {
+        ui.panel(r, Style::new().width(TREE_DISCLOSURE));
+    }
+    if let Some(icons) = ctx.icons {
+        let folder = if row.expanded {
+            Icon::FolderOpen
+        } else {
+            Icon::Folder
         };
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str()
-                && (name.ends_with(".png") || name.ends_with(".ron"))
-            {
-                names.push(format!("{sub}/{name}"));
+        ui.image(
+            r,
+            icons.get(folder),
+            Style::new().size(FILE_TREE_ICON, FILE_TREE_ICON),
+        );
+    }
+    ui.label(
+        r,
+        row.name.clone(),
+        Style::new().grow(1.0).ellipsis().foreground(theme.heading),
+    );
+    rows.file_tree_rows.push((r, row.path.clone()));
+}
+
+/// The contents of the selected folder: an empty-state label, a list, or a grid.
+fn build_contents(ui: &mut Ui, contents: WidgetId, ctx: &PaneCtx, rows: &mut EditorRows) {
+    let items = ctx.explorer.contents();
+    if items.is_empty() {
+        ui.label(
+            contents,
+            "This folder is empty".to_string(),
+            Style::new().padding(4.0).foreground(ctx.theme.subhead),
+        );
+        return;
+    }
+    match ctx.explorer.view() {
+        FileView::List => {
+            for entry in items {
+                build_list_entry(ui, contents, entry, ctx, rows);
+            }
+        }
+        FileView::Grid => {
+            for chunk in items.chunks(ctx.explorer_cols.max(1)) {
+                let row = ui.panel(contents, Style::new().row().gap(FILE_GRID_GAP));
+                for entry in chunk {
+                    build_grid_cell(ui, row, entry, ctx, rows);
+                }
             }
         }
     }
-    names.sort();
-    names
+}
+
+/// A list-view row: a small icon/thumbnail, the name, and a muted type tag.
+fn build_list_entry(
+    ui: &mut Ui,
+    parent: WidgetId,
+    entry: &Entry,
+    ctx: &PaneCtx,
+    rows: &mut EditorRows,
+) {
+    let theme = ctx.theme;
+    let background = if ctx.explorer.is_selected_file(&entry.path) {
+        theme.row_selected
+    } else {
+        Color::TRANSPARENT
+    };
+    let draggable = entry_draggable(entry);
+    let mut style = Style::new()
+        .row()
+        .gap(6.0)
+        .align_center()
+        .padding(3.0)
+        .flat()
+        .background(background);
+    if draggable {
+        style = style.draggable();
+    }
+    let r = ui.button(parent, "", style);
+    place_entry_icon(ui, r, entry, ctx, FILE_LIST_ICON);
+    ui.label(
+        r,
+        entry.name.clone(),
+        Style::new().grow(1.0).ellipsis().foreground(theme.heading),
+    );
+    if let Some(tag) = entry_tag(entry) {
+        ui.label(r, tag, Style::new().foreground(theme.subhead));
+    }
+    record_entry(entry, r, ctx, rows, draggable);
+}
+
+/// A grid cell: a large thumbnail/icon over a centered, ellipsized name.
+fn build_grid_cell(
+    ui: &mut Ui,
+    parent: WidgetId,
+    entry: &Entry,
+    ctx: &PaneCtx,
+    rows: &mut EditorRows,
+) {
+    let theme = ctx.theme;
+    let background = if ctx.explorer.is_selected_file(&entry.path) {
+        theme.row_selected
+    } else {
+        Color::TRANSPARENT
+    };
+    let draggable = entry_draggable(entry);
+    let mut style = Style::new()
+        .column()
+        .align_center()
+        .gap(4.0)
+        .padding(4.0)
+        .width(FILE_GRID_CELL)
+        .flat()
+        .corner_radius(4.0)
+        .background(background);
+    if draggable {
+        style = style.draggable();
+    }
+    let cell = ui.button(parent, "", style);
+    place_entry_icon(ui, cell, entry, ctx, FILE_GRID_THUMB);
+    ui.label(
+        cell,
+        entry.name.clone(),
+        Style::new()
+            .width(FILE_GRID_CELL - 8.0)
+            .ellipsis()
+            .text_center()
+            .foreground(theme.heading),
+    );
+    record_entry(entry, cell, ctx, rows, draggable);
+}
+
+/// Place an entry's visual: a ready thumbnail wins, else the type icon, else
+/// (no icon set, as in headless tests) a same-size spacer to keep the layout.
+fn place_entry_icon(ui: &mut Ui, parent: WidgetId, entry: &Entry, ctx: &PaneCtx, size: f32) {
+    if let Some(handle) = ctx.thumbnails.get(&entry.path) {
+        ui.image(parent, handle, Style::new().size(size, size));
+    } else if let Some(icons) = ctx.icons {
+        ui.image(
+            parent,
+            icons.get(entry_icon(entry)),
+            Style::new().size(size, size),
+        );
+    } else {
+        ui.panel(parent, Style::new().width(size).height(size));
+    }
+}
+
+/// The type icon for an entry (before any thumbnail is available).
+fn entry_icon(entry: &Entry) -> Icon {
+    if entry.is_dir() {
+        return Icon::Folder;
+    }
+    match classify(&entry.path) {
+        FileKind::Image => Icon::FileImage,
+        FileKind::Scene => Icon::FileScene,
+        FileKind::Other => Icon::FileGeneric,
+    }
+}
+
+/// The muted right-aligned tag for a file (its uppercase extension); none for a
+/// folder.
+fn entry_tag(entry: &Entry) -> Option<String> {
+    if entry.is_dir() {
+        return None;
+    }
+    entry
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_uppercase())
+}
+
+/// Whether an entry can be dragged into the viewport to spawn a sprite (a
+/// decodable image only - the same gate the sprite loader uses).
+fn entry_draggable(entry: &Entry) -> bool {
+    !entry.is_dir() && can_thumbnail(&entry.path)
+}
+
+/// Record an entry's widget for event routing: every entry for click handling,
+/// and draggable images additionally in `file_rows` with their spawn payload.
+fn record_entry(
+    entry: &Entry,
+    widget: WidgetId,
+    ctx: &PaneCtx,
+    rows: &mut EditorRows,
+    draggable: bool,
+) {
+    rows.file_entries
+        .push((widget, entry.path.clone(), entry.is_dir()));
+    if draggable && let Some(rel) = ctx.explorer.project_relative(&entry.path) {
+        rows.file_rows.push((widget, rel));
+    }
 }
 
 /// Render a reflected [`Value`] as editable text.
@@ -1673,6 +2019,14 @@ pub fn parse_value(text: &str, like: &Value) -> Option<Value> {
 mod tests {
     use super::*;
     use helios::{Component, Node, SpriteComponent, Transform};
+    use std::path::Path;
+
+    /// A file explorer over a path that does not exist, so its scan is empty and
+    /// instant - the shell tests exercise the dock/inspector, not the file pane,
+    /// and must not recursively walk the real temp dir.
+    fn test_explorer() -> FileExplorer {
+        FileExplorer::new(Path::new("/orbit-nonexistent-test-root"))
+    }
 
     /// Build the shell the way the tests did before docking: a single optional
     /// selection, the default dock layout, no scroll, no search, no rename.
@@ -1683,7 +2037,7 @@ mod tests {
         scene: &Scene,
         selected: Option<NodeId>,
         viewport_handle: ImageHandle,
-        project_dir: &Path,
+        _project_dir: &Path,
         _sizes: (),
         menu: Option<&ContextMenu>,
         gizmo_mode: GizmoMode,
@@ -1693,12 +2047,16 @@ mod tests {
         theme: &EditorTheme,
     ) -> (Ui, EditorRows) {
         let set: HashSet<NodeId> = selected.into_iter().collect();
+        let explorer = test_explorer();
+        let thumbnails = Thumbnails::new();
         build_editor_ui(
             scene,
             &set,
             selected,
             viewport_handle,
-            project_dir,
+            &explorer,
+            &thumbnails,
+            3,
             &DockNode::default_layout(),
             &HashMap::new(),
             menu,
@@ -1741,7 +2099,8 @@ mod tests {
         // text-independent, so these updates must now cost zero re-measures.
         let (scene, handle) = demo_scene();
         let sprite = scene.children(scene.root())[0];
-        let dir = std::env::temp_dir();
+        let explorer = test_explorer();
+        let thumbnails = Thumbnails::new();
         let dock = DockNode::default_layout();
         let mut set = HashSet::new();
         set.insert(sprite);
@@ -1750,7 +2109,9 @@ mod tests {
             &set,
             Some(sprite),
             handle,
-            &dir,
+            &explorer,
+            &thumbnails,
+            3,
             &dock,
             &HashMap::new(),
             None,
@@ -2134,16 +2495,20 @@ mod tests {
     fn build_with_dock(
         scene: &Scene,
         handle: ImageHandle,
-        dir: &Path,
+        _dir: &Path,
         dock: &DockNode,
         scrolls: &HashMap<Pane, f32>,
     ) -> (Ui, EditorRows) {
+        let explorer = test_explorer();
+        let thumbnails = Thumbnails::new();
         build_editor_ui(
             scene,
             &HashSet::new(),
             None,
             handle,
-            dir,
+            &explorer,
+            &thumbnails,
+            3,
             dock,
             scrolls,
             None,
@@ -2165,7 +2530,6 @@ mod tests {
     #[test]
     fn the_console_pane_renders_its_log_lines() {
         let (scene, handle) = demo_scene();
-        let dir = std::env::temp_dir();
         let dock = DockNode::Leaf {
             panes: vec![Pane::Console],
             active: 0,
@@ -2182,12 +2546,16 @@ mod tests {
                 message: "careful".into(),
             },
         ];
+        let explorer = test_explorer();
+        let thumbnails = Thumbnails::new();
         let (mut ui, rows) = build_editor_ui(
             &scene,
             &HashSet::new(),
             None,
             handle,
-            &dir,
+            &explorer,
+            &thumbnails,
+            3,
             &dock,
             &HashMap::new(),
             None,
@@ -2223,7 +2591,8 @@ mod tests {
         // the shape cache it must re-shape nothing - no text changed.
         let (scene, handle) = demo_scene();
         let sprite = scene.children(scene.root())[0];
-        let dir = std::env::temp_dir();
+        let explorer = test_explorer();
+        let thumbnails = Thumbnails::new();
         let dock = DockNode::default_layout();
         let mut set = HashSet::new();
         set.insert(sprite);
@@ -2232,7 +2601,9 @@ mod tests {
             &set,
             Some(sprite),
             handle,
-            &dir,
+            &explorer,
+            &thumbnails,
+            3,
             &dock,
             &HashMap::new(),
             None,
