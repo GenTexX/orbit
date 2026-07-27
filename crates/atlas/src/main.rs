@@ -288,6 +288,9 @@ struct State {
     /// Viewport view toggles (from the toolbar; persisted in global settings).
     show_grid: bool,
     show_axes: bool,
+    /// Transform snapping (on/off + increments); persisted in global settings.
+    /// Ctrl held during a drag inverts the on/off state for that drag.
+    snap: settings::SnapSettings,
     /// The OS clipboard (for text copy/cut/paste), or `None` if it could not
     /// be opened on this platform.
     clipboard: Option<arboard::Clipboard>,
@@ -501,6 +504,7 @@ impl State {
             GizmoMode::default(),
             settings.show_grid,
             settings.show_axes,
+            settings.snap.enabled,
             Some(&icons),
             &TreeView::default(),
             "",
@@ -551,6 +555,7 @@ impl State {
             gizmo_mode: GizmoMode::default(),
             show_grid: settings.show_grid,
             show_axes: settings.show_axes,
+            snap: settings.snap,
             clipboard: arboard::Clipboard::new()
                 .inspect_err(|err| tracing::warn!("no clipboard available: {err}"))
                 .ok(),
@@ -617,7 +622,18 @@ impl State {
             && let Some(world) = self.cursor_world()
         {
             let (node, _) = drag.target();
-            let new = drag.apply(&self.project.scene, world);
+            let mut new = drag.apply(&self.project.scene, world);
+            // Snap the dragged property to its increment when snapping is on
+            // (Ctrl held during the drag inverts that for this drag).
+            if self.snap.enabled ^ self.modifiers.control_key() {
+                new = viewport::snap_transform(
+                    &drag,
+                    new,
+                    self.snap.move_step,
+                    self.snap.rotate_step_deg.to_radians(),
+                    self.snap.scale_step,
+                );
+            }
             self.project.scene.node_mut(node).transform = new;
             // The scene and gizmo re-render from the live transform every frame
             // anyway; update just the inspector's transform fields in place so
@@ -1834,6 +1850,7 @@ impl State {
             theme: self.theme,
             show_grid: self.show_grid,
             show_axes: self.show_axes,
+            snap: self.snap,
         };
         if let Err(err) = settings::save(&settings) {
             tracing::warn!("could not save view settings: {err}");
@@ -2008,6 +2025,7 @@ impl State {
                 self.gizmo_mode,
                 self.show_grid,
                 self.show_axes,
+                self.snap.enabled,
                 Some(&self.icons),
                 &self.tree_view(),
                 &self.tree_filter,
@@ -2230,6 +2248,11 @@ impl State {
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.axes => {
                     self.show_axes = !self.show_axes;
+                    self.dirty = true;
+                    self.persist_view_prefs();
+                }
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.snap => {
+                    self.snap.enabled = !self.snap.enabled;
                     self.dirty = true;
                     self.persist_view_prefs();
                 }

@@ -319,10 +319,11 @@ pub struct EditorRows {
     pub add_sprite: Option<WidgetId>,
     pub save: Option<WidgetId>,
     pub load: Option<WidgetId>,
-    /// The toolbar's view toggles (grid, world axes): highlighted when active,
-    /// flipped on click.
+    /// The toolbar's view toggles (grid, world axes, snapping): highlighted when
+    /// active, flipped on click.
     pub grid: Option<WidgetId>,
     pub axes: Option<WidgetId>,
+    pub snap: Option<WidgetId>,
     /// The toolbar's gizmo-mode buttons, each mapped to the mode it selects.
     pub mode_buttons: Vec<(WidgetId, GizmoMode)>,
     /// Numeric inputs for the x/y components of a Vec2 field: submitting one
@@ -420,6 +421,7 @@ pub fn build_editor_ui(
     gizmo_mode: GizmoMode,
     show_grid: bool,
     show_axes: bool,
+    snap_enabled: bool,
     icons: Option<&Icons>,
     tree: &TreeView,
     filter: &str,
@@ -448,6 +450,7 @@ pub fn build_editor_ui(
         gizmo_mode,
         show_grid,
         show_axes,
+        snap_enabled,
         icons,
         viewport_handle,
         project_dir,
@@ -480,6 +483,7 @@ struct PaneCtx<'a> {
     gizmo_mode: GizmoMode,
     show_grid: bool,
     show_axes: bool,
+    snap_enabled: bool,
     icons: Option<&'a Icons>,
     viewport_handle: ImageHandle,
     project_dir: &'a Path,
@@ -684,6 +688,7 @@ fn build_viewport_pane(ui: &mut Ui, parent: WidgetId, ctx: &PaneCtx, rows: &mut 
         ctx.gizmo_mode,
         ctx.show_grid,
         ctx.show_axes,
+        ctx.snap_enabled,
         ctx.icons,
         ctx.theme,
         rows,
@@ -730,6 +735,7 @@ fn build_toolbar(
     mode: GizmoMode,
     show_grid: bool,
     show_axes: bool,
+    snap_enabled: bool,
     icons: Option<&Icons>,
     theme: &EditorTheme,
     rows: &mut EditorRows,
@@ -792,6 +798,14 @@ fn build_toolbar(
         "Axes",
         icon(Icon::Axes),
         toggle_bg(show_axes),
+        theme,
+    ));
+    rows.snap = Some(toolbar_button(
+        ui,
+        bar,
+        "Snap",
+        icon(Icon::Snap),
+        toggle_bg(snap_enabled),
         theme,
     ));
 
@@ -1623,6 +1637,7 @@ mod tests {
             gizmo_mode,
             true,
             true,
+            false,
             icons,
             tree,
             "",
@@ -1672,6 +1687,7 @@ mod tests {
             GizmoMode::Select,
             true,
             true,
+            false,
             None,
             &TreeView::default(),
             "",
@@ -2062,6 +2078,7 @@ mod tests {
             GizmoMode::Select,
             true,
             true,
+            false,
             None,
             &TreeView::default(),
             "",
@@ -2094,6 +2111,7 @@ mod tests {
             GizmoMode::Select,
             true,
             true,
+            false,
             None,
             &TreeView::default(),
             "",

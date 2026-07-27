@@ -632,6 +632,70 @@ impl Drag {
     }
 }
 
+/// Round `v` to the nearest multiple of `step` (a no-op for a non-positive
+/// step, so snapping can be turned off by zeroing an increment).
+fn snap(v: f32, step: f32) -> f32 {
+    if step <= 0.0 {
+        v
+    } else {
+        (v / step).round() * step
+    }
+}
+
+/// Snap the property a drag edits to its increment: translation to `move_step`
+/// world units, rotation to `rotate_step_rad` radians, scale to `scale_step`.
+/// Only the component the drag actually changes is snapped (a rotate leaves the
+/// position alone, a per-axis scale snaps just that axis), so snapping never
+/// disturbs a value the drag was not touching.
+pub fn snap_transform(
+    drag: &Drag,
+    t: Transform,
+    move_step: f32,
+    rotate_step_rad: f32,
+    scale_step: f32,
+) -> Transform {
+    match drag {
+        // Both move drags land the node's final position on the grid.
+        Drag::Move { .. } | Drag::MoveAxis { .. } => Transform {
+            translation: Vec2::new(
+                snap(t.translation.x, move_step),
+                snap(t.translation.y, move_step),
+            ),
+            ..t
+        },
+        Drag::Rotate { .. } => Transform {
+            rotation: snap(t.rotation, rotate_step_rad),
+            ..t
+        },
+        // Uniform scale snaps one axis and matches the other by the same factor,
+        // so it stays uniform.
+        Drag::ScaleUniform { .. } => {
+            let sx = snap(t.scale.x, scale_step);
+            let k = if t.scale.x.abs() > 1.0e-6 {
+                sx / t.scale.x
+            } else {
+                1.0
+            };
+            Transform {
+                scale: Vec2::new(sx, t.scale.y * k),
+                ..t
+            }
+        }
+        Drag::ScaleAxis { vertical, .. } => Transform {
+            scale: if *vertical {
+                Vec2::new(t.scale.x, snap(t.scale.y, scale_step))
+            } else {
+                Vec2::new(snap(t.scale.x, scale_step), t.scale.y)
+            },
+            ..t
+        },
+        Drag::ScaleFree { .. } => Transform {
+            scale: Vec2::new(snap(t.scale.x, scale_step), snap(t.scale.y, scale_step)),
+            ..t
+        },
+    }
+}
+
 /// Translate `original` by a world-space delta: the delta maps through the
 /// inverse of the parent's world transform into the node's local space
 /// (identity for a root child), so the node follows the cursor exactly even
@@ -656,6 +720,80 @@ mod tests {
     use helios::{Node, SpriteComponent};
 
     const EPS: f32 = 1.0e-3;
+
+    #[test]
+    fn snapping_rounds_only_the_property_the_drag_edits() {
+        let (scene, node) = scene_with_sprite(Vec2::ZERO, Vec2::splat(100.0));
+        let orig = scene.node(node).transform;
+        let step_rad = 15f32.to_radians();
+
+        // Move snaps the final position to the grid, leaves rotation/scale alone.
+        let mv = Drag::Move {
+            node,
+            original: orig,
+            grab_world: Vec2::ZERO,
+        };
+        let t = Transform {
+            translation: Vec2::new(35.0, -3.0),
+            ..orig
+        };
+        let s = snap_transform(&mv, t, 16.0, step_rad, 0.1);
+        assert_eq!(s.translation, Vec2::new(32.0, 0.0));
+        assert_eq!(s.rotation, orig.rotation);
+        assert_eq!(s.scale, orig.scale);
+        // Snapping off (a zero step) is the identity.
+        assert_eq!(
+            snap_transform(&mv, t, 0.0, 0.0, 0.0).translation,
+            t.translation
+        );
+
+        // Rotate snaps the angle (17deg -> 15deg), leaves position alone.
+        let rot = Drag::Rotate {
+            node,
+            original: orig,
+            pivot: Vec2::ZERO,
+            grab_angle: 0.0,
+        };
+        let t = Transform {
+            rotation: 17f32.to_radians(),
+            ..orig
+        };
+        let s = snap_transform(&rot, t, 16.0, step_rad, 0.1);
+        assert!((s.rotation - step_rad).abs() < EPS);
+        assert_eq!(s.translation, orig.translation);
+
+        // A per-axis scale snaps only its axis (horizontal -> x).
+        let sx = Drag::ScaleAxis {
+            node,
+            original: orig,
+            pivot: Vec2::ZERO,
+            axis_world: Vec2::X,
+            grab_proj: 1.0,
+            vertical: false,
+        };
+        let t = Transform {
+            scale: Vec2::new(1.37, 2.04),
+            ..orig
+        };
+        let s = snap_transform(&sx, t, 16.0, step_rad, 0.1);
+        assert!((s.scale.x - 1.4).abs() < EPS);
+        assert_eq!(s.scale.y, 2.04);
+
+        // Uniform scale snaps one axis and keeps the aspect ratio.
+        let su = Drag::ScaleUniform {
+            node,
+            original: orig,
+            pivot: Vec2::ZERO,
+            grab_dist: 1.0,
+        };
+        let t = Transform {
+            scale: Vec2::new(1.37, 1.37),
+            ..orig
+        };
+        let s = snap_transform(&su, t, 16.0, step_rad, 0.1);
+        assert!((s.scale.x - 1.4).abs() < EPS);
+        assert!((s.scale.x - s.scale.y).abs() < EPS, "stays uniform");
+    }
 
     #[test]
     fn nice_step_snaps_up_the_one_two_five_ladder() {

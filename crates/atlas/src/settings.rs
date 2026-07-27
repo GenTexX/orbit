@@ -26,6 +26,34 @@ pub struct Settings {
     /// Show the world origin axes in the viewport (default on).
     #[serde(default = "default_true")]
     pub show_axes: bool,
+    /// Transform snapping (increments and whether it is on).
+    #[serde(default)]
+    pub snap: SnapSettings,
+}
+
+/// Transform snapping: whether a viewport drag snaps, and to what increments.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnapSettings {
+    /// Whether snapping is on (toggled from the toolbar, Ctrl-inverted per drag).
+    pub enabled: bool,
+    /// Translation snaps to this many world units.
+    pub move_step: f32,
+    /// Rotation snaps to this many degrees.
+    pub rotate_step_deg: f32,
+    /// Scale snaps to this multiple.
+    pub scale_step: f32,
+}
+
+impl Default for SnapSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            move_step: 16.0,
+            rotate_step_deg: 15.0,
+            scale_step: 0.1,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -42,6 +70,7 @@ impl Default for Settings {
             theme: EditorTheme::default(),
             show_grid: true,
             show_axes: true,
+            snap: SnapSettings::default(),
         }
     }
 }
@@ -125,6 +154,12 @@ mod tests {
             theme: EditorTheme::light(),
             show_grid: false,
             show_axes: true,
+            snap: SnapSettings {
+                enabled: true,
+                move_step: 8.0,
+                rotate_step_deg: 45.0,
+                scale_step: 0.25,
+            },
         };
         let pretty = ron::ser::PrettyConfig::default();
         let text = ron::ser::to_string_pretty(&settings, pretty).unwrap();
@@ -132,6 +167,7 @@ mod tests {
         assert_eq!(back.theme, EditorTheme::light());
         assert!(!back.show_grid);
         assert!(back.show_axes);
+        assert_eq!(back.snap, settings.snap);
     }
 
     #[test]

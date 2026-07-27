@@ -53,6 +53,8 @@ pub enum Icon {
     Grid,
     /// Two arrows from an origin (the world-axes toggle).
     Axes,
+    /// A horseshoe magnet (the snapping toggle).
+    Snap,
 }
 
 /// An icon's coverage predicate over the normalized `[0, 1]` square.
@@ -74,6 +76,7 @@ const SPECS: &[(Icon, Predicate)] = &[
     (Icon::EyeOff, icon_eye_off),
     (Icon::Grid, icon_grid),
     (Icon::Axes, icon_axes),
+    (Icon::Snap, icon_snap),
 ];
 
 /// The registered icon images, looked up by [`Icon`].
@@ -320,6 +323,14 @@ fn icon_axes(x: f32, y: f32) -> bool {
         || line(x, y, o, (0.84, 0.82), STROKE)
         || arrowhead(x, y, (0.18, 0.08), (0.0, -1.0), 0.18, 0.1)
         || arrowhead(x, y, (0.92, 0.82), (1.0, 0.0), 0.18, 0.1)
+}
+
+/// A horseshoe magnet (the snapping toggle): two legs joined at the bottom.
+fn icon_snap(x: f32, y: f32) -> bool {
+    let w = 0.17;
+    line(x, y, (0.28, 0.24), (0.28, 0.62), w)
+        || line(x, y, (0.72, 0.24), (0.72, 0.62), w)
+        || line(x, y, (0.28, 0.6), (0.72, 0.6), w)
 }
 
 /// A diagonal double-headed arrow (scale/resize), thin with sharp heads.
