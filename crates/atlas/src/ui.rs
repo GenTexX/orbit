@@ -30,6 +30,10 @@ const INSET_RADIUS: f32 = 3.0;
 /// for scrollback; older lines are summarized with a count).
 const CONSOLE_TAIL: usize = 500;
 
+/// The rendered size of a toolbar button's icon. Kept generous so the icon
+/// detail (arrowheads, gear teeth) stays legible rather than washing out.
+const TOOLBAR_ICON: f32 = 24.0;
+
 /// The editor's full color palette: the aurora widget [`Theme`] plus atlas's own
 /// surface, text, and accent colors. Swapped as a unit so the whole editor
 /// recolors at once (see [`build_editor_ui`]). Loaded from the user's settings
@@ -1024,7 +1028,11 @@ fn toolbar_button(
                     .background(background)
                     .corner_radius(CONTROL_RADIUS),
             );
-            ui.image(button, handle, Style::new().size(20.0, 20.0));
+            ui.image(
+                button,
+                handle,
+                Style::new().size(TOOLBAR_ICON, TOOLBAR_ICON),
+            );
             button
         }
         None => ui.button(

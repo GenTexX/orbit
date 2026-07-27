@@ -368,16 +368,16 @@ fn icon_move(x: f32, y: f32) -> bool {
         || arrowhead(x, y, (0.92, 0.5), (1.0, 0.0), 0.21, 0.15)
 }
 
-/// A circular arrow (rotate): a nearly closed (~90%) ring with a bold head on
-/// the top end, pointing along the ring's clockwise tangent.
+/// A circular arrow (rotate): an ~80%-closed ring with a large head on the top
+/// end, pointing along the ring's clockwise tangent.
 fn icon_rotate(x: f32, y: f32) -> bool {
     use std::f32::consts::{PI, TAU};
     let c = (0.5, 0.5);
     let r = 0.3;
-    let gap = 0.1 * TAU; // ~36-degree opening at the top
+    let gap = 0.2 * TAU; // ~72-degree opening at the top
     let start = -PI / 2.0 + gap; // just clockwise of the top
-    let sweep = TAU - gap; // ~90% of the circle
-    arc_stroke(x, y, c, r, start, sweep, 0.08) || arc_arrow(x, y, c, r, start + sweep, true, 0.16)
+    let sweep = TAU - gap; // ~80% of the circle
+    arc_stroke(x, y, c, r, start, sweep, 0.08) || arc_arrow(x, y, c, r, start + sweep, true, 0.23)
 }
 
 /// A diagonal double-headed arrow (scale/resize), thin with bold heads.
@@ -519,8 +519,8 @@ fn icon_refresh(x: f32, y: f32) -> bool {
     let sweep = PI - gap; // each arc spans a little under a half-turn
     arc_stroke(x, y, c, r, start, sweep, w)
         || arc_stroke(x, y, c, r, start + PI, sweep, w)
-        || arc_arrow(x, y, c, r, start + sweep, true, 0.15)
-        || arc_arrow(x, y, c, r, start + PI + sweep, true, 0.15)
+        || arc_arrow(x, y, c, r, start + sweep, true, 0.2)
+        || arc_arrow(x, y, c, r, start + PI + sweep, true, 0.2)
 }
 
 /// Three stacked rows, each a leading dot and a line (the compact list view).
@@ -535,9 +535,9 @@ fn icon_view_grid(x: f32, y: f32) -> bool {
     cell(0.16, 0.16) || cell(0.56, 0.16) || cell(0.16, 0.56) || cell(0.56, 0.56)
 }
 
-/// An X (a modal's close button).
+/// An X (a modal's close button), the same stroke width as the plus.
 fn icon_close(x: f32, y: f32) -> bool {
-    line(x, y, (0.26, 0.26), (0.74, 0.74), 0.1) || line(x, y, (0.74, 0.26), (0.26, 0.74), 0.1)
+    line(x, y, (0.26, 0.26), (0.74, 0.74), 0.13) || line(x, y, (0.74, 0.26), (0.26, 0.74), 0.13)
 }
 
 /// A gear / cog (opens settings): a solid ring body (a hub hole in the middle)
@@ -553,10 +553,11 @@ fn icon_settings(x: f32, y: f32) -> bool {
     if annulus(x, y, c, hub, body) {
         return true;
     }
-    // Eight trapezoidal teeth, narrower at the tip than the base.
+    // Eight trapezoidal teeth, clearly wider where they join the body and
+    // tapering to a narrower tip.
     const TEETH: usize = 8;
-    let base_hw = 0.19; // base half-angle
-    let tip_hw = 0.11; // tip half-angle
+    let base_hw = 0.24; // base half-angle (wide, at the rim)
+    let tip_hw = 0.085; // tip half-angle (narrow)
     for k in 0..TEETH {
         let a = (k as f32 + 0.5) / TEETH as f32 * TAU;
         let quad = [
