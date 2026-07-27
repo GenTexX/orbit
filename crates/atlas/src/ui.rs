@@ -955,7 +955,7 @@ fn toolbar_button(
                     .background(background)
                     .corner_radius(CONTROL_RADIUS),
             );
-            ui.image(button, handle, Style::new().size(18.0, 18.0));
+            ui.image(button, handle, Style::new().size(20.0, 20.0));
             button
         }
         None => ui.button(
@@ -1619,7 +1619,7 @@ fn add_vec2_field(
 /// Fixed width of the folder-tree column (the contents pane takes the rest).
 const FILE_TREE_W: f32 = 190.0;
 /// The folder icon in a tree row.
-const FILE_TREE_ICON: f32 = 15.0;
+const FILE_TREE_ICON: f32 = 17.0;
 /// The icon/thumbnail size in a list-view row.
 const FILE_LIST_ICON: f32 = 22.0;
 /// A grid cell's width, its thumbnail size, and the gap between cells.

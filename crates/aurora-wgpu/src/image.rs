@@ -28,6 +28,10 @@ impl ImageRegistry {
             label: Some("image sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            // Trilinear: registry-owned images (icons, thumbnails) carry a
+            // mipmap chain (see make_rgba), so shrinking a 64px icon to a 16px
+            // toolbar slot samples the right level instead of aliasing.
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         Self {
@@ -136,31 +140,49 @@ impl ImageRegistry {
             height,
             depth_or_array_layers: 1,
         };
+        // A full mipmap chain (down to 1x1) so minified draws (a 64px icon in a
+        // 16px slot) pick a pre-filtered level rather than point-aliasing.
+        let mip_level_count = 1 + width.max(height).max(1).ilog2();
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("registered image"),
             size,
-            mip_level_count: 1,
+            mip_level_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width * 4),
-                rows_per_image: Some(height),
-            },
-            size,
-        );
+        // Upload level 0, then box-downsample each successive level on the CPU
+        // and upload it. (The icon art is white with an alpha coverage mask, so
+        // averaging the bytes is correct; for photos it is the usual good-enough
+        // sRGB box filter.)
+        let mut level = rgba.to_vec();
+        let (mut lw, mut lh) = (width, height);
+        for mip in 0..mip_level_count {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: mip,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &level,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(lw * 4),
+                    rows_per_image: Some(lh),
+                },
+                wgpu::Extent3d {
+                    width: lw,
+                    height: lh,
+                    depth_or_array_layers: 1,
+                },
+            );
+            if mip + 1 < mip_level_count {
+                (level, lw, lh) = downsample_2x2(&level, lw, lh);
+            }
+        }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.build_bind_group(device, layout, &view);
         (texture, bind_group)
@@ -191,5 +213,63 @@ impl ImageRegistry {
     /// resize that re-registered its image under a new handle for one frame).
     pub fn bind_group(&self, handle: ImageHandle) -> Option<&wgpu::BindGroup> {
         self.images.get(handle).map(|i| &i.bind_group)
+    }
+}
+
+/// Box-downsample an RGBA8 image to half size (each axis halved, floored at 1),
+/// averaging each 2x2 block per channel. Edge blocks on an odd dimension average
+/// only the texels that exist.
+fn downsample_2x2(src: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
+    let nw = (width / 2).max(1);
+    let nh = (height / 2).max(1);
+    let mut dst = vec![0u8; (nw * nh * 4) as usize];
+    for y in 0..nh {
+        for x in 0..nw {
+            for c in 0..4 {
+                let mut sum = 0u32;
+                let mut n = 0u32;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let (px, py) = (x * 2 + dx, y * 2 + dy);
+                        if px < width && py < height {
+                            sum += src[((py * width + px) * 4 + c) as usize] as u32;
+                            n += 1;
+                        }
+                    }
+                }
+                dst[((y * nw + x) * 4 + c) as usize] = (sum / n) as u8;
+            }
+        }
+    }
+    (dst, nw, nh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downsample_halves_and_averages() {
+        // A 2x2 image with channel-0 values 0,100,200,255 -> one texel averaging
+        // to 138 (rounded down); the other channels are constant.
+        let src = vec![
+            0, 10, 20, 30, //
+            100, 10, 20, 30, //
+            200, 10, 20, 30, //
+            255, 10, 20, 30,
+        ];
+        let (dst, w, h) = downsample_2x2(&src, 2, 2);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(dst, vec![138u8, 10, 20, 30]); // (0+100+200+255)/4 = 138
+    }
+
+    #[test]
+    fn downsample_handles_odd_dimensions() {
+        // 3x1 -> 1x1: the lone output block averages only the two texels that
+        // exist in its 2x2 footprint (x=0,1; x=2 falls in the next, absent block).
+        let src = vec![0, 0, 0, 0, 40, 0, 0, 0, 200, 0, 0, 0];
+        let (dst, w, h) = downsample_2x2(&src, 3, 1);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(dst[0], 20); // (0 + 40) / 2
     }
 }

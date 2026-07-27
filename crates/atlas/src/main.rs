@@ -416,11 +416,14 @@ impl ApplicationHandler for App {
                 ..
             } => match (button, btn_state) {
                 (MouseButton::Left, ElementState::Pressed) => {
+                    let hit = state.ui.hit_test(state.cursor);
                     // Keyboard focus follows the press: the shared shortcuts
                     // (delete/copy/rename) act on files when the press lands in
                     // the explorer pane, on the scene otherwise.
-                    state.explorer_focused =
-                        state.hit_in_explorer_pane(state.ui.hit_test(state.cursor));
+                    state.explorer_focused = state.hit_in_explorer_pane(hit);
+                    // A press on empty space in the contents area clears the file
+                    // selection (click "nothing" to deselect).
+                    state.clear_file_selection_on_empty_press(hit);
                     // A press outside an open menu dismisses it (before the
                     // viewport/gizmo logic, so a click on empty space just
                     // closes the menu without also deselecting).
@@ -541,12 +544,19 @@ impl State {
         let project = project::open_or_create(&project_dir)?;
         // Decode the demo sprite once for its natural pixel size (the default
         // size for newly spawned sprites); its pixels load through the cache.
-        let sprite_bytes =
-            std::fs::read(project_dir.join("assets/sprite.png")).context("read demo sprite")?;
-        let (w, h) = image::load_from_memory(&sprite_bytes)
-            .context("decode demo sprite")?
-            .to_rgba8()
-            .dimensions();
+        // Missing or unreadable (e.g. deleted through the file explorer) falls
+        // back to a fixed size rather than refusing to open the project.
+        let (w, h) = std::fs::read(project_dir.join("assets/sprite.png"))
+            .ok()
+            .and_then(|bytes| image::load_from_memory(&bytes).ok())
+            .map(|img| img.to_rgba8().dimensions())
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "demo sprite assets/sprite.png missing or unreadable; \
+                     using a default sprite size"
+                );
+                (100, 100)
+            });
 
         let (scene_target, viewport_handle) =
             build_viewport_target(&mut gui, &engine, (size.width, size.height));
@@ -1106,6 +1116,24 @@ impl State {
         match (hit, self.rows.file_pane) {
             (Some(hit), Some(pane)) => hit == pane || self.ui.is_within(hit, pane),
             _ => false,
+        }
+    }
+
+    /// Clear the file selection when a press lands on empty space in the contents
+    /// area - inside the contents pane but not on any entry (or its children).
+    fn clear_file_selection_on_empty_press(&mut self, hit: Option<aurora::WidgetId>) {
+        let (Some(hit), Some(contents)) = (hit, self.rows.file_contents) else {
+            return;
+        };
+        let in_contents = hit == contents || self.ui.is_within(hit, contents);
+        let on_entry = self
+            .rows
+            .file_entries
+            .iter()
+            .any(|(w, ..)| *w == hit || self.ui.is_within(hit, *w));
+        if in_contents && !on_entry && !self.explorer.selected().is_empty() {
+            self.explorer.clear_selection();
+            self.dirty = true;
         }
     }
 
