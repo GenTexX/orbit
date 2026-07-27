@@ -2437,7 +2437,10 @@ impl State {
                 self.saved_revision = self.history.revision();
                 tracing::info!("project saved to {}", self.project_dir.display());
             }
-            Err(err) => tracing::error!("save failed: {err}"),
+            Err(err) => {
+                tracing::error!("save failed: {err}");
+                self.open_modal(modal::Modal::report("Save failed", &err));
+            }
         }
     }
 
@@ -2467,7 +2470,10 @@ impl State {
                 self.dirty = true;
                 tracing::info!("project loaded from {}", self.project_dir.display());
             }
-            Err(err) => tracing::error!("load failed: {err}"),
+            Err(err) => {
+                tracing::error!("load failed: {err}");
+                self.open_modal(modal::Modal::report("Load failed", &err));
+            }
         }
     }
 

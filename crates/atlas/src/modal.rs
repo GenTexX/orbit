@@ -9,6 +9,7 @@
 //! Two bodies ship: a [`ModalBody::Message`] (errors/info) and a
 //! [`ModalBody::Settings`] form editing a [`SettingsDraft`].
 
+use std::fmt;
 use std::io;
 
 use helios::NodeId;
@@ -79,6 +80,18 @@ impl Modal {
             title: title.into(),
             closable: true,
             body: ModalBody::Message(friendly_error(err)),
+        }
+    }
+
+    /// An error dialog for any displayable failure (e.g. a save/load error that
+    /// is not a bare `io::Error`), its message read back as a sentence. Prefer
+    /// [`error`](Self::error) for file-op io errors, which get friendlier,
+    /// kind-specific wording (e.g. a name collision).
+    pub fn report(title: impl Into<String>, err: impl fmt::Display) -> Self {
+        Self {
+            title: title.into(),
+            closable: true,
+            body: ModalBody::Message(humanize(&err.to_string())),
         }
     }
 
@@ -231,7 +244,13 @@ fn friendly_error(err: &io::Error) -> String {
     if err.kind() == io::ErrorKind::AlreadyExists {
         return "A file with that name already exists.".to_string();
     }
-    let raw = err.to_string();
+    humanize(&err.to_string())
+}
+
+/// Read a raw error string back as a sentence: capitalize the first letter and
+/// add terminating punctuation if it has none. An empty string becomes a
+/// generic fallback.
+fn humanize(raw: &str) -> String {
     let mut chars = raw.chars();
     let mut msg = match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
@@ -261,6 +280,19 @@ mod tests {
         let other = io::Error::new(io::ErrorKind::InvalidInput, "invalid name");
         match Modal::error("x", &other).body {
             ModalBody::Message(m) => assert_eq!(m, "Invalid name."),
+            _ => panic!("expected a message body"),
+        }
+    }
+
+    #[test]
+    fn report_reads_any_display_error_as_a_sentence() {
+        // A save/load HeliosError is not an io::Error; report() humanizes its
+        // Display text (capitalized, period-terminated) the same way.
+        let modal = Modal::report("Save failed", "parsing scene RON: expected ']'");
+        assert_eq!(modal.title, "Save failed");
+        assert!(modal.closable);
+        match modal.body {
+            ModalBody::Message(m) => assert_eq!(m, "Parsing scene RON: expected ']'."),
             _ => panic!("expected a message body"),
         }
     }

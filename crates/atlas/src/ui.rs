@@ -20,9 +20,15 @@ use crate::modal::{Modal, ModalAction, ModalBody, SettingField, SettingsDraft};
 use crate::thumbnails::Thumbnails;
 use crate::viewport::GizmoMode;
 
-/// Corner radius for section cards, and for controls (buttons and fields).
+/// Corner radius for section cards, for controls (buttons and fields), and for
+/// small fields inset inside a row (e.g. an inline rename box).
 const CARD_RADIUS: f32 = 6.0;
 const CONTROL_RADIUS: f32 = 4.0;
+const INSET_RADIUS: f32 = 3.0;
+
+/// The newest console lines the pane builds a widget for (the ring stores more
+/// for scrollback; older lines are summarized with a count).
+const CONSOLE_TAIL: usize = 500;
 
 /// The editor's full color palette: the aurora widget [`Theme`] plus atlas's own
 /// surface, text, and accent colors. Swapped as a unit so the whole editor
@@ -714,7 +720,7 @@ fn build_group(
             Style::new()
                 .padding_x(8.0)
                 .padding_y(3.0)
-                .corner_radius(4.0)
+                .corner_radius(CONTROL_RADIUS)
                 .foreground(if selected {
                     theme.heading
                 } else {
@@ -809,7 +815,28 @@ fn build_console_pane(
             .scroll(),
     );
     rows.console_panel = Some(panel);
-    for line in logs {
+    if logs.is_empty() {
+        // An empty pane reads as "is it broken?"; name the state instead.
+        ui.label(
+            panel,
+            "No output yet.",
+            Style::new().foreground(theme.subhead),
+        );
+        return panel;
+    }
+    // The ring keeps more lines than are worth building a widget for each rebuild
+    // (see console::LOG_CAP). Render only the newest CONSOLE_TAIL and, when older
+    // lines exist, say how many rather than dropping them silently.
+    let start = logs.len().saturating_sub(CONSOLE_TAIL);
+    if start > 0 {
+        let plural = if start == 1 { "" } else { "s" };
+        ui.label(
+            panel,
+            format!("{start} earlier line{plural} not shown"),
+            Style::new().foreground(theme.subhead),
+        );
+    }
+    for line in &logs[start..] {
         let color = match line.level {
             tracing::Level::ERROR => theme.axis_x,
             tracing::Level::WARN => theme.console_warn,
@@ -1274,7 +1301,6 @@ fn build_settings_body(
 /// is a button that selects that image (its project-relative path is recorded in
 /// `asset_choices`).
 const CHOOSER_H: f32 = 320.0;
-const CHOOSER_COLS: usize = 4;
 const CHOOSER_CELL: f32 = 92.0;
 const CHOOSER_THUMB: f32 = 72.0;
 
@@ -1295,16 +1321,20 @@ fn build_asset_chooser_body(
         );
         return;
     }
+    let grid_w = MODAL_W - 32.0;
     let grid = ui.panel(
         card,
         Style::new()
             .column()
             .gap(FILE_GRID_GAP)
-            .width(MODAL_W - 32.0)
+            .width(grid_w)
             .height(CHOOSER_H)
             .scroll(),
     );
-    for chunk in images.chunks(CHOOSER_COLS) {
+    // Fit as many cells as the (fixed) modal width allows rather than hardcoding
+    // a count, so the grid stays correct if the modal or cell size changes.
+    let cols = columns_for(grid_w, CHOOSER_CELL, FILE_GRID_GAP, 0.0, 8);
+    for chunk in images.chunks(cols) {
         let row = ui.panel(grid, Style::new().row().gap(FILE_GRID_GAP));
         for asset in chunk {
             let cell = ui.button(
@@ -1317,7 +1347,7 @@ fn build_asset_chooser_body(
                     .padding(4.0)
                     .width(CHOOSER_CELL)
                     .flat()
-                    .corner_radius(4.0),
+                    .corner_radius(CONTROL_RADIUS),
             );
             if let Some(handle) = thumbnails.get(&asset.abs) {
                 ui.image(
@@ -1382,7 +1412,7 @@ fn build_scene_tree(
         Style::new()
             .foreground(theme.heading)
             .padding(5.0)
-            .corner_radius(4.0)
+            .corner_radius(CONTROL_RADIUS)
             .border(1.0, theme.row_selected)
             .placeholder("Search..."),
     );
@@ -1398,7 +1428,17 @@ fn build_scene_tree(
         icons,
         theme,
     };
-    add_tree_row(ui, panel, scene, scene.root(), 0, &ctx, rows);
+    // Under a search that matches nothing (not even the root's subtree), say so
+    // rather than leaving a lone root row that looks like a mistake.
+    if !query.is_empty() && !subtree_matches(scene, scene.root(), &query) {
+        ui.label(
+            panel,
+            "No matching nodes.",
+            Style::new().padding(4.0).foreground(theme.subhead),
+        );
+    } else {
+        add_tree_row(ui, panel, scene, scene.root(), 0, &ctx, rows);
+    }
     panel
 }
 
@@ -1542,7 +1582,7 @@ fn add_tree_row(
                 .grow(1.0)
                 .padding(1.0)
                 .foreground(theme.heading)
-                .corner_radius(3.0)
+                .corner_radius(INSET_RADIUS)
                 .border(1.0, theme.row_selected.lighten(0.2)),
         );
         rows.rename_field = Some((field, node));
@@ -1644,7 +1684,7 @@ pub fn add_file_tooltip(
             .padding(8.0)
             .width(FILE_TOOLTIP_W)
             .background(theme.menu_bg)
-            .corner_radius(6.0)
+            .corner_radius(CARD_RADIUS)
             .border(1.0, theme.card_border)
             .hit_transparent(),
     );
@@ -1739,13 +1779,15 @@ fn build_inspector(
             theme,
             rows,
         );
-        // Rotation is a single scalar, edited in degrees (stored radians).
+        // Rotation is a single scalar, edited in degrees (stored radians); the
+        // "deg" unit hint makes that explicit next to the field.
         let input = add_value_row(
             ui,
             card,
             "rotation",
             &Value::F32(t.rotation.to_degrees()),
             true,
+            Some("deg"),
             theme,
         );
         rows.transform_rows.push((input, node, "rotation"));
@@ -1823,7 +1865,7 @@ fn build_inspector(
                 }
                 _ => {
                     let numeric = matches!(value, Value::F32(_));
-                    let input = add_value_row(ui, card, field, &value, numeric, theme);
+                    let input = add_value_row(ui, card, field, &value, numeric, None, theme);
                     rows.field_rows.push((input, node, i, field));
                 }
             }
@@ -1986,6 +2028,7 @@ fn add_value_row(
     label: &str,
     value: &Value,
     numeric: bool,
+    unit: Option<&str>,
     theme: &EditorTheme,
 ) -> WidgetId {
     let row = ui.panel(panel, Style::new().row().gap(6.0).align_center());
@@ -1999,11 +2042,17 @@ fn add_value_row(
         .padding(4.0)
         .foreground(theme.heading)
         .corner_radius(CONTROL_RADIUS);
-    if numeric {
+    let input = if numeric {
         ui.numeric_input(row, value_to_text(value), style)
     } else {
         ui.text_input(row, value_to_text(value), style)
+    };
+    // An optional unit hint after the field (e.g. rotation in degrees), muted so
+    // it reads as an annotation rather than part of the value.
+    if let Some(unit) = unit {
+        ui.label(row, unit, Style::new().foreground(theme.subhead));
     }
+    input
 }
 
 /// A Vec2 field as two rows: a colored, draggable axis label (X red, Y green)
@@ -2065,14 +2114,21 @@ const FILE_COL_MODIFIED: f32 = 100.0;
 /// The hover tooltip's width.
 const FILE_TOOLTIP_W: f32 = 240.0;
 
+/// The number of `cell`-wide columns (with `gap` between them and `pad` on each
+/// side) that fit in a container `width` px wide - at least 1, at most `max`.
+/// N cells span N*cell + (N-1)*gap inside the padded area.
+fn columns_for(width: f32, cell: f32, gap: f32, pad: f32, max: usize) -> usize {
+    let inner = (width - pad * 2.0).max(0.0);
+    let cols = ((inner + gap) / (cell + gap)).floor();
+    (cols as usize).clamp(1, max)
+}
+
 /// The number of grid columns that fit in a contents pane `width` px wide (at
 /// least one). `main` reads the pane's laid-out width back each frame and feeds
 /// it here so the preview grid reflows with the pane.
 pub fn grid_cols(width: f32) -> usize {
-    // The contents panel pads by 6 on each side; N cells need N*cell + (N-1)*gap.
-    let inner = (width - 12.0).max(0.0);
-    let cols = ((inner + FILE_GRID_GAP) / (FILE_GRID_CELL + FILE_GRID_GAP)).floor();
-    (cols as usize).clamp(1, 8)
+    // The contents panel pads by 6 on each side.
+    columns_for(width, FILE_GRID_CELL, FILE_GRID_GAP, 6.0, 8)
 }
 
 /// The file-explorer pane: a bar (breadcrumbs + view toggles + refresh) over a
@@ -2368,7 +2424,7 @@ fn build_grid_cell(
         .padding(4.0)
         .width(FILE_GRID_CELL)
         .flat()
-        .corner_radius(4.0)
+        .corner_radius(CONTROL_RADIUS)
         .background(background);
     if draggable {
         style = style.draggable();
@@ -2402,7 +2458,7 @@ fn build_entry_name(
             entry.name.clone(),
             field_style
                 .foreground(ctx.theme.heading)
-                .corner_radius(3.0)
+                .corner_radius(INSET_RADIUS)
                 .border(1.0, ctx.theme.row_selected.lighten(0.2)),
         );
         rows.file_rename_field = Some((field, entry.path.clone()));
@@ -3451,5 +3507,71 @@ mod tests {
             parse_value("hero.png", &Value::Asset(String::new())),
             Some(Value::Asset("hero.png".into()))
         );
+    }
+
+    #[test]
+    fn value_to_text_round_trips_through_parse_value() {
+        // What the inspector shows for a value must parse back to that same
+        // value, so an untouched field commits unchanged (float formatting is
+        // shortest-round-trip, so the numeric cases are exact).
+        let cases = [
+            Value::F32(3.5),
+            Value::Bool(true),
+            Value::Str("hello".into()),
+            Value::Vec2(Vec2::new(1.5, -2.0)),
+            Value::Color([0.1, 0.2, 0.3, 1.0]),
+            Value::Asset("art/hero.png".into()),
+        ];
+        for v in &cases {
+            let text = value_to_text(v);
+            assert_eq!(
+                parse_value(&text, v).as_ref(),
+                Some(v),
+                "round-trip of {v:?} via {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn field_color_reads_back_what_set_field_color_wrote() {
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        let mut node = Node::new("sprite");
+        node.components.push(Component::Sprite(SpriteComponent {
+            texture: String::new(),
+            tint: [1.0, 1.0, 1.0, 1.0],
+            size: Vec2::splat(10.0),
+        }));
+        let id = scene.add_child(root, node);
+
+        let tint = ColorTarget {
+            node: id,
+            index: 0,
+            field: "tint",
+        };
+        set_field_color(&mut scene, tint, [0.2, 0.4, 0.6, 0.8]);
+        assert_eq!(field_color(&scene, tint), [0.2, 0.4, 0.6, 0.8]);
+
+        // A non-color field falls back to opaque black rather than panicking.
+        let size = ColorTarget {
+            node: id,
+            index: 0,
+            field: "size",
+        };
+        assert_eq!(field_color(&scene, size), [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn grid_columns_fit_the_width_and_clamp() {
+        // At least one column at any width, clamped to the file grid's max of 8.
+        assert_eq!(grid_cols(0.0), 1);
+        assert_eq!(grid_cols(10_000.0), 8);
+        // 6 cells span 6*84 + 5*6 = 534 inside the 6px-per-side padding.
+        assert_eq!(grid_cols(534.0 + 12.0), 6);
+
+        // The general helper: cells of `cell` with `gap` between, `pad` per side.
+        assert_eq!(columns_for(100.0, 20.0, 0.0, 0.0, 8), 5);
+        assert_eq!(columns_for(0.0, 20.0, 5.0, 0.0, 8), 1);
+        assert_eq!(columns_for(10_000.0, 20.0, 0.0, 0.0, 3), 3);
     }
 }
