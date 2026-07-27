@@ -119,6 +119,12 @@ pub struct Ui {
     /// re-measures a whole subtree on any resize, so without this a panel drag or
     /// any change re-shaped thousands of unchanged strings (see `ShapeCacheEntry`).
     shape_cache: SecondaryMap<WidgetId, ShapeCacheEntry>,
+    /// Per ellipsis widget, the (full text, content-box width bits, font-size
+    /// bits, weight) it was last truncated for. `ellipsize` skips re-truncating
+    /// when these are unchanged, and re-runs (re-expanding or shortening) when
+    /// the width changes - which matters now that the shape cache no longer
+    /// re-shapes the widget to its full text on every layout.
+    ellipsized: SecondaryMap<WidgetId, (String, u32, u32, FontWeight)>,
     /// A shaped buffer for each placeholder-bearing text input, produced after
     /// layout and drawn (dimmed) only while the input's own text is empty.
     placeholder_buffers: SecondaryMap<WidgetId, Buffer>,
@@ -192,6 +198,7 @@ impl Ui {
             font_system: text::make_font_system(),
             buffers: SecondaryMap::new(),
             shape_cache: SecondaryMap::new(),
+            ellipsized: SecondaryMap::new(),
             placeholder_buffers: SecondaryMap::new(),
             check_buffers: SecondaryMap::new(),
             text_vscroll: SecondaryMap::new(),
@@ -460,12 +467,19 @@ impl Ui {
     }
 
     /// Replace a label's text. It is re-shaped and re-measured on the next
-    /// [`layout`](Self::layout); a no-op on non-label widgets.
+    /// [`layout`](Self::layout); a no-op on non-label widgets, and a no-op (no
+    /// layout invalidation) when the text is unchanged - so an app that re-sets a
+    /// status readout to the same value every frame costs nothing.
     pub fn set_label(&mut self, id: WidgetId, text: impl Into<String>) {
-        if let WidgetKind::Label(s) = &mut self.widgets[id].kind {
-            *s = text.into();
-            self.invalidate_text(id);
+        let WidgetKind::Label(s) = &mut self.widgets[id].kind else {
+            return;
+        };
+        let text = text.into();
+        if *s == text {
+            return;
         }
+        *s = text;
+        self.invalidate_text(id);
     }
 
     /// Replace a text input's contents (e.g. an editor populating a field). The
@@ -483,7 +497,11 @@ impl Ui {
         let WidgetKind::TextInput(s) = &mut self.widgets[id].kind else {
             return;
         };
-        *s = text.into();
+        let text = text.into();
+        if *s == text {
+            return;
+        }
+        *s = text;
         let len = s.len();
         if self.focused == Some(id) {
             self.caret = self.caret.min(len);
@@ -908,7 +926,23 @@ impl Ui {
             .collect();
         let buffers = &mut self.buffers;
         let font_system = &mut self.font_system;
+        let cache = &mut self.ellipsized;
         for (id, full, content_w, font_size, weight) in jobs {
+            // Skip when the text, box width, and font are unchanged since the
+            // last truncation - the buffer already holds the right text. When
+            // any of these change (notably a panel resize), fall through and
+            // re-evaluate, so the label re-expands or shortens as needed.
+            let key = (
+                full.clone(),
+                content_w.to_bits(),
+                font_size.to_bits(),
+                weight,
+            );
+            if cache.get(id) == Some(&key) {
+                continue;
+            }
+            cache.insert(id, key);
+
             let Some(buffer) = buffers.get_mut(id) else {
                 continue;
             };
@@ -922,8 +956,11 @@ impl Ui {
                 b.shape_until_scroll(false);
                 b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
             };
-            // Already shaped full text (from measure) fits: nothing to do.
-            if buffer.layout_runs().map(|r| r.line_w).fold(0.0, f32::max) <= content_w {
+            // Re-shape to the FULL text and measure it: the shape cache may have
+            // left the buffer holding a previous truncation, so we cannot trust
+            // its current width. If the full text fits, the buffer now correctly
+            // holds it (a re-expand after a widen).
+            if shaped_w(buffer, font_system, &full) <= content_w {
                 continue;
             }
             // Char-boundary byte offsets, plus the end. Binary-search the longest
@@ -978,7 +1015,10 @@ impl Ui {
         );
         self.content_origin.insert(id, pos + inset);
 
-        let children = self.widgets[id].children.clone();
+        // Iterate children by index, re-borrowing each step, so this per-frame
+        // whole-tree walk does not clone every node's children Vec. accumulate
+        // never mutates `children`, so the indices stay valid.
+        let child_count = self.widgets[id].children.len();
 
         // A scroll container shifts its children up by its offset; everything
         // downstream (rects, text origins, hit-testing, drawing) follows from
@@ -988,7 +1028,8 @@ impl Ui {
         if self.widgets[id].scroll {
             let pad_bottom = layout.padding.bottom + layout.border.bottom;
             let mut content_bottom = 0.0f32;
-            for &child in &children {
+            for i in 0..child_count {
+                let child = self.widgets[id].children[i];
                 let cl = self
                     .taffy
                     .layout(self.widgets[child].taffy)
@@ -1003,7 +1044,8 @@ impl Ui {
             child_origin.y -= offset;
         }
 
-        for child in children {
+        for i in 0..child_count {
+            let child = self.widgets[id].children[i];
             self.accumulate(child, child_origin);
         }
     }
@@ -3270,6 +3312,41 @@ mod tests {
         let s = ui.rect(small).unwrap().size;
         let b = ui.rect(big).unwrap().size;
         assert!(b.y > s.y, "small={s:?} big={b:?}");
+    }
+
+    #[test]
+    fn widening_an_ellipsis_label_re_expands_it_despite_the_shape_cache() {
+        // The shape cache means measure no longer re-shapes an ellipsis label to
+        // its full text each frame, so ellipsize must itself re-check on a width
+        // change - otherwise a widened panel would keep showing "..." forever.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(500.0, 200.0));
+        let boxed = ui.panel(root, Style::new().row().width(60.0));
+        ui.label(
+            boxed,
+            "A fairly long node name here",
+            Style::new().grow(1.0).ellipsis(),
+        );
+        let glyphs = |ui: &mut Ui| {
+            ui.draw_list()
+                .commands
+                .iter()
+                .filter_map(|c| match c {
+                    DrawCommand::Text { glyphs, .. } => Some(glyphs.len()),
+                    _ => None,
+                })
+                .sum::<usize>()
+        };
+        ui.layout(Vec2::new(500.0, 200.0)).unwrap();
+        let narrow = glyphs(&mut ui);
+
+        ui.set_width(boxed, 400.0);
+        ui.layout(Vec2::new(500.0, 200.0)).unwrap();
+        let wide = glyphs(&mut ui);
+        assert!(
+            wide > narrow,
+            "widening should re-expand the ellipsized text ({narrow} -> {wide} glyphs)"
+        );
     }
 
     #[test]
