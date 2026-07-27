@@ -2746,6 +2746,14 @@ impl State {
 
     /// Commit a finished inline file rename to disk, reselecting the result.
     fn commit_file_rename(&mut self, old: &std::path::Path, name: String) {
+        // Only the first commit of a rename session touches the disk. A stray
+        // second Submitted for the same field would otherwise try to rename `old`
+        // (now gone) onto the name the first commit just created and report a
+        // spurious "already exists". Clearing the renaming state first makes the
+        // filesystem rename idempotent, independent of how many events arrive.
+        if self.explorer.renaming().is_none() {
+            return;
+        }
         self.explorer.set_renaming(None);
         match file_ops::rename(old, name.trim()) {
             Ok(new_path) => {

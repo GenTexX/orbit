@@ -1413,8 +1413,18 @@ impl Ui {
             if multiline {
                 self.insert_newline();
             } else {
-                self.events.push(Event::Submitted(id));
+                // Commit this field, then advance to the next like Tab.
+                // focus_step already submits the field it LEAVES, so pushing here
+                // unconditionally would emit Submitted twice whenever there is a
+                // next field to move to - which double-runs a non-idempotent
+                // handler (an inline rename would rename, then "rename" again onto
+                // the name it just created). Only push when focus_step does not
+                // move (a lone field in the ring), so Enter submits exactly once.
+                let before = self.focused;
                 self.focus_step(1);
+                if self.focused == before {
+                    self.events.push(Event::Submitted(id));
+                }
             }
             return;
         }
@@ -4738,5 +4748,26 @@ mod tests {
         ui.handle_input(InputEvent::Key(Key::Enter));
         assert_eq!(ui.drain_events(), vec![Event::Submitted(field)]);
         assert_eq!(text_of(&ui, field), "hello"); // unchanged - Enter commits, not edits
+    }
+
+    #[test]
+    fn enter_submits_the_left_field_exactly_once_while_advancing() {
+        // With more than one field in the ring, Enter commits the current field
+        // AND advances to the next (like Tab). It must emit Submitted for the
+        // left field EXACTLY once: a duplicate double-runs a non-idempotent
+        // handler (an inline rename would rename, then fail renaming onto the
+        // name it just created).
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(200.0, 100.0));
+        let first = ui.text_input(root, "a", Style::new().size(180.0, 24.0));
+        let second = ui.text_input(root, "b", Style::new().size(180.0, 24.0));
+        ui.layout(Vec2::new(200.0, 100.0)).unwrap();
+
+        ui.focus(first);
+        ui.drain_events();
+        ui.handle_input(InputEvent::Key(Key::Enter));
+
+        assert_eq!(ui.drain_events(), vec![Event::Submitted(first)]);
+        assert_eq!(ui.focused(), Some(second)); // advanced to the next field
     }
 }
