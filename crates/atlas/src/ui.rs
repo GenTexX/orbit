@@ -2013,6 +2013,66 @@ mod tests {
     }
 
     #[test]
+    fn a_panel_resize_reshapes_no_text() {
+        // The reported fps drop: resizing a panel re-shaped ~2600 unchanged text
+        // buffers per drag frame (taffy re-measures the stretched subtree). With
+        // the shape cache it must re-shape nothing - no text changed.
+        let (scene, handle) = demo_scene();
+        let sprite = scene.children(scene.root())[0];
+        let dir = std::env::temp_dir();
+        let dock = DockNode::default_layout();
+        let mut set = HashSet::new();
+        set.insert(sprite);
+        let (mut ui, rows) = build_editor_ui(
+            &scene,
+            &set,
+            Some(sprite),
+            handle,
+            &dir,
+            &dock,
+            &HashMap::new(),
+            None,
+            GizmoMode::Select,
+            None,
+            &TreeView::default(),
+            "",
+            None,
+            &InspectorView::default(),
+            &EditorTheme::default(),
+        );
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        assert_eq!(ui.last_measure_count(), 0, "idle re-shapes nothing");
+
+        let tree = pane_group(&rows, Pane::SceneTree);
+        let w = ui.rect(tree).unwrap().size.x;
+        ui.set_width(tree, w + 20.0);
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        assert_eq!(
+            ui.last_measure_count(),
+            0,
+            "resizing a panel must not re-shape any text"
+        );
+    }
+
+    #[test]
+    fn a_cold_rebuild_shapes_each_text_once_not_the_whole_tree_repeatedly() {
+        // taffy probes each text leaf several times per layout; the shape cache
+        // must collapse those to one shape per distinct string, so even a full
+        // cold rebuild stays cheap (it was thousands of re-shapes before).
+        let (scene, handle) = demo_scene();
+        let dir = std::env::temp_dir();
+        let dock = DockNode::default_layout();
+        let (mut ui, _rows) = build_with_dock(&scene, handle, &dir, &dock, &HashMap::new());
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        assert!(
+            ui.last_measure_count() < 200,
+            "a cold rebuild should shape each text about once, got {}",
+            ui.last_measure_count()
+        );
+    }
+
+    #[test]
     fn dock_split_sizes_survive_a_shell_rebuild() {
         // The regression: drag a splitter, then trigger a rebuild (as a
         // selection change does) - the dragged size must carry over, not snap

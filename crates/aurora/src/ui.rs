@@ -43,6 +43,57 @@ const DRAG_THRESHOLD: f32 = 4.0;
 /// Opacity of the drag "ghost" (the faded copy of the dragged widget).
 const DRAG_GHOST_ALPHA: f32 = 0.6;
 
+/// What a text widget's buffer was last shaped with, and the size that produced.
+/// `measure_widget` compares the live inputs against this and re-shapes only on a
+/// mismatch, so taffy's repeated measure probes - and container resizes that
+/// change no text - cost a field compare instead of a cosmic-text re-shape.
+struct ShapeCacheEntry {
+    content: String,
+    font_bits: u32,
+    weight: FontWeight,
+    /// One-line widgets (single-line inputs, ellipsis) are width-independent, so
+    /// a hit needs only the text/font to match.
+    one_line: bool,
+    /// If the last shape landed on a single line, the width it needed; the shape
+    /// is then identical at any wrap width >= this (the text does not wrap), so a
+    /// panel resize that only widens the box is a hit. `None` if it wrapped onto
+    /// multiple lines - then `wrap_bits` pins the exact width it was shaped at.
+    single_line_w: Option<f32>,
+    wrap_bits: Option<u32>,
+    size: Size<f32>,
+}
+
+impl ShapeCacheEntry {
+    /// Whether this cached shape is still valid for the given inputs (so the
+    /// re-shape can be skipped).
+    fn hits(
+        &self,
+        content: &str,
+        one_line: bool,
+        wrap_width: Option<f32>,
+        font_bits: u32,
+        weight: FontWeight,
+    ) -> bool {
+        if self.content != content
+            || self.font_bits != font_bits
+            || self.weight != weight
+            || self.one_line != one_line
+        {
+            return false;
+        }
+        if one_line {
+            return true; // width-independent
+        }
+        match self.single_line_w {
+            // Was a single line; still one line (identical shape) if the box is
+            // unconstrained or at least as wide as the text needs.
+            Some(natural) => wrap_width.is_none_or(|w| w >= natural),
+            // Wrapped; the exact wrap width must match or it re-flows.
+            None => self.wrap_bits == wrap_width.map(f32::to_bits),
+        }
+    }
+}
+
 /// A retained Aurora UI: owns the widget arena, the taffy layout tree, the font
 /// system, and the shaped text buffers; caches each widget's absolute rectangle
 /// after [`layout`](Self::layout).
@@ -62,6 +113,12 @@ pub struct Ui {
     font_system: FontSystem,
     /// One shaped text buffer per text-bearing widget, produced during layout.
     buffers: SecondaryMap<WidgetId, Buffer>,
+    /// Per-widget record of the inputs its `buffers` entry was last shaped with,
+    /// so `measure_widget` can skip a full cosmic-text re-shape when nothing that
+    /// affects the text changed. Taffy probes each leaf 2-4 times per layout and
+    /// re-measures a whole subtree on any resize, so without this a panel drag or
+    /// any change re-shaped thousands of unchanged strings (see `ShapeCacheEntry`).
+    shape_cache: SecondaryMap<WidgetId, ShapeCacheEntry>,
     /// A shaped buffer for each placeholder-bearing text input, produced after
     /// layout and drawn (dimmed) only while the input's own text is empty.
     placeholder_buffers: SecondaryMap<WidgetId, Buffer>,
@@ -134,6 +191,7 @@ impl Ui {
             content_origin: SecondaryMap::new(),
             font_system: text::make_font_system(),
             buffers: SecondaryMap::new(),
+            shape_cache: SecondaryMap::new(),
             placeholder_buffers: SecondaryMap::new(),
             check_buffers: SecondaryMap::new(),
             text_vscroll: SecondaryMap::new(),
@@ -448,16 +506,38 @@ impl Ui {
     /// path of `measure_widget`.
     fn reshape_field(&mut self, id: WidgetId) {
         let metrics = text::metrics_for(self.widgets[id].font_size);
-        let attrs = text::attrs_for(self.widgets[id].font_weight);
+        let weight = self.widgets[id].font_weight;
+        let attrs = text::attrs_for(weight);
         let WidgetKind::TextInput(text) = &self.widgets[id].kind else {
             return;
         };
         let text = text.clone();
-        let mut borrowed = self.buffers[id].borrow_with(&mut self.font_system);
-        borrowed.set_metrics(metrics);
-        borrowed.set_size(None, None);
-        borrowed.set_text(&text, &attrs, Shaping::Advanced, None);
-        borrowed.shape_until_scroll(false);
+        {
+            let mut borrowed = self.buffers[id].borrow_with(&mut self.font_system);
+            borrowed.set_metrics(metrics);
+            borrowed.set_size(None, None);
+            borrowed.set_text(&text, &attrs, Shaping::Advanced, None);
+            borrowed.shape_until_scroll(false);
+        }
+        // Keep the shape cache in step with the buffer we just re-shaped (a
+        // single-line field: width-independent, intrinsic width 0), so a later
+        // measure - e.g. a panel resize that dirties this node - sees a hit and
+        // does not redundantly re-shape.
+        self.shape_cache.insert(
+            id,
+            ShapeCacheEntry {
+                content: text,
+                font_bits: self.widgets[id].font_size.to_bits(),
+                weight,
+                one_line: true,
+                single_line_w: None,
+                wrap_bits: None,
+                size: Size {
+                    width: 0.0,
+                    height: metrics.line_height,
+                },
+            },
+        );
     }
 
     /// Set whether the caret is in its visible blink phase. Apps that want a
@@ -709,7 +789,10 @@ impl Ui {
         let buffers = &mut self.buffers;
         let check_buffers = &mut self.check_buffers;
         let font_system = &mut self.font_system;
-        let mut measures = 0u32;
+        let shape_cache = &mut self.shape_cache;
+        // Counts actual cosmic-text re-shapes (cache misses), not measure calls,
+        // so it reflects the work done - see `last_measure_count`.
+        let mut reshapes = 0u32;
         self.taffy.compute_layout_with_measure(
             root_node,
             Size {
@@ -717,7 +800,6 @@ impl Ui {
                 height: AvailableSpace::Definite(available.y),
             },
             |known, avail, _node, ctx, _style| {
-                measures += 1;
                 measure_widget(
                     known,
                     avail,
@@ -726,10 +808,12 @@ impl Ui {
                     buffers,
                     check_buffers,
                     font_system,
+                    shape_cache,
+                    &mut reshapes,
                 )
             },
         )?;
-        self.last_measure_count = measures;
+        self.last_measure_count = reshapes;
 
         self.rects.clear();
         self.content_origin.clear();
@@ -1240,10 +1324,11 @@ impl Ui {
         self.focused
     }
 
-    /// How many times the measure (text-shaping) function ran during the last
-    /// [`layout`](Self::layout). A diagnostic: it should stay small when only a
-    /// few widgets' text changed; a large count means a change is defeating
-    /// taffy's per-node measure cache and re-shaping much of the tree.
+    /// How many text buffers were actually re-shaped (cosmic-text) during the
+    /// last [`layout`](Self::layout) - cache misses, not measure calls. A
+    /// diagnostic: it should stay small when only a few widgets' text changed; a
+    /// large count means shaping work is being repeated (e.g. the shape cache is
+    /// being defeated, or many strings genuinely changed).
     pub fn last_measure_count(&self) -> u32 {
         self.last_measure_count
     }
@@ -2511,6 +2596,7 @@ fn next_word_boundary(s: &str, i: usize) -> usize {
 
 /// taffy measure function: shape a text-bearing leaf and return its size. Called
 /// only for leaf nodes without a definite style size.
+#[allow(clippy::too_many_arguments)]
 fn measure_widget(
     known: Size<Option<f32>>,
     available: Size<AvailableSpace>,
@@ -2519,21 +2605,21 @@ fn measure_widget(
     buffers: &mut SecondaryMap<WidgetId, Buffer>,
     check_buffers: &mut SecondaryMap<WidgetId, Buffer>,
     font_system: &mut FontSystem,
+    shape_cache: &mut SecondaryMap<WidgetId, ShapeCacheEntry>,
+    reshapes: &mut u32,
 ) -> Size<f32> {
     let Some(&mut id) = ctx else {
         return Size::ZERO;
     };
     let content = match &widgets[id].kind {
         WidgetKind::Label(t) | WidgetKind::Button(t) | WidgetKind::TextInput(t) => t.as_str(),
-        // A checkbox is a fixed-size box plus an optional caption. Shape the
-        // check glyph into check_buffers (drawn when checked) and the caption
-        // into the main buffer; measure to box + gap + caption width.
+        // A checkbox is a fixed-size box plus an optional caption. The check
+        // glyph is a constant, shaped once at first sight; the caption is shaped
+        // (and its width cached) like any other text below.
         WidgetKind::Checkbox { label, .. } => {
             let box_metrics = text::checkmark_metrics(theme::CHECKBOX_SIZE);
             if !check_buffers.contains_key(id) {
                 check_buffers.insert(id, Buffer::new(font_system, box_metrics));
-            }
-            {
                 let mut borrowed = check_buffers[id].borrow_with(font_system);
                 borrowed.set_metrics(box_metrics);
                 borrowed.set_size(None, None);
@@ -2545,20 +2631,29 @@ fn measure_widget(
                 );
                 borrowed.shape_until_scroll(false);
             }
+            let metrics = text::metrics_for(widgets[id].font_size);
+            let line_h = theme::CHECKBOX_SIZE.max(metrics.line_height);
+            let weight = widgets[id].font_weight;
+            let font_bits = widgets[id].font_size.to_bits();
+            // Cache the caption shape + resulting box size on the label text (the
+            // caption never wraps, so it is width-independent - one_line=true).
+            if let Some(e) = shape_cache.get(id)
+                && e.hits(label, true, None, font_bits, weight)
+                && (label.is_empty() || buffers.contains_key(id))
+            {
+                return e.size;
+            }
             let mut label_w = 0.0f32;
-            let mut line_h = theme::CHECKBOX_SIZE;
             if !label.is_empty() {
-                let metrics = text::metrics_for(widgets[id].font_size);
-                line_h = line_h.max(metrics.line_height);
                 if !buffers.contains_key(id) {
                     buffers.insert(id, Buffer::new(font_system, metrics));
                 }
                 let mut borrowed = buffers[id].borrow_with(font_system);
                 borrowed.set_metrics(metrics);
                 borrowed.set_size(None, None);
-                let attrs = text::attrs_for(widgets[id].font_weight);
-                borrowed.set_text(label, &attrs, Shaping::Advanced, None);
+                borrowed.set_text(label, &text::attrs_for(weight), Shaping::Advanced, None);
                 borrowed.shape_until_scroll(false);
+                *reshapes += 1;
                 label_w = borrowed.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
             }
             let width = theme::CHECKBOX_SIZE
@@ -2567,10 +2662,23 @@ fn measure_widget(
                 } else {
                     0.0
                 };
-            return Size {
+            let size = Size {
                 width,
                 height: line_h,
             };
+            shape_cache.insert(
+                id,
+                ShapeCacheEntry {
+                    content: label.clone(),
+                    font_bits,
+                    weight,
+                    one_line: true,
+                    single_line_w: None,
+                    wrap_bits: None,
+                    size,
+                },
+            );
+            return size;
         }
         // Panels, images, sliders, and splitters have no intrinsic content
         // size; they take their size from style (fixed size, grow, or fill).
@@ -2601,10 +2709,22 @@ fn measure_widget(
         })
     };
 
+    // Skip the (expensive) re-shape when nothing that affects it changed. Taffy
+    // probes each leaf several times per layout - and re-measures whole subtrees
+    // on any resize - so this turns almost all of those into a field compare.
+    let font_bits = widgets[id].font_size.to_bits();
+    let weight = widgets[id].font_weight;
+    if let Some(e) = shape_cache.get(id)
+        && e.hits(content, one_line, wrap_width, font_bits, weight)
+        && buffers.contains_key(id)
+    {
+        return e.size;
+    }
+
     // Shape at this widget's font size and weight, so headings and captions
     // measure (and later draw) at their size and weight.
     let metrics = text::metrics_for(widgets[id].font_size);
-    let attrs = text::attrs_for(widgets[id].font_weight);
+    let attrs = text::attrs_for(weight);
     if !buffers.contains_key(id) {
         buffers.insert(id, Buffer::new(font_system, metrics));
     }
@@ -2616,15 +2736,7 @@ fn measure_widget(
         borrowed.set_text(content, &attrs, Shaping::Advanced, None);
         borrowed.shape_until_scroll(false);
     }
-
-    if one_line {
-        // Intrinsic width 0: the style's width or grow drives the widget's size;
-        // its text is not part of that, so it never resizes to fit long text.
-        return Size {
-            width: 0.0,
-            height: metrics.line_height,
-        };
-    }
+    *reshapes += 1;
 
     let mut width = 0.0f32;
     let mut lines = 0u32;
@@ -2632,10 +2744,38 @@ fn measure_widget(
         width = width.max(run.line_w);
         lines += 1;
     }
-    Size {
-        width: width.ceil(),
-        height: lines.max(1) as f32 * metrics.line_height,
-    }
+    let (size, single_line_w) = if one_line {
+        // Intrinsic width 0: the style's width or grow drives the widget's size;
+        // its text is not part of that, so it never resizes to fit long text.
+        (
+            Size {
+                width: 0.0,
+                height: metrics.line_height,
+            },
+            None,
+        )
+    } else {
+        let size = Size {
+            width: width.ceil(),
+            height: lines.max(1) as f32 * metrics.line_height,
+        };
+        // A single-line result is width-independent for any wider box; record
+        // its natural width so a panel resize that only widens is a cache hit.
+        (size, (lines <= 1).then_some(width))
+    };
+    shape_cache.insert(
+        id,
+        ShapeCacheEntry {
+            content: content.to_string(),
+            font_bits,
+            weight,
+            one_line,
+            single_line_w,
+            wrap_bits: wrap_width.map(f32::to_bits),
+            size,
+        },
+    );
+    size
 }
 
 #[cfg(test)]
@@ -3130,6 +3270,31 @@ mod tests {
         let s = ui.rect(small).unwrap().size;
         let b = ui.rect(big).unwrap().size;
         assert!(b.y > s.y, "small={s:?} big={b:?}");
+    }
+
+    #[test]
+    fn narrowing_a_wrapping_label_re_wraps_it_despite_the_shape_cache() {
+        // The shape cache treats a single-line result as width-independent for
+        // any WIDER box, but narrowing below the text's width must re-shape and
+        // wrap taller - otherwise a resized panel would show clipped text.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(500.0, 400.0));
+        let boxed = ui.panel(root, Style::new().column().width(400.0));
+        let label = ui.label(
+            boxed,
+            "one two three four five six seven eight nine",
+            Style::new(),
+        );
+        ui.layout(Vec2::new(500.0, 400.0)).unwrap();
+        let wide = ui.rect(label).unwrap().size.y;
+
+        ui.set_width(boxed, 70.0);
+        ui.layout(Vec2::new(500.0, 400.0)).unwrap();
+        let narrow = ui.rect(label).unwrap().size.y;
+        assert!(
+            narrow > wide,
+            "narrowing must re-wrap the label taller (was {wide}, now {narrow})"
+        );
     }
 
     #[test]
