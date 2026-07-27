@@ -1989,6 +1989,12 @@ impl State {
                 self.renaming = None;
                 self.tree_filter.clear();
                 self.node_clip.clear();
+                // These hold NodeIds from the OLD scene arena. A reload builds a
+                // fresh arena, so the old keys are invalid - indexing the slotmap
+                // with them (as the next state save would, via encode_collapsed)
+                // panics. Drop them; the new scene starts fully expanded.
+                self.tree_collapsed.clear();
+                self.inspector_collapsed.clear();
                 self.dirty = true;
                 tracing::info!("project loaded from {}", self.project_dir.display());
             }

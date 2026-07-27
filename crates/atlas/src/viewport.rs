@@ -413,7 +413,10 @@ pub fn grid_sprites(
     show_grid: bool,
     show_axes: bool,
 ) -> Vec<Sprite> {
-    let zoom = camera.zoom;
+    // Guard against a non-positive zoom from a corrupt editor.ron: a zero or
+    // negative zoom would make the step NaN/negative and the line loops below
+    // run forever (or never terminate at all).
+    let zoom = camera.zoom.max(1.0e-3);
     let min = camera.pan;
     let max = camera.pan + viewport_px / zoom;
     let (width, height) = (max.x - min.x, max.y - min.y);
@@ -642,11 +645,14 @@ fn snap(v: f32, step: f32) -> f32 {
     }
 }
 
-/// Snap the property a drag edits to its increment: translation to `move_step`
-/// world units, rotation to `rotate_step_rad` radians, scale to `scale_step`.
-/// Only the component the drag actually changes is snapped (a rotate leaves the
-/// position alone, a per-axis scale snaps just that axis), so snapping never
-/// disturbs a value the drag was not touching.
+/// Snap the property a drag edits to its increment: translation to `move_step`,
+/// rotation to `rotate_step_rad` radians, scale to `scale_step`. Translation is
+/// snapped in the node's LOCAL space (its `Transform.translation`), so the grid
+/// is world-aligned only for a node whose parent is untransformed - the common
+/// case; under a rotated or scaled parent the increment follows the parent's
+/// frame. Only the component the drag actually changes is snapped (a rotate
+/// leaves the position alone, a per-axis scale snaps just that axis), so
+/// snapping never disturbs a value the drag was not touching.
 pub fn snap_transform(
     drag: &Drag,
     t: Transform,
@@ -655,14 +661,28 @@ pub fn snap_transform(
     scale_step: f32,
 ) -> Transform {
     match drag {
-        // Both move drags land the node's final position on the grid.
-        Drag::Move { .. } | Drag::MoveAxis { .. } => Transform {
+        // A free move lands the node's final position on the grid.
+        Drag::Move { .. } => Transform {
             translation: Vec2::new(
                 snap(t.translation.x, move_step),
                 snap(t.translation.y, move_step),
             ),
             ..t
         },
+        // An axis-constrained move snaps only the distance travelled ALONG the
+        // constraint axis, so the perpendicular position it was locked out of is
+        // never disturbed (the node stays exactly on the gizmo arrow's line).
+        Drag::MoveAxis {
+            original,
+            axis_world,
+            ..
+        } => {
+            let along = (t.translation - original.translation).dot(*axis_world);
+            Transform {
+                translation: original.translation + *axis_world * snap(along, move_step),
+                ..t
+            }
+        }
         Drag::Rotate { .. } => Transform {
             rotation: snap(t.rotation, rotate_step_rad),
             ..t
@@ -670,7 +690,7 @@ pub fn snap_transform(
         // Uniform scale snaps one axis and matches the other by the same factor,
         // so it stays uniform.
         Drag::ScaleUniform { .. } => {
-            let sx = snap(t.scale.x, scale_step);
+            let sx = snap_scale(t.scale.x, scale_step);
             let k = if t.scale.x.abs() > 1.0e-6 {
                 sx / t.scale.x
             } else {
@@ -683,17 +703,26 @@ pub fn snap_transform(
         }
         Drag::ScaleAxis { vertical, .. } => Transform {
             scale: if *vertical {
-                Vec2::new(t.scale.x, snap(t.scale.y, scale_step))
+                Vec2::new(t.scale.x, snap_scale(t.scale.y, scale_step))
             } else {
-                Vec2::new(snap(t.scale.x, scale_step), t.scale.y)
+                Vec2::new(snap_scale(t.scale.x, scale_step), t.scale.y)
             },
             ..t
         },
         Drag::ScaleFree { .. } => Transform {
-            scale: Vec2::new(snap(t.scale.x, scale_step), snap(t.scale.y, scale_step)),
+            scale: Vec2::new(
+                snap_scale(t.scale.x, scale_step),
+                snap_scale(t.scale.y, scale_step),
+            ),
             ..t
         },
     }
+}
+
+/// Snap a scale component to `step`, but never to zero (or below) - a snapped
+/// scale of 0 would collapse the sprite. Floored at the same 0.05 the drags use.
+fn snap_scale(v: f32, step: f32) -> f32 {
+    snap(v, step).max(0.05)
 }
 
 /// Translate `original` by a world-space delta: the delta maps through the
@@ -793,6 +822,79 @@ mod tests {
         let s = snap_transform(&su, t, 16.0, step_rad, 0.1);
         assert!((s.scale.x - 1.4).abs() < EPS);
         assert!((s.scale.x - s.scale.y).abs() < EPS, "stays uniform");
+    }
+
+    #[test]
+    fn axis_move_snaps_along_the_axis_and_never_touches_the_perpendicular() {
+        let (scene, node) = scene_with_sprite(Vec2::ZERO, Vec2::splat(100.0));
+        // Start with an off-grid perpendicular coordinate (y = 7) that snapping
+        // to a 16-unit grid would round to 0 if it wrongly touched it.
+        let orig = Transform {
+            translation: Vec2::new(0.0, 7.0),
+            ..scene.node(node).transform
+        };
+        let step_rad = 15f32.to_radians();
+
+        // Horizontal arrow drag (vertical = false, axis = +X): the node has slid
+        // to x = 35, y untouched at 7. Snapping rounds x to 32 and leaves y = 7.
+        let dx = Drag::MoveAxis {
+            node,
+            original: orig,
+            grab_world: orig.translation,
+            axis_world: Vec2::X,
+            vertical: false,
+        };
+        let t = Transform {
+            translation: Vec2::new(35.0, 7.0),
+            ..orig
+        };
+        let s = snap_transform(&dx, t, 16.0, step_rad, 0.1);
+        assert_eq!(s.translation, Vec2::new(32.0, 7.0), "y perpendicular kept");
+
+        // A rotated (diagonal) axis: the snapped result must stay exactly on the
+        // axis line (zero perpendicular drift) with the along-distance snapped.
+        let axis = Vec2::new(1.0, 1.0).normalize();
+        let diag = Drag::MoveAxis {
+            node,
+            original: orig,
+            grab_world: orig.translation,
+            axis_world: axis,
+            vertical: false,
+        };
+        let t = Transform {
+            translation: orig.translation + axis * 20.0, // 20 along -> snaps to 16
+            ..orig
+        };
+        let s = snap_transform(&diag, t, 16.0, step_rad, 0.1);
+        let moved = s.translation - orig.translation;
+        let perp = Vec2::new(-axis.y, axis.x);
+        assert!(moved.dot(perp).abs() < EPS, "no perpendicular drift");
+        assert!(
+            (moved.length() - 16.0).abs() < EPS,
+            "distance snapped to 16"
+        );
+    }
+
+    #[test]
+    fn scale_snapping_never_collapses_to_zero() {
+        let (scene, node) = scene_with_sprite(Vec2::ZERO, Vec2::splat(100.0));
+        let orig = scene.node(node).transform;
+        // A small scale (0.05) with a coarse step (0.5) would round to 0 without
+        // the floor, collapsing the sprite; snap_scale keeps it at 0.05.
+        let sx = Drag::ScaleAxis {
+            node,
+            original: orig,
+            pivot: Vec2::ZERO,
+            axis_world: Vec2::X,
+            grab_proj: 1.0,
+            vertical: false,
+        };
+        let t = Transform {
+            scale: Vec2::new(0.05, 1.0),
+            ..orig
+        };
+        let s = snap_transform(&sx, t, 16.0, 0.0, 0.5);
+        assert!(s.scale.x >= 0.05, "scale never snaps to zero");
     }
 
     #[test]

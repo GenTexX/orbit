@@ -327,6 +327,17 @@ impl History {
         else {
             return;
         };
+        // Dropping a node back onto the spot it already holds changes nothing;
+        // recording it would push a no-op onto the undo stack and falsely mark
+        // the project modified. `apply` unlinks the node before linking it, so
+        // `new_index` is measured against the siblings WITHOUT the node - the
+        // same frame as `old_index` - and `link` clamps it to that shorter list.
+        if old_parent == new_parent {
+            let after_unlink = scene.children(new_parent).len() - 1;
+            if new_index.min(after_unlink) == old_index {
+                return;
+            }
+        }
         self.push(
             scene,
             Edit::Reparent {
@@ -531,6 +542,36 @@ mod tests {
         // Reparenting a node into its own subtree is refused.
         history.reparent(&mut scene, root, a, 0);
         assert_eq!(scene.parent(root), None);
+    }
+
+    #[test]
+    fn reparenting_a_node_to_its_current_spot_records_nothing() {
+        let (mut scene, root) = scene_with_root();
+        let mut history = History::new();
+        let a = history.add_node(&mut scene, root, Node::new("a"));
+        let b = history.add_node(&mut scene, root, Node::new("b"));
+        let c = history.add_node(&mut scene, root, Node::new("c")); // [a, b, c]
+        let rev = history.revision();
+
+        // Dropping b onto its own position, expressed either as its index (1) or
+        // via clamping past the end, must be a no-op: no undo step, no revision
+        // bump (which would falsely flag the project as modified).
+        history.reparent(&mut scene, b, root, 1);
+        history.reparent(&mut scene, a, root, 0);
+        history.reparent(&mut scene, c, root, 99);
+        assert_eq!(scene.children(root), &[a, b, c]);
+        assert_eq!(
+            history.revision(),
+            rev,
+            "no-op reparents do not bump revision"
+        );
+        // A real move still records, bumps the revision, and undoes back to the
+        // layout before it.
+        history.reparent(&mut scene, a, root, 2);
+        assert_eq!(scene.children(root), &[b, c, a]);
+        assert_ne!(history.revision(), rev);
+        history.undo(&mut scene);
+        assert_eq!(scene.children(root), &[a, b, c], "the real move undoes");
     }
 
     #[test]

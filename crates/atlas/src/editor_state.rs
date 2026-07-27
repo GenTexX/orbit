@@ -127,7 +127,11 @@ pub fn encode_collapsed(scene: &Scene, collapsed: &HashSet<NodeId>) -> Vec<Vec<u
 }
 
 /// The child-index path from the root down to `node` (empty for the root), or
-/// `None` if `node` is detached from the tree.
+/// `None` if `node` is not reachable from the root - either detached (e.g.
+/// deleted, so `parent` is `None` but the node lingers in the arena) or sitting
+/// under a detached ancestor. Without the final root check a detached node walks
+/// zero steps and would masquerade as the root's empty path, collapsing the
+/// whole tree when that path is decoded after a reload.
 fn node_path(scene: &Scene, node: NodeId) -> Option<Vec<usize>> {
     let mut path = Vec::new();
     let mut cur = node;
@@ -135,6 +139,11 @@ fn node_path(scene: &Scene, node: NodeId) -> Option<Vec<usize>> {
         let idx = scene.children(parent).iter().position(|&c| c == cur)?;
         path.push(idx);
         cur = parent;
+    }
+    // The walk stops at the topmost ancestor; it is a real path only if that is
+    // the scene root. Anything else means `node` was detached from the tree.
+    if cur != scene.root() {
+        return None;
     }
     path.reverse();
     Some(path)
@@ -231,6 +240,32 @@ mod tests {
         let survivors = decode_collapsed(&smaller, &paths);
         // Only the depth-1 index-0 path ("a") resolves to the lone child.
         assert_eq!(survivors.len(), 1);
+    }
+
+    #[test]
+    fn a_detached_node_is_dropped_not_encoded_as_the_root() {
+        use helios::{History, Node};
+        // root -> [a -> [a0], b]; collapse a0 then delete it. Delete detaches
+        // (unlinks) the node, leaving it in the arena with parent = None.
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        let a = scene.add_child(root, Node::new("a"));
+        let a0 = scene.add_child(a, Node::new("a0"));
+        let b = scene.add_child(root, Node::new("b"));
+        // Sanity: an attached node encodes to a non-empty path.
+        assert_eq!(node_path(&scene, a0), Some(vec![0, 0]));
+
+        let mut history = History::new();
+        history.remove_node(&mut scene, a0);
+        // A detached node must NOT masquerade as the root's empty path.
+        assert_eq!(node_path(&scene, a0), None);
+        assert_eq!(node_path(&scene, root), Some(vec![]));
+
+        let collapsed: HashSet<NodeId> = [a0, b].into_iter().collect();
+        let paths = encode_collapsed(&scene, &collapsed);
+        // Only b survives; the detached a0 is dropped (not encoded as root []).
+        assert_eq!(paths, vec![vec![1]]);
+        assert!(!paths.contains(&vec![]), "no phantom root path");
     }
 
     #[test]
