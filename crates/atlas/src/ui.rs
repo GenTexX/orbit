@@ -10,6 +10,7 @@ use glam::Vec2;
 use helios::{NodeId, Scene, Value};
 
 use crate::color;
+use crate::console::LogLine;
 use crate::dock::{DockNode, Fixed, Pane, SplitDir};
 use crate::icons::{Icon, Icons};
 use crate::viewport::GizmoMode;
@@ -45,6 +46,15 @@ pub struct EditorTheme {
     /// Engine axis palette (X red, Y green) for the inspector's Vec2 labels.
     pub axis_x: Color,
     pub axis_y: Color,
+    /// The console pane's WARN-level line color (ERROR reuses `axis_x`, INFO
+    /// `heading`, lower levels `subhead`). A serde default so settings files
+    /// written before it existed still load.
+    #[serde(default = "default_console_warn")]
+    pub console_warn: Color,
+}
+
+fn default_console_warn() -> Color {
+    Color::rgb(0.85, 0.72, 0.30)
 }
 
 impl EditorTheme {
@@ -64,6 +74,7 @@ impl EditorTheme {
             mode_active: Color::rgb(0.24, 0.40, 0.62),
             axis_x: Color::rgb(0.90, 0.32, 0.32),
             axis_y: Color::rgb(0.35, 0.70, 0.38),
+            console_warn: default_console_warn(),
         }
     }
 
@@ -85,6 +96,7 @@ impl EditorTheme {
             mode_active: Color::rgb(0.62, 0.76, 0.96),
             axis_x: Color::rgb(0.85, 0.30, 0.30),
             axis_y: Color::rgb(0.28, 0.62, 0.34),
+            console_warn: Color::rgb(0.72, 0.55, 0.10),
         }
     }
 }
@@ -308,6 +320,9 @@ pub struct EditorRows {
     pub dock_splits: Vec<(WidgetId, SplitDir)>,
     /// Each scrollable pane and its scroll panel, so scroll survives a rebuild.
     pub pane_scrolls: Vec<(Pane, WidgetId)>,
+    /// The console pane's scroll panel, if the console is visible (for the app's
+    /// stick-to-bottom follow logic).
+    pub console_panel: Option<WidgetId>,
     /// The viewport image widget; the app sizes the scene render target to
     /// this widget's laid-out rect each frame, so the scene draws 1:1 instead
     /// of stretching a window-sized texture into a smaller panel.
@@ -427,6 +442,8 @@ pub fn build_editor_ui(
     filter: &str,
     renaming: Option<NodeId>,
     inspector: &InspectorView,
+    logs: &[LogLine],
+    console_follow: bool,
     theme: &EditorTheme,
 ) -> (Ui, EditorRows) {
     let mut ui = Ui::new();
@@ -455,6 +472,8 @@ pub fn build_editor_ui(
         viewport_handle,
         project_dir,
         scrolls,
+        logs,
+        console_follow,
         theme,
     };
     build_dock_node(&mut ui, dock_area, dock, Sizing::Grow, &ctx, &mut rows);
@@ -488,6 +507,10 @@ struct PaneCtx<'a> {
     viewport_handle: ImageHandle,
     project_dir: &'a Path,
     scrolls: &'a HashMap<Pane, f32>,
+    logs: &'a [LogLine],
+    /// Whether the console pane should stick to the newest line (the user has
+    /// not scrolled up).
+    console_follow: bool,
     theme: &'a EditorTheme,
 }
 
@@ -669,6 +692,18 @@ fn build_pane(ui: &mut Ui, parent: WidgetId, pane: Pane, ctx: &PaneCtx, rows: &m
             build_viewport_pane(ui, parent, ctx, rows);
             None
         }
+        Pane::Console => {
+            // The console handles its own scroll: follow the newest line unless
+            // the user has scrolled up (then restore where they were).
+            let scroll = build_console_pane(ui, parent, ctx.logs, ctx.theme, rows);
+            rows.pane_scrolls.push((Pane::Console, scroll));
+            if ctx.console_follow {
+                ui.set_scroll_offset(scroll, f32::MAX); // layout clamps to bottom
+            } else if let Some(&offset) = ctx.scrolls.get(&Pane::Console) {
+                ui.set_scroll_offset(scroll, offset);
+            }
+            None
+        }
     };
     if let Some(scroll) = scroll {
         rows.pane_scrolls.push((pane, scroll));
@@ -676,6 +711,39 @@ fn build_pane(ui: &mut Ui, parent: WidgetId, pane: Pane, ctx: &PaneCtx, rows: &m
             ui.set_scroll_offset(scroll, offset);
         }
     }
+}
+
+/// The console pane: recent log lines, newest at the bottom, colored by level.
+fn build_console_pane(
+    ui: &mut Ui,
+    parent: WidgetId,
+    logs: &[LogLine],
+    theme: &EditorTheme,
+    rows: &mut EditorRows,
+) -> WidgetId {
+    let panel = ui.panel(
+        parent,
+        Style::new()
+            .column()
+            .grow(1.0)
+            .padding(6.0)
+            .gap(1.0)
+            .scroll(),
+    );
+    rows.console_panel = Some(panel);
+    for line in logs {
+        let color = match line.level {
+            tracing::Level::ERROR => theme.axis_x,
+            tracing::Level::WARN => theme.console_warn,
+            tracing::Level::INFO => theme.heading,
+            _ => theme.subhead,
+        };
+        // Just the last path segment of the target keeps lines readable.
+        let target = line.target.rsplit("::").next().unwrap_or(&line.target);
+        let text = format!("{:>5} {}: {}", line.level, target, line.message);
+        ui.label(panel, text, Style::new().foreground(color).ellipsis());
+    }
+    panel
 }
 
 /// The viewport pane: the gizmo-mode toolbar pinned above the scene render
@@ -1643,6 +1711,8 @@ mod tests {
             "",
             None,
             inspector,
+            &[],
+            true,
             theme,
         )
     }
@@ -1693,6 +1763,8 @@ mod tests {
             "",
             None,
             &InspectorView::default(),
+            &[],
+            true,
             &EditorTheme::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
@@ -2084,8 +2156,64 @@ mod tests {
             "",
             None,
             &InspectorView::default(),
+            &[],
+            true,
             &EditorTheme::default(),
         )
+    }
+
+    #[test]
+    fn the_console_pane_renders_its_log_lines() {
+        let (scene, handle) = demo_scene();
+        let dir = std::env::temp_dir();
+        let dock = DockNode::Leaf {
+            panes: vec![Pane::Console],
+            active: 0,
+        };
+        let logs = vec![
+            LogLine {
+                level: tracing::Level::INFO,
+                target: "atlas".into(),
+                message: "started".into(),
+            },
+            LogLine {
+                level: tracing::Level::WARN,
+                target: "atlas::wgpu".into(),
+                message: "careful".into(),
+            },
+        ];
+        let (mut ui, rows) = build_editor_ui(
+            &scene,
+            &HashSet::new(),
+            None,
+            handle,
+            &dir,
+            &dock,
+            &HashMap::new(),
+            None,
+            GizmoMode::Select,
+            true,
+            true,
+            false,
+            None,
+            &TreeView::default(),
+            "",
+            None,
+            &InspectorView::default(),
+            &logs,
+            true,
+            &EditorTheme::default(),
+        );
+        assert!(rows.console_panel.is_some());
+        assert!(rows.pane_scrolls.iter().any(|(p, _)| *p == Pane::Console));
+        ui.layout(Vec2::new(600.0, 400.0)).unwrap();
+        let texts = ui
+            .draw_list()
+            .commands
+            .iter()
+            .filter(|c| matches!(c, aurora::DrawCommand::Text { .. }))
+            .count();
+        assert!(texts >= 2, "expected a label per log line, drew {texts}");
     }
 
     #[test]
@@ -2117,6 +2245,8 @@ mod tests {
             "",
             None,
             &InspectorView::default(),
+            &[],
+            true,
             &EditorTheme::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();

@@ -709,6 +709,16 @@ impl Ui {
         self.scroll_offsets.insert(id, offset.max(0.0));
     }
 
+    /// The largest valid scroll offset for a container from the last layout: its
+    /// content height minus its own height, floored at 0 (so it is 0 when the
+    /// content fits). Lets an app tell whether a scroll view is at the bottom -
+    /// e.g. a log pane deciding whether to keep following new lines.
+    pub fn max_scroll_offset(&self, id: WidgetId) -> f32 {
+        let content = self.scroll_content.get(id).copied().unwrap_or(0.0);
+        let view = self.rect(id).map_or(0.0, |r| r.size.y);
+        (content - view).max(0.0)
+    }
+
     /// Fix a widget's width in pixels at runtime (e.g. a splitter resizing its
     /// target), pinning the minimum too - the same contract as
     /// [`Style::width`](crate::Style::width). Reads the node's current taffy

@@ -14,6 +14,7 @@ pub enum Pane {
     Viewport,
     Files,
     Inspector,
+    Console,
 }
 
 impl Pane {
@@ -24,6 +25,7 @@ impl Pane {
             Pane::Viewport => "Viewport",
             Pane::Files => "Files",
             Pane::Inspector => "Inspector",
+            Pane::Console => "Console",
         }
     }
 }
@@ -89,7 +91,8 @@ impl DockNode {
     }
 
     /// The editor's starting layout: the scene tree on the left, the inspector
-    /// on the right, and the viewport above the file explorer in the center.
+    /// on the right, and the viewport above the file explorer (with the console
+    /// tabbed behind it) in the center.
     pub fn default_layout() -> DockNode {
         DockNode::Split {
             dir: SplitDir::Row,
@@ -105,7 +108,10 @@ impl DockNode {
                     fixed: Fixed::Second,
                     size: STACK_DEFAULT,
                     first: Box::new(DockNode::leaf(Pane::Viewport)),
-                    second: Box::new(DockNode::leaf(Pane::Files)),
+                    second: Box::new(DockNode::Leaf {
+                        panes: vec![Pane::Files, Pane::Console],
+                        active: 0,
+                    }),
                 }),
                 second: Box::new(DockNode::leaf(Pane::Inspector)),
             }),
@@ -316,13 +322,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_default_layout_holds_all_four_panes_once() {
+    fn the_default_layout_holds_every_pane_once() {
         let dock = DockNode::default_layout();
         let mut panes = dock.panes();
         panes.sort_by_key(|p| p.title());
         assert_eq!(
             panes,
             vec![
+                Pane::Console,
                 Pane::Files,
                 Pane::Inspector,
                 Pane::SceneTree,
@@ -357,6 +364,7 @@ mod tests {
         assert_eq!(
             panes,
             vec![
+                Pane::Console,
                 Pane::Files,
                 Pane::Inspector,
                 Pane::SceneTree,

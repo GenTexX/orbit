@@ -6,6 +6,7 @@
 
 mod actions;
 mod color;
+mod console;
 mod dock;
 mod icons;
 mod project;
@@ -158,7 +159,7 @@ struct ScrubDrag {
 }
 
 fn main() -> Result<()> {
-    init_logging();
+    let logs = init_logging();
     tracing::info!("atlas starting");
 
     // Kept alive for the whole run; dropping it would stop the profiler server.
@@ -167,15 +168,25 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
     // A live viewport redraws continuously, like the sandbox's game loop.
     event_loop.set_control_flow(ControlFlow::Poll);
-    event_loop.run_app(&mut App::default())?;
+    event_loop.run_app(&mut App { state: None, logs })?;
     Ok(())
 }
 
-fn init_logging() {
+fn init_logging() -> console::LogBuffer {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,wgpu_core=warn,wgpu_hal=warn,naga=warn"));
-    fmt().with_env_filter(filter).init();
+    let buf = console::buffer();
+    // The env filter gates both sinks; the terminal keeps its usual formatting,
+    // and the Console pane mirrors the same events (see the console module).
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer())
+        .with(console::ConsoleLayer::new(buf.clone()))
+        .init();
+    buf
 }
 
 /// Start the puffin profiler server when ORBIT_PROFILE is set (the same
@@ -197,9 +208,11 @@ fn init_profiling() -> Option<puffin_http::Server> {
     }
 }
 
-#[derive(Default)]
 struct App {
     state: Option<State>,
+    /// The shared log ring the console pane shows (also written by the tracing
+    /// layer); handed to `State` when the window is created.
+    logs: console::LogBuffer,
 }
 
 struct State {
@@ -280,6 +293,14 @@ struct State {
     saved_revision: u64,
     /// The window title currently applied (set only on change, like the cursor).
     applied_title: String,
+    /// The shared log ring shown in the Console pane (written by the tracing
+    /// layer). `last_log_gen` is the ring's generation at the last rebuild and
+    /// `last_log_poll` throttles the check for new lines; `console_follow` keeps
+    /// the pane pinned to the newest line while the user has not scrolled up.
+    logs: console::LogBuffer,
+    last_log_gen: u64,
+    last_log_poll: std::time::Instant,
+    console_follow: bool,
     /// The open right-click context menu, if any (Aurora popup layer).
     context_menu: Option<ContextMenu>,
     /// The active transform tool (select/move/rotate/scale), chosen from the
@@ -335,7 +356,7 @@ impl ApplicationHandler for App {
         if self.state.is_some() {
             return;
         }
-        match State::new(event_loop) {
+        match State::new(event_loop, self.logs.clone()) {
             Ok(state) => {
                 state.window.request_redraw();
                 self.state = Some(state);
@@ -439,7 +460,7 @@ impl ApplicationHandler for App {
 impl State {
     /// Bootstrap the shared GPU context (ADR 0018), the two renderers it feeds,
     /// the demo project (opened or created), and the editor shell around it.
-    fn new(event_loop: &ActiveEventLoop) -> Result<Self> {
+    fn new(event_loop: &ActiveEventLoop, logs: console::LogBuffer) -> Result<Self> {
         let window = Arc::new(
             event_loop
                 .create_window(Window::default_attributes().with_title(WINDOW_TITLE))
@@ -510,6 +531,8 @@ impl State {
             "",
             None,
             &InspectorView::default(),
+            &[],
+            true,
             &theme,
         );
 
@@ -551,6 +574,10 @@ impl State {
             applied_cursor: aurora::CursorHint::Default,
             saved_revision: 0,
             applied_title: WINDOW_TITLE.to_string(),
+            logs,
+            last_log_gen: 0,
+            last_log_poll: std::time::Instant::now(),
+            console_follow: true,
             context_menu: None,
             gizmo_mode: GizmoMode::default(),
             show_grid: settings.show_grid,
@@ -1948,6 +1975,32 @@ impl State {
         let sizes = capture_dock_sizes(&self.ui, &self.rows);
         self.dock.set_fixed_sizes(&sizes);
         self.pane_scrolls = capture_dock_scrolls(&self.ui, &self.rows);
+        // The console follows new lines only while the user is at (or near) the
+        // bottom; scrolling up pins it there instead.
+        if let Some(console) = self.rows.console_panel {
+            self.console_follow =
+                self.ui.scroll_offset(console) >= self.ui.max_scroll_offset(console) - 1.0;
+        }
+    }
+
+    /// Rebuild the shell when the log ring has new lines and the console pane is
+    /// visible - throttled so a burst of logs does not rebuild every frame.
+    fn poll_console(&mut self) {
+        if self.last_log_poll.elapsed() < std::time::Duration::from_millis(150) {
+            return;
+        }
+        self.last_log_poll = std::time::Instant::now();
+        // No point rebuilding for logs the console is not currently showing.
+        if self.rows.console_panel.is_none() {
+            return;
+        }
+        let generation = self
+            .logs
+            .lock()
+            .map_or(self.last_log_gen, |ring| ring.generation);
+        if generation != self.last_log_gen {
+            self.dirty = true;
+        }
     }
 
     /// Refresh the status bar readouts in place (no shell rebuild).
@@ -1993,6 +2046,7 @@ impl State {
         profiling::scope!("editor_frame");
         let fstart = std::time::Instant::now();
         self.poll_settings();
+        self.poll_console();
         self.react();
         self.sync_tree_filter();
         let t_react = fstart.elapsed();
@@ -2013,6 +2067,13 @@ impl State {
             // (sync_dock_state), when the Ui and dock are guaranteed to match -
             // a rearrange this frame has already restructured self.dock.
             let filter_caret = self.ui.caret_offset();
+            // Snapshot the log ring for the console pane (brief lock), recording
+            // the generation so the poll below only rebuilds when it changes.
+            let logs: Vec<console::LogLine> = {
+                let ring = self.logs.lock().expect("log ring not poisoned");
+                self.last_log_gen = ring.generation;
+                ring.lines.iter().cloned().collect()
+            };
             let (ui, rows) = build_editor_ui(
                 &self.project.scene,
                 &self.selection.as_set(),
@@ -2031,6 +2092,8 @@ impl State {
                 &self.tree_filter,
                 self.renaming,
                 &self.inspector_view(),
+                &logs,
+                self.console_follow,
                 &self.theme,
             );
             self.ui = ui;
