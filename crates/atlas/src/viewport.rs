@@ -11,15 +11,39 @@ use glam::Vec2;
 use helios::{Component, NodeId, Scene, Transform};
 use photon::{Camera, Color, Sprite};
 
-/// Selection accent (outline) - matches the UI's selected-row blue.
-const OUTLINE: Color = Color::new(0.30, 0.55, 0.90, 1.0);
-/// The engine-wide axis palette (also for future inspector x/y fields): X red,
-/// Y green - and rotation, being about Z, gets Z's blue.
-const AXIS_X: Color = Color::new(0.90, 0.32, 0.32, 1.0);
-const AXIS_Y: Color = Color::new(0.35, 0.80, 0.35, 1.0);
-const ROTATE_HANDLE: Color = Color::new(0.35, 0.55, 1.0, 1.0);
-/// The uniform-scale corner handle, amber - distinct from every axis color.
-const SCALE_HANDLE: Color = Color::new(1.0, 0.75, 0.25, 1.0);
+/// The viewport's themeable colors (in photon color space), built from the
+/// editor theme each frame and passed to the drawing functions. Only colors live
+/// here; sizes/alphas below stay module constants.
+#[derive(Debug, Clone, Copy)]
+pub struct Palette {
+    /// The selected sprite's outline (and the rotate stem).
+    pub outline: Color,
+    /// The engine axis palette: X red, Y green (move arrows, scale handles, and
+    /// the origin grid axes).
+    pub axis_x: Color,
+    pub axis_y: Color,
+    /// The rotate handle (blue) and the uniform-scale corner handle (amber).
+    pub rotate_handle: Color,
+    pub scale_handle: Color,
+    /// Minor and major grid lines.
+    pub grid_minor: Color,
+    pub grid_major: Color,
+}
+
+impl Palette {
+    /// The built-in defaults, used by the headless tests (the app builds the
+    /// palette from the live theme instead).
+    #[allow(dead_code)]
+    pub const DEFAULT: Palette = Palette {
+        outline: Color::new(0.30, 0.55, 0.90, 1.0),
+        axis_x: Color::new(0.90, 0.32, 0.32, 1.0),
+        axis_y: Color::new(0.35, 0.70, 0.38, 1.0),
+        rotate_handle: Color::new(0.35, 0.55, 1.0, 1.0),
+        scale_handle: Color::new(1.0, 0.75, 0.25, 1.0),
+        grid_minor: Color::new(0.0, 0.0, 0.0, 0.10),
+        grid_major: Color::new(0.0, 0.0, 0.0, 0.22),
+    };
+}
 
 /// Gizmo metrics in *screen* pixels (divided by zoom at use, so the gizmo
 /// keeps its size as the view zooms). Grab radii are deliberately larger than
@@ -39,11 +63,6 @@ const GUIDE_ALPHA: f32 = 0.55;
 /// Editor grid metrics. Lines are 1 screen-px; the origin axes a touch thicker.
 const GRID_LINE_PX: f32 = 1.0;
 const GRID_AXIS_PX: f32 = 1.5;
-/// Faint grid over the scene: dark lines that just darken the (light gray)
-/// viewport - minor barely there, major a little stronger - so the grid reads as
-/// a subtle guide rather than dominating the scene.
-const GRID_MINOR: Color = Color::new(0.0, 0.0, 0.0, 0.10);
-const GRID_MAJOR: Color = Color::new(0.0, 0.0, 0.0, 0.22);
 /// Adaptive spacing target: the on-screen gap between major lines is kept at or
 /// above this, so the grid never gets denser than this as the view zooms out.
 const GRID_MIN_PX: f32 = 48.0;
@@ -276,7 +295,7 @@ pub fn hit_gizmo(gizmo: &Gizmo, world: Vec2, mode: GizmoMode) -> Option<GizmoHit
 /// selection outline always, plus the handles the `mode` shows (move arrows,
 /// rotate lollipop, scale handles), all sized in screen pixels so they stay
 /// constant under zoom.
-pub fn gizmo_sprites(gizmo: &Gizmo, zoom: f32, mode: GizmoMode) -> Vec<Sprite> {
+pub fn gizmo_sprites(gizmo: &Gizmo, zoom: f32, mode: GizmoMode, pal: &Palette) -> Vec<Sprite> {
     let t = OUTLINE_PX / zoom;
     let half = HANDLE_HALF_PX / zoom;
     let (w, h) = (gizmo.size.x, gizmo.size.y);
@@ -301,48 +320,48 @@ pub fn gizmo_sprites(gizmo: &Gizmo, zoom: f32, mode: GizmoMode) -> Vec<Sprite> {
     // The selection outline is always drawn - the four edges of the (possibly
     // rotated) selection rectangle.
     let mut sprites = vec![
-        quad(at(Vec2::ZERO), Vec2::new(w, t), OUTLINE),
-        quad(at(Vec2::ZERO), Vec2::new(t, h), OUTLINE),
-        quad(at(Vec2::new(0.0, h - t)), Vec2::new(w, t), OUTLINE),
-        quad(at(Vec2::new(w - t, 0.0)), Vec2::new(t, h), OUTLINE),
+        quad(at(Vec2::ZERO), Vec2::new(w, t), pal.outline),
+        quad(at(Vec2::ZERO), Vec2::new(t, h), pal.outline),
+        quad(at(Vec2::new(0.0, h - t)), Vec2::new(w, t), pal.outline),
+        quad(at(Vec2::new(w - t, 0.0)), Vec2::new(t, h), pal.outline),
     ];
     if mode.shows(GizmoHit::MoveX) {
         // A shaft from the center along local X, with an endpoint square (red).
         sprites.push(quad(
             gizmo.center - gizmo.axis_y * (t * 0.5),
             Vec2::new(arrow, t),
-            AXIS_X,
+            pal.axis_x,
         ));
-        sprites.push(handle(gizmo.arrow_x_end, AXIS_X));
+        sprites.push(handle(gizmo.arrow_x_end, pal.axis_x));
     }
     if mode.shows(GizmoHit::MoveY) {
         sprites.push(quad(
             gizmo.center - gizmo.axis_x * (t * 0.5),
             Vec2::new(t, arrow),
-            AXIS_Y,
+            pal.axis_y,
         ));
-        sprites.push(handle(gizmo.arrow_y_end, AXIS_Y));
+        sprites.push(handle(gizmo.arrow_y_end, pal.axis_y));
     }
     if mode.shows(GizmoHit::Rotate) {
         // A stem from the top edge up to the rotate handle (blue).
         sprites.push(quad(
             at(Vec2::new(w * 0.5 - t * 0.5, -ROTATE_OFFSET_PX / zoom)),
             Vec2::new(t, ROTATE_OFFSET_PX / zoom),
-            OUTLINE,
+            pal.outline,
         ));
-        sprites.push(handle(gizmo.rotate_center, ROTATE_HANDLE));
+        sprites.push(handle(gizmo.rotate_center, pal.rotate_handle));
     }
     // Gate each scale handle on its own hit, matching hit_gizmo (which tests
     // ScaleX/ScaleY/ScaleCorner independently) and the per-axis Move handles
     // above - so a mode that shows only some scale handles draws exactly those.
     if mode.shows(GizmoHit::ScaleX) {
-        sprites.push(handle(gizmo.scale_x, AXIS_X));
+        sprites.push(handle(gizmo.scale_x, pal.axis_x));
     }
     if mode.shows(GizmoHit::ScaleY) {
-        sprites.push(handle(gizmo.scale_y, AXIS_Y));
+        sprites.push(handle(gizmo.scale_y, pal.axis_y));
     }
     if mode.shows(GizmoHit::ScaleCorner) {
-        sprites.push(handle(gizmo.scale_corner, SCALE_HANDLE));
+        sprites.push(handle(gizmo.scale_corner, pal.scale_handle));
     }
     sprites
 }
@@ -356,6 +375,7 @@ pub fn axis_guide_sprite(
     scene: &Scene,
     camera: &EditorCamera,
     viewport_px: Vec2,
+    pal: &Palette,
 ) -> Option<Sprite> {
     let (point, dir, vertical) = match *drag {
         // The node's current world origin always lies on the motion line.
@@ -383,7 +403,7 @@ pub fn axis_guide_sprite(
     // visible world rectangle's diagonal, extended both ways.
     let len = (viewport_px / camera.zoom).length();
     let t = GUIDE_PX / camera.zoom;
-    let color = if vertical { AXIS_Y } else { AXIS_X };
+    let color = if vertical { pal.axis_y } else { pal.axis_x };
 
     let mut s = Sprite::new(
         point - dir * len - dir.perp() * (t * 0.5),
@@ -420,6 +440,7 @@ pub fn grid_sprites(
     viewport_px: Vec2,
     show_grid: bool,
     show_axes: bool,
+    pal: &Palette,
 ) -> Vec<Sprite> {
     // Guard against a non-positive zoom from a corrupt editor.ron: a zero or
     // negative zoom would make the step NaN/negative and the line loops below
@@ -452,30 +473,30 @@ pub fn grid_sprites(
         if show_minor {
             for i in (min.x / minor).floor() as i64..=(max.x / minor).ceil() as i64 {
                 if i % 5 != 0 {
-                    line(true, i as f32 * minor, t, GRID_MINOR);
+                    line(true, i as f32 * minor, t, pal.grid_minor);
                 }
             }
             for j in (min.y / minor).floor() as i64..=(max.y / minor).ceil() as i64 {
                 if j % 5 != 0 {
-                    line(false, j as f32 * minor, t, GRID_MINOR);
+                    line(false, j as f32 * minor, t, pal.grid_minor);
                 }
             }
         }
         for i in (min.x / step).floor() as i64..=(max.x / step).ceil() as i64 {
-            line(true, i as f32 * step, t, GRID_MAJOR);
+            line(true, i as f32 * step, t, pal.grid_major);
         }
         for j in (min.y / step).floor() as i64..=(max.y / step).ceil() as i64 {
-            line(false, j as f32 * step, t, GRID_MAJOR);
+            line(false, j as f32 * step, t, pal.grid_major);
         }
     }
 
     if show_axes {
         let t = GRID_AXIS_PX / zoom;
         if (min.y..=max.y).contains(&0.0) {
-            line(false, 0.0, t, AXIS_X); // world X axis (horizontal) is red
+            line(false, 0.0, t, pal.axis_x); // world X axis (horizontal) is red
         }
         if (min.x..=max.x).contains(&0.0) {
-            line(true, 0.0, t, AXIS_Y); // world Y axis (vertical) is green
+            line(true, 0.0, t, pal.axis_y); // world Y axis (vertical) is green
         }
     }
     out
@@ -928,7 +949,7 @@ mod tests {
                 pan: Vec2::new(-123.0, 45.0),
                 zoom,
             };
-            let sprites = grid_sprites(&cam, view, true, true);
+            let sprites = grid_sprites(&cam, view, true, true, &Palette::DEFAULT);
             // A screenful of lines, never the whole world: bounded well under a
             // few hundred quads at any zoom (verticals+horizontals, minor+major).
             assert!(
@@ -951,16 +972,19 @@ mod tests {
             zoom: 1.0,
         };
         // Axes-only (no grid) gives exactly the two origin axes.
-        assert_eq!(grid_sprites(&cam, view, false, true).len(), 2);
+        assert_eq!(
+            grid_sprites(&cam, view, false, true, &Palette::DEFAULT).len(),
+            2
+        );
         // Nothing when both are off.
-        assert!(grid_sprites(&cam, view, false, false).is_empty());
+        assert!(grid_sprites(&cam, view, false, false, &Palette::DEFAULT).is_empty());
         // Panned so the origin is off-screen (top-left far into +x,+y world):
         // neither axis line is emitted.
         let off = EditorCamera {
             pan: Vec2::new(500.0, 500.0),
             zoom: 1.0,
         };
-        assert!(grid_sprites(&off, view, false, true).is_empty());
+        assert!(grid_sprites(&off, view, false, true, &Palette::DEFAULT).is_empty());
     }
 
     fn scene_with_sprite(translation: Vec2, size: Vec2) -> (Scene, NodeId) {
@@ -1092,11 +1116,11 @@ mod tests {
 
         // The overlay only draws the outline plus the active mode's handles:
         // Rotate mode has fewer sprites than Select (which shows everything).
-        let select = gizmo_sprites(&g, 1.0, GizmoMode::Select).len();
-        let rotate = gizmo_sprites(&g, 1.0, GizmoMode::Rotate).len();
+        let select = gizmo_sprites(&g, 1.0, GizmoMode::Select, &Palette::DEFAULT).len();
+        let rotate = gizmo_sprites(&g, 1.0, GizmoMode::Rotate, &Palette::DEFAULT).len();
         assert!(rotate < select, "{rotate} should be fewer than {select}");
         // The outline (4 edges) is always present.
-        assert!(gizmo_sprites(&g, 1.0, GizmoMode::Move).len() >= 4);
+        assert!(gizmo_sprites(&g, 1.0, GizmoMode::Move, &Palette::DEFAULT).len() >= 4);
     }
 
     #[test]
@@ -1282,8 +1306,8 @@ mod tests {
             axis_world: Vec2::X,
             vertical: false,
         };
-        let guide =
-            axis_guide_sprite(&drag, &scene, &cam, viewport_px).expect("axis drags have a guide");
+        let guide = axis_guide_sprite(&drag, &scene, &cam, viewport_px, &Palette::DEFAULT)
+            .expect("axis drags have a guide");
         // Long enough to cross the whole view from the node's origin (the
         // visible diagonal both ways), thin, and along +X.
         assert!(guide.size.x >= viewport_px.length() * 2.0 - EPS);
@@ -1299,6 +1323,6 @@ mod tests {
             original: scene.node(node).transform,
             grab_world: Vec2::ZERO,
         };
-        assert!(axis_guide_sprite(&free, &scene, &cam, viewport_px).is_none());
+        assert!(axis_guide_sprite(&free, &scene, &cam, viewport_px, &Palette::DEFAULT).is_none());
     }
 }

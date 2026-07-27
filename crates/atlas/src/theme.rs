@@ -203,6 +203,7 @@ theme_tokens! {
     "card_bg": Color => card_bg,
     "card_border": Color => card_border,
     "panel_border": Color => panel_border,
+    "field_border": Color => field_border,
     "mode_active": Color => mode_active,
     "axis_x": Color => axis_x,
     "axis_y": Color => axis_y,
@@ -213,6 +214,14 @@ theme_tokens! {
     "control_radius": Scalar => control_radius,
     "inset_radius": Scalar => inset_radius,
     "splitter_width": Scalar => splitter_width,
+    "border_width": Scalar => border_width,
+    // viewport (scene view) colors.
+    "viewport_bg": Color => viewport_bg,
+    "grid_line": Color => grid_line,
+    "grid_line_strong": Color => grid_line_strong,
+    "selection_outline": Color => selection_outline,
+    "gizmo_rotate": Color => gizmo_rotate,
+    "gizmo_scale": Color => gizmo_scale,
 }
 
 impl ThemeDoc {

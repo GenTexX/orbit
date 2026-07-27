@@ -3117,9 +3117,19 @@ impl State {
         phase = std::time::Instant::now();
 
         profiling::scope!("scene_render");
-        // A neutral, Godot-like gray (linear; it sRGB-encodes to ~0.25 on screen)
-        // rather than a dark blue, so sprites sit on a calm mid-gray backdrop.
-        let clear = PhotonColor::new(0.052, 0.052, 0.055, 1.0);
+        // Viewport colors come from the theme (clear + grid + gizmo palette),
+        // converted from the aurora color space into photon's.
+        let to_photon = |c: aurora::Color| PhotonColor::new(c.r, c.g, c.b, c.a);
+        let clear = to_photon(self.theme.viewport_bg);
+        let pal = viewport::Palette {
+            outline: to_photon(self.theme.selection_outline),
+            axis_x: to_photon(self.theme.axis_x),
+            axis_y: to_photon(self.theme.axis_y),
+            rotate_handle: to_photon(self.theme.gizmo_rotate),
+            scale_handle: to_photon(self.theme.gizmo_scale),
+            grid_minor: to_photon(self.theme.grid_line),
+            grid_major: to_photon(self.theme.grid_line_strong),
+        };
         let camera = self.camera.camera(Vec2::new(w as f32, h as f32));
         // Draw the scene as per-texture runs, so each sprite shows the texture
         // it names (consecutive same-texture sprites batch, order preserved).
@@ -3142,6 +3152,7 @@ impl State {
                 Vec2::new(w as f32, h as f32),
                 self.show_grid,
                 self.show_axes,
+                &pal,
             ));
         }
         if let Some(drag) = &self.drag
@@ -3150,6 +3161,7 @@ impl State {
                 &self.project.scene,
                 &self.camera,
                 Vec2::new(w as f32, h as f32),
+                &pal,
             )
         {
             overlay.push(guide);
@@ -3161,6 +3173,7 @@ impl State {
                 &g,
                 self.camera.zoom,
                 self.gizmo_mode,
+                &pal,
             ));
         }
         if !overlay.is_empty() {

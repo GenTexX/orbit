@@ -59,6 +59,8 @@ pub struct EditorTheme {
     /// Borders between panels: the draggable splitters, and the bottom underline
     /// on bars (toolbar, breadcrumbs, the tab strip).
     pub panel_border: Color,
+    /// A text input's resting outline (the tree search box).
+    pub field_border: Color,
     /// The active gizmo-mode toolbar button.
     pub mode_active: Color,
     /// Engine axis palette (X red, Y green) for the inspector's Vec2 labels.
@@ -76,6 +78,19 @@ pub struct EditorTheme {
     pub inset_radius: f32,
     /// Thickness of the draggable dividers between docked panels.
     pub splitter_width: f32,
+    /// Width of drawn UI borders (card outlines, bar underlines).
+    pub border_width: f32,
+    /// Viewport (scene-view) colors. Stored as [`Color`] like the rest of the
+    /// theme, converted to photon colors where the scene is drawn.
+    /// The clear color behind the scene.
+    pub viewport_bg: Color,
+    /// Minor and major editor grid lines.
+    pub grid_line: Color,
+    pub grid_line_strong: Color,
+    /// The selected sprite's outline, and the rotate/scale gizmo handles.
+    pub selection_outline: Color,
+    pub gizmo_rotate: Color,
+    pub gizmo_scale: Color,
 }
 
 fn default_console_warn() -> Color {
@@ -111,6 +126,7 @@ impl EditorTheme {
             card_bg: Color::rgb(0.128, 0.135, 0.165),
             card_border: Color::rgb(0.20, 0.22, 0.27),
             panel_border: Color::rgb(0.24, 0.26, 0.32),
+            field_border: Color::rgb(0.24, 0.26, 0.32),
             mode_active: Color::rgb(0.22, 0.38, 0.60),
             axis_x: Color::rgb(0.90, 0.32, 0.32),
             axis_y: Color::rgb(0.35, 0.70, 0.38),
@@ -120,6 +136,13 @@ impl EditorTheme {
             control_radius: 4.0,
             inset_radius: 3.0,
             splitter_width: 2.0,
+            border_width: 1.0,
+            viewport_bg: Color::rgb(0.052, 0.052, 0.055),
+            grid_line: Color::rgba(0.0, 0.0, 0.0, 0.10),
+            grid_line_strong: Color::rgba(0.0, 0.0, 0.0, 0.22),
+            selection_outline: Color::rgb(0.30, 0.55, 0.90),
+            gizmo_rotate: Color::rgb(0.35, 0.55, 1.0),
+            gizmo_scale: Color::rgb(1.0, 0.75, 0.25),
         }
     }
 
@@ -141,6 +164,7 @@ impl EditorTheme {
             card_bg: Color::rgb(0.85, 0.86, 0.90),
             card_border: Color::rgb(0.72, 0.74, 0.80),
             panel_border: Color::rgb(0.66, 0.68, 0.74),
+            field_border: Color::rgb(0.66, 0.68, 0.74),
             mode_active: Color::rgb(0.62, 0.76, 0.96),
             axis_x: Color::rgb(0.85, 0.30, 0.30),
             axis_y: Color::rgb(0.28, 0.62, 0.34),
@@ -150,6 +174,13 @@ impl EditorTheme {
             control_radius: 4.0,
             inset_radius: 3.0,
             splitter_width: 2.0,
+            border_width: 1.0,
+            viewport_bg: Color::rgb(0.86, 0.87, 0.89),
+            grid_line: Color::rgba(0.0, 0.0, 0.0, 0.08),
+            grid_line_strong: Color::rgba(0.0, 0.0, 0.0, 0.16),
+            selection_outline: Color::rgb(0.20, 0.50, 0.90),
+            gizmo_rotate: Color::rgb(0.25, 0.45, 0.95),
+            gizmo_scale: Color::rgb(0.90, 0.62, 0.10),
         }
     }
 }
@@ -744,7 +775,7 @@ fn build_group(
             .padding_top(5.0)
             .padding_x(6.0)
             .background(theme.bar_bg)
-            .border_bottom(1.0, theme.panel_border),
+            .border_bottom(theme.border_width, theme.panel_border),
     );
     let active = active.min(panes.len().saturating_sub(1));
     for (i, &pane) in panes.iter().enumerate() {
@@ -952,7 +983,7 @@ fn build_toolbar(
             .padding(5.0)
             .align_center()
             .background(theme.panel_bg)
-            .border_bottom(1.0, theme.panel_border),
+            .border_bottom(theme.border_width, theme.panel_border),
     );
     let icon = |id: Icon| icons.map(|i| i.get(id));
     rows.add_sprite = Some(toolbar_button(
@@ -1096,7 +1127,7 @@ fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, theme: &EditorTheme, rows
             .padding(4.0)
             .background(theme.menu_bg)
             .corner_radius(theme.card_radius)
-            .border(1.0, theme.card_border)
+            .border(theme.border_width, theme.card_border)
             .clip(),
     );
     for (label, action) in &menu.items {
@@ -1137,7 +1168,7 @@ pub fn build_color_picker(
             .padding(8.0)
             .background(theme.menu_bg)
             .corner_radius(theme.card_radius)
-            .border(1.0, theme.card_border)
+            .border(theme.border_width, theme.card_border)
             .clip(),
     );
     let top = ui.panel(popup, Style::new().row().gap(6.0));
@@ -1211,7 +1242,7 @@ pub fn build_modal(
             .padding(16.0)
             .background(theme.card_bg)
             .corner_radius(theme.card_radius)
-            .border(1.0, theme.card_border),
+            .border(theme.border_width, theme.card_border),
     );
     rows.modal_card = Some(card);
 
@@ -1327,7 +1358,7 @@ fn build_settings_body(
                 .grow(1.0)
                 .padding(3.0)
                 .corner_radius(theme.control_radius)
-                .border(1.0, theme.card_border),
+                .border(theme.border_width, theme.card_border),
         );
         rows.modal_inputs.push((input, field));
     }
@@ -1449,7 +1480,7 @@ fn build_scene_tree(
             .foreground(theme.heading)
             .padding(5.0)
             .corner_radius(theme.control_radius)
-            .border(1.0, theme.row_selected)
+            .border(theme.border_width, theme.field_border)
             .placeholder("Search..."),
     );
     rows.tree_filter = Some(search);
@@ -1619,7 +1650,7 @@ fn add_tree_row(
                 .padding(1.0)
                 .foreground(theme.heading)
                 .corner_radius(theme.inset_radius)
-                .border(1.0, theme.row_selected.lighten(0.2)),
+                .border(theme.border_width, theme.aurora.focus),
         );
         rows.rename_field = Some((field, node));
     } else {
@@ -1721,7 +1752,7 @@ pub fn add_file_tooltip(
             .width(FILE_TOOLTIP_W)
             .background(theme.menu_bg)
             .corner_radius(theme.card_radius)
-            .border(1.0, theme.card_border)
+            .border(theme.border_width, theme.card_border)
             .hit_transparent(),
     );
     ui.label(
@@ -2033,7 +2064,7 @@ fn add_inspector_section(
         Style::new()
             .column()
             .background(theme.card_bg)
-            .border(1.0, theme.card_border),
+            .border(theme.border_width, theme.card_border),
     );
     // A distinct darker header bar spanning the card, holding the section title
     // (and a disclosure chevron). Clicking anywhere on the bar toggles the
@@ -2048,7 +2079,7 @@ fn add_inspector_section(
             .padding_x(8.0)
             .padding_y(6.0)
             .background(theme.header_bg)
-            .border_bottom(1.0, theme.card_border),
+            .border_bottom(theme.border_width, theme.card_border),
     );
     if let Some(icons) = icons {
         let chevron = if collapsed {
@@ -2214,7 +2245,7 @@ fn build_file_explorer(
             .gap(4.0)
             .padding(5.0)
             .background(theme.panel_bg)
-            .border_bottom(1.0, theme.panel_border),
+            .border_bottom(theme.border_width, theme.panel_border),
     );
     let crumbs = ui.panel(
         bar,
@@ -2530,7 +2561,7 @@ fn build_entry_name(
             field_style
                 .foreground(ctx.theme.heading)
                 .corner_radius(ctx.theme.inset_radius)
-                .border(1.0, ctx.theme.row_selected.lighten(0.2)),
+                .border(ctx.theme.border_width, ctx.theme.aurora.focus),
         );
         rows.file_rename_field = Some((field, entry.path.clone()));
     } else {
