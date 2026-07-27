@@ -2,7 +2,7 @@
 //! file explorer) from the current scene, selection, and project directory
 //! (M3 step 6 - "the editor looks like an editor").
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use aurora::{Color, ImageHandle, Orientation, Style, Theme, Ui, WidgetId};
@@ -10,11 +10,10 @@ use glam::Vec2;
 use helios::{NodeId, Scene, Value};
 
 use crate::color;
+use crate::dock::{DockNode, Fixed, Pane, SplitDir};
 use crate::icons::{Icon, Icons};
 use crate::viewport::GizmoMode;
 
-/// Font size for a panel's title (larger than the default UI text).
-const PANEL_TITLE: f32 = 17.0;
 /// Corner radius for section cards, and for controls (buttons and fields).
 const CARD_RADIUS: f32 = 6.0;
 const CONTROL_RADIUS: f32 = 4.0;
@@ -297,11 +296,18 @@ pub struct EditorRows {
     /// A submitted transform row commits to the node's Transform; the field is
     /// `"position"`, `"rotation"`, or `"scale"`.
     pub transform_rows: Vec<(WidgetId, NodeId, &'static str)>,
-    /// The three resizable panels, for reading their current (possibly
-    /// splitter-dragged) sizes back before a rebuild.
-    pub tree_panel: Option<WidgetId>,
-    pub inspector_panel: Option<WidgetId>,
-    pub files_panel: Option<WidgetId>,
+    /// Dock tabs mapped to the pane each shows: a click activates it, a drag
+    /// re-docks it.
+    pub dock_tabs: Vec<(WidgetId, Pane)>,
+    /// Each tab group's content area mapped to the pane it currently shows: the
+    /// drop region (and its rect gives the zones) a tab drag lands in.
+    pub dock_groups: Vec<(WidgetId, Pane)>,
+    /// The fixed-size child of each split and the split's direction, in the same
+    /// depth-first order [`DockNode::set_fixed_sizes`] walks - so their laid-out
+    /// sizes can be read back into the dock after a splitter drag.
+    pub dock_splits: Vec<(WidgetId, SplitDir)>,
+    /// Each scrollable pane and its scroll panel, so scroll survives a rebuild.
+    pub pane_scrolls: Vec<(Pane, WidgetId)>,
     /// The viewport image widget; the app sizes the scene render target to
     /// this widget's laid-out rect each frame, so the scene draws 1:1 instead
     /// of stretching a window-sized texture into a smaller panel.
@@ -361,56 +367,37 @@ pub struct ContextMenu {
     pub items: Vec<(String, MenuAction)>,
 }
 
-/// The dock's panel sizes. Splitter drags mutate the live widget tree, so the
-/// app captures them here before each shell rebuild ([`capture_panel_sizes`])
-/// and feeds them back in - otherwise a rebuild (selection change, edit)
-/// would silently snap every panel back to its default.
-#[derive(Debug, Clone, Copy)]
-pub struct PanelSizes {
-    pub tree_width: f32,
-    pub inspector_width: f32,
-    pub files_height: f32,
-    /// Scroll offsets, preserved across rebuilds like the sizes (same lesson:
-    /// widget-tree state dies with the tree unless captured and fed back).
-    pub tree_scroll: f32,
-    pub inspector_scroll: f32,
-    pub files_scroll: f32,
+/// Read each split's fixed-child size out of a laid-out `Ui`, in the depth-first
+/// order [`DockNode::set_fixed_sizes`] expects, so a splitter drag (which
+/// mutates the live widget tree) can be written back into the dock and survive
+/// the next rebuild - otherwise a rebuild would snap every panel to its default.
+pub fn capture_dock_sizes(ui: &Ui, rows: &EditorRows) -> Vec<f32> {
+    rows.dock_splits
+        .iter()
+        .filter_map(|&(id, dir)| {
+            ui.rect(id).map(|r| match dir {
+                SplitDir::Row => r.size.x,
+                SplitDir::Column => r.size.y,
+            })
+        })
+        .collect()
 }
 
-impl Default for PanelSizes {
-    fn default() -> Self {
-        Self {
-            tree_width: 220.0,
-            inspector_width: 260.0,
-            files_height: 140.0,
-            tree_scroll: 0.0,
-            inspector_scroll: 0.0,
-            files_scroll: 0.0,
-        }
-    }
+/// Read each scrollable pane's current scroll offset out of a laid-out `Ui`, so
+/// scroll survives a rebuild the same way (widget-tree state dies with the tree
+/// unless captured and fed back).
+pub fn capture_dock_scrolls(ui: &Ui, rows: &EditorRows) -> HashMap<Pane, f32> {
+    rows.pane_scrolls
+        .iter()
+        .map(|&(pane, id)| (pane, ui.scroll_offset(id)))
+        .collect()
 }
 
-/// Read the current panel sizes out of a laid-out `Ui`, falling back to
-/// `prior` for any panel that has no rect yet (e.g. before the first layout).
-pub fn capture_panel_sizes(ui: &Ui, rows: &EditorRows, prior: PanelSizes) -> PanelSizes {
-    let size_of = |panel: Option<WidgetId>| panel.and_then(|id| ui.rect(id)).map(|r| r.size);
-    let scroll_of = |panel: Option<WidgetId>| panel.map(|id| ui.scroll_offset(id));
-    PanelSizes {
-        tree_width: size_of(rows.tree_panel).map_or(prior.tree_width, |s| s.x),
-        inspector_width: size_of(rows.inspector_panel).map_or(prior.inspector_width, |s| s.x),
-        files_height: size_of(rows.files_panel).map_or(prior.files_height, |s| s.y),
-        tree_scroll: scroll_of(rows.tree_panel).unwrap_or(prior.tree_scroll),
-        inspector_scroll: scroll_of(rows.inspector_panel).unwrap_or(prior.inspector_scroll),
-        files_scroll: scroll_of(rows.files_panel).unwrap_or(prior.files_scroll),
-    }
-}
-
-/// Build the whole editor shell for one frame: docked, resizable panels
-/// (scene-tree, viewport, inspector, file explorer) around the viewport.
-/// Rebuild whenever the scene or selection changes; the tree is cheap enough
-/// that a fresh rebuild beats diffing (M2's inspector already proved this
-/// pattern's frame cost is negligible). `sizes` carries the panel sizes across
-/// rebuilds so splitter drags persist.
+/// Build the whole editor shell for one frame from the dock layout: a tree of
+/// resizable, tabbed panes. Rebuild whenever the scene or selection changes; the
+/// tree is cheap enough that a fresh rebuild beats diffing (M2's inspector
+/// proved this pattern's frame cost is negligible). `dock` carries the layout
+/// and split sizes across rebuilds, `scrolls` the per-pane scroll offsets.
 // The editor view is described by several small pieces of state; a params
 // struct would not read more clearly than these named arguments.
 #[allow(clippy::too_many_arguments)]
@@ -420,7 +407,8 @@ pub fn build_editor_ui(
     primary: Option<NodeId>,
     viewport_handle: ImageHandle,
     project_dir: &Path,
-    sizes: PanelSizes,
+    dock: &DockNode,
+    scrolls: &HashMap<Pane, f32>,
     menu: Option<&ContextMenu>,
     gizmo_mode: GizmoMode,
     icons: Option<&Icons>,
@@ -434,70 +422,28 @@ pub fn build_editor_ui(
     ui.set_theme(theme.aurora);
     let mut rows = EditorRows::default();
 
-    // The three-way dock fills the window (no full-width strip above it - the
-    // toolbar sits over the viewport, in the center column).
     let root = ui.root_panel(Style::new().fill().column().background(theme.root_bg));
-    // `main` clips (Overflow::Hidden): this is what lets the scroll panels
-    // inside it stay window-sized instead of ballooning the row to their tall
-    // content - see aurora's nested-row scroll test.
-    let main = ui.panel(root, Style::new().row().grow(1.0).clip());
+    // The dock area fills the window above the status bar. It clips
+    // (Overflow::Hidden) so the scroll panes inside stay window-sized instead of
+    // ballooning the row to their tall content (see aurora's nested-row test).
+    let dock_area = ui.panel(root, Style::new().row().grow(1.0).clip());
 
-    let tree_panel = build_scene_tree(
-        &mut ui,
-        main,
+    let ctx = PaneCtx {
         scene,
         selected,
         primary,
-        sizes.tree_width,
         tree,
         filter,
         renaming,
-        icons,
-        theme,
-        &mut rows,
-    );
-    let splitter_1 = ui.splitter(main, Orientation::Vertical, 1.0, Style::new().width(4.0));
-    ui.set_splitter_target(splitter_1, tree_panel);
-
-    // Center: the toolbar directly above the viewport, then a resizable
-    // file-explorer strip below (Godot's viewport-toolbar layout).
-    let center = ui.panel(main, Style::new().column().grow(1.0));
-    build_toolbar(&mut ui, center, gizmo_mode, icons, theme, &mut rows);
-    // A drop target so a PNG dragged from the file explorer can land here.
-    let viewport = ui.image(
-        center,
-        viewport_handle,
-        Style::new().grow(1.0).drop_target(),
-    );
-    let splitter_2 = ui.splitter(
-        center,
-        Orientation::Horizontal,
-        -1.0,
-        Style::new().height(4.0),
-    );
-    let files_panel = build_file_explorer(
-        &mut ui,
-        center,
-        project_dir,
-        sizes.files_height,
-        theme,
-        &mut rows,
-    );
-    ui.set_splitter_target(splitter_2, files_panel);
-
-    let splitter_3 = ui.splitter(main, Orientation::Vertical, -1.0, Style::new().width(4.0));
-    let inspector_panel = build_inspector(
-        &mut ui,
-        main,
-        scene,
-        primary,
-        sizes.inspector_width,
-        icons,
         inspector,
+        gizmo_mode,
+        icons,
+        viewport_handle,
+        project_dir,
+        scrolls,
         theme,
-        &mut rows,
-    );
-    ui.set_splitter_target(splitter_3, inspector_panel);
+    };
+    build_dock_node(&mut ui, dock_area, dock, Sizing::Grow, &ctx, &mut rows);
 
     build_status_bar(&mut ui, root, theme, &mut rows);
 
@@ -507,16 +453,226 @@ pub fn build_editor_ui(
         build_context_menu(&mut ui, menu, theme, &mut rows);
     }
 
-    // Restore the scroll positions captured from the previous shell.
-    ui.set_scroll_offset(tree_panel, sizes.tree_scroll);
-    ui.set_scroll_offset(inspector_panel, sizes.inspector_scroll);
-    ui.set_scroll_offset(files_panel, sizes.files_scroll);
-
-    rows.tree_panel = Some(tree_panel);
-    rows.inspector_panel = Some(inspector_panel);
-    rows.files_panel = Some(files_panel);
-    rows.viewport = Some(viewport);
     (ui, rows)
+}
+
+/// The read-only editor state a pane needs to render itself, bundled so the
+/// dock recursion threads one reference instead of a dozen arguments.
+struct PaneCtx<'a> {
+    scene: &'a Scene,
+    selected: &'a HashSet<NodeId>,
+    primary: Option<NodeId>,
+    tree: &'a TreeView,
+    filter: &'a str,
+    renaming: Option<NodeId>,
+    inspector: &'a InspectorView,
+    gizmo_mode: GizmoMode,
+    icons: Option<&'a Icons>,
+    viewport_handle: ImageHandle,
+    project_dir: &'a Path,
+    scrolls: &'a HashMap<Pane, f32>,
+    theme: &'a EditorTheme,
+}
+
+/// How a dock node is sized within its parent split: it grows to fill, or takes
+/// a fixed extent along the parent split's axis.
+#[derive(Clone, Copy)]
+enum Sizing {
+    Grow,
+    Fixed(SplitDir, f32),
+}
+
+/// Apply a [`Sizing`] to a node's root style (a fixed width for a Row parent, a
+/// fixed height for a Column parent, or grow).
+fn apply_sizing(style: Style, sizing: Sizing) -> Style {
+    match sizing {
+        Sizing::Grow => style.grow(1.0),
+        Sizing::Fixed(SplitDir::Row, size) => style.width(size),
+        Sizing::Fixed(SplitDir::Column, size) => style.height(size),
+    }
+}
+
+/// The divider thickness between two docked nodes.
+const DOCK_SPLITTER: f32 = 4.0;
+
+/// Recursively build a dock node under `parent`, sized by `sizing`. A split
+/// emits its two children with a draggable divider between; a leaf emits a tab
+/// group. Returns the node's root widget.
+fn build_dock_node(
+    ui: &mut Ui,
+    parent: WidgetId,
+    node: &DockNode,
+    sizing: Sizing,
+    ctx: &PaneCtx,
+    rows: &mut EditorRows,
+) -> WidgetId {
+    match node {
+        DockNode::Leaf { panes, active } => {
+            build_group(ui, parent, panes, *active, sizing, ctx, rows)
+        }
+        DockNode::Split {
+            dir,
+            fixed,
+            size,
+            first,
+            second,
+        } => {
+            let (row_style, orientation, splitter_style) = match dir {
+                SplitDir::Row => (
+                    Style::new().row(),
+                    Orientation::Vertical,
+                    Style::new().width(DOCK_SPLITTER),
+                ),
+                SplitDir::Column => (
+                    Style::new().column(),
+                    Orientation::Horizontal,
+                    Style::new().height(DOCK_SPLITTER),
+                ),
+            };
+            let container = ui.panel(parent, apply_sizing(row_style.clip(), sizing));
+            let first_fixed = *fixed == Fixed::First;
+            let (first_sizing, second_sizing) = if first_fixed {
+                (Sizing::Fixed(*dir, *size), Sizing::Grow)
+            } else {
+                (Sizing::Grow, Sizing::Fixed(*dir, *size))
+            };
+            let first_id = build_dock_node(ui, container, first, first_sizing, ctx, rows);
+            // sign: +1 when the fixed target sits before the divider (first
+            // child), -1 when after (second) - matching aurora's splitter drag.
+            let sign = if first_fixed { 1.0 } else { -1.0 };
+            let splitter = ui.splitter(container, orientation, sign, splitter_style);
+            let second_id = build_dock_node(ui, container, second, second_sizing, ctx, rows);
+            let fixed_id = if first_fixed { first_id } else { second_id };
+            ui.set_splitter_target(splitter, fixed_id);
+            // Post-order: children's splits are recorded before this one, so the
+            // list matches DockNode::set_fixed_sizes' post-order walk.
+            rows.dock_splits.push((fixed_id, *dir));
+            container
+        }
+    }
+}
+
+/// The tab-bar height and per-tab horizontal padding.
+const TAB_BAR_PAD: f32 = 4.0;
+
+/// Build a tab group under `parent`: a tab bar (one draggable button per pane)
+/// above the active pane's content. Returns the group's root widget.
+fn build_group(
+    ui: &mut Ui,
+    parent: WidgetId,
+    panes: &[Pane],
+    active: usize,
+    sizing: Sizing,
+    ctx: &PaneCtx,
+    rows: &mut EditorRows,
+) -> WidgetId {
+    let theme = ctx.theme;
+    let group = ui.panel(
+        parent,
+        apply_sizing(
+            Style::new().column().clip().background(theme.panel_bg),
+            sizing,
+        ),
+    );
+    // The tab bar.
+    let bar = ui.panel(
+        group,
+        Style::new()
+            .row()
+            .gap(2.0)
+            .padding(TAB_BAR_PAD)
+            .background(theme.root_bg),
+    );
+    let active = active.min(panes.len().saturating_sub(1));
+    for (i, &pane) in panes.iter().enumerate() {
+        let selected = i == active;
+        let tab = ui.button(
+            bar,
+            pane.title(),
+            Style::new()
+                .padding_x(8.0)
+                .padding_y(3.0)
+                .corner_radius(4.0)
+                .foreground(if selected {
+                    theme.heading
+                } else {
+                    theme.subhead
+                })
+                .background(if selected {
+                    theme.panel_bg
+                } else {
+                    Color::TRANSPARENT
+                })
+                .draggable(),
+        );
+        rows.dock_tabs.push((tab, pane));
+    }
+    // The active pane's content fills the rest of the group.
+    let content = ui.panel(group, Style::new().column().grow(1.0).clip());
+    let pane = panes[active];
+    rows.dock_groups.push((content, pane));
+    build_pane(ui, content, pane, ctx, rows);
+    group
+}
+
+/// Build the content of a single pane into `parent`, restoring its saved scroll.
+fn build_pane(ui: &mut Ui, parent: WidgetId, pane: Pane, ctx: &PaneCtx, rows: &mut EditorRows) {
+    let scroll = match pane {
+        Pane::SceneTree => Some(build_scene_tree(
+            ui,
+            parent,
+            ctx.scene,
+            ctx.selected,
+            ctx.primary,
+            ctx.tree,
+            ctx.filter,
+            ctx.renaming,
+            ctx.icons,
+            ctx.theme,
+            rows,
+        )),
+        Pane::Inspector => Some(build_inspector(
+            ui,
+            parent,
+            ctx.scene,
+            ctx.primary,
+            ctx.icons,
+            ctx.inspector,
+            ctx.theme,
+            rows,
+        )),
+        Pane::Files => Some(build_file_explorer(
+            ui,
+            parent,
+            ctx.project_dir,
+            ctx.theme,
+            rows,
+        )),
+        Pane::Viewport => {
+            build_viewport_pane(ui, parent, ctx, rows);
+            None
+        }
+    };
+    if let Some(scroll) = scroll {
+        rows.pane_scrolls.push((pane, scroll));
+        if let Some(&offset) = ctx.scrolls.get(&pane) {
+            ui.set_scroll_offset(scroll, offset);
+        }
+    }
+}
+
+/// The viewport pane: the gizmo-mode toolbar pinned above the scene render
+/// target (which travels with the pane wherever it docks).
+fn build_viewport_pane(ui: &mut Ui, parent: WidgetId, ctx: &PaneCtx, rows: &mut EditorRows) {
+    let col = ui.panel(parent, Style::new().column().grow(1.0).clip());
+    build_toolbar(ui, col, ctx.gizmo_mode, ctx.icons, ctx.theme, rows);
+    // A drop target so a PNG dragged from the file explorer can land here.
+    let viewport = ui.image(
+        col,
+        ctx.viewport_handle,
+        Style::new().grow(1.0).drop_target(),
+    );
+    rows.viewport = Some(viewport);
 }
 
 /// The status bar along the bottom: live readouts the app refreshes in place
@@ -734,7 +890,9 @@ pub fn build_color_picker(
     rows.picker_hex = Some(hex);
 }
 
-/// The docked scene-tree panel: one clickable row per node, indented by depth.
+/// The scene-tree pane's content: one clickable row per node, indented by
+/// depth, above a search box. Fills `parent` (a dock group's content area); the
+/// group frames it and the tab shows its name.
 #[allow(clippy::too_many_arguments)]
 fn build_scene_tree(
     ui: &mut Ui,
@@ -742,7 +900,6 @@ fn build_scene_tree(
     scene: &Scene,
     selected: &HashSet<NodeId>,
     primary: Option<NodeId>,
-    width: f32,
     tree: &TreeView,
     filter: &str,
     renaming: Option<NodeId>,
@@ -754,19 +911,10 @@ fn build_scene_tree(
         parent,
         Style::new()
             .column()
-            .width(width)
+            .grow(1.0)
             .padding(10.0)
             .gap(TREE_ROW_GAP)
-            .scroll()
-            .background(theme.panel_bg),
-    );
-    ui.label(
-        panel,
-        "Scene",
-        Style::new()
-            .foreground(theme.heading)
-            .font_size(PANEL_TITLE)
-            .bold(),
+            .scroll(),
     );
     // A search box: its live text (read back by the app each frame) filters the
     // tree to nodes whose name matches, keeping their ancestors for context.
@@ -1025,7 +1173,6 @@ fn build_inspector(
     parent: WidgetId,
     scene: &Scene,
     selected: Option<NodeId>,
-    width: f32,
     icons: Option<&Icons>,
     inspector: &InspectorView,
     theme: &EditorTheme,
@@ -1035,19 +1182,10 @@ fn build_inspector(
         parent,
         Style::new()
             .column()
-            .width(width)
+            .grow(1.0)
             .padding(10.0)
             .gap(8.0)
-            .scroll()
-            .background(theme.panel_bg),
-    );
-    ui.label(
-        panel,
-        "Inspector",
-        Style::new()
-            .foreground(theme.heading)
-            .font_size(PANEL_TITLE)
-            .bold(),
+            .scroll(),
     );
 
     let Some(node) = selected else {
@@ -1296,12 +1434,12 @@ fn add_vec2_field(
     }
 }
 
-/// The docked file explorer: the project's PNG and scene files.
+/// The file-explorer pane's content: the project's PNG and scene files, filling
+/// `parent` (a dock group's content area).
 fn build_file_explorer(
     ui: &mut Ui,
     parent: WidgetId,
     project_dir: &Path,
-    height: f32,
     theme: &EditorTheme,
     rows: &mut EditorRows,
 ) -> WidgetId {
@@ -1309,19 +1447,10 @@ fn build_file_explorer(
         parent,
         Style::new()
             .column()
-            .height(height)
+            .grow(1.0)
             .padding(10.0)
             .gap(4.0)
-            .scroll()
-            .background(theme.panel_bg),
-    );
-    ui.label(
-        panel,
-        "Files",
-        Style::new()
-            .foreground(theme.heading)
-            .font_size(PANEL_TITLE)
-            .bold(),
+            .scroll(),
     );
     for name in list_project_files(project_dir) {
         if name.ends_with(".png") {
@@ -1410,16 +1539,17 @@ mod tests {
     use super::*;
     use helios::{Component, Node, SpriteComponent, Transform};
 
-    /// Build the shell the way the tests did before multi-select: a single
-    /// optional selection, no search filter, no rename in progress. Keeps the
-    /// test call sites terse while exercising the real `build_editor_ui`.
+    /// Build the shell the way the tests did before docking: a single optional
+    /// selection, the default dock layout, no scroll, no search, no rename.
+    /// Keeps the test call sites terse while exercising the real builder. The
+    /// unused `_sizes` argument keeps existing call sites compiling unchanged.
     #[allow(clippy::too_many_arguments)]
     fn build_editor_ui_test(
         scene: &Scene,
         selected: Option<NodeId>,
         viewport_handle: ImageHandle,
         project_dir: &Path,
-        sizes: PanelSizes,
+        _sizes: (),
         menu: Option<&ContextMenu>,
         gizmo_mode: GizmoMode,
         icons: Option<&Icons>,
@@ -1434,7 +1564,8 @@ mod tests {
             selected,
             viewport_handle,
             project_dir,
-            sizes,
+            &DockNode::default_layout(),
+            &HashMap::new(),
             menu,
             gizmo_mode,
             icons,
@@ -1552,7 +1683,7 @@ mod tests {
                 None,
                 handle,
                 &dir,
-                PanelSizes::default(),
+                (),
                 None,
                 GizmoMode::Select,
                 None,
@@ -1594,7 +1725,7 @@ mod tests {
                 None,
                 handle,
                 &dir,
-                PanelSizes::default(),
+                (),
                 None,
                 GizmoMode::Select,
                 None,
@@ -1631,7 +1762,7 @@ mod tests {
             None,
             handle,
             &dir,
-            PanelSizes::default(),
+            (),
             None,
             GizmoMode::Select,
             None,
@@ -1656,7 +1787,7 @@ mod tests {
                 Some(sprite),
                 handle,
                 &dir,
-                PanelSizes::default(),
+                (),
                 None,
                 GizmoMode::Select,
                 None,
@@ -1721,7 +1852,7 @@ mod tests {
             None,
             handle,
             &dir,
-            PanelSizes::default(),
+            (),
             None,
             GizmoMode::Select,
             None,
@@ -1759,7 +1890,7 @@ mod tests {
             Some(node),
             handle,
             &dir,
-            PanelSizes::default(),
+            (),
             None,
             GizmoMode::Select,
             None,
@@ -1795,65 +1926,78 @@ mod tests {
         assert_eq!(axis_of(field_vec2(&scene, field), Axis::Y), 10.0);
     }
 
+    /// The widget of the tab group currently showing `pane` (its content area).
+    fn pane_group(rows: &EditorRows, pane: Pane) -> WidgetId {
+        rows.dock_groups
+            .iter()
+            .find(|(_, p)| *p == pane)
+            .map(|(w, _)| *w)
+            .expect("pane should have a group")
+    }
+
+    /// Build the shell with a given dock layout and scroll offsets (the paths
+    /// the docking tests exercise), otherwise the default editor state.
+    fn build_with_dock(
+        scene: &Scene,
+        handle: ImageHandle,
+        dir: &Path,
+        dock: &DockNode,
+        scrolls: &HashMap<Pane, f32>,
+    ) -> (Ui, EditorRows) {
+        build_editor_ui(
+            scene,
+            &HashSet::new(),
+            None,
+            handle,
+            dir,
+            dock,
+            scrolls,
+            None,
+            GizmoMode::Select,
+            None,
+            &TreeView::default(),
+            "",
+            None,
+            &InspectorView::default(),
+            &EditorTheme::default(),
+        )
+    }
+
     #[test]
-    fn panel_sizes_survive_a_shell_rebuild() {
+    fn dock_split_sizes_survive_a_shell_rebuild() {
         // The regression: drag a splitter, then trigger a rebuild (as a
         // selection change does) - the dragged size must carry over, not snap
         // back to the default.
         let (scene, handle) = demo_scene();
         let dir = std::env::temp_dir(); // no project files needed for this test
+        let mut dock = DockNode::default_layout();
+        let scrolls = HashMap::new();
 
-        let sizes = PanelSizes::default();
-        let (mut ui, rows) = build_editor_ui_test(
-            &scene,
-            None,
-            handle,
-            &dir,
-            sizes,
-            None,
-            GizmoMode::Select,
-            None,
-            &TreeView::default(),
-            &InspectorView::default(),
-            &EditorTheme::default(),
-        );
+        let (mut ui, rows) = build_with_dock(&scene, handle, &dir, &dock, &scrolls);
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
-        // Drag the tree panel's splitter 50px right, as a user would.
-        let tree = rows.tree_panel.unwrap();
-        assert_eq!(ui.rect(tree).unwrap().size.x, sizes.tree_width);
-        let bar = {
-            // The splitter sits just right of the tree panel.
-            let r = ui.rect(tree).unwrap();
-            Vec2::new(r.max().x + 2.0, 100.0)
-        };
+        // Drag the tree pane's splitter 50px right, as a user would.
+        let tree = pane_group(&rows, Pane::SceneTree);
+        let before = ui.rect(tree).unwrap().size.x;
+        let bar = Vec2::new(ui.rect(tree).unwrap().max().x + 2.0, 100.0);
         ui.handle_input(aurora::InputEvent::PointerMoved(bar));
         ui.handle_input(aurora::InputEvent::PointerPressed);
         ui.handle_input(aurora::InputEvent::PointerMoved(bar + Vec2::new(50.0, 0.0)));
         ui.handle_input(aurora::InputEvent::PointerReleased);
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
-        assert_eq!(ui.rect(tree).unwrap().size.x, sizes.tree_width + 50.0);
+        assert_eq!(ui.rect(tree).unwrap().size.x, before + 50.0);
 
-        // Rebuild the shell (what a tree-row click triggers) with captured sizes.
-        let captured = capture_panel_sizes(&ui, &rows, sizes);
-        assert_eq!(captured.tree_width, sizes.tree_width + 50.0);
-        let (mut ui2, rows2) = build_editor_ui_test(
-            &scene,
-            None,
-            handle,
-            &dir,
-            captured,
-            None,
-            GizmoMode::Select,
-            None,
-            &TreeView::default(),
-            &InspectorView::default(),
-            &EditorTheme::default(),
-        );
+        // Capture the dragged size back into the dock, then rebuild (what a
+        // tree-row click triggers): the width carries over.
+        dock.set_fixed_sizes(&capture_dock_sizes(&ui, &rows));
+        let (mut ui2, rows2) = build_with_dock(&scene, handle, &dir, &dock, &scrolls);
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
         assert_eq!(
-            ui2.rect(rows2.tree_panel.unwrap()).unwrap().size.x,
-            sizes.tree_width + 50.0,
+            ui2.rect(pane_group(&rows2, Pane::SceneTree))
+                .unwrap()
+                .size
+                .x,
+            before + 50.0,
             "the dragged width survives the rebuild"
         );
     }
@@ -1867,7 +2011,7 @@ mod tests {
             None,
             handle,
             &dir,
-            PanelSizes::default(),
+            (),
             None,
             GizmoMode::Rotate,
             None,
@@ -1912,7 +2056,7 @@ mod tests {
             None,
             handle,
             &dir,
-            PanelSizes::default(),
+            (),
             Some(&menu),
             GizmoMode::Select,
             None,
@@ -1947,7 +2091,7 @@ mod tests {
             Some(node),
             handle,
             &dir,
-            PanelSizes::default(),
+            (),
             None,
             GizmoMode::Select,
             None,
@@ -1995,49 +2139,34 @@ mod tests {
             scene.add_child(root_node, helios::Node::new(format!("n{i}")));
         }
         let dir = std::env::temp_dir();
+        let dock = DockNode::default_layout();
 
-        let sizes = PanelSizes::default();
-        let (mut ui, rows) = build_editor_ui_test(
-            &scene,
-            None,
-            handle,
-            &dir,
-            sizes,
-            None,
-            GizmoMode::Select,
-            None,
-            &TreeView::default(),
-            &InspectorView::default(),
-            &EditorTheme::default(),
-        );
+        let (mut ui, rows) = build_with_dock(&scene, handle, &dir, &dock, &HashMap::new());
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
 
-        // Wheel-scroll the tree panel down.
-        let tree = rows.tree_panel.unwrap();
-        let inside = ui.rect(tree).unwrap().pos + Vec2::new(20.0, 60.0);
+        // Wheel-scroll the tree pane down. Its scroll panel is inside the group.
+        let (_, scroll) = *rows
+            .pane_scrolls
+            .iter()
+            .find(|(p, _)| *p == Pane::SceneTree)
+            .unwrap();
+        let inside = ui.rect(scroll).unwrap().pos + Vec2::new(20.0, 20.0);
         ui.handle_input(aurora::InputEvent::PointerMoved(inside));
         ui.handle_input(aurora::InputEvent::Scroll(90.0));
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
-        assert_eq!(ui.scroll_offset(tree), 90.0);
+        assert_eq!(ui.scroll_offset(scroll), 90.0);
 
         // Rebuild with captured state: the offset carries over.
-        let captured = capture_panel_sizes(&ui, &rows, sizes);
-        assert_eq!(captured.tree_scroll, 90.0);
-        let (mut ui2, rows2) = build_editor_ui_test(
-            &scene,
-            None,
-            handle,
-            &dir,
-            captured,
-            None,
-            GizmoMode::Select,
-            None,
-            &TreeView::default(),
-            &InspectorView::default(),
-            &EditorTheme::default(),
-        );
+        let captured = capture_dock_scrolls(&ui, &rows);
+        assert_eq!(captured.get(&Pane::SceneTree), Some(&90.0));
+        let (mut ui2, rows2) = build_with_dock(&scene, handle, &dir, &dock, &captured);
         ui2.layout(Vec2::new(1200.0, 800.0)).unwrap();
-        assert_eq!(ui2.scroll_offset(rows2.tree_panel.unwrap()), 90.0);
+        let (_, scroll2) = *rows2
+            .pane_scrolls
+            .iter()
+            .find(|(p, _)| *p == Pane::SceneTree)
+            .unwrap();
+        assert_eq!(ui2.scroll_offset(scroll2), 90.0);
     }
 
     #[test]
@@ -2049,26 +2178,15 @@ mod tests {
         let (scene, handle) = demo_scene();
         let dir = std::env::temp_dir();
 
-        let (mut ui, rows) = build_editor_ui_test(
-            &scene,
-            None,
-            handle,
-            &dir,
-            PanelSizes::default(),
-            None,
-            GizmoMode::Select,
-            None,
-            &TreeView::default(),
-            &InspectorView::default(),
-            &EditorTheme::default(),
-        );
+        let dock = DockNode::default_layout();
+        let (mut ui, rows) = build_with_dock(&scene, handle, &dir, &dock, &HashMap::new());
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
         let viewport = rows.viewport.unwrap();
         let before = ui.rect(viewport).unwrap().size;
 
         // Drag the tree splitter 60px right.
         let bar = Vec2::new(
-            ui.rect(rows.tree_panel.unwrap()).unwrap().max().x + 2.0,
+            ui.rect(pane_group(&rows, Pane::SceneTree)).unwrap().max().x + 2.0,
             100.0,
         );
         ui.handle_input(aurora::InputEvent::PointerMoved(bar));

@@ -6,6 +6,7 @@
 
 mod actions;
 mod color;
+mod dock;
 mod icons;
 mod project;
 mod settings;
@@ -13,7 +14,7 @@ mod textures;
 mod ui;
 mod viewport;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -33,12 +34,13 @@ use winit::{
 };
 
 use crate::color::Hsva;
+use crate::dock::{DockNode, DropZone, Pane};
 use crate::icons::Icons;
 use crate::textures::TextureCache;
 use crate::ui::{
     Axis, ColorPickerView, ColorTarget, ContextMenu, DropSpot, EditorRows, EditorTheme, FieldRef,
-    InspectorSection, InspectorView, MenuAction, PanelSizes, TreeView, build_color_picker,
-    build_editor_ui, capture_panel_sizes, field_color, field_vec2, parse_value, resolve_drop,
+    InspectorSection, InspectorView, MenuAction, TreeView, build_color_picker, build_editor_ui,
+    capture_dock_scrolls, capture_dock_sizes, field_color, field_vec2, parse_value, resolve_drop,
     set_field_color, set_field_vec2, visible_nodes, with_axis,
 };
 use crate::viewport::{Drag, EditorCamera, GizmoHit, GizmoMode};
@@ -230,9 +232,13 @@ struct State {
     viewport_handle: ImageHandle,
     ui: aurora::Ui,
     rows: EditorRows,
-    /// The dock's panel sizes, captured from the live `Ui` before each rebuild
-    /// so splitter drags survive rebuilds (and, later, restarts).
-    panel_sizes: PanelSizes,
+    /// The dockable-panel layout (a tree of splits and tab groups): which panes
+    /// go where, their tabs, and the split sizes - captured from the live `Ui`
+    /// before each rebuild so splitter drags and rearrangements persist.
+    dock: DockNode,
+    /// Per-pane scroll offsets, captured before each rebuild so scroll survives
+    /// like the dock sizes do (widget-tree state dies with the tree otherwise).
+    pane_scrolls: HashMap<crate::dock::Pane, f32>,
     /// Set when the scene, selection, or viewport handle changed since the
     /// `Ui` was last built; rebuilding only then (not every frame) keeps
     /// in-progress typing and hover state intact across ordinary frames.
@@ -456,7 +462,8 @@ impl State {
 
         let (scene_target, viewport_handle) =
             build_viewport_target(&mut gui, &engine, (size.width, size.height));
-        let panel_sizes = PanelSizes::default();
+        let dock = DockNode::default_layout();
+        let pane_scrolls = HashMap::new();
         // The editor theme comes from the user's settings file (~/.config/orbit),
         // written with defaults on first run - see the `settings` module.
         let theme = settings::load().theme;
@@ -466,7 +473,8 @@ impl State {
             None,
             viewport_handle,
             &project_dir,
-            panel_sizes,
+            &dock,
+            &pane_scrolls,
             None,
             GizmoMode::default(),
             Some(&icons),
@@ -497,7 +505,8 @@ impl State {
             viewport_handle,
             ui,
             rows,
-            panel_sizes,
+            dock,
+            pane_scrolls,
             dirty: false,
             camera: EditorCamera::default(),
             drag: None,
@@ -1168,6 +1177,62 @@ impl State {
         self.dirty = true;
     }
 
+    /// The pane a dock tab (by widget) shows, if `id` is one.
+    fn dock_tab_pane(&self, id: aurora::WidgetId) -> Option<Pane> {
+        self.rows
+            .dock_tabs
+            .iter()
+            .find(|(w, _)| *w == id)
+            .map(|(_, p)| *p)
+    }
+
+    /// The dock group under the cursor: the pane it shows and its content rect
+    /// (whose regions decide the drop zone). `None` if the cursor is over none.
+    fn dock_group_at_cursor(&self) -> Option<(Pane, aurora::Rect)> {
+        self.rows.dock_groups.iter().find_map(|&(content, pane)| {
+            let rect = self.ui.rect(content)?;
+            rect.contains(self.cursor).then_some((pane, rect))
+        })
+    }
+
+    /// Which zone of a group's content `rect` the cursor is in: the central area
+    /// merges as a tab, the four edge bands split off that side.
+    fn dock_drop_zone(rect: aurora::Rect, cursor: Vec2) -> DropZone {
+        let fx = ((cursor.x - rect.pos.x) / rect.size.x.max(1.0)).clamp(0.0, 1.0);
+        let fy = ((cursor.y - rect.pos.y) / rect.size.y.max(1.0)).clamp(0.0, 1.0);
+        let (left, right, top, bottom) = (fx, 1.0 - fx, fy, 1.0 - fy);
+        let nearest = left.min(right).min(top).min(bottom);
+        // Within ~30% of no edge -> the central tab zone.
+        if nearest > 0.3 {
+            DropZone::Tab
+        } else if nearest == left {
+            DropZone::Left
+        } else if nearest == right {
+            DropZone::Right
+        } else if nearest == top {
+            DropZone::Top
+        } else {
+            DropZone::Bottom
+        }
+    }
+
+    /// Activate the tab showing `pane` (a tab click).
+    fn activate_tab(&mut self, pane: Pane) {
+        self.dock.activate(pane);
+        self.dirty = true;
+    }
+
+    /// Finish a tab drag: dock `pane` into the group under the cursor at the
+    /// hovered zone. A no-op if the cursor is over no group.
+    fn drop_dock_tab(&mut self, pane: Pane) {
+        let Some((target, rect)) = self.dock_group_at_cursor() else {
+            return;
+        };
+        let zone = Self::dock_drop_zone(rect, self.cursor);
+        self.dock.move_pane(pane, target, zone);
+        self.dirty = true;
+    }
+
     /// The scene-tree row node under the cursor, if any (a drop target). Reads
     /// the interactive widget under the cursor (the row button, not the label
     /// child a raw hit-test would return) with a fresh query, not the retained
@@ -1742,6 +1807,16 @@ impl State {
         }
     }
 
+    /// Read the live dock splitter sizes and per-pane scroll offsets back out of
+    /// the laid-out `Ui` into `self.dock`/`self.pane_scrolls`, so the next
+    /// rebuild restores them. Called each frame after layout, when the Ui and
+    /// dock structure are guaranteed to match.
+    fn sync_dock_state(&mut self) {
+        let sizes = capture_dock_sizes(&self.ui, &self.rows);
+        self.dock.set_fixed_sizes(&sizes);
+        self.pane_scrolls = capture_dock_scrolls(&self.ui, &self.rows);
+    }
+
     /// Refresh the status bar readouts in place (no shell rebuild).
     fn update_status_bar(&mut self) {
         let cursor = match (self.over_viewport(), self.cursor_world()) {
@@ -1785,19 +1860,19 @@ impl State {
         if self.dirty {
             // Capture the search box's caret before discarding the old Ui, so it
             // can be restored after the rebuild (the box refilters, and so
-            // rebuilds, on every keystroke - see refocus_filter below).
+            // rebuilds, on every keystroke - see refocus_filter below). The dock
+            // sizes and scroll are captured at the end of each frame instead
+            // (sync_dock_state), when the Ui and dock are guaranteed to match -
+            // a rearrange this frame has already restructured self.dock.
             let filter_caret = self.ui.caret_offset();
-            // Splitter drags live only in the widget tree; read the panels'
-            // current sizes back before discarding it, or a rebuild would snap
-            // every panel to its default (a real bug the first time).
-            self.panel_sizes = capture_panel_sizes(&self.ui, &self.rows, self.panel_sizes);
             let (ui, rows) = build_editor_ui(
                 &self.project.scene,
                 &self.selection.as_set(),
                 self.selection.primary(),
                 self.viewport_handle,
                 &self.project_dir,
-                self.panel_sizes,
+                &self.dock,
+                &self.pane_scrolls,
                 self.context_menu.as_ref(),
                 self.gizmo_mode,
                 Some(&self.icons),
@@ -1866,6 +1941,12 @@ impl State {
             self.ui.layout(window)?;
         }
 
+        // Now the shell is laid out and the Ui matches self.dock exactly (this
+        // frame's rebuild, if any, has already restructured the dock), read the
+        // live splitter sizes and pane scroll back so the next rebuild restores
+        // them - the docking equivalent of the old capture_panel_sizes.
+        self.sync_dock_state();
+
         // Match the scene target to the viewport widget's on-screen size, so
         // sprites draw 1:1 (a panel resize reflows the viewport, it does not
         // stretch it). The handle stays valid across the swap (update_image),
@@ -1927,7 +2008,22 @@ impl State {
                 .overlay_to_target(&self.scene_target, &camera, &self.white, &overlay);
         }
 
-        let list = self.ui.draw_list();
+        let mut list = self.ui.draw_list();
+        // A live drop-zone preview while a dock tab is being dragged: a
+        // translucent fill over the half (or whole, for a tab merge) of the
+        // group the pane would land in. Appended to the draw list each frame
+        // rather than added as a popup, since a tab drag lives in Aurora's
+        // retained state and must not trigger a rebuild (which would drop it).
+        if let Some(src) = self.ui.drag_source()
+            && self.dock_tab_pane(src).is_some()
+            && let Some((_, rect)) = self.dock_group_at_cursor()
+        {
+            let zone = Self::dock_drop_zone(rect, self.cursor);
+            list.commands.push(aurora::DrawCommand::FillRect {
+                rect: dock_zone_rect(rect, zone),
+                color: self.theme.row_drop.fade(0.4),
+            });
+        }
         self.gui.render(
             &list,
             self.ui.font_system_mut(),
@@ -2026,6 +2122,10 @@ impl State {
                         self.toggle_section(node, section);
                     }
                 }
+                AuroraEvent::Clicked(id) if self.dock_tab_pane(id).is_some() => {
+                    let pane = self.dock_tab_pane(id).expect("guarded by the match arm");
+                    self.activate_tab(pane);
+                }
                 AuroraEvent::Clicked(id) => {
                     if let Some(&(_, node)) =
                         self.rows.tree_rows.iter().find(|(widget, _)| *widget == id)
@@ -2050,7 +2150,15 @@ impl State {
                     self.commit_vec_input(id);
                     self.commit_picker_hex(id);
                 }
-                AuroraEvent::Dropped { source, target } => self.drop_file(source, target),
+                AuroraEvent::Dropped { source, target } => {
+                    // A dragged dock tab re-docks into the group under the
+                    // cursor; anything else is a file-explorer drag.
+                    if let Some(pane) = self.dock_tab_pane(source) {
+                        self.drop_dock_tab(pane);
+                    } else {
+                        self.drop_file(source, target);
+                    }
+                }
                 _ => {}
             }
         }
@@ -2160,6 +2268,25 @@ impl State {
             self.history
                 .set_field(&mut self.project.scene, node, component, field, new);
         }
+    }
+}
+
+/// The preview rectangle for a dock drop zone within a group's `rect`: the half
+/// the pane would occupy for a side drop, or the whole group for a tab merge.
+fn dock_zone_rect(rect: aurora::Rect, zone: DropZone) -> aurora::Rect {
+    let (w, h) = (rect.size.x, rect.size.y);
+    match zone {
+        DropZone::Tab => rect,
+        DropZone::Left => aurora::Rect::new(rect.pos, Vec2::new(w * 0.5, h)),
+        DropZone::Right => aurora::Rect::new(
+            Vec2::new(rect.pos.x + w * 0.5, rect.pos.y),
+            Vec2::new(w * 0.5, h),
+        ),
+        DropZone::Top => aurora::Rect::new(rect.pos, Vec2::new(w, h * 0.5)),
+        DropZone::Bottom => aurora::Rect::new(
+            Vec2::new(rect.pos.x, rect.pos.y + h * 0.5),
+            Vec2::new(w, h * 0.5),
+        ),
     }
 }
 
