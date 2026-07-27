@@ -132,7 +132,7 @@ pub struct Gizmo {
 /// The active transform tool, chosen from the viewport toolbar. It filters
 /// which gizmo handles are shown and hittable; the sprite body always drags to
 /// move, whatever the mode. `Select` shows the full gizmo (every handle).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum GizmoMode {
     #[default]
     Select,

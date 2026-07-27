@@ -6,9 +6,11 @@
 //! tree to emit the shell; dragging a tab onto another pane mutates it through
 //! [`DockNode::move_pane`]. Headless and unit-tested - no widgets here.
 
+use serde::{Deserialize, Serialize};
+
 /// A dockable panel, identified by which editor view it shows. Each pane
 /// appears exactly once across the whole tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Pane {
     SceneTree,
     Viewport,
@@ -18,6 +20,15 @@ pub enum Pane {
 }
 
 impl Pane {
+    /// Every pane, so a loaded layout can be checked for completeness.
+    pub const ALL: [Pane; 5] = [
+        Pane::SceneTree,
+        Pane::Viewport,
+        Pane::Files,
+        Pane::Inspector,
+        Pane::Console,
+    ];
+
     /// The pane's tab caption.
     pub fn title(self) -> &'static str {
         match self {
@@ -31,7 +42,7 @@ impl Pane {
 }
 
 /// Which way a [`DockNode::Split`] divides its space.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SplitDir {
     /// Children sit side by side (`first` left, `second` right).
     Row,
@@ -42,7 +53,7 @@ pub enum SplitDir {
 /// Which child of a split holds the fixed size; the other grows to fill. Splits
 /// keep one fixed-size child and one flexible one (as the shell's splitters
 /// always have), so a window resize flexes the right panel, not the tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Fixed {
     First,
     Second,
@@ -66,7 +77,7 @@ const STACK_DEFAULT: f32 = 160.0;
 pub const MIN_SIZE: f32 = 80.0;
 
 /// The dock layout tree (see the module docs).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DockNode {
     /// A tab group: one or more panes, `active` shown (the rest as tabs).
     Leaf { panes: Vec<Pane>, active: usize },
@@ -116,6 +127,34 @@ impl DockNode {
                 second: Box::new(DockNode::leaf(Pane::Inspector)),
             }),
         }
+    }
+
+    /// Whether the tree holds every pane exactly once - the invariant a valid
+    /// layout must keep. A loaded (possibly stale or hand-edited) layout that
+    /// fails this is discarded for [`default_layout`](Self::default_layout), so a
+    /// pane can never go missing or appear twice.
+    pub fn is_complete(&self) -> bool {
+        let mut seen = self.flat_panes();
+        seen.sort_by_key(|p| p.title());
+        let mut all = Pane::ALL.to_vec();
+        all.sort_by_key(|p| p.title());
+        seen == all
+    }
+
+    /// Every pane in the tree, in order (may contain duplicates if malformed).
+    fn flat_panes(&self) -> Vec<Pane> {
+        let mut out = Vec::new();
+        fn walk(node: &DockNode, out: &mut Vec<Pane>) {
+            match node {
+                DockNode::Leaf { panes, .. } => out.extend_from_slice(panes),
+                DockNode::Split { first, second, .. } => {
+                    walk(first, out);
+                    walk(second, out);
+                }
+            }
+        }
+        walk(self, &mut out);
+        out
     }
 
     /// Make the tab holding `pane` show it (a tab click). A no-op if not found.
@@ -320,6 +359,22 @@ impl DockNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_layout_round_trips_through_ron_and_is_complete() {
+        let dock = DockNode::default_layout();
+        assert!(dock.is_complete());
+        let text = ron::ser::to_string(&dock).unwrap();
+        let back: DockNode = ron::from_str(&text).unwrap();
+        assert_eq!(back, dock);
+        // A layout missing a pane, or with a duplicate, is not complete.
+        assert!(!DockNode::leaf(Pane::Viewport).is_complete());
+        let dup = DockNode::Leaf {
+            panes: vec![Pane::Viewport, Pane::Viewport],
+            active: 0,
+        };
+        assert!(!dup.is_complete());
+    }
 
     #[test]
     fn the_default_layout_holds_every_pane_once() {

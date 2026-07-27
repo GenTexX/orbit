@@ -8,6 +8,7 @@ mod actions;
 mod color;
 mod console;
 mod dock;
+mod editor_state;
 mod icons;
 mod project;
 mod settings;
@@ -301,6 +302,12 @@ struct State {
     last_log_gen: u64,
     last_log_poll: std::time::Instant,
     console_follow: bool,
+    /// Set when the per-project view state (dock, camera, tool, collapse) changed
+    /// since the last editor-state save; a debounced save writes it out. Kept
+    /// separate from `dirty` (the UI-rebuild flag). `editor_state_saved` is when
+    /// it was last written, for the debounce.
+    view_dirty: bool,
+    editor_state_saved: std::time::Instant,
     /// The open right-click context menu, if any (Aurora popup layer).
     context_menu: Option<ContextMenu>,
     /// The active transform tool (select/move/rotate/scale), chosen from the
@@ -455,6 +462,14 @@ impl ApplicationHandler for App {
             state.window.request_redraw();
         }
     }
+
+    /// On a clean exit, flush the per-project view state so the layout, camera,
+    /// and collapse survive to the next launch (even if no debounced save fired).
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = self.state.as_mut() {
+            state.save_editor_state();
+        }
+    }
 }
 
 impl State {
@@ -507,12 +522,31 @@ impl State {
 
         let (scene_target, viewport_handle) =
             build_viewport_target(&mut gui, &engine, (size.width, size.height));
-        let dock = DockNode::default_layout();
-        let pane_scrolls = HashMap::new();
         // Editor prefs come from the user's settings file (~/.config/orbit),
         // written with defaults on first run - see the `settings` module.
         let settings = settings::load();
         let theme = settings.theme;
+        // Per-project view state (dock layout, camera, tool, scroll, collapsed
+        // tree nodes) comes from <project>/.orbit/editor.ron if present; an
+        // absent or invalid file just yields the defaults.
+        let saved = editor_state::load(&project_dir);
+        let dock = saved
+            .as_ref()
+            .map_or_else(DockNode::default_layout, |s| s.dock.clone());
+        let camera = saved
+            .as_ref()
+            .map_or_else(EditorCamera::default, |s| s.camera.to_camera());
+        let gizmo_mode = saved
+            .as_ref()
+            .map_or_else(GizmoMode::default, |s| s.gizmo_mode);
+        let pane_scrolls: HashMap<dock::Pane, f32> = saved
+            .as_ref()
+            .map(|s| s.pane_scrolls.iter().copied().collect())
+            .unwrap_or_default();
+        let tree_collapsed = saved
+            .as_ref()
+            .map(|s| editor_state::decode_collapsed(&project.scene, &s.collapsed))
+            .unwrap_or_default();
         let (ui, rows) = build_editor_ui(
             &project.scene,
             &HashSet::new(),
@@ -522,7 +556,7 @@ impl State {
             &dock,
             &pane_scrolls,
             None,
-            GizmoMode::default(),
+            gizmo_mode,
             settings.show_grid,
             settings.show_axes,
             settings.snap.enabled,
@@ -559,7 +593,7 @@ impl State {
             dock,
             pane_scrolls,
             dirty: false,
-            camera: EditorCamera::default(),
+            camera,
             drag: None,
             panning: false,
             cursor: Vec2::ZERO,
@@ -578,8 +612,10 @@ impl State {
             last_log_gen: 0,
             last_log_poll: std::time::Instant::now(),
             console_follow: true,
+            view_dirty: false,
+            editor_state_saved: std::time::Instant::now(),
             context_menu: None,
-            gizmo_mode: GizmoMode::default(),
+            gizmo_mode,
             show_grid: settings.show_grid,
             show_axes: settings.show_axes,
             snap: settings.snap,
@@ -592,7 +628,7 @@ impl State {
             picker_sv,
             picker_hue,
             picker_alpha,
-            tree_collapsed: HashSet::new(),
+            tree_collapsed,
             inspector_collapsed: HashSet::new(),
             theme,
             settings_mtime: settings::modified(),
@@ -635,6 +671,7 @@ impl State {
 
         if self.panning {
             self.camera.pan_by_screen(delta);
+            self.view_dirty = true;
         }
         if self.scrub.is_some() {
             self.apply_scrub();
@@ -872,6 +909,7 @@ impl State {
         if self.gizmo_mode != mode {
             self.gizmo_mode = mode;
             self.dirty = true;
+            self.view_dirty = true;
         }
     }
 
@@ -1245,6 +1283,7 @@ impl State {
             self.tree_collapsed.insert(node);
         }
         self.dirty = true;
+        self.view_dirty = true;
     }
 
     /// React to a click on tree row `id` (its `node`): plain click selects just
@@ -1351,6 +1390,7 @@ impl State {
     fn activate_tab(&mut self, pane: Pane) {
         self.dock.activate(pane);
         self.dirty = true;
+        self.view_dirty = true;
     }
 
     /// Finish a tab drag: dock `pane` into the group under the cursor at the
@@ -1362,6 +1402,7 @@ impl State {
         let zone = Self::dock_drop_zone(rect, self.cursor);
         self.dock.move_pane(pane, target, zone);
         self.dirty = true;
+        self.view_dirty = true;
     }
 
     /// The scene-tree row node under the cursor, if any (a drop target). Reads
@@ -1658,6 +1699,7 @@ impl State {
             MouseScrollDelta::PixelDelta(p) => 1.001f32.powf(p.y as f32),
         };
         self.camera.zoom_about(self.cursor - rect.pos, factor);
+        self.view_dirty = true;
     }
 
     /// Keyboard shortcuts. ctrl+s saves (always). With a text field focused,
@@ -1868,6 +1910,40 @@ impl State {
     /// Whether the project has edits since the last save or load.
     fn is_modified(&self) -> bool {
         self.history.revision() != self.saved_revision
+    }
+
+    /// The current per-project editor state, for saving.
+    fn editor_state(&self) -> editor_state::EditorState {
+        let mut pane_scrolls: Vec<(dock::Pane, f32)> =
+            self.pane_scrolls.iter().map(|(&p, &s)| (p, s)).collect();
+        pane_scrolls.sort_by_key(|(p, _)| p.title());
+        editor_state::EditorState {
+            dock: self.dock.clone(),
+            camera: editor_state::CameraState::from_camera(&self.camera),
+            gizmo_mode: self.gizmo_mode,
+            pane_scrolls,
+            collapsed: editor_state::encode_collapsed(&self.project.scene, &self.tree_collapsed),
+        }
+    }
+
+    /// Write the per-project editor state to `<project>/.orbit/editor.ron`
+    /// (best-effort; a failure is logged, not fatal).
+    fn save_editor_state(&mut self) {
+        let state = self.editor_state();
+        if let Err(err) = editor_state::save(&self.project_dir, &state) {
+            tracing::warn!("could not save editor state: {err}");
+        }
+        self.view_dirty = false;
+        self.editor_state_saved = std::time::Instant::now();
+    }
+
+    /// A debounced editor-state save: writes ~2s after the last view change, so a
+    /// continuous pan or resize does not hit the disk every frame.
+    fn maybe_save_editor_state(&mut self) {
+        if self.view_dirty && self.editor_state_saved.elapsed() > std::time::Duration::from_secs(2)
+        {
+            self.save_editor_state();
+        }
     }
 
     /// Write the current viewport view toggles back to the global settings file
@@ -2162,6 +2238,7 @@ impl State {
         // live splitter sizes and pane scroll back so the next rebuild restores
         // them - the docking equivalent of the old capture_panel_sizes.
         self.sync_dock_state();
+        self.maybe_save_editor_state();
 
         // Match the scene target to the viewport widget's on-screen size, so
         // sprites draw 1:1 (a panel resize reflows the viewport, it does not

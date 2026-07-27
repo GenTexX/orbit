@@ -1,3 +1,6 @@
 /target
 /site
 crates/atlas/icons_preview.png
+
+# Per-project editor view state (machine-managed, not shared).
+.orbit/
