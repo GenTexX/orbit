@@ -1288,7 +1288,7 @@ impl State {
                     "assets/sprite.png",
                     self.texture_size,
                 );
-                self.selection.select_one(node);
+                self.select_new_node(node);
             }
             MenuAction::OpenFolder(path) => self.select_explorer_dir(&path),
             MenuAction::RenameFile(path) => self.start_file_rename(&path),
@@ -2339,8 +2339,7 @@ impl State {
                 &path,
                 self.texture_size,
             );
-            self.selection.select_one(node);
-            self.dirty = true;
+            self.select_new_node(node);
             return;
         }
         // Dropped onto an inspector asset field: set that field.
@@ -2350,6 +2349,16 @@ impl State {
         {
             self.commit_asset_field(node, component, field, path);
         }
+    }
+
+    /// Select a just-created scene node and move keyboard focus to the scene, so
+    /// a following Delete/Duplicate acts on the node - not on whatever file was
+    /// last focused in the explorer (e.g. the PNG that was dragged in to place
+    /// the sprite, which otherwise kept the delete key pointed at the file).
+    fn select_new_node(&mut self, node: NodeId) {
+        self.selection.select_one(node);
+        self.explorer_focused = false;
+        self.dirty = true;
     }
 
     /// The toolbar's Add Sprite: spawn at the center of the current view.
@@ -2365,8 +2374,7 @@ impl State {
             "assets/sprite.png",
             self.texture_size,
         );
-        self.selection.select_one(node);
-        self.dirty = true;
+        self.select_new_node(node);
     }
 
     /// Whether the project has edits since the last save or load.
