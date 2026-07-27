@@ -26,8 +26,11 @@ use std::collections::HashMap;
 use aurora::ImageHandle;
 use aurora_wgpu::Renderer as AuroraRenderer;
 
-/// The rendered pixel size of each icon (square).
-const SIZE: usize = 24;
+/// The rendered pixel size of each icon (square). Sized for the largest place
+/// an icon is shown (the file explorer's preview grid at 64px), so it is crisp
+/// there; the small toolbar/tree uses (15-22px) downscale cleanly from this
+/// anti-aliased source.
+const SIZE: usize = 64;
 /// Supersampling factor per axis for the coverage mask (anti-aliasing).
 const SS: usize = 4;
 
@@ -471,7 +474,7 @@ mod tests {
     #[test]
     #[ignore = "writes a preview PNG; run with --ignored to regenerate"]
     fn write_preview() {
-        const SCALE: usize = 8;
+        const SCALE: usize = 3;
         let cols = SPECS.len();
         let (w, h) = (cols * SIZE * SCALE, SIZE * SCALE);
         let mut img = image::RgbImage::from_pixel(w as u32, h as u32, image::Rgb([40, 42, 52]));

@@ -171,8 +171,12 @@ pub struct FileExplorer {
     expanded: HashSet<PathBuf>,
     /// The directory whose contents fill the right pane (defaults to the root).
     selected_dir: PathBuf,
-    /// The highlighted file in the contents pane, if any.
-    selected_file: Option<PathBuf>,
+    /// The highlighted entries in the contents pane (files and sub-folders of
+    /// `selected_dir`). Multi-select via ctrl/shift; the last is the primary
+    /// (what a rename targets).
+    selected: Vec<PathBuf>,
+    /// The fixed end of a shift-range selection (the last plain/ctrl click).
+    anchor: Option<PathBuf>,
     /// Compact list vs. large-preview grid.
     view: FileView,
     /// The folder tree's scroll offset, kept here (not in the per-pane scroll
@@ -180,6 +184,10 @@ pub struct FileExplorer {
     /// rebuilds that a selection or a landing thumbnail trigger. Transient - not
     /// persisted across restarts.
     tree_scroll: f32,
+    /// The contents entry being inline-renamed, if any (its row shows an edit
+    /// field instead of a label). Held here so the renderer sees it via the same
+    /// reference the pane already threads.
+    renaming: Option<PathBuf>,
 }
 
 impl FileExplorer {
@@ -194,10 +202,22 @@ impl FileExplorer {
             root,
             expanded,
             selected_dir: root_path,
-            selected_file: None,
+            selected: Vec::new(),
+            anchor: None,
             view: FileView::default(),
             tree_scroll: 0.0,
+            renaming: None,
         }
+    }
+
+    /// The contents entry currently being inline-renamed, if any.
+    pub fn renaming(&self) -> Option<&Path> {
+        self.renaming.as_deref()
+    }
+
+    /// Begin (or, with `None`, cancel) an inline rename of a contents entry.
+    pub fn set_renaming(&mut self, path: Option<PathBuf>) {
+        self.renaming = path;
     }
 
     /// The folder tree's saved scroll offset (restored into the tree panel on
@@ -230,12 +250,15 @@ impl FileExplorer {
         if self.find(&self.selected_dir).is_none_or(|e| !e.is_dir()) {
             self.selected_dir = root_path;
         }
-        if self
-            .selected_file
-            .as_ref()
-            .is_some_and(|p| self.find(p).is_none())
-        {
-            self.selected_file = None;
+        // Drop highlighted / renaming entries that no longer exist (deleted,
+        // moved, renamed).
+        let present: Vec<PathBuf> = self.contents().iter().map(|e| e.path.clone()).collect();
+        self.selected.retain(|p| present.contains(p));
+        if self.anchor.as_ref().is_some_and(|a| !present.contains(a)) {
+            self.anchor = None;
+        }
+        if self.renaming.as_ref().is_some_and(|p| !present.contains(p)) {
+            self.renaming = None;
         }
     }
 
@@ -293,8 +316,20 @@ impl FileExplorer {
         &self.selected_dir
     }
 
-    pub fn is_selected_file(&self, path: &Path) -> bool {
-        self.selected_file.as_deref() == Some(path)
+    /// Whether `path` is one of the highlighted contents entries.
+    pub fn is_selected(&self, path: &Path) -> bool {
+        self.selected.iter().any(|p| p == path)
+    }
+
+    /// The highlighted contents entries (files and sub-folders).
+    pub fn selected(&self) -> &[PathBuf] {
+        &self.selected
+    }
+
+    /// The primary selection - the most recently clicked entry, what a rename
+    /// targets.
+    pub fn primary(&self) -> Option<&Path> {
+        self.selected.last().map(|p| p.as_path())
     }
 
     pub fn view(&self) -> FileView {
@@ -326,13 +361,68 @@ impl FileExplorer {
             return;
         }
         self.selected_dir = dir.to_path_buf();
-        self.selected_file = None;
+        self.clear_selection();
+        // A rename in progress in the old folder is abandoned (its field is no
+        // longer rendered), so drop the state or it would swallow the next Escape.
+        self.renaming = None;
         self.expand_ancestors(dir);
     }
 
-    /// Highlight a file in the contents pane.
-    pub fn select_file(&mut self, path: &Path) {
-        self.selected_file = Some(path.to_path_buf());
+    /// The single selected entry when it is exactly one directory, else `None`
+    /// (used to target a paste / new folder at a highlighted sub-folder).
+    pub fn selected_single_dir(&self) -> Option<&Path> {
+        match self.selected.as_slice() {
+            [only] if self.find(only).is_some_and(Entry::is_dir) => Some(only),
+            _ => None,
+        }
+    }
+
+    /// Replace the contents selection with just `path` (a plain click).
+    pub fn select_one(&mut self, path: &Path) {
+        self.selected = vec![path.to_path_buf()];
+        self.anchor = Some(path.to_path_buf());
+    }
+
+    /// Toggle `path` in/out of the selection (a ctrl-click), keeping the rest.
+    pub fn toggle_selected(&mut self, path: &Path) {
+        if let Some(i) = self.selected.iter().position(|p| p == path) {
+            self.selected.remove(i);
+        } else {
+            self.selected.push(path.to_path_buf());
+        }
+        self.anchor = Some(path.to_path_buf());
+    }
+
+    /// Select the contiguous range of contents entries between the anchor and
+    /// `path` in display order (a shift-click); falls back to a plain select if
+    /// there is no anchor or either end is not in the current folder.
+    pub fn select_range(&mut self, path: &Path) {
+        let order: Vec<PathBuf> = self.contents().iter().map(|e| e.path.clone()).collect();
+        let anchor = self.anchor.clone();
+        let ends = anchor
+            .as_deref()
+            .and_then(|a| order.iter().position(|p| p == a))
+            .zip(order.iter().position(|p| p == path));
+        match ends {
+            Some((i, j)) => {
+                let (lo, hi) = if i <= j { (i, j) } else { (j, i) };
+                self.selected = order[lo..=hi].to_vec();
+                // The anchor stays put so the range can be resized.
+            }
+            None => self.select_one(path),
+        }
+    }
+
+    /// Select every entry in the current folder (ctrl+a).
+    pub fn select_all(&mut self) {
+        self.selected = self.contents().iter().map(|e| e.path.clone()).collect();
+        self.anchor = self.selected.first().cloned();
+    }
+
+    /// Clear the contents selection.
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.anchor = None;
     }
 
     /// Expand every ancestor of `path` up to and including the root, so `path`
@@ -529,6 +619,74 @@ mod tests {
         // Selecting a non-directory (a file) is refused.
         ex.select_dir(&dir.path().join("assets/a.png"));
         assert_eq!(ex.selected_dir(), dir.path().join("assets"));
+    }
+
+    #[test]
+    fn contents_selection_supports_single_toggle_range_and_all() {
+        let dir = sample_project();
+        let mut ex = FileExplorer::new(dir.path());
+        ex.select_dir(&dir.path().join("assets")); // contents: [a.png, b.png]
+        let a = dir.path().join("assets/a.png");
+        let b = dir.path().join("assets/b.png");
+
+        // Plain select replaces; is the primary.
+        ex.select_one(&a);
+        assert!(ex.is_selected(&a) && !ex.is_selected(&b));
+        assert_eq!(ex.primary(), Some(a.as_path()));
+        // Ctrl-toggle adds then removes, keeping the rest.
+        ex.toggle_selected(&b);
+        assert_eq!(ex.selected(), &[a.clone(), b.clone()]);
+        ex.toggle_selected(&a);
+        assert_eq!(ex.selected(), std::slice::from_ref(&b));
+        // Shift-range from the anchor covers the span in display order.
+        ex.select_one(&a); // anchor = a
+        ex.select_range(&b);
+        assert_eq!(ex.selected(), &[a.clone(), b.clone()]);
+        // Select-all, then clear.
+        ex.clear_selection();
+        assert!(ex.selected().is_empty());
+        ex.select_all();
+        assert_eq!(ex.selected().len(), 2);
+        // Navigating to another folder drops the selection.
+        ex.select_dir(dir.path());
+        assert!(ex.selected().is_empty());
+    }
+
+    #[test]
+    fn selected_single_dir_targets_a_lone_selected_folder() {
+        let dir = sample_project();
+        let mut ex = FileExplorer::new(dir.path()); // root: [assets, scenes, sub, orbit.toml]
+        // One folder selected -> that folder.
+        ex.select_one(&dir.path().join("sub"));
+        assert_eq!(
+            ex.selected_single_dir(),
+            Some(dir.path().join("sub").as_path())
+        );
+        // A file, or a multi-selection, is not a single-folder target.
+        ex.select_one(&dir.path().join("orbit.toml"));
+        assert_eq!(ex.selected_single_dir(), None);
+        ex.select_one(&dir.path().join("sub"));
+        ex.toggle_selected(&dir.path().join("assets"));
+        assert_eq!(ex.selected_single_dir(), None);
+    }
+
+    #[test]
+    fn an_in_progress_rename_is_dropped_on_navigation_and_rescan() {
+        let dir = sample_project();
+        let mut ex = FileExplorer::new(dir.path());
+        ex.select_dir(&dir.path().join("assets"));
+        let a = dir.path().join("assets/a.png");
+        ex.set_renaming(Some(a.clone()));
+        assert_eq!(ex.renaming(), Some(a.as_path()));
+        // Navigating away abandons the rename (else it swallows the next Escape).
+        ex.select_dir(dir.path());
+        assert_eq!(ex.renaming(), None);
+        // A rescan that loses the renamed entry also clears it.
+        ex.select_dir(&dir.path().join("assets"));
+        ex.set_renaming(Some(a.clone()));
+        std::fs::remove_file(&a).unwrap();
+        ex.rescan();
+        assert_eq!(ex.renaming(), None);
     }
 
     #[test]

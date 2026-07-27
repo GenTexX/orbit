@@ -352,6 +352,12 @@ pub struct EditorRows {
     /// The folder-tree scroll panel, whose offset is captured each frame so the
     /// tree does not jump to the top on every shell rebuild.
     pub file_tree_scroll: Option<WidgetId>,
+    /// The inline rename field over a contents entry and the path it renames,
+    /// present only while a file rename is in progress.
+    pub file_rename_field: Option<(WidgetId, PathBuf)>,
+    /// The explorer pane's root widget: a press inside it gives the explorer
+    /// keyboard focus (so its shortcuts act on files, not scene nodes).
+    pub file_pane: Option<WidgetId>,
     /// The toolbar actions.
     pub add_sprite: Option<WidgetId>,
     pub save: Option<WidgetId>,
@@ -393,7 +399,7 @@ pub struct EditorRows {
 }
 
 /// An action offered by a right-click context menu (built on Aurora popups).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum MenuAction {
     /// Delete the current selection (all selected nodes, with their subtrees).
     DeleteSelection,
@@ -403,6 +409,22 @@ pub enum MenuAction {
     RenameNode(NodeId),
     /// Spawn a new sprite at this world position (viewport menu).
     AddSpriteAt(Vec2),
+    // --- file explorer ---
+    /// Open (navigate into) this folder.
+    OpenFolder(PathBuf),
+    /// Start an inline rename of this file or folder.
+    RenameFile(PathBuf),
+    /// Create a new folder in the current directory.
+    NewFolder,
+    /// Duplicate the selected entries.
+    DuplicateFiles,
+    /// Move the selected entries to the project trash.
+    DeleteFiles,
+    /// Copy / cut the selected entries to the file clipboard.
+    CopyFiles,
+    CutFiles,
+    /// Paste the file clipboard into the current directory.
+    PasteFiles,
 }
 
 /// An open right-click context menu: where it is anchored and what it offers.
@@ -983,7 +1005,7 @@ fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, theme: &EditorTheme, rows
                 .foreground(theme.heading)
                 .corner_radius(CONTROL_RADIUS),
         );
-        rows.menu_items.push((item, *action));
+        rows.menu_items.push((item, action.clone()));
     }
     rows.menu_popup = Some(popup);
 }
@@ -1628,6 +1650,7 @@ fn build_file_explorer(
     let theme = ctx.theme;
     let ex = ctx.explorer;
     let pane = ui.panel(parent, Style::new().column().grow(1.0));
+    rows.file_pane = Some(pane);
 
     // The bar: breadcrumbs on the left, view toggles + refresh on the right.
     let bar = ui.panel(
@@ -1845,7 +1868,7 @@ fn build_list_entry(
     rows: &mut EditorRows,
 ) {
     let theme = ctx.theme;
-    let background = if ctx.explorer.is_selected_file(&entry.path) {
+    let background = if ctx.explorer.is_selected(&entry.path) {
         theme.row_selected
     } else {
         Color::TRANSPARENT
@@ -1863,11 +1886,9 @@ fn build_list_entry(
     }
     let r = ui.button(parent, "", style);
     place_entry_icon(ui, r, entry, ctx, FILE_LIST_ICON);
-    ui.label(
-        r,
-        entry.name.clone(),
-        Style::new().grow(1.0).ellipsis().foreground(theme.heading),
-    );
+    let label = Style::new().grow(1.0).ellipsis().foreground(theme.heading);
+    let field = Style::new().grow(1.0).padding(1.0);
+    build_entry_name(ui, r, entry, ctx, rows, field, label);
     if let Some(tag) = entry_tag(entry) {
         ui.label(r, tag, Style::new().foreground(theme.subhead));
     }
@@ -1883,7 +1904,7 @@ fn build_grid_cell(
     rows: &mut EditorRows,
 ) {
     let theme = ctx.theme;
-    let background = if ctx.explorer.is_selected_file(&entry.path) {
+    let background = if ctx.explorer.is_selected(&entry.path) {
         theme.row_selected
     } else {
         Color::TRANSPARENT
@@ -1903,16 +1924,40 @@ fn build_grid_cell(
     }
     let cell = ui.button(parent, "", style);
     place_entry_icon(ui, cell, entry, ctx, FILE_GRID_THUMB);
-    ui.label(
-        cell,
-        entry.name.clone(),
-        Style::new()
-            .width(FILE_GRID_CELL - 8.0)
-            .ellipsis()
-            .text_center()
-            .foreground(theme.heading),
-    );
+    let label = Style::new()
+        .width(FILE_GRID_CELL - 8.0)
+        .ellipsis()
+        .text_center()
+        .foreground(theme.heading);
+    let field = Style::new().width(FILE_GRID_CELL - 8.0).padding(1.0);
+    build_entry_name(ui, cell, entry, ctx, rows, field, label);
     record_entry(entry, cell, ctx, rows, draggable);
+}
+
+/// Render a contents entry's name: an inline rename field when this entry is
+/// being renamed, otherwise a plain (styled) label.
+fn build_entry_name(
+    ui: &mut Ui,
+    parent: WidgetId,
+    entry: &Entry,
+    ctx: &PaneCtx,
+    rows: &mut EditorRows,
+    field_style: Style,
+    label_style: Style,
+) {
+    if ctx.explorer.renaming() == Some(entry.path.as_path()) {
+        let field = ui.text_input(
+            parent,
+            entry.name.clone(),
+            field_style
+                .foreground(ctx.theme.heading)
+                .corner_radius(3.0)
+                .border(1.0, ctx.theme.row_selected.lighten(0.2)),
+        );
+        rows.file_rename_field = Some((field, entry.path.clone()));
+    } else {
+        ui.label(parent, entry.name.clone(), label_style);
+    }
 }
 
 /// Place an entry's visual: a ready thumbnail wins, else the type icon, else

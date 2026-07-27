@@ -10,6 +10,7 @@ mod console;
 mod dock;
 mod editor_state;
 mod explorer;
+mod file_ops;
 mod icons;
 mod project;
 mod settings;
@@ -358,6 +359,18 @@ struct State {
     /// The explorer grid's column count, recomputed from the contents pane's
     /// laid-out width each frame so the preview grid reflows with the pane.
     explorer_cols: usize,
+    /// Whether the file explorer is the active pane, so the shared keyboard
+    /// shortcuts (copy/cut/paste/select-all/delete/rename) act on files rather
+    /// than on scene nodes. Set by clicking in the explorer, cleared by clicking
+    /// the scene tree or the viewport.
+    explorer_focused: bool,
+    /// The explorer's file clipboard: paths copied or cut, and whether a paste
+    /// should move them (a cut) rather than copy.
+    file_clip: Vec<PathBuf>,
+    file_clip_cut: bool,
+    /// Set when a file-rename field was just created, so the next rebuild focuses
+    /// it once (mirrors `focus_rename` for scene nodes).
+    focus_file_rename: bool,
 }
 
 /// A tree row being dragged to reparent it; `target` is the current valid drop
@@ -403,6 +416,11 @@ impl ApplicationHandler for App {
                 ..
             } => match (button, btn_state) {
                 (MouseButton::Left, ElementState::Pressed) => {
+                    // Keyboard focus follows the press: the shared shortcuts
+                    // (delete/copy/rename) act on files when the press lands in
+                    // the explorer pane, on the scene otherwise.
+                    state.explorer_focused =
+                        state.hit_in_explorer_pane(state.ui.hit_test(state.cursor));
                     // A press outside an open menu dismisses it (before the
                     // viewport/gizmo logic, so a click on empty space just
                     // closes the menu without also deselecting).
@@ -661,6 +679,10 @@ impl State {
             explorer,
             thumbnails,
             explorer_cols,
+            explorer_focused: false,
+            file_clip: Vec::new(),
+            file_clip_cut: false,
+            focus_file_rename: false,
         })
     }
 
@@ -792,6 +814,8 @@ impl State {
         if self.ui.hit_test(self.cursor) != self.rows.viewport {
             return;
         }
+        // Interacting with the viewport moves keyboard focus off the explorer.
+        self.explorer_focused = false;
         let (Some(rect), Some(world)) = (self.viewport_rect(), self.cursor_world()) else {
             return;
         };
@@ -967,6 +991,8 @@ impl State {
     /// Sprite Here" at the cursor. Anywhere else it just closes any open menu.
     fn open_context_menu(&mut self) {
         let hit = self.ui.hit_test(self.cursor);
+        // A right-press also moves keyboard focus, like a left-press.
+        self.explorer_focused = self.hit_in_explorer_pane(hit);
         if let Some(&(_, node)) =
             hit.and_then(|id| self.rows.tree_rows.iter().find(|(w, _)| *w == id))
         {
@@ -986,6 +1012,16 @@ impl State {
                 items,
             });
             self.dirty = true;
+        } else if let Some((path, is_dir)) = hit.and_then(|id| {
+            self.rows
+                .file_entries
+                .iter()
+                .find(|(w, ..)| *w == id)
+                .map(|(_, p, d)| (p.clone(), *d))
+        }) {
+            self.open_file_entry_menu(&path, is_dir);
+        } else if self.hit_in_explorer(hit) {
+            self.open_explorer_background_menu();
         } else if hit == self.rows.viewport
             && let Some(world) = self.cursor_world()
         {
@@ -999,6 +1035,77 @@ impl State {
             self.dirty = true;
         } else {
             self.close_menu();
+        }
+    }
+
+    /// The context menu for a right-clicked contents entry: select it (if it was
+    /// not part of the selection), then offer the file operations.
+    fn open_file_entry_menu(&mut self, path: &std::path::Path, is_dir: bool) {
+        self.explorer_focused = true;
+        if !self.explorer.is_selected(path) {
+            self.explorer.select_one(path);
+        }
+        let mut items = Vec::new();
+        if is_dir {
+            items.push((
+                "Open".to_string(),
+                MenuAction::OpenFolder(path.to_path_buf()),
+            ));
+        }
+        items.push((
+            "Rename".to_string(),
+            MenuAction::RenameFile(path.to_path_buf()),
+        ));
+        items.push(("Duplicate".to_string(), MenuAction::DuplicateFiles));
+        items.push(("Copy".to_string(), MenuAction::CopyFiles));
+        items.push(("Cut".to_string(), MenuAction::CutFiles));
+        if !self.file_clip.is_empty() {
+            items.push(("Paste".to_string(), MenuAction::PasteFiles));
+        }
+        items.push(("Delete".to_string(), MenuAction::DeleteFiles));
+        items.push(("New Folder".to_string(), MenuAction::NewFolder));
+        self.context_menu = Some(ContextMenu {
+            anchor: self.cursor,
+            items,
+        });
+        self.dirty = true;
+    }
+
+    /// The context menu for empty explorer space: new folder, and paste when the
+    /// file clipboard holds something.
+    fn open_explorer_background_menu(&mut self) {
+        self.explorer_focused = true;
+        let mut items = vec![("New Folder".to_string(), MenuAction::NewFolder)];
+        if !self.file_clip.is_empty() {
+            items.push(("Paste".to_string(), MenuAction::PasteFiles));
+        }
+        self.context_menu = Some(ContextMenu {
+            anchor: self.cursor,
+            items,
+        });
+        self.dirty = true;
+    }
+
+    /// Whether `hit` lands inside the explorer's tree or contents area (used to
+    /// offer the background menu on empty space there).
+    fn hit_in_explorer(&self, hit: Option<aurora::WidgetId>) -> bool {
+        let Some(hit) = hit else {
+            return false;
+        };
+        let within = |anchor: Option<aurora::WidgetId>| {
+            anchor.is_some_and(|a| a == hit || self.ui.is_within(hit, a))
+        };
+        within(self.rows.file_contents) || within(self.rows.file_tree_scroll)
+    }
+
+    /// Whether `hit` lands anywhere inside the whole explorer pane (bar, tree, or
+    /// contents). This is the authoritative source for `explorer_focused`,
+    /// recomputed on each press so the flag tracks visible focus instead of
+    /// drifting - a stale flag would send Delete to the wrong place.
+    fn hit_in_explorer_pane(&self, hit: Option<aurora::WidgetId>) -> bool {
+        match (hit, self.rows.file_pane) {
+            (Some(hit), Some(pane)) => hit == pane || self.ui.is_within(hit, pane),
+            _ => false,
         }
     }
 
@@ -1043,6 +1150,14 @@ impl State {
                 );
                 self.selection.select_one(node);
             }
+            MenuAction::OpenFolder(path) => self.select_explorer_dir(&path),
+            MenuAction::RenameFile(path) => self.start_file_rename(&path),
+            MenuAction::NewFolder => self.file_new_folder(),
+            MenuAction::DuplicateFiles => self.file_duplicate(),
+            MenuAction::DeleteFiles => self.file_delete(),
+            MenuAction::CopyFiles => self.file_copy(false),
+            MenuAction::CutFiles => self.file_copy(true),
+            MenuAction::PasteFiles => self.file_paste(),
         }
         self.context_menu = None;
         self.dirty = true;
@@ -1317,6 +1432,9 @@ impl State {
     /// it, ctrl-click toggles it, shift-click ranges from the anchor; a second
     /// click on the same row in quick succession starts an inline rename.
     fn click_tree_row(&mut self, id: aurora::WidgetId, node: NodeId) {
+        // The scene tree takes keyboard focus back from the explorer, so the
+        // shared shortcuts (delete/copy/rename) act on nodes again.
+        self.explorer_focused = false;
         let now = std::time::Instant::now();
         let double = self
             .last_click
@@ -1748,6 +1866,26 @@ impl State {
         if self.ui.focused().is_some() {
             return self.clipboard_shortcut(c);
         }
+        // When the file explorer is the active pane, copy/cut/paste/select-all
+        // act on files rather than on scene nodes.
+        if self.explorer_focused {
+            if c.eq_ignore_ascii_case("c") {
+                self.file_copy(false);
+                return true;
+            }
+            if c.eq_ignore_ascii_case("x") {
+                self.file_copy(true);
+                return true;
+            }
+            if c.eq_ignore_ascii_case("v") {
+                self.file_paste();
+                return true;
+            }
+            if c.eq_ignore_ascii_case("a") {
+                self.explorer_select_all();
+                return true;
+            }
+        }
         // No field focused: ctrl combos act on the scene and the selection.
         if c.eq_ignore_ascii_case("z") {
             let changed = if self.modifiers.shift_key() {
@@ -1801,12 +1939,21 @@ impl State {
         };
         match named {
             NamedKey::Escape => {
+                if self.explorer.renaming().is_some() {
+                    self.cancel_file_rename();
+                    return true;
+                }
                 if self.renaming.is_some() {
                     self.cancel_rename();
                     return true;
                 }
                 if self.ui.focused().is_some() {
                     return false;
+                }
+                if self.explorer_focused && !self.explorer.selected().is_empty() {
+                    self.explorer.clear_selection();
+                    self.dirty = true;
+                    return true;
                 }
                 if !self.selection.is_empty() {
                     self.selection.clear();
@@ -1815,11 +1962,19 @@ impl State {
                 true
             }
             NamedKey::Delete if self.ui.focused().is_none() => {
-                self.delete_selection();
+                if self.explorer_focused {
+                    self.file_delete();
+                } else {
+                    self.delete_selection();
+                }
                 true
             }
             NamedKey::F2 if self.ui.focused().is_none() => {
-                if let Some(node) = self.selection.primary() {
+                if self.explorer_focused {
+                    if let Some(path) = self.explorer.primary().map(|p| p.to_path_buf()) {
+                        self.start_file_rename(&path);
+                    }
+                } else if let Some(node) = self.selection.primary() {
                     self.start_rename(node);
                 }
                 true
@@ -2096,6 +2251,175 @@ impl State {
         self.dirty = true;
     }
 
+    /// A click on a contents entry: a double-click opens a folder; otherwise it
+    /// updates the selection (shift = range, ctrl = toggle, plain = replace).
+    fn click_file_entry(&mut self, id: aurora::WidgetId, path: &std::path::Path, is_dir: bool) {
+        self.explorer_focused = true;
+        let now = std::time::Instant::now();
+        let double = self
+            .last_click
+            .is_some_and(|(w, t)| w == id && now.duration_since(t) < DOUBLE_CLICK);
+        self.last_click = Some((id, now));
+        if double && is_dir {
+            self.select_explorer_dir(path);
+            return;
+        }
+        if self.modifiers.shift_key() {
+            self.explorer.select_range(path);
+        } else if self.modifiers.control_key() {
+            self.explorer.toggle_selected(path);
+        } else {
+            self.explorer.select_one(path);
+        }
+        self.dirty = true;
+    }
+
+    /// Select every entry in the current folder (explorer ctrl+a).
+    fn explorer_select_all(&mut self) {
+        self.explorer.select_all();
+        self.dirty = true;
+    }
+
+    /// Copy (or, with `cut`, cut) the selected entries to the file clipboard.
+    fn file_copy(&mut self, cut: bool) {
+        let sel = self.explorer.selected();
+        if sel.is_empty() {
+            return;
+        }
+        self.file_clip = sel.to_vec();
+        self.file_clip_cut = cut;
+    }
+
+    /// The folder a paste or new-folder targets: a single highlighted sub-folder
+    /// if there is exactly one, else the folder whose contents are shown.
+    fn explorer_dest_dir(&self) -> std::path::PathBuf {
+        self.explorer
+            .selected_single_dir()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.explorer.selected_dir().to_path_buf())
+    }
+
+    /// Paste the file clipboard into the target folder (copying, or moving for a
+    /// cut), then reselect what landed.
+    fn file_paste(&mut self) {
+        if self.file_clip.is_empty() {
+            return;
+        }
+        let dst = self.explorer_dest_dir();
+        let clip = self.file_clip.clone();
+        let cut = self.file_clip_cut;
+        let mut pasted = Vec::new();
+        for src in &clip {
+            let result = if cut {
+                file_ops::move_into(src, &dst)
+            } else {
+                file_ops::copy_into(src, &dst)
+            };
+            match result {
+                Ok(path) => pasted.push(path),
+                Err(err) => tracing::warn!("paste {} failed: {err}", src.display()),
+            }
+        }
+        // Only clear a cut clipboard once something actually moved, so a fully
+        // failed paste leaves it intact for a retry.
+        if cut && !pasted.is_empty() {
+            self.file_clip.clear();
+            self.file_clip_cut = false;
+        }
+        self.after_file_change(&pasted);
+    }
+
+    /// Move the selected entries to the project trash (recoverable).
+    fn file_delete(&mut self) {
+        let sel = self.explorer.selected().to_vec();
+        if sel.is_empty() {
+            return;
+        }
+        let root = self.project_dir.clone();
+        let mut moved = 0;
+        for path in &sel {
+            match file_ops::delete_to_trash(&root, path) {
+                Ok(_) => moved += 1,
+                Err(err) => tracing::error!("delete {} failed: {err}", path.display()),
+            }
+        }
+        if moved > 0 {
+            tracing::info!("moved {moved} item(s) to {}/.orbit/trash", root.display());
+        }
+        self.after_file_change(&[]);
+    }
+
+    /// Duplicate the selected entries beside their originals.
+    fn file_duplicate(&mut self) {
+        let sel = self.explorer.selected().to_vec();
+        if sel.is_empty() {
+            return;
+        }
+        let mut dups = Vec::new();
+        for path in &sel {
+            match file_ops::duplicate(path) {
+                Ok(path) => dups.push(path),
+                Err(err) => tracing::warn!("duplicate {} failed: {err}", path.display()),
+            }
+        }
+        self.after_file_change(&dups);
+    }
+
+    /// Create a new folder in the target directory and start renaming it.
+    fn file_new_folder(&mut self) {
+        let dst = self.explorer_dest_dir();
+        match file_ops::create_folder(&dst) {
+            Ok(path) => {
+                self.explorer.rescan();
+                self.explorer.select_one(&path);
+                self.start_file_rename(&path);
+            }
+            Err(err) => tracing::error!("new folder failed: {err}"),
+        }
+        self.dirty = true;
+    }
+
+    /// Begin an inline rename of a contents entry (focused on the next rebuild).
+    fn start_file_rename(&mut self, path: &std::path::Path) {
+        self.explorer.set_renaming(Some(path.to_path_buf()));
+        self.focus_file_rename = true;
+        self.dirty = true;
+    }
+
+    /// Commit a finished inline file rename to disk, reselecting the result.
+    fn commit_file_rename(&mut self, old: &std::path::Path, name: String) {
+        self.explorer.set_renaming(None);
+        match file_ops::rename(old, name.trim()) {
+            Ok(new_path) => {
+                self.explorer.rescan();
+                self.thumbnails.invalidate(&mut self.gui);
+                self.explorer.select_one(&new_path);
+            }
+            Err(err) => tracing::warn!("rename failed: {err}"),
+        }
+        self.dirty = true;
+    }
+
+    /// Cancel an in-progress file rename (Escape), if any.
+    fn cancel_file_rename(&mut self) {
+        if self.explorer.renaming().is_some() {
+            self.explorer.set_renaming(None);
+            self.dirty = true;
+        }
+    }
+
+    /// Shared tail of the file operations: re-scan the folder, refresh previews,
+    /// and select the entries the operation produced.
+    fn after_file_change(&mut self, produced: &[std::path::PathBuf]) {
+        self.explorer.rescan();
+        self.thumbnails.invalidate(&mut self.gui);
+        self.explorer.clear_selection();
+        for path in produced {
+            self.explorer.toggle_selected(path);
+        }
+        self.dirty = true;
+    }
+
     /// Log the frame rate once a second (the M3 "usable editor" health check).
     fn report_fps(&mut self) {
         self.frames += 1;
@@ -2308,6 +2632,14 @@ impl State {
                 self.ui.focus(field);
                 self.focus_rename = false;
             }
+            // Same for a file rename in the explorer's contents pane.
+            if self.focus_file_rename
+                && let Some((field, _)) = self.rows.file_rename_field.as_ref()
+            {
+                let field = *field;
+                self.ui.focus(field);
+                self.focus_file_rename = false;
+            }
             // Restore focus to the search box at its preserved caret, so typing
             // a query is not interrupted by the per-keystroke rebuild.
             if self.refocus_filter
@@ -2504,12 +2836,15 @@ impl State {
                     self.persist_view_prefs();
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.file_view_list => {
+                    self.explorer_focused = true;
                     self.set_file_view(explorer::FileView::List);
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.file_view_grid => {
+                    self.explorer_focused = true;
                     self.set_file_view(explorer::FileView::Grid);
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.file_refresh => {
+                    self.explorer_focused = true;
                     self.explorer.rescan();
                     self.thumbnails.invalidate(&mut self.gui);
                     self.dirty = true;
@@ -2524,6 +2859,7 @@ impl State {
                         .find(|(w, _)| *w == id)
                         .map(|(_, p)| p.clone())
                         .expect("guarded by the match arm");
+                    self.explorer_focused = true;
                     self.explorer.toggle_expand(&path);
                     self.view_dirty = true;
                     self.dirty = true;
@@ -2538,6 +2874,7 @@ impl State {
                         .find(|(w, _)| *w == id)
                         .map(|(_, p)| p.clone())
                         .expect("guarded by the match arm");
+                    self.explorer_focused = true;
                     self.select_explorer_dir(&path);
                 }
                 AuroraEvent::Clicked(id) if self.rows.file_crumbs.iter().any(|(w, _)| *w == id) => {
@@ -2548,6 +2885,7 @@ impl State {
                         .find(|(w, _)| *w == id)
                         .map(|(_, p)| p.clone())
                         .expect("guarded by the match arm");
+                    self.explorer_focused = true;
                     self.select_explorer_dir(&path);
                 }
                 AuroraEvent::Clicked(id)
@@ -2560,13 +2898,7 @@ impl State {
                         .find(|(w, ..)| *w == id)
                         .map(|(_, p, d)| (p.clone(), *d))
                         .expect("guarded by the match arm");
-                    if is_dir {
-                        self.select_explorer_dir(&path);
-                    } else {
-                        self.explorer.select_file(&path);
-                        self.view_dirty = true;
-                        self.dirty = true;
-                    }
+                    self.click_file_entry(id, &path, is_dir);
                 }
                 AuroraEvent::Clicked(id)
                     if self.rows.mode_buttons.iter().any(|(w, _)| *w == id) =>
@@ -2586,7 +2918,7 @@ impl State {
                         .menu_items
                         .iter()
                         .find(|(w, _)| *w == id)
-                        .map(|(_, a)| *a)
+                        .map(|(_, a)| a.clone())
                         .expect("guarded by the match arm");
                     self.run_menu_action(action);
                 }
@@ -2663,6 +2995,15 @@ impl State {
                         if let WidgetKind::TextInput(text) = self.ui.kind(id) {
                             let text = text.clone();
                             self.commit_rename(node, text);
+                        }
+                        continue;
+                    }
+                    if let Some((field, path)) = self.rows.file_rename_field.clone()
+                        && field == id
+                    {
+                        if let WidgetKind::TextInput(text) = self.ui.kind(id) {
+                            let text = text.clone();
+                            self.commit_file_rename(&path, text);
                         }
                         continue;
                     }
