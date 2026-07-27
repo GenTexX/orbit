@@ -846,13 +846,17 @@ impl Ui {
         self.rects.clear();
         self.content_origin.clear();
         self.accumulate(root, Vec2::ZERO);
-        // Nudge any popup that overhangs the right or bottom edge back on
-        // screen (a menu opened near a corner would otherwise spill off).
+        // Nudge any popup that overhangs an edge back on screen (a menu opened
+        // near a corner would otherwise spill off). Clamp the top-left corner
+        // into [0, available - size]: this pulls in a popup hanging off the
+        // right/bottom AND one placed past the left/top. When the popup is larger
+        // than the window that range is empty, so the corner pins to (0, 0) and
+        // the overhang falls off the far edge - better to keep the top-left,
+        // where the content starts, visible.
         for &popup in &self.popups.clone() {
             if let Some(rect) = self.rect(popup) {
-                let over = (rect.max() - available).max(Vec2::ZERO);
-                let under = rect.pos.min(Vec2::ZERO);
-                let shift = under - over;
+                let max_pos = (available - rect.size).max(Vec2::ZERO);
+                let shift = rect.pos.clamp(Vec2::ZERO, max_pos) - rect.pos;
                 if shift != Vec2::ZERO {
                     self.shift_subtree(popup, shift);
                 }
@@ -1897,9 +1901,16 @@ impl Ui {
             if widget.disabled {
                 continue;
             }
+            // These grab zones extend past the widget's own rect (that is what
+            // makes a thin bar or an overhanging thumb easy to grab), so they get
+            // priority over the plain tree descent below. But they must still obey
+            // the clip stack: a splitter or slider scrolled out of its container
+            // must not keep grabbing from behind the clip. `clip_for` gives the
+            // clip its ancestors impose; the point has to fall inside it.
             if let WidgetKind::Splitter { orientation, .. } = widget.kind
                 && let Some(rect) = self.rect(id)
                 && inflate_splitter(rect, orientation).contains(point)
+                && self.clip_for(id).is_none_or(|c| c.contains(point))
             {
                 return Some(id);
             }
@@ -1913,13 +1924,32 @@ impl Ui {
                     rect.pos - Vec2::new(half, 0.0),
                     rect.size + Vec2::new(half * 2.0, 0.0),
                 );
-                if grab.contains(point) {
+                if grab.contains(point) && self.clip_for(id).is_none_or(|c| c.contains(point)) {
                     return Some(id);
                 }
             }
         }
         let root = self.root?;
         self.hit_test_node(root, point, None)
+    }
+
+    /// The clip rectangle a widget's ancestors impose on it: the intersection of
+    /// every clipping ancestor's rect (a widget's own clip bounds its subtree,
+    /// not itself, so it is excluded). `None` when nothing clips it. Used to keep
+    /// the extended splitter/slider grab zones from firing where their widget is
+    /// scrolled out of view.
+    fn clip_for(&self, id: WidgetId) -> Option<Rect> {
+        let mut clip: Option<Rect> = None;
+        let mut cur = self.widgets[id].parent;
+        while let Some(a) = cur {
+            if self.widgets[a].clip
+                && let Some(rect) = self.rect(a)
+            {
+                clip = Some(clip.map_or(rect, |c| c.intersect(rect)));
+            }
+            cur = self.widgets[a].parent;
+        }
+        clip
     }
 
     fn hit_test_node(&self, id: WidgetId, point: Vec2, clip: Option<Rect>) -> Option<WidgetId> {
@@ -4424,6 +4454,51 @@ mod tests {
         // Pushed fully inside: right edge at 400, bottom at 300.
         assert_eq!(rect.max(), Vec2::new(400.0, 300.0));
         assert!(ui.is_within(menu, menu));
+    }
+
+    #[test]
+    fn a_popup_off_the_top_left_is_pulled_back_to_the_corner() {
+        let mut ui = Ui::new();
+        ui.root_panel(Style::new().fill());
+        // Anchored off the top-left edge (negative), so it must be pulled back
+        // so its corner sits at the origin - not shoved further off (the old
+        // sign bug moved it the wrong way).
+        let menu = ui.popup(Vec2::new(-30.0, -20.0), Style::new().size(80.0, 60.0));
+        ui.layout(Vec2::new(400.0, 300.0)).unwrap();
+        assert_eq!(ui.rect(menu).unwrap().pos, Vec2::ZERO);
+
+        // A popup larger than the window pins its top-left to the origin (where
+        // the content starts) rather than centering the overhang.
+        let big = ui.popup(Vec2::new(50.0, 50.0), Style::new().size(600.0, 500.0));
+        ui.layout(Vec2::new(400.0, 300.0)).unwrap();
+        assert_eq!(ui.rect(big).unwrap().pos, Vec2::ZERO);
+    }
+
+    #[test]
+    fn a_splitter_clipped_out_of_its_container_does_not_steal_the_hit() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column().size(200.0, 200.0));
+        // A 40px-tall clipping container whose content overflows: a 60px spacer
+        // pushes the splitter down to y=60, well past the clip's bottom edge.
+        let clip = ui.panel(root, Style::new().column().size(200.0, 40.0).clip());
+        ui.panel(clip, Style::new().size(200.0, 60.0));
+        let split = ui.splitter(
+            clip,
+            Orientation::Horizontal,
+            1.0,
+            Style::new().size(200.0, 6.0),
+        );
+        // A sibling panel fills the area below the clip - what a click at y=62
+        // visually lands on, since the splitter there is clipped away.
+        let below = ui.panel(root, Style::new().size(200.0, 160.0));
+        ui.layout(Vec2::new(200.0, 200.0)).unwrap();
+
+        // The splitter's rect sits at y=60, inside its grab zone at y=62 - but it
+        // is clipped out of the 40px window, so the point belongs to `below`. The
+        // grab-zone pre-pass must honor the clip and not return the splitter.
+        let hit = ui.hit_test(Vec2::new(100.0, 62.0));
+        assert_eq!(hit, Some(below));
+        assert_ne!(hit, Some(split));
     }
 
     #[test]

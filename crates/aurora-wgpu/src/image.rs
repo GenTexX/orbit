@@ -219,29 +219,69 @@ impl ImageRegistry {
 /// Box-downsample an RGBA8 image to half size (each axis halved, floored at 1),
 /// averaging each 2x2 block per channel. Edge blocks on an odd dimension average
 /// only the texels that exist.
+///
+/// The source is sRGB-encoded (the texture is `Rgba8UnormSrgb`), so the color
+/// channels are decoded to linear light before averaging and re-encoded after.
+/// Averaging the raw sRGB bytes would darken every mip level - a box filter of
+/// black and white should read as mid-gray (~188), not the too-dark 128 a naive
+/// byte average gives. Alpha is already linear, so it is averaged directly.
 fn downsample_2x2(src: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
     let nw = (width / 2).max(1);
     let nh = (height / 2).max(1);
+    // Decode the 256 possible sRGB byte values to linear once, then reuse.
+    let to_linear: [f32; 256] = std::array::from_fn(srgb_to_linear);
     let mut dst = vec![0u8; (nw * nh * 4) as usize];
     for y in 0..nh {
         for x in 0..nw {
             for c in 0..4 {
-                let mut sum = 0u32;
+                let mut sum = 0.0f32;
                 let mut n = 0u32;
                 for dy in 0..2 {
                     for dx in 0..2 {
                         let (px, py) = (x * 2 + dx, y * 2 + dy);
                         if px < width && py < height {
-                            sum += src[((py * width + px) * 4 + c) as usize] as u32;
+                            let byte = src[((py * width + px) * 4 + c) as usize];
+                            // Alpha (channel 3) is linear; color channels are sRGB.
+                            sum += if c == 3 {
+                                byte as f32 / 255.0
+                            } else {
+                                to_linear[byte as usize]
+                            };
                             n += 1;
                         }
                     }
                 }
-                dst[((y * nw + x) * 4 + c) as usize] = (sum / n) as u8;
+                let avg = sum / n as f32;
+                let out = if c == 3 {
+                    (avg * 255.0).round()
+                } else {
+                    linear_to_srgb(avg)
+                };
+                dst[((y * nw + x) * 4 + c) as usize] = out as u8;
             }
         }
     }
     (dst, nw, nh)
+}
+
+/// Decode one sRGB-encoded byte (0..=255) to linear light in [0, 1].
+fn srgb_to_linear(byte: usize) -> f32 {
+    let c = byte as f32 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Encode linear light in [0, 1] back to an sRGB byte value (0..=255, as f32).
+fn linear_to_srgb(l: f32) -> f32 {
+    let c = if l <= 0.0031308 {
+        l * 12.92
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    };
+    (c * 255.0).round()
 }
 
 #[cfg(test)]
@@ -250,8 +290,10 @@ mod tests {
 
     #[test]
     fn downsample_halves_and_averages() {
-        // A 2x2 image with channel-0 values 0,100,200,255 -> one texel averaging
-        // to 138 (rounded down); the other channels are constant.
+        // A 2x2 image with channel-0 values 0,100,200,255 averaged in LINEAR
+        // light -> 175, not the too-dark 138 a raw sRGB byte average would give.
+        // The other (constant) color channels round-trip through linear; alpha
+        // (channel 3) averages straight.
         let src = vec![
             0, 10, 20, 30, //
             100, 10, 20, 30, //
@@ -260,16 +302,17 @@ mod tests {
         ];
         let (dst, w, h) = downsample_2x2(&src, 2, 2);
         assert_eq!((w, h), (1, 1));
-        assert_eq!(dst, vec![138u8, 10, 20, 30]); // (0+100+200+255)/4 = 138
+        assert_eq!(dst, vec![175u8, 10, 20, 30]);
     }
 
     #[test]
     fn downsample_handles_odd_dimensions() {
         // 3x1 -> 1x1: the lone output block averages only the two texels that
         // exist in its 2x2 footprint (x=0,1; x=2 falls in the next, absent block).
+        // 0 and 40 averaged in linear light re-encode to 26.
         let src = vec![0, 0, 0, 0, 40, 0, 0, 0, 200, 0, 0, 0];
         let (dst, w, h) = downsample_2x2(&src, 3, 1);
         assert_eq!((w, h), (1, 1));
-        assert_eq!(dst[0], 20); // (0 + 40) / 2
+        assert_eq!(dst[0], 26);
     }
 }
