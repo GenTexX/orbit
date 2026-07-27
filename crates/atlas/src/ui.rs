@@ -1498,7 +1498,7 @@ fn list_project_files(dir: &Path) -> Vec<String> {
 }
 
 /// Render a reflected [`Value`] as editable text.
-fn value_to_text(value: &Value) -> String {
+pub fn value_to_text(value: &Value) -> String {
     match value {
         Value::F32(x) => x.to_string(),
         Value::Bool(b) => b.to_string(),
@@ -1591,6 +1591,55 @@ mod tests {
         let mut registry: slotmap::SlotMap<ImageHandle, ()> = slotmap::SlotMap::with_key();
         let handle = registry.insert(());
         (scene, handle)
+    }
+
+    #[test]
+    fn live_inspector_updates_do_not_relayout_the_shell() {
+        // The viewport-drag fps regression: updating the inspector's transform
+        // inputs each frame (a field buried deep under the dock) re-measured
+        // thousands of nodes per frame. A single-line field's box is
+        // text-independent, so these updates must now cost zero re-measures.
+        let (scene, handle) = demo_scene();
+        let sprite = scene.children(scene.root())[0];
+        let dir = std::env::temp_dir();
+        let dock = DockNode::default_layout();
+        let mut set = HashSet::new();
+        set.insert(sprite);
+        let (mut ui, rows) = build_editor_ui(
+            &scene,
+            &set,
+            Some(sprite),
+            handle,
+            &dir,
+            &dock,
+            &HashMap::new(),
+            None,
+            GizmoMode::Select,
+            None,
+            &TreeView::default(),
+            "",
+            None,
+            &InspectorView::default(),
+            &EditorTheme::default(),
+        );
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        assert_eq!(ui.last_measure_count(), 0, "cached when nothing changed");
+
+        // Some inspector fields actually exist to drive.
+        assert!(!rows.vec_inputs.is_empty());
+        for &(w, ..) in &rows.vec_inputs {
+            ui.set_text_input(w, "123.4");
+        }
+        for &(w, ..) in &rows.transform_rows {
+            ui.set_text_input(w, "45.6");
+        }
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        assert_eq!(
+            ui.last_measure_count(),
+            0,
+            "live inspector updates must not re-measure the tree"
+        );
     }
 
     #[test]

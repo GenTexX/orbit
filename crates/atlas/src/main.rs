@@ -39,9 +39,10 @@ use crate::icons::Icons;
 use crate::textures::TextureCache;
 use crate::ui::{
     Axis, ColorPickerView, ColorTarget, ContextMenu, DropSpot, EditorRows, EditorTheme, FieldRef,
-    InspectorSection, InspectorView, MenuAction, TreeView, build_color_picker, build_editor_ui,
-    capture_dock_scrolls, capture_dock_sizes, field_color, field_vec2, parse_value, resolve_drop,
-    set_field_color, set_field_vec2, visible_nodes, with_axis,
+    InspectorSection, InspectorView, MenuAction, TreeView, axis_of, build_color_picker,
+    build_editor_ui, capture_dock_scrolls, capture_dock_sizes, field_color, field_vec2,
+    parse_value, resolve_drop, set_field_color, set_field_vec2, value_to_text, visible_nodes,
+    with_axis,
 };
 use crate::viewport::{Drag, EditorCamera, GizmoHit, GizmoMode};
 
@@ -260,6 +261,14 @@ struct State {
     fps_since: std::time::Instant,
     /// The fps figure currently shown in the status bar.
     last_fps: f32,
+    /// Per-frame profiling (set by the ORBIT_FRAME_LOG env var): logs a timing
+    /// breakdown for any frame slower than a threshold. `pointer_events` and
+    /// `pointer_time` accumulate the cost of the pointer-move events handled
+    /// since the last frame (they run before draw, so draw timing alone misses
+    /// them - the suspect during a drag's event flood).
+    frame_log: bool,
+    pointer_events: u32,
+    pointer_time: std::time::Duration,
     /// The cursor icon currently applied to the window (set only on change).
     applied_cursor: aurora::CursorHint,
     /// The open right-click context menu, if any (Aurora popup layer).
@@ -517,6 +526,9 @@ impl State {
             frames: 0,
             fps_since: std::time::Instant::now(),
             last_fps: 0.0,
+            frame_log: std::env::var_os("ORBIT_FRAME_LOG").is_some(),
+            pointer_events: 0,
+            pointer_time: std::time::Duration::ZERO,
             applied_cursor: aurora::CursorHint::Default,
             context_menu: None,
             gizmo_mode: GizmoMode::default(),
@@ -565,6 +577,7 @@ impl State {
     /// Route a pointer move: Aurora always sees it; a live pan or drag applies
     /// its delta too.
     fn pointer_moved(&mut self, p: Vec2) {
+        let timer = self.frame_log.then(std::time::Instant::now);
         let delta = p - self.cursor;
         self.cursor = p;
         self.ui.handle_input(InputEvent::PointerMoved(p));
@@ -587,8 +600,62 @@ impl State {
             let (node, _) = drag.target();
             let new = drag.apply(&self.project.scene, world);
             self.project.scene.node_mut(node).transform = new;
-            // Rebuild so the inspector's transform rows read out live.
-            self.dirty = true;
+            // The scene and gizmo re-render from the live transform every frame
+            // anyway; update just the inspector's transform fields in place so
+            // they read out live WITHOUT rebuilding the whole shell each move (a
+            // full rebuild per pointer event dropped the drag to ~30 fps).
+            self.sync_inspector_transform(node);
+        }
+        if let Some(timer) = timer {
+            self.pointer_time += timer.elapsed();
+            self.pointer_events += 1;
+        }
+    }
+
+    /// Write `node`'s current transform into the inspector's position, rotation,
+    /// and scale inputs in place (no shell rebuild) - used during a viewport drag
+    /// so the readout tracks the drag without a per-move rebuild.
+    fn sync_inspector_transform(&mut self, node: NodeId) {
+        let scene = &self.project.scene;
+        let mut updates: Vec<(aurora::WidgetId, String)> = self
+            .rows
+            .vec_inputs
+            .iter()
+            .filter(|&&(_, field, _)| {
+                matches!(field, FieldRef::Position(n) | FieldRef::Scale(n) if n == node)
+            })
+            .map(|&(widget, field, axis)| {
+                let value = axis_of(field_vec2(scene, field), axis);
+                (widget, value_to_text(&Value::F32(value)))
+            })
+            .collect();
+        let rotation = scene.node(node).transform.rotation.to_degrees();
+        updates.extend(
+            self.rows
+                .transform_rows
+                .iter()
+                .filter(|&&(_, n, field)| n == node && field == "rotation")
+                .map(|&(widget, ..)| (widget, value_to_text(&Value::F32(rotation)))),
+        );
+        for (widget, text) in updates {
+            self.ui.set_text_input(widget, text);
+        }
+    }
+
+    /// Update one Vec2 field component's inspector input in place (no rebuild) -
+    /// used during an inspector label drag-scrub, the same way a viewport drag
+    /// updates the transform inputs.
+    fn sync_vec_input(&mut self, field: FieldRef, axis: Axis) {
+        let value = axis_of(field_vec2(&self.project.scene, field), axis);
+        let text = value_to_text(&Value::F32(value));
+        let widget = self
+            .rows
+            .vec_inputs
+            .iter()
+            .find(|&&(_, f, a)| f == field && a == axis)
+            .map(|&(w, ..)| w);
+        if let Some(widget) = widget {
+            self.ui.set_text_input(widget, text);
         }
     }
 
@@ -1057,7 +1124,9 @@ impl State {
         let base = crate::ui::axis_of(scrub.original, scrub.axis);
         let value = with_axis(scrub.original, scrub.axis, base + delta);
         set_field_vec2(&mut self.project.scene, scrub.field, value);
-        self.dirty = true;
+        // Update the scrubbed input in place rather than rebuilding every move
+        // (the scene re-renders live regardless); see sync_inspector_transform.
+        self.sync_vec_input(scrub.field, scrub.axis);
     }
 
     /// Finish a scrub: rewind to the press-time value and commit the final one
@@ -1846,9 +1915,12 @@ impl State {
 
     fn draw(&mut self) -> Result<()> {
         profiling::scope!("editor_frame");
+        let fstart = std::time::Instant::now();
         self.poll_settings();
         self.react();
         self.sync_tree_filter();
+        let t_react = fstart.elapsed();
+        let mut phase = std::time::Instant::now();
         // Whether this frame rebuilds the shell. The insertion-line overlay is
         // added post-layout onto the popup layer, so it only exists on frames
         // that (re)build - on still frames the previous frame's line persists
@@ -1921,6 +1993,8 @@ impl State {
                 self.refocus_filter = false;
             }
         }
+        let t_rebuild = phase.elapsed();
+        phase = std::time::Instant::now();
 
         self.apply_cursor();
         self.update_status_bar();
@@ -1966,6 +2040,9 @@ impl State {
                 .update_image(self.viewport_handle, self.scene_target.view());
         }
 
+        let t_mid = phase.elapsed();
+        phase = std::time::Instant::now();
+
         profiling::scope!("scene_render");
         let clear = PhotonColor::new(0.02, 0.02, 0.05, 1.0);
         let camera = self.camera.camera(Vec2::new(w as f32, h as f32));
@@ -2008,6 +2085,9 @@ impl State {
                 .overlay_to_target(&self.scene_target, &camera, &self.white, &overlay);
         }
 
+        let t_scene = phase.elapsed();
+        phase = std::time::Instant::now();
+
         let mut list = self.ui.draw_list();
         // A live drop-zone preview while a dock tab is being dragged: a
         // translucent fill over the half (or whole, for a tab merge) of the
@@ -2029,8 +2109,35 @@ impl State {
             self.ui.font_system_mut(),
             aurora::Color::rgb(0.08, 0.08, 0.10),
         )?;
+        let t_gui = phase.elapsed();
 
         self.report_fps();
+        // Frame profiling (ORBIT_FRAME_LOG): log a breakdown for any slow frame.
+        // `pointer` is the time (and count) spent handling pointer-move events
+        // since the last frame - they run before draw, so a drag's event flood
+        // shows up here, not in the draw phases.
+        if self.frame_log {
+            let total = fstart.elapsed();
+            let slow = total.as_secs_f32() > 0.008 || self.pointer_time.as_secs_f32() > 0.008;
+            if slow {
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+                tracing::warn!(
+                    "draw {:.2}ms [react {:.2} rebuild {:.2}(={}) mid {:.2} scene {:.2} gui {:.2}] | pointer {}x = {:.2}ms | measures {}",
+                    ms(total),
+                    ms(t_react),
+                    ms(t_rebuild),
+                    rebuilt,
+                    ms(t_mid),
+                    ms(t_scene),
+                    ms(t_gui),
+                    self.pointer_events,
+                    ms(self.pointer_time),
+                    self.ui.last_measure_count(),
+                );
+            }
+            self.pointer_events = 0;
+            self.pointer_time = std::time::Duration::ZERO;
+        }
         // Mark the frame boundary for the profiler (a no-op when profiling off).
         profiling::finish_frame!();
         Ok(())
