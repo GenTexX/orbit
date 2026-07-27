@@ -2,10 +2,16 @@
 //! white-on-transparent bitmaps once at startup, registered as Aurora images.
 //!
 //! Each icon is a boolean coverage predicate in a normalized `[0, 1]` square
-//! (union of simple shapes - capsules, triangles, polygons, arcs, rects). The
-//! rasterizer supersamples it into an alpha mask; the RGB is white, so the
-//! image pipeline's tint can recolor it later. No new GPU pipeline, no bundled
-//! font or art assets - the "custom Aurora icon" path from the ideatank.
+//! (union of simple shapes - capsules, triangles, polygons, discs, rects, and
+//! stroked circular arcs). The rasterizer supersamples it into an alpha mask;
+//! the RGB is white, so the image pipeline's tint can recolor it later. No new
+//! GPU pipeline, no bundled font or art assets - the "custom Aurora icon" path
+//! from the ideatank.
+//!
+//! Curved marks (the eye, the rotate/refresh arrows, the magnet) are built from
+//! [`arc_stroke`] - a wrap-safe stroked arc that can be centered anywhere - and
+//! [`arc_arrow`], which caps an arc with a tangent-aligned head. That is what
+//! keeps the round icons smooth rather than faceted.
 //!
 //! # Adding an icon
 //!
@@ -209,30 +215,21 @@ fn poly(x: f32, y: f32, pts: &[(f32, f32)]) -> bool {
     inside
 }
 
-/// A ring segment: within the annulus `[rin, rout]` and within the angle span
-/// `[a0, a1]` (radians, measured with atan2, y-down so angles grow clockwise).
-fn arc(x: f32, y: f32, rin: f32, rout: f32, a0: f32, a1: f32) -> bool {
-    let (dx, dy) = (x - 0.5, y - 0.5);
-    let d = dx.hypot(dy);
-    if d < rin || d > rout {
-        return false;
-    }
-    let mut a = dy.atan2(dx);
-    if a < 0.0 {
-        a += std::f32::consts::TAU;
-    }
-    a >= a0 && a <= a1
-}
-
 /// A rectangle `[x0, x1] x [y0, y1]`.
 fn rect(x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> bool {
     (x0..=x1).contains(&x) && (y0..=y1).contains(&y)
 }
 
-/// A filled disc of radius `r` centered at `c` (unlike [`arc`], it can sit
-/// anywhere in the square, so interior symbols on a page icon can be placed).
+/// A filled disc of radius `r` centered at `c`.
 fn disc(x: f32, y: f32, c: (f32, f32), r: f32) -> bool {
     (x - c.0).hypot(y - c.1) <= r
+}
+
+/// A filled annulus about `c`: the ring between radii `rin` and `rout` (a disc
+/// with a hole - e.g. a gear body or the eye's iris).
+fn annulus(x: f32, y: f32, c: (f32, f32), rin: f32, rout: f32) -> bool {
+    let d = (x - c.0).hypot(y - c.1);
+    (rin..=rout).contains(&d)
 }
 
 /// A thin rectangular outline (four capsule edges of width `w`): the "page" the
@@ -242,6 +239,49 @@ fn frame(x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32, w: f32) -> bool {
         || line(x, y, (x0, y1), (x1, y1), w)
         || line(x, y, (x0, y0), (x0, y1), w)
         || line(x, y, (x1, y0), (x1, y1), w)
+}
+
+/// The outline of a simple polygon (each edge a capsule of width `w`), used for
+/// crisp line-art silhouettes like the floppy-disk body.
+fn outline(x: f32, y: f32, pts: &[(f32, f32)], w: f32) -> bool {
+    pts.iter()
+        .zip(pts.iter().cycle().skip(1))
+        .take(pts.len())
+        .any(|(&a, &b)| line(x, y, a, b, w))
+}
+
+/// The point on the circle of radius `r` about `c` at angle `a` (radians, y-down
+/// so `0` is +x, `PI/2` is down, `-PI/2` is up).
+fn on_circle(c: (f32, f32), r: f32, a: f32) -> (f32, f32) {
+    (c.0 + r * a.cos(), c.1 + r * a.sin())
+}
+
+/// A stroked circular arc: within `w/2` of the circle of radius `r` about `c`,
+/// and within the clockwise angular sweep of `sweep` radians starting at `start`
+/// (y-down, so increasing angle turns clockwise). Wrap-safe - the sweep may
+/// cross the atan2 seam - and, unlike a center-fixed helper, it can sit anywhere,
+/// which is what the eye lids and the round arrows need.
+fn arc_stroke(x: f32, y: f32, c: (f32, f32), r: f32, start: f32, sweep: f32, w: f32) -> bool {
+    let (dx, dy) = (x - c.0, y - c.1);
+    if (dx.hypot(dy) - r).abs() > w * 0.5 {
+        return false;
+    }
+    (dy.atan2(dx) - start).rem_euclid(std::f32::consts::TAU) <= sweep
+}
+
+/// An arrowhead capping a circular arc at angle `a` on the circle of radius `r`
+/// about `c`, pointing along the arc's tangent (clockwise if `cw`), `len` long
+/// (its base half as wide again). Turns an [`arc_stroke`] into a rotate/refresh
+/// arrow with the head exactly on the ring.
+fn arc_arrow(x: f32, y: f32, c: (f32, f32), r: f32, a: f32, cw: bool, len: f32) -> bool {
+    let tip = on_circle(c, r, a);
+    // The clockwise tangent (increasing angle) is (-sin, cos); reverse for ccw.
+    let dir = if cw {
+        (-a.sin(), a.cos())
+    } else {
+        (a.sin(), -a.cos())
+    };
+    arrowhead(x, y, tip, dir, len, len * 0.7)
 }
 
 /// A sharp arrowhead: a triangle with its `tip` pointing along `dir` (any
@@ -272,11 +312,26 @@ fn icon_add(x: f32, y: f32) -> bool {
     line(x, y, (0.5, 0.18), (0.5, 0.82), 0.13) || line(x, y, (0.2, 0.5), (0.8, 0.5), 0.13)
 }
 
-/// A down arrow onto a baseline (save/export to disk).
+/// A floppy disk (save): a beveled-corner body outline, the top shutter, and a
+/// label panel - the universal save mark, and clearly not a download arrow.
 fn icon_save(x: f32, y: f32) -> bool {
-    line(x, y, (0.5, 0.14), (0.5, 0.5), STROKE)
-        || arrowhead(x, y, (0.5, 0.66), (0.0, 1.0), 0.22, 0.14)
-        || line(x, y, (0.22, 0.84), (0.78, 0.84), STROKE)
+    const BODY: [(f32, f32); 5] = [
+        (0.18, 0.17),
+        (0.65, 0.17),
+        (0.83, 0.35),
+        (0.83, 0.83),
+        (0.18, 0.83),
+    ];
+    // Body outline.
+    if outline(x, y, &BODY, 0.06) {
+        return true;
+    }
+    // The metal shutter at the top (a solid block, offset toward the bevel).
+    if rect(x, y, 0.5, 0.17, 0.68, 0.37) {
+        return true;
+    }
+    // The write-protect label: an outlined panel filling the lower half.
+    frame(x, y, 0.31, 0.52, 0.7, 0.78, 0.05)
 }
 
 /// A folder (open/load): a body rectangle with a tab.
@@ -298,23 +353,33 @@ fn icon_select(x: f32, y: f32) -> bool {
     poly(x, y, &PTS)
 }
 
-/// Four thin arrows radiating from the center (move), sharp heads at the edges.
+/// Four arrows radiating from the center (move), with bold heads at the edges.
 fn icon_move(x: f32, y: f32) -> bool {
-    line(x, y, (0.5, 0.2), (0.5, 0.8), STROKE)
-        || line(x, y, (0.2, 0.5), (0.8, 0.5), STROKE)
-        || arrowhead(x, y, (0.5, 0.09), (0.0, -1.0), 0.16, 0.11)
-        || arrowhead(x, y, (0.5, 0.91), (0.0, 1.0), 0.16, 0.11)
-        || arrowhead(x, y, (0.09, 0.5), (-1.0, 0.0), 0.16, 0.11)
-        || arrowhead(x, y, (0.91, 0.5), (1.0, 0.0), 0.16, 0.11)
+    line(x, y, (0.5, 0.24), (0.5, 0.76), STROKE)
+        || line(x, y, (0.24, 0.5), (0.76, 0.5), STROKE)
+        || arrowhead(x, y, (0.5, 0.08), (0.0, -1.0), 0.21, 0.15)
+        || arrowhead(x, y, (0.5, 0.92), (0.0, 1.0), 0.21, 0.15)
+        || arrowhead(x, y, (0.08, 0.5), (-1.0, 0.0), 0.21, 0.15)
+        || arrowhead(x, y, (0.92, 0.5), (1.0, 0.0), 0.21, 0.15)
 }
 
-/// A circular arrow (rotate): a thin ~290-degree ring with a sharp arrowhead
-/// on the upper end, pointing along the ring's tangent (clockwise).
+/// A circular arrow (rotate): a nearly closed (~90%) ring with a bold head on
+/// the top end, pointing along the ring's clockwise tangent.
 fn icon_rotate(x: f32, y: f32) -> bool {
-    use std::f32::consts::PI;
-    // Ring open at the top; the upper end sits near (0.40, 0.20).
-    arc(x, y, 0.28, 0.35, 0.1 * PI, 1.4 * PI)
-        || arrowhead(x, y, (0.52, 0.16), (0.95, -0.31), 0.17, 0.1)
+    use std::f32::consts::{PI, TAU};
+    let c = (0.5, 0.5);
+    let r = 0.3;
+    let gap = 0.1 * TAU; // ~36-degree opening at the top
+    let start = -PI / 2.0 + gap; // just clockwise of the top
+    let sweep = TAU - gap; // ~90% of the circle
+    arc_stroke(x, y, c, r, start, sweep, 0.08) || arc_arrow(x, y, c, r, start + sweep, true, 0.2)
+}
+
+/// A diagonal double-headed arrow (scale/resize), thin with bold heads.
+fn icon_scale(x: f32, y: f32) -> bool {
+    line(x, y, (0.28, 0.72), (0.72, 0.28), STROKE)
+        || arrowhead(x, y, (0.15, 0.85), (-1.0, 1.0), 0.26, 0.17)
+        || arrowhead(x, y, (0.85, 0.15), (1.0, -1.0), 0.26, 0.17)
 }
 
 /// A solid triangle pointing right (a collapsed tree node).
@@ -327,32 +392,26 @@ fn icon_chevron_down(x: f32, y: f32) -> bool {
     tri(x, y, (0.16, 0.3), (0.84, 0.3), (0.5, 0.78))
 }
 
-/// An open eye: an almond lid outline with a filled pupil (a visible node).
+/// An open eye: a smooth almond (two circular-arc lids meeting at the corners)
+/// with a filled pupil - a visible node's toggle.
 fn icon_eye(x: f32, y: f32) -> bool {
-    // The lid, as a closed outline of thin segments around an almond.
-    const LID: [(f32, f32); 8] = [
-        (0.11, 0.5),
-        (0.3, 0.33),
-        (0.5, 0.28),
-        (0.7, 0.33),
-        (0.89, 0.5),
-        (0.7, 0.67),
-        (0.5, 0.72),
-        (0.3, 0.67),
-    ];
-    // Each lid point joined to the next (wrapping) by a thin segment.
-    for (&a, &b) in LID.iter().zip(LID.iter().cycle().skip(1)) {
-        if line(x, y, a, b, 0.06) {
-            return true;
-        }
-    }
-    // The pupil: a filled disc at the center (arc with a zero inner radius).
-    arc(x, y, 0.0, 0.14, 0.0, std::f32::consts::TAU)
+    let w = 0.06;
+    // The lids are arcs of two equal circles centered below and above the eye,
+    // so each bows past the y=0.5 midline; clipping to a half keeps just the
+    // near lid. They meet exactly at the corners (0.12, 0.5) and (0.88, 0.5).
+    let top = ring_band(x, y, (0.5, 0.79), 0.478, w) && y <= 0.5;
+    let bottom = ring_band(x, y, (0.5, 0.21), 0.478, w) && y >= 0.5;
+    top || bottom || disc(x, y, (0.5, 0.5), 0.12)
 }
 
 /// A struck-through eye (a hidden node): the eye plus a diagonal slash.
 fn icon_eye_off(x: f32, y: f32) -> bool {
-    icon_eye(x, y) || line(x, y, (0.16, 0.16), (0.84, 0.84), 0.075)
+    icon_eye(x, y) || line(x, y, (0.16, 0.18), (0.84, 0.82), 0.075)
+}
+
+/// A thin circular outline: within `w/2` of the circle of radius `r` about `c`.
+fn ring_band(x: f32, y: f32, c: (f32, f32), r: f32, w: f32) -> bool {
+    ((x - c.0).hypot(y - c.1) - r).abs() <= w * 0.5
 }
 
 /// A 3x3 grid of lines (the viewport grid toggle).
@@ -367,25 +426,29 @@ fn icon_grid(x: f32, y: f32) -> bool {
 /// Two arrows from a shared origin (up and right): the world X/Y axes.
 fn icon_axes(x: f32, y: f32) -> bool {
     let o = (0.18, 0.82);
-    line(x, y, o, (0.18, 0.16), STROKE)
-        || line(x, y, o, (0.84, 0.82), STROKE)
-        || arrowhead(x, y, (0.18, 0.08), (0.0, -1.0), 0.18, 0.1)
-        || arrowhead(x, y, (0.92, 0.82), (1.0, 0.0), 0.18, 0.1)
+    line(x, y, o, (0.18, 0.18), STROKE)
+        || line(x, y, o, (0.82, 0.82), STROKE)
+        || arrowhead(x, y, (0.18, 0.07), (0.0, -1.0), 0.2, 0.14)
+        || arrowhead(x, y, (0.93, 0.82), (1.0, 0.0), 0.2, 0.14)
 }
 
-/// A horseshoe magnet (the snapping toggle): two legs joined at the bottom.
+/// A horseshoe magnet (the snapping toggle): a thick U opening downward, its two
+/// pole faces squared off at the bottom.
 fn icon_snap(x: f32, y: f32) -> bool {
-    let w = 0.17;
-    line(x, y, (0.28, 0.24), (0.28, 0.62), w)
-        || line(x, y, (0.72, 0.24), (0.72, 0.62), w)
-        || line(x, y, (0.28, 0.6), (0.72, 0.6), w)
-}
-
-/// A diagonal double-headed arrow (scale/resize), thin with sharp heads.
-fn icon_scale(x: f32, y: f32) -> bool {
-    line(x, y, (0.26, 0.74), (0.74, 0.26), STROKE)
-        || arrowhead(x, y, (0.16, 0.84), (-1.0, 1.0), 0.22, 0.12)
-        || arrowhead(x, y, (0.84, 0.16), (1.0, -1.0), 0.22, 0.12)
+    use std::f32::consts::PI;
+    let c = (0.5, 0.46);
+    let r = 0.26; // mid-radius of the band
+    let t = 0.17; // band thickness
+    let foot = 0.8; // y of the pole faces
+    // The curved back: the upper semicircle, from left (PI) clockwise over the
+    // top to right (TAU).
+    arc_stroke(x, y, c, r, PI, PI, t)
+        // The two legs down to the poles.
+        || rect(x, y, c.0 - r - t * 0.5, c.1, c.0 - r + t * 0.5, foot)
+        || rect(x, y, c.0 + r - t * 0.5, c.1, c.0 + r + t * 0.5, foot)
+        // Squared pole faces (a touch wider) so it reads as a magnet, not a U.
+        || rect(x, y, c.0 - r - t * 0.6, foot, c.0 - r + t * 0.6, foot + 0.09)
+        || rect(x, y, c.0 + r - t * 0.6, foot, c.0 + r + t * 0.6, foot + 0.09)
 }
 
 /// A closed folder: a back tab and the front body (a filled silhouette).
@@ -393,14 +456,17 @@ fn icon_folder(x: f32, y: f32) -> bool {
     rect(x, y, 0.12, 0.24, 0.46, 0.34) || rect(x, y, 0.12, 0.30, 0.88, 0.78)
 }
 
-/// An open folder: the back panel plus a front flap swept open (a trapezoid),
-/// so the selected directory reads differently from the closed ones.
+/// An open folder (the selected directory): an upright back panel with a tab,
+/// and a front cover fanned open toward the viewer - a trapezoid narrow where it
+/// meets the back and wide at its base, so the "mouth" reads apart from the flat
+/// closed folders.
 fn icon_folder_open(x: f32, y: f32) -> bool {
-    // Back tab + a shallow back wall.
-    rect(x, y, 0.12, 0.22, 0.46, 0.32)
-        || rect(x, y, 0.12, 0.28, 0.88, 0.5)
-        // The open front, a trapezoid leaning down-right.
-        || poly(x, y, &[(0.14, 0.5), (0.98, 0.5), (0.82, 0.8), (0.02, 0.8)])
+    // Tab + upright back panel (its top edge shows above the fanned front).
+    rect(x, y, 0.1, 0.2, 0.4, 0.3)
+        || rect(x, y, 0.1, 0.28, 0.8, 0.46)
+        // The open front: narrow at the top (on the back panel), fanning wider
+        // toward the base - a folder tipped open toward you.
+        || poly(x, y, &[(0.24, 0.46), (0.9, 0.46), (0.98, 0.8), (0.04, 0.8)])
 }
 
 /// The document "page" the file icons share: a thin rounded-rectangle outline.
@@ -432,14 +498,21 @@ fn icon_file_generic(x: f32, y: f32) -> bool {
         || line(x, y, (0.34, 0.68), (0.58, 0.68), 0.05)
 }
 
-/// A circular refresh arrow: two opposing arcs, each arrowhead-capped, so it
-/// reads as "reload" and not the rotate tool.
+/// A two-arrow circular refresh mark: two opposing arcs, each capped with a
+/// tangent head, with the openings top and bottom - reads as "reload", not the
+/// single-arrow rotate tool.
 fn icon_refresh(x: f32, y: f32) -> bool {
-    use std::f32::consts::PI;
-    arc(x, y, 0.27, 0.34, 0.12 * PI, 0.82 * PI)
-        || arc(x, y, 0.27, 0.34, 1.12 * PI, 1.82 * PI)
-        || arrowhead(x, y, (0.19, 0.38), (0.7, -0.9), 0.16, 0.1)
-        || arrowhead(x, y, (0.81, 0.62), (-0.7, 0.9), 0.16, 0.1)
+    use std::f32::consts::{PI, TAU};
+    let c = (0.5, 0.5);
+    let r = 0.3;
+    let w = 0.075;
+    let gap = 0.14 * TAU; // matching openings at top and bottom
+    let start = -PI / 2.0 + gap * 0.5; // just clockwise of the top
+    let sweep = PI - gap; // each arc spans a little under a half-turn
+    arc_stroke(x, y, c, r, start, sweep, w)
+        || arc_stroke(x, y, c, r, start + PI, sweep, w)
+        || arc_arrow(x, y, c, r, start + sweep, true, 0.17)
+        || arc_arrow(x, y, c, r, start + PI + sweep, true, 0.17)
 }
 
 /// Three stacked rows, each a leading dot and a line (the compact list view).
@@ -459,21 +532,32 @@ fn icon_close(x: f32, y: f32) -> bool {
     line(x, y, (0.26, 0.26), (0.74, 0.74), 0.1) || line(x, y, (0.74, 0.26), (0.26, 0.74), 0.1)
 }
 
-/// A gear / cog (opens settings): a ring body with radial teeth and a hollow
-/// hub, so it reads as a cog and not a plain circle.
+/// A gear / cog (opens settings): a solid ring body (a hub hole in the middle)
+/// with eight blocky trapezoidal teeth around the rim - a cog, not a wheel of
+/// thin spokes.
 fn icon_settings(x: f32, y: f32) -> bool {
     use std::f32::consts::TAU;
-    // The ring body (annulus - the hole in the middle is the hub).
-    if arc(x, y, 0.17, 0.31, 0.0, TAU) {
+    let c = (0.5, 0.5);
+    let body = 0.29; // outer radius of the ring body
+    let tip = 0.44; // radius the teeth reach
+    let hub = 0.13; // the center hole
+    // The body: a filled ring with a hub hole.
+    if annulus(x, y, c, hub, body) {
         return true;
     }
-    // Eight teeth radiating from the outer edge.
-    for k in 0..8 {
-        let a = k as f32 / 8.0 * TAU;
-        let (dx, dy) = (a.cos(), a.sin());
-        let inner = (0.5 + dx * 0.29, 0.5 + dy * 0.29);
-        let outer = (0.5 + dx * 0.43, 0.5 + dy * 0.43);
-        if line(x, y, inner, outer, 0.12) {
+    // Eight trapezoidal teeth, narrower at the tip than the base.
+    const TEETH: usize = 8;
+    let base_hw = 0.19; // base half-angle
+    let tip_hw = 0.11; // tip half-angle
+    for k in 0..TEETH {
+        let a = (k as f32 + 0.5) / TEETH as f32 * TAU;
+        let quad = [
+            on_circle(c, body - 0.02, a - base_hw),
+            on_circle(c, tip, a - tip_hw),
+            on_circle(c, tip, a + tip_hw),
+            on_circle(c, body - 0.02, a + base_hw),
+        ];
+        if poly(x, y, &quad) {
             return true;
         }
     }
@@ -499,34 +583,87 @@ mod tests {
         }
     }
 
-    /// Render every icon into one PNG (white on a dark strip, scaled up) so a
-    /// new or tweaked icon can be eyeballed. Ignored by default; run with
+    /// Box-downsample a 64px icon mask to `n`x`n` (its alpha channel only), so
+    /// the preview can show how an icon reads at toolbar size.
+    fn downsample_alpha(mask: &[u8], n: usize) -> Vec<u8> {
+        let mut small = vec![0u8; n * n];
+        let step = SIZE / n;
+        for sy in 0..n {
+            for sx in 0..n {
+                let mut sum = 0u32;
+                for dy in 0..step {
+                    for dx in 0..step {
+                        let px = sx * step + dx;
+                        let py = sy * step + dy;
+                        sum += mask[(py * SIZE + px) * 4 + 3] as u32;
+                    }
+                }
+                small[sy * n + sx] = (sum / (step * step) as u32) as u8;
+            }
+        }
+        small
+    }
+
+    /// Render every icon into one PNG so a new or tweaked icon can be eyeballed:
+    /// a grid (in [`SPECS`] order) of each icon at a large scale, and beside it
+    /// the same icon downsampled to toolbar size, both white on a dark tile.
+    /// Ignored by default; run with
     /// `cargo test -p atlas icons::tests::write_preview -- --ignored --nocapture`
     /// then open the printed path.
     #[test]
     #[ignore = "writes a preview PNG; run with --ignored to regenerate"]
     fn write_preview() {
-        const SCALE: usize = 3;
-        let cols = SPECS.len();
-        let (w, h) = (cols * SIZE * SCALE, SIZE * SCALE);
-        let mut img = image::RgbImage::from_pixel(w as u32, h as u32, image::Rgb([40, 42, 52]));
-        for (col, &(_, predicate)) in SPECS.iter().enumerate() {
+        const COLS: usize = 6;
+        const BIG: usize = 96; // large sample, per icon
+        const SMALL: usize = 22; // toolbar-size sample
+        const PAD: usize = 10;
+        const CELL_W: usize = BIG + SMALL + PAD * 3;
+        const CELL_H: usize = BIG + PAD * 2;
+        let rows = SPECS.len().div_ceil(COLS);
+        let (w, h) = (COLS * CELL_W, rows * CELL_H);
+        let bg = image::Rgb([32, 34, 44]);
+        let tile = image::Rgb([44, 47, 60]);
+        let mut img = image::RgbImage::from_pixel(w as u32, h as u32, bg);
+
+        for (idx, &(_, predicate)) in SPECS.iter().enumerate() {
             let mask = rasterize(predicate);
-            for py in 0..SIZE {
-                for px in 0..SIZE {
-                    let a = mask[(py * SIZE + px) * 4 + 3] as u32;
-                    let mix = |bg: u32| ((bg * (255 - a) + 255 * a) / 255) as u8;
-                    let color = image::Rgb([mix(40), mix(42), mix(52)]);
-                    for yy in 0..SCALE {
-                        for xx in 0..SCALE {
-                            let x = (col * SIZE + px) * SCALE + xx;
-                            let y = py * SCALE + yy;
-                            img.put_pixel(x as u32, y as u32, color);
-                        }
+            let (col, row) = (idx % COLS, idx / COLS);
+            let (cx, cy) = (col * CELL_W, row * CELL_H);
+            let blit = |img: &mut image::RgbImage,
+                        ox: usize,
+                        oy: usize,
+                        side: usize,
+                        alpha: &dyn Fn(usize, usize) -> u32| {
+                for yy in 0..side {
+                    for xx in 0..side {
+                        let a = alpha(xx, yy);
+                        // Composite white (the icon) over the tile by coverage.
+                        let c = |ch: usize| ((tile[ch] as u32 * (255 - a) + 255 * a) / 255) as u8;
+                        img.put_pixel(
+                            (ox + xx) as u32,
+                            (oy + yy) as u32,
+                            image::Rgb([c(0), c(1), c(2)]),
+                        );
                     }
                 }
-            }
+            };
+            // Large sample: nearest-upscale the 64px anti-aliased mask.
+            let big_x = cx + PAD;
+            let big_y = cy + PAD;
+            blit(&mut img, big_x, big_y, BIG, &|xx, yy| {
+                let sx = xx * SIZE / BIG;
+                let sy = yy * SIZE / BIG;
+                mask[(sy * SIZE + sx) * 4 + 3] as u32
+            });
+            // Small sample: a real box-downsample to toolbar size, top-aligned.
+            let small = downsample_alpha(&mask, SMALL);
+            let small_x = cx + PAD * 2 + BIG;
+            let small_y = cy + PAD;
+            blit(&mut img, small_x, small_y, SMALL, &|xx, yy| {
+                small[yy * SMALL + xx] as u32
+            });
         }
+
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/icons_preview.png");
         img.save(path).expect("write preview");
         println!("icon preview written to {path}");
