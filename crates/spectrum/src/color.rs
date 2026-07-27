@@ -1,7 +1,6 @@
-//! atlas color: HSV/RGB/hex conversions and the gradient bitmaps the color
-//! picker draws (an SV square, a hue bar, an alpha bar), each with its current
-//! marker baked in. Pure and headless; the picker's GPU side is just uploading
-//! these RGBA buffers as images.
+//! HSV/RGB/hex color math and the gradient bitmaps a color picker draws (an SV
+//! square, a hue bar, an alpha bar), each with its current marker baked in.
+//! Pure and headless; the picker uploads these RGBA buffers as images.
 
 /// A color in HSVA, each component in `0.0..=1.0` (hue wraps).
 #[derive(Debug, Clone, Copy, PartialEq)]

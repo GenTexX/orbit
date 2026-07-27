@@ -5,7 +5,6 @@
 //! across panels and inspector edits committed through the undo history.
 
 mod actions;
-mod color;
 mod console;
 mod dock;
 mod editor_state;
@@ -40,7 +39,6 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use crate::color::Hsva;
 use crate::dock::{DockNode, DropZone, Pane};
 use crate::icons::Icons;
 use crate::modal::ModalAction;
@@ -53,6 +51,7 @@ use crate::ui::{
     value_to_text, visible_nodes, with_axis,
 };
 use crate::viewport::{Drag, EditorCamera, GizmoHit, GizmoMode};
+use spectrum::color::{self, Hsva};
 
 /// The color picker's gradient image sizes (px): the SV square, the hue bar
 /// width, and the alpha bar height. Must match the widget sizes in
@@ -618,7 +617,7 @@ impl State {
         // written with defaults on first run - see the `settings` module.
         let settings = settings::load();
         let theme_doc = settings.theme;
-        let theme = theme_doc.resolve();
+        let theme = theme::resolve(&theme_doc);
         // Per-project view state (dock layout, camera, tool, scroll, collapsed
         // tree nodes) comes from <project>/.orbit/editor.ron if present; an
         // absent or invalid file just yields the defaults.
@@ -1020,7 +1019,7 @@ impl State {
             && loaded.theme != self.theme_doc
         {
             self.theme_doc = loaded.theme;
-            self.theme = self.theme_doc.resolve();
+            self.theme = theme::resolve(&self.theme_doc);
             self.dirty = true;
             tracing::info!("reloaded theme from settings");
         }

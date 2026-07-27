@@ -10,18 +10,15 @@
 //!
 //! Run atlas once first so the file exists, then `cargo run -p prism`.
 
-mod color;
-mod model;
-mod tokens;
-
 use std::sync::Arc;
 use std::time::Instant;
 
 use aurora::{Color, Event, ImageHandle, InputEvent, Key, Rect, Style, Theme, Ui, WidgetId};
 use aurora_wgpu::Renderer;
-use color::Hsva;
 use glam::Vec2;
-use model::{Bind, ThemeDoc, Value};
+use spectrum::color::{self, Hsva};
+use spectrum::settings;
+use spectrum::theme::{self, Bind, Kind, ThemeDoc, Value};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, WindowEvent},
@@ -152,7 +149,7 @@ impl ApplicationHandler for App {
             SV as u32,
             ALPHA_H as u32,
         );
-        let doc = model::read().unwrap_or_default().theme;
+        let doc = settings::read().unwrap_or_default().theme;
         let mut state = State {
             window,
             renderer,
@@ -580,9 +577,9 @@ impl State {
         if !self.save_pending {
             return;
         }
-        let mut settings = model::read().unwrap_or_default();
-        settings.theme = self.doc.clone();
-        if let Err(err) = model::save(&settings) {
+        let mut file = settings::read().unwrap_or_default();
+        file.theme = self.doc.clone();
+        if let Err(err) = settings::save(&file) {
             tracing::warn!("could not save theme: {err}");
         }
         self.save_pending = false;
@@ -608,17 +605,17 @@ fn text_of(ui: &Ui, id: WidgetId) -> String {
 /// A literal for `token` of its declared kind, keeping `resolved` when it already
 /// matches (so a scalar token's literal is always a scalar, never a color).
 fn literal_for(token: &str, resolved: Option<Value>) -> Value {
-    match (tokens::kind_of(token), resolved) {
-        (tokens::Kind::Scalar, Some(v @ Value::Scalar(_))) => v,
-        (tokens::Kind::Color, Some(v @ Value::Color(..))) => v,
-        (tokens::Kind::Scalar, _) => Value::Scalar(4.0),
-        (tokens::Kind::Color, _) => Value::Color(0.5, 0.5, 0.5, 1.0),
+    match (theme::kind_of(token), resolved) {
+        (Kind::Scalar, Some(v @ Value::Scalar(_))) => v,
+        (Kind::Color, Some(v @ Value::Color(..))) => v,
+        (Kind::Scalar, _) => Value::Scalar(4.0),
+        (Kind::Color, _) => Value::Color(0.5, 0.5, 0.5, 1.0),
     }
 }
 
 /// The display group a token belongs to (unknown tokens go under "Other").
 fn group_of(token: &str) -> &'static str {
-    tokens::spec(token).map(|s| s.group).unwrap_or("Other")
+    theme::spec(token).map(|s| s.group).unwrap_or("Other")
 }
 
 fn translate_key(event: &winit::event::KeyEvent, ctrl: bool) -> Vec<InputEvent> {
@@ -692,7 +689,7 @@ fn build_ui(doc: &ThemeDoc) -> (Ui, Rows) {
     section(&mut ui, scroll, "Tokens");
     // Group tokens by their registry group (in a fixed order), with any unknown
     // token under "Other".
-    let groups = tokens::GROUPS
+    let groups = theme::GROUPS
         .iter()
         .copied()
         .chain(std::iter::once("Other"));
@@ -817,7 +814,7 @@ fn build_token(
             .background(CARD)
             .corner_radius(4.0),
     );
-    if let Some(spec) = tokens::spec(name) {
+    if let Some(spec) = theme::spec(name) {
         rows.token_rows.push((row, spec.doc));
     }
     ui.label(
@@ -827,7 +824,7 @@ fn build_token(
     );
 
     let is_var = matches!(bind, Bind::Var(_));
-    let is_color = tokens::kind_of(name) == tokens::Kind::Color;
+    let is_color = theme::kind_of(name) == Kind::Color;
     // A leading preview keyed on the token's KIND (not the bind), so a scalar
     // token never shows a color swatch: color tokens get a swatch (a button when
     // it is an editable literal), scalar tokens get their resolved number.

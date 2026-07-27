@@ -9,7 +9,6 @@ use aurora::{Color, ImageHandle, Orientation, Style, Theme, Ui, WidgetId};
 use glam::Vec2;
 use helios::{NodeId, Scene, Value};
 
-use crate::color;
 use crate::console::LogLine;
 use crate::dock::{DockNode, Fixed, Pane, SplitDir};
 use crate::explorer::{
@@ -19,6 +18,7 @@ use crate::icons::{Icon, Icons};
 use crate::modal::{Modal, ModalAction, ModalBody, SettingField, SettingsDraft};
 use crate::thumbnails::Thumbnails;
 use crate::viewport::GizmoMode;
+use spectrum::color;
 
 /// The newest console lines the pane builds a widget for (the ring stores more
 /// for scrollback; older lines are summarized with a count).

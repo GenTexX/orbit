@@ -1,0 +1,13 @@
+[package]
+name = "spectrum"
+version.workspace = true
+edition.workspace = true
+
+# spectrum: the editor's theme + settings model, shared by atlas (which resolves
+# it into concrete colors) and prism (which edits it). Pure data + color math;
+# no GUI dependency, so colors are plain f32 tuples the consumers convert.
+
+[dependencies]
+ron = "0.12.2"
+serde = { version = "1.0.229", features = ["derive"] }
+tracing = "0.1.44"
