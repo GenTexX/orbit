@@ -4,19 +4,21 @@
 //! variables and the tokens that reference them. Every edit is written straight
 //! back to the file, and a running atlas hot-reloads it, so colors change live.
 //!
-//! Variables are edited with RGBA sliders (drag to recolor); scalar variables
-//! and token literals use numeric fields. A token can be bound to a variable
-//! (type its name) or hold a literal, toggled per token.
+//! Click a color swatch to open a color picker (SV square + hue + alpha + hex);
+//! scalar variables and token literals use numeric fields; a token can be bound
+//! to a variable (type its name) or hold a literal, toggled per token.
 //!
 //! Run atlas once first so the file exists, then `cargo run -p prism`.
 
+mod color;
 mod model;
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use aurora::{Color, Event, InputEvent, Key, Style, Theme, Ui, WidgetId};
+use aurora::{Color, Event, ImageHandle, InputEvent, Key, Rect, Style, Theme, Ui, WidgetId};
 use aurora_wgpu::Renderer;
+use color::Hsva;
 use glam::Vec2;
 use model::{Bind, ThemeDoc, Value};
 use winit::{
@@ -26,6 +28,12 @@ use winit::{
     keyboard::{Key as WinitKey, ModifiersState, NamedKey},
     window::{Window, WindowId},
 };
+
+/// Color-picker gradient sizes (px): the SV square side, the hue bar width, the
+/// alpha bar height. The hue bar is SV tall; the alpha bar is SV wide.
+const SV: usize = 176;
+const HUE_W: usize = 16;
+const ALPHA_H: usize = 16;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -52,14 +60,28 @@ enum Target {
     Token(String),
 }
 
+/// An open color picker editing one target.
+struct Picker {
+    target: Target,
+    hsva: Hsva,
+    anchor: Vec2,
+    drag: Option<Region>,
+}
+
+/// Which picker gradient a press/drag is on.
+#[derive(Clone, Copy, PartialEq)]
+enum Region {
+    Sv,
+    Hue,
+    Alpha,
+}
+
 /// Widget handles the app maps events back to after building the tree.
 #[derive(Default)]
 struct Rows {
-    /// A color channel slider: (widget, which value, channel 0..=3).
-    channels: Vec<(WidgetId, Target, usize)>,
-    /// A live swatch to recolor as its value changes: (widget, which value).
+    /// A color swatch button (click to open the picker) and its live fill.
     swatches: Vec<(WidgetId, Target)>,
-    /// A scalar numeric field: (widget, which value).
+    /// A scalar numeric field.
     scalars: Vec<(WidgetId, Target)>,
     /// A token's variable-name field: (widget, token name).
     var_names: Vec<(WidgetId, String)>,
@@ -67,12 +89,16 @@ struct Rows {
     toggles: Vec<(WidgetId, String)>,
     /// A remove-variable button: (widget, variable name).
     removes: Vec<(WidgetId, String)>,
-    /// The new-variable name field, and the two "add" buttons.
     new_name: Option<WidgetId>,
     add_color: Option<WidgetId>,
     add_scalar: Option<WidgetId>,
-    /// The scroll panel (its offset is preserved across rebuilds).
     scroll: Option<WidgetId>,
+    /// Picker sub-widgets (present only while the picker is open).
+    pk_sv: Option<WidgetId>,
+    pk_hue: Option<WidgetId>,
+    pk_alpha: Option<WidgetId>,
+    pk_hex: Option<WidgetId>,
+    pk_done: Option<WidgetId>,
 }
 
 struct State {
@@ -80,13 +106,17 @@ struct State {
     renderer: Renderer,
     ui: Ui,
     rows: Rows,
-    /// The theme being edited.
     doc: ThemeDoc,
+    picker: Option<Picker>,
+    /// The picker's gradient images (registered once, updated in place).
+    img_sv: ImageHandle,
+    img_hue: ImageHandle,
+    img_alpha: ImageHandle,
+    cursor: Vec2,
     modifiers: ModifiersState,
-    /// Set when the doc changed; a throttled save flushes it to disk.
     save_pending: bool,
     last_save: Instant,
-    /// Set when the tree must be rebuilt (structure changed).
+    /// Set when the tree must be rebuilt (structure changed / picker opened).
     dirty: bool,
 }
 
@@ -101,20 +131,41 @@ impl ApplicationHandler for App {
                 .unwrap(),
         );
         let size = window.inner_size();
-        let renderer = Renderer::new(window.clone(), (size.width, size.height)).expect("renderer");
+        let mut renderer =
+            Renderer::new(window.clone(), (size.width, size.height)).expect("renderer");
+        // Register the picker's three gradient images once; they are updated in
+        // place as the picker's color changes.
+        let img_sv = renderer.register_image_rgba(
+            &color::sv_square(0.0, SV, 0.0, 0.0),
+            SV as u32,
+            SV as u32,
+        );
+        let img_hue =
+            renderer.register_image_rgba(&color::hue_bar(HUE_W, SV, 0.0), HUE_W as u32, SV as u32);
+        let img_alpha = renderer.register_image_rgba(
+            &color::alpha_bar([0.0, 0.0, 0.0], SV, ALPHA_H, 1.0),
+            SV as u32,
+            ALPHA_H as u32,
+        );
         let doc = model::read().unwrap_or_default().theme;
-        let (ui, rows) = build_ui(&doc);
-        self.state = Some(State {
+        let mut state = State {
             window,
             renderer,
-            ui,
-            rows,
+            ui: Ui::new(),
+            rows: Rows::default(),
             doc,
+            picker: None,
+            img_sv,
+            img_hue,
+            img_alpha,
+            cursor: Vec2::ZERO,
             modifiers: ModifiersState::default(),
             save_pending: false,
             last_save: Instant::now(),
             dirty: false,
-        });
+        };
+        state.rebuild();
+        self.state = Some(state);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -128,10 +179,13 @@ impl ApplicationHandler for App {
                 state.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                state.ui.handle_input(InputEvent::PointerMoved(Vec2::new(
-                    position.x as f32,
-                    position.y as f32,
-                )));
+                state.cursor = Vec2::new(position.x as f32, position.y as f32);
+                state
+                    .ui
+                    .handle_input(InputEvent::PointerMoved(state.cursor));
+                if state.picker.as_ref().is_some_and(|p| p.drag.is_some()) {
+                    state.drag_picker();
+                }
                 state.window.request_redraw();
             }
             WindowEvent::CursorLeft { .. } => {
@@ -151,14 +205,19 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                let ev = match btn {
-                    ElementState::Pressed => InputEvent::PointerPressed,
-                    ElementState::Released => InputEvent::PointerReleased,
-                };
-                state.ui.handle_input(ev);
-                // A release flushes any pending save immediately (the drag ended).
-                if btn == ElementState::Released {
-                    state.flush_save();
+                match btn {
+                    ElementState::Pressed => {
+                        state.ui.handle_input(InputEvent::PointerPressed);
+                        // A press on a gradient starts (and applies) a drag.
+                        state.press_picker();
+                    }
+                    ElementState::Released => {
+                        if let Some(p) = state.picker.as_mut() {
+                            p.drag = None;
+                        }
+                        state.ui.handle_input(InputEvent::PointerReleased);
+                        state.flush_save();
+                    }
                 }
                 state.window.request_redraw();
             }
@@ -180,15 +239,12 @@ impl ApplicationHandler for App {
                         .scroll
                         .map(|s| state.ui.scroll_offset(s))
                         .unwrap_or(0.0);
-                    let (ui, rows) = build_ui(&state.doc);
-                    state.ui = ui;
-                    state.rows = rows;
+                    state.rebuild();
                     if let Some(s) = state.rows.scroll {
                         state.ui.set_scroll_offset(s, scroll);
                     }
                     state.dirty = false;
                 }
-                // Throttled save so a slider drag does not thrash the disk.
                 if state.save_pending && state.last_save.elapsed().as_millis() >= 120 {
                     state.flush_save();
                 }
@@ -212,11 +268,25 @@ impl ApplicationHandler for App {
 }
 
 impl State {
-    /// Drain this frame's events and apply them to the doc.
+    /// Rebuild the widget tree from the doc, adding the picker popup on top when
+    /// one is open.
+    fn rebuild(&mut self) {
+        let (mut ui, mut rows) = build_ui(&self.doc);
+        if let Some(picker) = &self.picker {
+            build_picker(
+                &mut ui,
+                picker,
+                [self.img_sv, self.img_hue, self.img_alpha],
+                &mut rows,
+            );
+        }
+        self.ui = ui;
+        self.rows = rows;
+    }
+
     fn react(&mut self) {
         for event in self.ui.drain_events() {
             match event {
-                Event::SliderChanged { id, value } => self.slider_changed(id, value),
                 Event::Submitted(id) => self.submitted(id),
                 Event::Clicked(id) => self.clicked(id),
                 _ => {}
@@ -224,27 +294,18 @@ impl State {
         }
     }
 
-    /// A color-channel slider moved: update the value in place (no rebuild) and
-    /// recolor its swatch live.
-    fn slider_changed(&mut self, id: WidgetId, value: f32) {
-        let Some((_, target, ch)) = self.rows.channels.iter().find(|(w, ..)| *w == id).cloned()
-        else {
-            return;
-        };
-        if let Some(Value::Color(r, g, b, a)) = self.value_mut(&target) {
-            let mut c = [*r, *g, *b, *a];
-            c[ch] = value;
-            (*r, *g, *b, *a) = (c[0], c[1], c[2], c[3]);
-            let color = Color::rgba(c[0], c[1], c[2], c[3]);
-            if let Some((sw, _)) = self.rows.swatches.iter().find(|(_, t)| *t == target) {
-                self.ui.set_background(*sw, color);
-            }
-            self.save_pending = true;
-        }
-    }
-
-    /// A numeric/text field committed.
     fn submitted(&mut self, id: WidgetId) {
+        // The picker's hex field.
+        if Some(id) == self.rows.pk_hex {
+            if let Some(rgba) = color::from_hex(&text_of(&self.ui, id)) {
+                let keep = self.picker.as_ref().map(|p| p.hsva.h).unwrap_or(0.0);
+                if let Some(p) = self.picker.as_mut() {
+                    p.hsva = Hsva::from_rgba(rgba, keep);
+                }
+                self.commit_color();
+            }
+            return;
+        }
         // A scalar value field.
         if let Some((_, target)) = self.rows.scalars.iter().find(|(w, _)| *w == id).cloned() {
             if let Ok(v) = text_of(&self.ui, id).trim().parse::<f32>() {
@@ -255,7 +316,7 @@ impl State {
             }
             return;
         }
-        // A token's variable-name field: rebind it (rebuild for the swatch).
+        // A token's variable-name field: rebind it.
         if let Some((_, token)) = self.rows.var_names.iter().find(|(w, _)| *w == id).cloned() {
             let name = text_of(&self.ui, id).trim().to_string();
             self.doc.tokens.insert(token, Bind::Var(name));
@@ -265,6 +326,34 @@ impl State {
     }
 
     fn clicked(&mut self, id: WidgetId) {
+        // Close the picker.
+        if Some(id) == self.rows.pk_done {
+            self.picker = None;
+            self.dirty = true;
+            return;
+        }
+        // Open the picker on a color swatch.
+        if let Some((sw, target)) = self.rows.swatches.iter().find(|(w, _)| *w == id).cloned() {
+            let rgba = match self.target_color(&target) {
+                Some(c) => c,
+                None => return,
+            };
+            let anchor = self
+                .ui
+                .rect(sw)
+                .map(|r| r.pos + Vec2::new(0.0, r.size.y + 4.0))
+                .unwrap_or(self.cursor);
+            let keep = self.picker.as_ref().map(|p| p.hsva.h).unwrap_or(0.0);
+            self.picker = Some(Picker {
+                target,
+                hsva: Hsva::from_rgba(rgba, keep),
+                anchor,
+                drag: None,
+            });
+            self.refresh_images();
+            self.dirty = true;
+            return;
+        }
         // Add a variable using the typed name.
         if Some(id) == self.rows.add_color || Some(id) == self.rows.add_scalar {
             let name = self
@@ -295,25 +384,19 @@ impl State {
         // Toggle a token between a variable reference and a literal.
         if let Some((_, token)) = self.rows.toggles.iter().find(|(w, _)| *w == id).cloned() {
             let next = match self.doc.tokens.get(&token) {
-                Some(Bind::Var(_)) | None => {
-                    // Become a literal of whatever it currently resolves to.
-                    let v = self
-                        .doc
+                Some(Bind::Var(_)) | None => Bind::Lit(
+                    self.doc
                         .resolved(&token)
-                        .unwrap_or(Value::Color(0.5, 0.5, 0.5, 1.0));
-                    Bind::Lit(v)
-                }
-                Some(Bind::Lit(_)) => {
-                    // Reference the first variable (or an empty name to fill in).
-                    let first = self
-                        .doc
+                        .unwrap_or(Value::Color(0.5, 0.5, 0.5, 1.0)),
+                ),
+                Some(Bind::Lit(_)) => Bind::Var(
+                    self.doc
                         .variables
                         .keys()
                         .next()
                         .cloned()
-                        .unwrap_or_default();
-                    Bind::Var(first)
-                }
+                        .unwrap_or_default(),
+                ),
             };
             self.doc.tokens.insert(token, next);
             self.save_pending = true;
@@ -321,8 +404,128 @@ impl State {
         }
     }
 
-    /// A mutable handle to the value a target points at (a variable's value, or a
-    /// token's literal).
+    /// A left press while the picker is open: if it landed on a gradient, start a
+    /// drag there and apply it.
+    fn press_picker(&mut self) {
+        let Some(region) = self
+            .picker
+            .as_ref()
+            .and_then(|_| self.region_at(self.cursor))
+        else {
+            return;
+        };
+        if let Some(p) = self.picker.as_mut() {
+            p.drag = Some(region);
+        }
+        self.drag_picker();
+    }
+
+    /// Apply the active gradient drag from the cursor.
+    fn drag_picker(&mut self) {
+        let Some(region) = self.picker.as_ref().and_then(|p| p.drag) else {
+            return;
+        };
+        let rect = match region {
+            Region::Sv => self.rows.pk_sv,
+            Region::Hue => self.rows.pk_hue,
+            Region::Alpha => self.rows.pk_alpha,
+        }
+        .and_then(|id| self.ui.rect(id));
+        let Some(rect) = rect else { return };
+        let fx = ((self.cursor.x - rect.pos.x) / rect.size.x).clamp(0.0, 1.0);
+        let fy = ((self.cursor.y - rect.pos.y) / rect.size.y).clamp(0.0, 1.0);
+        if let Some(p) = self.picker.as_mut() {
+            match region {
+                Region::Sv => {
+                    p.hsva.s = fx;
+                    p.hsva.v = 1.0 - fy;
+                }
+                Region::Hue => p.hsva.h = fy,
+                Region::Alpha => p.hsva.a = fx,
+            }
+        }
+        self.commit_color();
+    }
+
+    /// Which gradient rect (if any) `p` is over.
+    fn region_at(&self, p: Vec2) -> Option<Region> {
+        let hit = |id: Option<WidgetId>| {
+            id.and_then(|i| self.ui.rect(i))
+                .is_some_and(|r| within(r, p))
+        };
+        if hit(self.rows.pk_sv) {
+            Some(Region::Sv)
+        } else if hit(self.rows.pk_hue) {
+            Some(Region::Hue)
+        } else if hit(self.rows.pk_alpha) {
+            Some(Region::Alpha)
+        } else {
+            None
+        }
+    }
+
+    /// Write the picker's color to the doc, recolor its swatch, and refresh the
+    /// gradient images - all in place, no rebuild.
+    fn commit_color(&mut self) {
+        let Some((target, rgba)) = self
+            .picker
+            .as_ref()
+            .map(|p| (p.target.clone(), p.hsva.to_rgba()))
+        else {
+            return;
+        };
+        if let Some(slot) = self.value_mut(&target) {
+            *slot = Value::Color(rgba[0], rgba[1], rgba[2], rgba[3]);
+        }
+        if let Some((sw, _)) = self.rows.swatches.iter().find(|(_, t)| *t == target) {
+            self.ui
+                .set_background(*sw, Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3]));
+        }
+        self.refresh_images();
+        self.save_pending = true;
+    }
+
+    /// Regenerate the picker's gradient bitmaps for its current color.
+    fn refresh_images(&mut self) {
+        let Some(hsva) = self.picker.as_ref().map(|p| p.hsva) else {
+            return;
+        };
+        let [r, g, b, _] = hsva.to_rgba();
+        self.renderer.update_image_rgba(
+            self.img_sv,
+            &color::sv_square(hsva.h, SV, hsva.s, hsva.v),
+            SV as u32,
+            SV as u32,
+        );
+        self.renderer.update_image_rgba(
+            self.img_hue,
+            &color::hue_bar(HUE_W, SV, hsva.h),
+            HUE_W as u32,
+            SV as u32,
+        );
+        self.renderer.update_image_rgba(
+            self.img_alpha,
+            &color::alpha_bar([r, g, b], SV, ALPHA_H, hsva.a),
+            SV as u32,
+            ALPHA_H as u32,
+        );
+    }
+
+    /// The current RGBA of a target that holds a color.
+    fn target_color(&self, target: &Target) -> Option<[f32; 4]> {
+        let v = match target {
+            Target::Var(name) => self.doc.variables.get(name).copied(),
+            Target::Token(name) => match self.doc.tokens.get(name) {
+                Some(Bind::Lit(v)) => Some(*v),
+                _ => None,
+            },
+        };
+        match v {
+            Some(Value::Color(r, g, b, a)) => Some([r, g, b, a]),
+            _ => None,
+        }
+    }
+
     fn value_mut(&mut self, target: &Target) -> Option<&mut Value> {
         match target {
             Target::Var(name) => self.doc.variables.get_mut(name),
@@ -333,24 +536,30 @@ impl State {
         }
     }
 
-    /// Write the theme back to the shared settings file, re-reading first so
-    /// atlas's non-theme settings (grid/snap) are preserved.
+    /// Write the theme back, re-reading first so atlas's non-theme settings
+    /// (grid/snap) are preserved.
     fn flush_save(&mut self) {
         if !self.save_pending {
             return;
         }
         let mut settings = model::read().unwrap_or_default();
         settings.theme = self.doc.clone();
-        match model::save(&settings) {
-            Ok(()) => tracing::debug!("theme saved"),
-            Err(err) => tracing::warn!("could not save theme: {err}"),
+        if let Err(err) = model::save(&settings) {
+            tracing::warn!("could not save theme: {err}");
         }
         self.save_pending = false;
         self.last_save = Instant::now();
     }
 }
 
-/// A text input's current contents (empty for a non-input widget).
+/// Whether `rect` contains `p`.
+fn within(rect: Rect, p: Vec2) -> bool {
+    p.x >= rect.pos.x
+        && p.y >= rect.pos.y
+        && p.x <= rect.pos.x + rect.size.x
+        && p.y <= rect.pos.y + rect.size.y
+}
+
 fn text_of(ui: &Ui, id: WidgetId) -> String {
     match ui.kind(id) {
         aurora::WidgetKind::TextInput(s) => s.clone(),
@@ -420,13 +629,13 @@ fn build_ui(doc: &ThemeDoc) -> (Ui, Rows) {
         Style::new().foreground(DIM),
     );
 
-    section_header(&mut ui, scroll, "Variables");
+    section(&mut ui, scroll, "Variables");
     build_add_variable(&mut ui, scroll, &mut rows);
     for (name, value) in &doc.variables {
         build_variable(&mut ui, scroll, name, *value, &mut rows);
     }
 
-    section_header(&mut ui, scroll, "Tokens");
+    section(&mut ui, scroll, "Tokens");
     for (name, bind) in &doc.tokens {
         build_token(&mut ui, scroll, name, bind, doc, &mut rows);
     }
@@ -434,7 +643,7 @@ fn build_ui(doc: &ThemeDoc) -> (Ui, Rows) {
     (ui, rows)
 }
 
-fn section_header(ui: &mut Ui, parent: WidgetId, title: &str) {
+fn section(ui: &mut Ui, parent: WidgetId, title: &str) {
     ui.label(
         parent,
         title.to_string(),
@@ -445,81 +654,54 @@ fn section_header(ui: &mut Ui, parent: WidgetId, title: &str) {
     );
 }
 
-/// The "add variable" row: a name field and Color/Scalar buttons.
 fn build_add_variable(ui: &mut Ui, parent: WidgetId, rows: &mut Rows) {
     let row = ui.panel(parent, Style::new().row().gap(6.0).align_center());
     ui.label(row, "New:", Style::new().foreground(DIM).width(40.0));
     let name = ui.text_input(
         row,
         String::new(),
-        Style::new()
-            .grow(1.0)
-            .padding(4.0)
-            .background(FIELD)
-            .foreground(TEXT)
-            .corner_radius(4.0)
-            .placeholder("variable name"),
+        value_field().grow(1.0).placeholder("variable name"),
     );
     rows.new_name = Some(name);
     rows.add_color = Some(ui.button(row, "+ Color", small_button()));
     rows.add_scalar = Some(ui.button(row, "+ Scalar", small_button()));
 }
 
-/// A variable: its name, an editor (RGBA sliders + swatch, or a scalar field),
-/// and a remove button.
 fn build_variable(ui: &mut Ui, parent: WidgetId, name: &str, value: Value, rows: &mut Rows) {
     let card = ui.panel(
         parent,
         Style::new()
-            .column()
-            .gap(5.0)
+            .row()
+            .align_center()
+            .gap(8.0)
             .padding(8.0)
             .background(CARD)
             .corner_radius(5.0),
     );
-    let head = ui.panel(card, Style::new().row().align_center().gap(6.0));
     ui.label(
-        head,
+        card,
         name.to_string(),
-        Style::new().grow(1.0).foreground(TEXT),
+        Style::new().width(120.0).foreground(TEXT),
     );
-    let remove = ui.button(head, "x", small_button());
-    rows.removes.push((remove, name.to_string()));
-
-    let target = Target::Var(name.to_string());
     match value {
         Value::Color(r, g, b, a) => {
-            let body = ui.panel(card, Style::new().row().gap(8.0).align_center());
-            let sw = ui.panel(
-                body,
-                Style::new()
-                    .size(40.0, 40.0)
-                    .background(Color::rgba(r, g, b, a))
-                    .corner_radius(4.0),
+            let sw = swatch_button(ui, card, Color::rgba(r, g, b, a), 26.0);
+            rows.swatches.push((sw, Target::Var(name.to_string())));
+            ui.label(
+                card,
+                color::to_hex([r, g, b, a]),
+                Style::new().grow(1.0).foreground(DIM),
             );
-            rows.swatches.push((sw, target.clone()));
-            let cols = ui.panel(body, Style::new().column().grow(1.0).gap(3.0));
-            for (ch, (chan_name, v)) in [("R", r), ("G", g), ("B", b), ("A", a)]
-                .into_iter()
-                .enumerate()
-            {
-                let line = ui.panel(cols, Style::new().row().align_center().gap(6.0));
-                ui.label(line, chan_name, Style::new().width(14.0).foreground(DIM));
-                let slider = ui.slider(line, v, 0.0, 1.0, Style::new().grow(1.0).height(16.0));
-                rows.channels.push((slider, target.clone(), ch));
-            }
         }
         Value::Scalar(s) => {
-            let body = ui.panel(card, Style::new().row().align_center().gap(6.0));
-            ui.label(body, "Value", Style::new().width(48.0).foreground(DIM));
-            let field = ui.numeric_input(body, format!("{s}"), value_field());
-            rows.scalars.push((field, target));
+            let field = ui.numeric_input(card, format!("{s}"), value_field().grow(1.0));
+            rows.scalars.push((field, Target::Var(name.to_string())));
         }
     }
+    let remove = ui.button(card, "x", small_button());
+    rows.removes.push((remove, name.to_string()));
 }
 
-/// A token: its name, a swatch of its resolved value, a Var/Lit toggle, and the
-/// bind editor (a variable-name field, or a literal editor).
 fn build_token(
     ui: &mut Ui,
     parent: WidgetId,
@@ -544,21 +726,28 @@ fn build_token(
         Style::new().width(130.0).foreground(TEXT),
     );
 
-    // A swatch of the resolved value (grey for a scalar or unresolved).
-    let resolved = doc.resolved(name);
-    let swatch_color = match resolved {
-        Some(Value::Color(r, g, b, a)) => Color::rgba(r, g, b, a),
-        _ => Color::rgb(0.25, 0.26, 0.30),
-    };
-    ui.panel(
-        row,
-        Style::new()
-            .size(20.0, 20.0)
-            .background(swatch_color)
-            .corner_radius(3.0),
-    );
-
     let is_var = matches!(bind, Bind::Var(_));
+    match bind {
+        Bind::Lit(Value::Color(r, g, b, a)) => {
+            let sw = swatch_button(ui, row, Color::rgba(*r, *g, *b, *a), 20.0);
+            rows.swatches.push((sw, Target::Token(name.to_string())));
+        }
+        _ => {
+            // A non-editable preview swatch of the resolved value (or grey).
+            let c = match doc.resolved(name) {
+                Some(Value::Color(r, g, b, a)) => Color::rgba(r, g, b, a),
+                _ => Color::rgb(0.25, 0.26, 0.30),
+            };
+            ui.panel(
+                row,
+                Style::new()
+                    .size(20.0, 20.0)
+                    .background(c)
+                    .corner_radius(3.0),
+            );
+        }
+    }
+
     let toggle = ui.button(row, if is_var { "var" } else { "lit" }, small_button());
     rows.toggles.push((toggle, name.to_string()));
 
@@ -567,7 +756,7 @@ fn build_token(
             let field = ui.text_input(
                 row,
                 var.clone(),
-                value_field().grow(1.0).placeholder("variable name"),
+                value_field().grow(1.0).placeholder("variable"),
             );
             rows.var_names.push((field, name.to_string()));
         }
@@ -576,23 +765,52 @@ fn build_token(
             rows.scalars.push((field, Target::Token(name.to_string())));
         }
         Bind::Lit(Value::Color(r, g, b, a)) => {
-            // A compact literal color editor: one RGBA slider stack inline.
-            let target = Target::Token(name.to_string());
-            let sw = ui.panel(
+            ui.label(
                 row,
-                Style::new()
-                    .size(20.0, 20.0)
-                    .background(Color::rgba(*r, *g, *b, *a))
-                    .corner_radius(3.0),
+                color::to_hex([*r, *g, *b, *a]),
+                Style::new().grow(1.0).foreground(DIM),
             );
-            rows.swatches.push((sw, target.clone()));
-            let cols = ui.panel(row, Style::new().column().grow(1.0).gap(2.0));
-            for (ch, v) in [*r, *g, *b, *a].into_iter().enumerate() {
-                let slider = ui.slider(cols, v, 0.0, 1.0, Style::new().grow(1.0).height(12.0));
-                rows.channels.push((slider, target.clone(), ch));
-            }
         }
     }
+}
+
+/// The floating color picker: SV square + hue bar + alpha bar + hex + Done.
+fn build_picker(ui: &mut Ui, picker: &Picker, imgs: [ImageHandle; 3], rows: &mut Rows) {
+    let [sv, hue, alpha] = imgs;
+    let pop = ui.popup(
+        picker.anchor,
+        Style::new()
+            .column()
+            .gap(6.0)
+            .padding(8.0)
+            .background(CARD)
+            .corner_radius(6.0)
+            .border(1.0, Color::rgb(0.28, 0.30, 0.36)),
+    );
+    let top = ui.panel(pop, Style::new().row().gap(6.0));
+    rows.pk_sv = Some(ui.image(top, sv, Style::new().size(SV as f32, SV as f32)));
+    rows.pk_hue = Some(ui.image(top, hue, Style::new().size(HUE_W as f32, SV as f32)));
+    rows.pk_alpha = Some(ui.image(pop, alpha, Style::new().size(SV as f32, ALPHA_H as f32)));
+    let bottom = ui.panel(pop, Style::new().row().gap(6.0).align_center());
+    let hex = ui.text_input(
+        bottom,
+        color::to_hex(picker.hsva.to_rgba()),
+        value_field().width(120.0),
+    );
+    rows.pk_hex = Some(hex);
+    rows.pk_done = Some(ui.button(bottom, "Done", small_button()));
+}
+
+fn swatch_button(ui: &mut Ui, parent: WidgetId, color: Color, size: f32) -> WidgetId {
+    ui.button(
+        parent,
+        "",
+        Style::new()
+            .size(size, size)
+            .background(color)
+            .corner_radius(4.0)
+            .border(1.0, Color::rgb(0.28, 0.30, 0.36)),
+    )
 }
 
 fn small_button() -> Style {
