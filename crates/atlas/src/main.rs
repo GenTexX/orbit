@@ -12,6 +12,7 @@ mod editor_state;
 mod explorer;
 mod file_ops;
 mod icons;
+mod modal;
 mod project;
 mod settings;
 mod textures;
@@ -41,13 +42,14 @@ use winit::{
 use crate::color::Hsva;
 use crate::dock::{DockNode, DropZone, Pane};
 use crate::icons::Icons;
+use crate::modal::ModalAction;
 use crate::textures::TextureCache;
 use crate::ui::{
     Axis, ColorPickerView, ColorTarget, ContextMenu, DropSpot, EditorRows, EditorTheme, FieldRef,
     InspectorSection, InspectorView, MenuAction, TreeView, axis_of, build_color_picker,
-    build_editor_ui, capture_dock_scrolls, capture_dock_sizes, field_color, field_vec2, grid_cols,
-    parse_value, resolve_drop, set_field_color, set_field_vec2, value_to_text, visible_nodes,
-    with_axis,
+    build_editor_ui, build_modal, capture_dock_scrolls, capture_dock_sizes, field_color,
+    field_vec2, grid_cols, parse_value, resolve_drop, set_field_color, set_field_vec2,
+    value_to_text, visible_nodes, with_axis,
 };
 use crate::viewport::{Drag, EditorCamera, GizmoHit, GizmoMode};
 
@@ -333,6 +335,10 @@ struct State {
     icons: Icons,
     /// The open color picker, if any.
     picker: Option<ColorPicker>,
+    /// The open modal dialog (error message or the settings overlay), if any.
+    /// While it is `Some`, a backdrop popup blocks all interaction with the
+    /// shell and the editor's keyboard shortcuts are suppressed.
+    modal: Option<modal::Modal>,
     /// The picker's three gradient images (registered once, updated in place as
     /// the color changes).
     picker_sv: ImageHandle,
@@ -427,6 +433,13 @@ impl ApplicationHandler for App {
                 ..
             } => match (button, btn_state) {
                 (MouseButton::Left, ElementState::Pressed) => {
+                    // A modal takes over: the backdrop already blocks the shell,
+                    // and this routes the press to the dialog (button/input) or
+                    // dismisses it on a backdrop click.
+                    if state.modal.is_some() {
+                        state.handle_modal_press();
+                        return;
+                    }
                     // While the button is held the tooltip logic is frozen (see
                     // update_file_tooltip): a rebuild here - even to hide a shown
                     // tooltip - would re-id the widgets and break a file drag.
@@ -473,12 +486,19 @@ impl ApplicationHandler for App {
                 }
                 (MouseButton::Right, ElementState::Pressed) => state.open_context_menu(),
                 (MouseButton::Middle, ElementState::Pressed) => {
-                    state.panning = state.over_viewport();
+                    // A modal takes over: no viewport pan behind it.
+                    state.panning = state.modal.is_none() && state.over_viewport();
                 }
                 (MouseButton::Middle, ElementState::Released) => state.panning = false,
                 _ => {}
             },
-            WindowEvent::MouseWheel { delta, .. } => state.wheel(delta),
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Explicitly no wheel scroll/zoom while a modal owns the screen
+                // (otherwise only the backdrop's hit-test incidentally blocks it).
+                if state.modal.is_none() {
+                    state.wheel(delta);
+                }
+            }
             WindowEvent::ModifiersChanged(m) => {
                 state.modifiers = m.state();
                 // Aurora needs shift to know whether movement keys extend a
@@ -486,6 +506,26 @@ impl ApplicationHandler for App {
                 state.ui.set_shift(m.state().shift_key());
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                // A modal takes over the keyboard: Escape closes it, Enter
+                // confirms its default action (when no field is focused), and
+                // every other key reaches only a focused modal input - the
+                // editor's own shortcuts are suppressed.
+                if state.modal.is_some() {
+                    if let WinitKey::Named(named) = &event.logical_key {
+                        if *named == NamedKey::Escape && state.modal_closable() {
+                            state.close_modal();
+                            return;
+                        }
+                        if *named == NamedKey::Enter && state.ui.focused().is_none() {
+                            state.confirm_modal_default();
+                            return;
+                        }
+                    }
+                    for ev in translate_key(&event, state.modifiers.control_key()) {
+                        state.ui.handle_input(ev);
+                    }
+                    return;
+                }
                 if !state.handle_shortcut(&event)
                     && !state.handle_editor_key(&event)
                     && !state.handle_mode_key(&event)
@@ -693,6 +733,7 @@ impl State {
             scrub: None,
             icons,
             picker: None,
+            modal: None,
             picker_sv,
             picker_hue,
             picker_alpha,
@@ -1019,6 +1060,10 @@ impl State {
     /// actions (and selects that node); over the viewport it offers "Add
     /// Sprite Here" at the cursor. Anywhere else it just closes any open menu.
     fn open_context_menu(&mut self) {
+        // A modal owns all input; no context menu behind it.
+        if self.modal.is_some() {
+            return;
+        }
         let hit = self.ui.hit_test(self.cursor);
         // A right-press also moves keyboard focus, like a left-press.
         self.explorer_focused = self.hit_in_explorer_pane(hit);
@@ -1160,9 +1205,10 @@ impl State {
     /// tooltip (a rebuild adds the popup post-layout). Hovering off hides it; an
     /// open menu suppresses it.
     fn update_file_tooltip(&mut self) {
-        // Frozen while a button is held: a tooltip change forces a rebuild, and
-        // rebuilding during a press/drag breaks the file drag (stale widget ids).
-        if self.pointer_down {
+        // Frozen while a button is held (a tooltip change forces a rebuild, and
+        // rebuilding during a press/drag breaks the file drag) or while a modal
+        // is up (it owns the screen).
+        if self.pointer_down || self.modal.is_some() {
             return;
         }
         let hovered = if self.context_menu.is_some() {
@@ -1261,6 +1307,89 @@ impl State {
         }
         self.context_menu = None;
         self.dirty = true;
+    }
+
+    // ---- modal dialogs ----
+
+    /// Open a modal. A modal is exclusive: any menu, picker, or tooltip is
+    /// dismissed so nothing lingers under the backdrop.
+    fn open_modal(&mut self, modal: modal::Modal) {
+        self.context_menu = None;
+        self.picker = None;
+        self.tooltip_target = None;
+        self.modal = Some(modal);
+        self.dirty = true;
+    }
+
+    /// Close the open modal (discarding any draft).
+    fn close_modal(&mut self) {
+        if self.modal.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Whether the open modal, if any, can be dismissed without a button.
+    fn modal_closable(&self) -> bool {
+        self.modal.as_ref().is_some_and(|m| m.closable)
+    }
+
+    /// Open the settings overlay, seeded from the current view toggles and snap.
+    fn open_settings_modal(&mut self) {
+        let draft = modal::SettingsDraft::new(self.show_grid, self.show_axes, self.snap);
+        self.open_modal(modal::Modal::settings(draft));
+    }
+
+    /// A press while a modal is open: focus a clicked input / arm a button, and
+    /// (for a closable modal) dismiss when the press lands on the backdrop rather
+    /// than the card. Replaces the shell's own press handling entirely.
+    fn handle_modal_press(&mut self) {
+        self.ui.handle_input(InputEvent::PointerPressed);
+        if !self.modal_closable() {
+            return;
+        }
+        let hit = self.ui.hit_test(self.cursor);
+        let in_card = self.rows.modal_card.is_some_and(|card| {
+            hit == Some(card) || hit.is_some_and(|h| self.ui.is_within(h, card))
+        });
+        if !in_card {
+            self.close_modal();
+        }
+    }
+
+    /// Run the default footer action (what Enter confirms).
+    fn confirm_modal_default(&mut self) {
+        if let Some(action) = self.modal.as_ref().map(|m| m.default_action()) {
+            self.run_modal_action(action);
+        }
+    }
+
+    /// Dispatch a clicked modal footer button.
+    fn run_modal_action(&mut self, action: ModalAction) {
+        match action {
+            ModalAction::Close => self.close_modal(),
+            ModalAction::SaveSettings => self.save_settings_from_modal(),
+        }
+    }
+
+    /// Apply and persist the settings draft, folding in each numeric input's live
+    /// text first (so an un-submitted edit is not lost), then close.
+    fn save_settings_from_modal(&mut self) {
+        let Some(mut draft) = self.modal.as_ref().and_then(modal::Modal::settings_draft) else {
+            self.close_modal();
+            return;
+        };
+        for (id, field) in self.rows.modal_inputs.clone() {
+            if let WidgetKind::TextInput(text) = self.ui.kind(id)
+                && let Ok(value) = text.trim().parse::<f32>()
+            {
+                draft.set_number(field, value);
+            }
+        }
+        self.show_grid = draft.show_grid;
+        self.show_axes = draft.show_axes;
+        self.snap = draft.snap();
+        self.persist_view_prefs();
+        self.close_modal();
     }
 
     /// The selection in scene order (root first), skipping the scene root (which
@@ -1749,6 +1878,9 @@ impl State {
 
     /// Open the color picker for `target`, seeded with its current color.
     fn open_color_picker(&mut self, target: ColorTarget) {
+        if self.modal.is_some() {
+            return;
+        }
         let original = field_color(&self.project.scene, target);
         self.picker = Some(ColorPicker {
             target,
@@ -2409,6 +2541,7 @@ impl State {
         let clip = self.file_clip.clone();
         let cut = self.file_clip_cut;
         let mut pasted = Vec::new();
+        let mut first_err = None;
         for src in &clip {
             let result = if cut {
                 file_ops::move_into(src, &dst)
@@ -2417,7 +2550,10 @@ impl State {
             };
             match result {
                 Ok(path) => pasted.push(path),
-                Err(err) => tracing::warn!("paste {} failed: {err}", src.display()),
+                Err(err) => {
+                    tracing::warn!("paste {} failed: {err}", src.display());
+                    first_err.get_or_insert(err);
+                }
             }
         }
         // Only clear a cut clipboard once something actually moved, so a fully
@@ -2427,6 +2563,9 @@ impl State {
             self.file_clip_cut = false;
         }
         self.after_file_change(&pasted);
+        if let Some(err) = first_err {
+            self.open_modal(modal::Modal::error("Paste failed", &err));
+        }
     }
 
     /// Move the selected entries to the project trash (recoverable).
@@ -2437,16 +2576,23 @@ impl State {
         }
         let root = self.project_dir.clone();
         let mut moved = 0;
+        let mut first_err = None;
         for path in &sel {
             match file_ops::delete_to_trash(&root, path) {
                 Ok(_) => moved += 1,
-                Err(err) => tracing::error!("delete {} failed: {err}", path.display()),
+                Err(err) => {
+                    tracing::error!("delete {} failed: {err}", path.display());
+                    first_err.get_or_insert(err);
+                }
             }
         }
         if moved > 0 {
             tracing::info!("moved {moved} item(s) to {}/.orbit/trash", root.display());
         }
         self.after_file_change(&[]);
+        if let Some(err) = first_err {
+            self.open_modal(modal::Modal::error("Delete failed", &err));
+        }
     }
 
     /// Duplicate the selected entries beside their originals.
@@ -2456,13 +2602,20 @@ impl State {
             return;
         }
         let mut dups = Vec::new();
+        let mut first_err = None;
         for path in &sel {
             match file_ops::duplicate(path) {
                 Ok(path) => dups.push(path),
-                Err(err) => tracing::warn!("duplicate {} failed: {err}", path.display()),
+                Err(err) => {
+                    tracing::warn!("duplicate {} failed: {err}", path.display());
+                    first_err.get_or_insert(err);
+                }
             }
         }
         self.after_file_change(&dups);
+        if let Some(err) = first_err {
+            self.open_modal(modal::Modal::error("Duplicate failed", &err));
+        }
     }
 
     /// Create a new folder in the target directory and start renaming it.
@@ -2474,7 +2627,10 @@ impl State {
                 self.explorer.select_one(&path);
                 self.start_file_rename(&path);
             }
-            Err(err) => tracing::error!("new folder failed: {err}"),
+            Err(err) => {
+                tracing::error!("new folder failed: {err}");
+                self.open_modal(modal::Modal::error("New folder failed", &err));
+            }
         }
         self.dirty = true;
     }
@@ -2495,7 +2651,10 @@ impl State {
                 self.thumbnails.invalidate(&mut self.gui);
                 self.explorer.select_one(&new_path);
             }
-            Err(err) => tracing::warn!("rename failed: {err}"),
+            Err(err) => {
+                tracing::warn!("rename failed: {err}");
+                self.open_modal(modal::Modal::error("Rename failed", &err));
+            }
         }
         self.dirty = true;
     }
@@ -2719,6 +2878,17 @@ impl State {
                 };
                 build_color_picker(&mut self.ui, &view, &self.theme, &mut self.rows);
             }
+            // The modal is the topmost popup: added last so its backdrop covers
+            // (and blocks) the shell and any picker beneath it.
+            if let Some(m) = &self.modal {
+                build_modal(
+                    &mut self.ui,
+                    m,
+                    Some(&self.icons),
+                    &self.theme,
+                    &mut self.rows,
+                );
+            }
             self.dirty = false;
             // The fresh Ui has no cursor, so its layout-time hover refresh would
             // find nothing hovered. Seed the cursor so hover (and clicking the
@@ -2931,6 +3101,9 @@ impl State {
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.save => self.save_project(),
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.load => self.load_project(),
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.settings_button => {
+                    self.open_settings_modal();
+                }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.grid => {
                     self.show_grid = !self.show_grid;
                     self.dirty = true;
@@ -3033,6 +3206,36 @@ impl State {
                         .expect("guarded by the match arm");
                     self.run_menu_action(action);
                 }
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.modal_close => self.close_modal(),
+                AuroraEvent::Clicked(id)
+                    if self.rows.modal_buttons.iter().any(|(w, _)| *w == id) =>
+                {
+                    let action = self
+                        .rows
+                        .modal_buttons
+                        .iter()
+                        .find(|(w, _)| *w == id)
+                        .map(|(_, a)| *a)
+                        .expect("guarded by the match arm");
+                    self.run_modal_action(action);
+                }
+                AuroraEvent::Toggled { id, checked }
+                    if self.rows.modal_checks.iter().any(|(w, _)| *w == id) =>
+                {
+                    let field = self
+                        .rows
+                        .modal_checks
+                        .iter()
+                        .find(|(w, _)| *w == id)
+                        .map(|(_, f)| *f)
+                        .expect("guarded by the match arm");
+                    if let Some(draft) = self.modal.as_mut().and_then(|m| m.settings_draft_mut()) {
+                        draft.set_checked(field, checked);
+                    }
+                    // No rebuild: Aurora flips the checkbox's own visual state,
+                    // and a rebuild here would re-render the numeric inputs from
+                    // the draft, discarding any number the user was mid-typing.
+                }
                 AuroraEvent::Clicked(id)
                     if self.rows.color_swatches.iter().any(|(w, _)| *w == id) =>
                 {
@@ -3115,6 +3318,17 @@ impl State {
                         if let WidgetKind::TextInput(text) = self.ui.kind(id) {
                             let text = text.clone();
                             self.commit_file_rename(&path, text);
+                        }
+                        continue;
+                    }
+                    if let Some(&(_, field)) = self.rows.modal_inputs.iter().find(|(w, _)| *w == id)
+                    {
+                        if let WidgetKind::TextInput(text) = self.ui.kind(id)
+                            && let Ok(value) = text.trim().parse::<f32>()
+                            && let Some(draft) =
+                                self.modal.as_mut().and_then(|m| m.settings_draft_mut())
+                        {
+                            draft.set_number(field, value);
                         }
                         continue;
                     }

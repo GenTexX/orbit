@@ -74,6 +74,10 @@ pub enum Icon {
     ViewList,
     /// A 2x2 of squares (the explorer's grid/preview view).
     ViewGrid,
+    /// An X (a modal's close button).
+    Close,
+    /// A gear/cog (opens the settings dialog).
+    Settings,
 }
 
 /// An icon's coverage predicate over the normalized `[0, 1]` square.
@@ -104,6 +108,8 @@ const SPECS: &[(Icon, Predicate)] = &[
     (Icon::Refresh, icon_refresh),
     (Icon::ViewList, icon_view_list),
     (Icon::ViewGrid, icon_view_grid),
+    (Icon::Close, icon_close),
+    (Icon::Settings, icon_settings),
 ];
 
 /// The registered icon images, looked up by [`Icon`].
@@ -446,6 +452,32 @@ fn icon_view_list(x: f32, y: f32) -> bool {
 fn icon_view_grid(x: f32, y: f32) -> bool {
     let cell = |x0: f32, y0: f32| rect(x, y, x0, y0, x0 + 0.28, y0 + 0.28);
     cell(0.16, 0.16) || cell(0.56, 0.16) || cell(0.16, 0.56) || cell(0.56, 0.56)
+}
+
+/// An X (a modal's close button).
+fn icon_close(x: f32, y: f32) -> bool {
+    line(x, y, (0.26, 0.26), (0.74, 0.74), 0.1) || line(x, y, (0.74, 0.26), (0.26, 0.74), 0.1)
+}
+
+/// A gear / cog (opens settings): a ring body with radial teeth and a hollow
+/// hub, so it reads as a cog and not a plain circle.
+fn icon_settings(x: f32, y: f32) -> bool {
+    use std::f32::consts::TAU;
+    // The ring body (annulus - the hole in the middle is the hub).
+    if arc(x, y, 0.17, 0.31, 0.0, TAU) {
+        return true;
+    }
+    // Eight teeth radiating from the outer edge.
+    for k in 0..8 {
+        let a = k as f32 / 8.0 * TAU;
+        let (dx, dy) = (a.cos(), a.sin());
+        let inner = (0.5 + dx * 0.29, 0.5 + dy * 0.29);
+        let outer = (0.5 + dx * 0.43, 0.5 + dy * 0.43);
+        if line(x, y, inner, outer, 0.12) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

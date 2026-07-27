@@ -14,6 +14,7 @@ use crate::console::LogLine;
 use crate::dock::{DockNode, Fixed, Pane, SplitDir};
 use crate::explorer::{Entry, FileExplorer, FileKind, FileView, TreeRow, can_thumbnail, classify};
 use crate::icons::{Icon, Icons};
+use crate::modal::{Modal, ModalAction, ModalBody, SettingField, SettingsDraft};
 use crate::thumbnails::Thumbnails;
 use crate::viewport::GizmoMode;
 
@@ -53,10 +54,18 @@ pub struct EditorTheme {
     /// written before it existed still load.
     #[serde(default = "default_console_warn")]
     pub console_warn: Color,
+    /// The translucent backdrop dimming the editor behind a modal dialog. A
+    /// serde default so settings files written before it existed still load.
+    #[serde(default = "default_scrim")]
+    pub scrim: Color,
 }
 
 fn default_console_warn() -> Color {
     Color::rgb(0.85, 0.72, 0.30)
+}
+
+fn default_scrim() -> Color {
+    Color::rgba(0.0, 0.0, 0.0, 0.5)
 }
 
 impl EditorTheme {
@@ -77,6 +86,7 @@ impl EditorTheme {
             axis_x: Color::rgb(0.90, 0.32, 0.32),
             axis_y: Color::rgb(0.35, 0.70, 0.38),
             console_warn: default_console_warn(),
+            scrim: default_scrim(),
         }
     }
 
@@ -99,6 +109,7 @@ impl EditorTheme {
             axis_x: Color::rgb(0.85, 0.30, 0.30),
             axis_y: Color::rgb(0.28, 0.62, 0.34),
             console_warn: Color::rgb(0.72, 0.55, 0.10),
+            scrim: Color::rgba(0.05, 0.05, 0.08, 0.45),
         }
     }
 }
@@ -367,6 +378,8 @@ pub struct EditorRows {
     pub grid: Option<WidgetId>,
     pub axes: Option<WidgetId>,
     pub snap: Option<WidgetId>,
+    /// The toolbar's settings gear (opens the settings modal).
+    pub settings_button: Option<WidgetId>,
     /// The toolbar's gizmo-mode buttons, each mapped to the mode it selects.
     pub mode_buttons: Vec<(WidgetId, GizmoMode)>,
     /// Numeric inputs for the x/y components of a Vec2 field: submitting one
@@ -396,6 +409,13 @@ pub struct EditorRows {
     pub picker_hue: Option<WidgetId>,
     pub picker_alpha: Option<WidgetId>,
     pub picker_hex: Option<WidgetId>,
+    /// The open modal dialog: its card (for backdrop-click dismiss detection),
+    /// close button, footer action buttons, and settings-form controls.
+    pub modal_card: Option<WidgetId>,
+    pub modal_close: Option<WidgetId>,
+    pub modal_buttons: Vec<(WidgetId, ModalAction)>,
+    pub modal_checks: Vec<(WidgetId, SettingField)>,
+    pub modal_inputs: Vec<(WidgetId, SettingField)>,
 }
 
 /// An action offered by a right-click context menu (built on Aurora popups).
@@ -933,6 +953,15 @@ fn build_toolbar(
         let button = toolbar_button(ui, bar, m.label(), icon(mode_icon(m)), background, theme);
         rows.mode_buttons.push((button, m));
     }
+    // The settings gear sits at the far right.
+    rows.settings_button = Some(toolbar_button(
+        ui,
+        bar,
+        "Settings",
+        icon(Icon::Settings),
+        theme.panel_bg,
+        theme,
+    ));
 }
 
 /// A toolbar button: an icon inside a fixed square when an icon is given, else
@@ -1068,6 +1097,158 @@ pub fn build_color_picker(
     rows.picker_hue = Some(hue);
     rows.picker_alpha = Some(alpha);
     rows.picker_hex = Some(hex);
+}
+
+/// A modal card's width.
+const MODAL_W: f32 = 420.0;
+
+/// Build a modal dialog on the popup layer: a full-window scrim backdrop (which,
+/// being opaque to hit-testing, blocks all input to the shell beneath it) with a
+/// centered card holding a title bar, the body, and footer buttons. Call this
+/// LAST (after the shell and any color picker) so it is the topmost popup.
+pub fn build_modal(
+    ui: &mut Ui,
+    modal: &Modal,
+    icons: Option<&Icons>,
+    theme: &EditorTheme,
+    rows: &mut EditorRows,
+) {
+    // The backdrop fills the window and dims it. Its column + cross-axis center
+    // centers the card horizontally; grow spacers above and below center it
+    // vertically (aurora has no justify-content builder).
+    let backdrop = ui.popup(
+        Vec2::ZERO,
+        Style::new()
+            .fill()
+            .background(theme.scrim)
+            .column()
+            .align_center(),
+    );
+    ui.panel(backdrop, Style::new().grow(1.0));
+    let card = ui.panel(
+        backdrop,
+        Style::new()
+            .column()
+            .gap(12.0)
+            .width(MODAL_W)
+            .padding(16.0)
+            .background(theme.card_bg)
+            .corner_radius(CARD_RADIUS)
+            .border(1.0, theme.card_border),
+    );
+    rows.modal_card = Some(card);
+
+    // Title bar: the title, and an optional close button at the top-right.
+    let bar = ui.panel(card, Style::new().row().align_center().gap(6.0));
+    ui.label(
+        bar,
+        modal.title.clone(),
+        Style::new().grow(1.0).ellipsis().foreground(theme.heading),
+    );
+    if modal.closable {
+        let close = ui.button(bar, "", Style::new().icon_button().padding(3.0));
+        match icons {
+            Some(icons) => {
+                ui.image(close, icons.get(Icon::Close), Style::new().size(16.0, 16.0));
+            }
+            None => {
+                ui.label(close, "x", Style::new().foreground(theme.heading));
+            }
+        }
+        rows.modal_close = Some(close);
+    }
+
+    match &modal.body {
+        ModalBody::Message(text) => {
+            ui.label(
+                card,
+                text.clone(),
+                Style::new().width(MODAL_W - 32.0).foreground(theme.subhead),
+            );
+        }
+        ModalBody::Settings(draft) => build_settings_body(ui, card, draft, theme, rows),
+    }
+
+    // Footer: action buttons pushed to the right; the last one is the accented
+    // default (OK / Save).
+    let footer = ui.panel(card, Style::new().row().gap(8.0).align_center());
+    ui.panel(footer, Style::new().grow(1.0));
+    let buttons: &[(&str, ModalAction)] = match &modal.body {
+        ModalBody::Message(_) => &[("OK", ModalAction::Close)],
+        ModalBody::Settings(_) => &[
+            ("Cancel", ModalAction::Close),
+            ("Save", ModalAction::SaveSettings),
+        ],
+    };
+    for (i, &(label, action)) in buttons.iter().enumerate() {
+        let primary = i == buttons.len() - 1;
+        let background = if primary {
+            theme.mode_active
+        } else {
+            theme.menu_bg
+        };
+        let btn = ui.button(
+            footer,
+            label,
+            Style::new()
+                .padding_x(14.0)
+                .padding_y(6.0)
+                .background(background)
+                .foreground(theme.heading)
+                .corner_radius(CONTROL_RADIUS),
+        );
+        rows.modal_buttons.push((btn, action));
+    }
+
+    ui.panel(backdrop, Style::new().grow(1.0));
+}
+
+/// The settings form body: a checkbox per boolean toggle, then a labelled
+/// numeric input per snap increment.
+fn build_settings_body(
+    ui: &mut Ui,
+    parent: WidgetId,
+    draft: &SettingsDraft,
+    theme: &EditorTheme,
+    rows: &mut EditorRows,
+) {
+    let col = ui.panel(parent, Style::new().column().gap(8.0));
+    for (field, label) in [
+        (SettingField::ShowGrid, "Show grid"),
+        (SettingField::ShowAxes, "Show world axes"),
+        (SettingField::SnapEnabled, "Enable snapping"),
+    ] {
+        let cb = ui.checkbox(
+            col,
+            draft.checked(field),
+            label,
+            Style::new().foreground(theme.heading),
+        );
+        rows.modal_checks.push((cb, field));
+    }
+    for (field, label) in [
+        (SettingField::MoveStep, "Move step (units)"),
+        (SettingField::RotateStep, "Rotate step (deg)"),
+        (SettingField::ScaleStep, "Scale step"),
+    ] {
+        let row = ui.panel(col, Style::new().row().align_center().gap(8.0));
+        ui.label(
+            row,
+            label,
+            Style::new().width(140.0).foreground(theme.subhead),
+        );
+        let value = draft.number(field).unwrap_or(0.0);
+        let input = ui.numeric_input(
+            row,
+            format!("{value}"),
+            Style::new()
+                .grow(1.0)
+                .padding(3.0)
+                .corner_radius(CONTROL_RADIUS)
+                .border(1.0, theme.card_border),
+        );
+        rows.modal_inputs.push((input, field));
+    }
 }
 
 /// The scene-tree pane's content: one clickable row per node, indented by
@@ -2131,6 +2312,37 @@ mod tests {
     /// and must not recursively walk the real temp dir.
     fn test_explorer() -> FileExplorer {
         FileExplorer::new(Path::new("/orbit-nonexistent-test-root"))
+    }
+
+    /// Build a modal on a bare Ui and lay it out (a fresh root + one popup).
+    fn laid_out_modal(modal: &Modal) -> EditorRows {
+        let theme = EditorTheme::default();
+        let mut ui = Ui::new();
+        ui.set_theme(theme.aurora);
+        ui.root_panel(Style::new().fill());
+        let mut rows = EditorRows::default();
+        build_modal(&mut ui, modal, None, &theme, &mut rows);
+        ui.layout(Vec2::new(1000.0, 700.0)).unwrap();
+        rows
+    }
+
+    #[test]
+    fn a_message_modal_lays_out_with_a_card_close_and_one_button() {
+        let err = std::io::Error::new(std::io::ErrorKind::AlreadyExists, "x");
+        let rows = laid_out_modal(&Modal::error("Rename failed", &err));
+        assert!(rows.modal_card.is_some(), "the card is recorded");
+        assert!(rows.modal_close.is_some(), "closable -> a close button");
+        assert_eq!(rows.modal_buttons.len(), 1, "just OK");
+        assert!(rows.modal_checks.is_empty() && rows.modal_inputs.is_empty());
+    }
+
+    #[test]
+    fn a_settings_modal_lays_out_with_three_checks_inputs_and_two_buttons() {
+        let draft = SettingsDraft::new(true, true, crate::settings::SnapSettings::default());
+        let rows = laid_out_modal(&Modal::settings(draft));
+        assert_eq!(rows.modal_checks.len(), 3, "grid / axes / snap");
+        assert_eq!(rows.modal_inputs.len(), 3, "move / rotate / scale step");
+        assert_eq!(rows.modal_buttons.len(), 2, "Cancel + Save");
     }
 
     /// Build the shell the way the tests did before docking: a single optional
