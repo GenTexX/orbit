@@ -3478,6 +3478,37 @@ mod tests {
     }
 
     #[test]
+    fn a_splitter_in_a_clipped_container_keeps_dragging_across_frames() {
+        // The atlas dock nests splitters inside clipped groups and re-lays-out
+        // between pointer moves (one layout per frame). The drag must survive a
+        // layout between moves - clip-aware grab must not drop a live drag.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().row().size(400.0, 200.0).clip());
+        let left = ui.panel(root, Style::new().width(100.0));
+        let splitter = ui.splitter(root, Orientation::Vertical, 1.0, Style::new().width(4.0));
+        ui.set_splitter_target(splitter, left);
+        ui.panel(root, Style::new().grow(1.0));
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+
+        let bar = Vec2::new(102.0, 100.0);
+        ui.handle_input(InputEvent::PointerMoved(bar));
+        ui.handle_input(InputEvent::PointerPressed);
+        // Five 20px moves, each followed by a layout (as a real frame would),
+        // WITHOUT re-pressing: the drag rides on the retained press.
+        for i in 1..=5 {
+            ui.handle_input(InputEvent::PointerMoved(
+                bar + Vec2::new(20.0 * i as f32, 0.0),
+            ));
+            ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        }
+        assert_eq!(
+            ui.rect(left).unwrap().size.x,
+            200.0,
+            "left grows by the full 100px even with a layout between moves"
+        );
+    }
+
+    #[test]
     fn programmatic_focus_selects_all_and_focus_caret_preserves_the_caret() {
         let mut ui = Ui::new();
         let root = ui.root_panel(Style::new().column().size(200.0, 80.0));

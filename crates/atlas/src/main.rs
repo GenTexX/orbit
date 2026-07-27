@@ -2899,15 +2899,23 @@ impl State {
         profiling::scope!("editor_frame");
         let fstart = std::time::Instant::now();
         self.poll_settings();
-        self.poll_console();
         self.react();
         self.sync_tree_filter();
-        // Decode any newly visible previews and capture the explorer's live
-        // layout (tree scroll, grid columns); both can request a rebuild, so
-        // they run before `dirty` is read.
-        self.ensure_thumbnails();
-        self.ensure_asset_thumbnails();
-        self.sync_explorer_view();
+        // Incidental background maintenance that can flip `dirty` and so force a
+        // shell rebuild: new console lines, streamed-in thumbnails, and the
+        // explorer's grid reflowing as its pane resizes. A rebuild swaps the whole
+        // Ui, dropping Aurora's retained press state - which would abort an
+        // in-progress splitter/slider/file drag the instant one of these fires
+        // (e.g. dragging the Files splitter across a column boundary). So defer
+        // them while a button is held; none is time-critical, and they resume the
+        // moment it is released. (update_file_tooltip is frozen for the same
+        // reason - see its guard.)
+        if !self.pointer_down {
+            self.poll_console();
+            self.ensure_thumbnails();
+            self.ensure_asset_thumbnails();
+            self.sync_explorer_view();
+        }
         self.update_file_tooltip();
         let t_react = fstart.elapsed();
         let mut phase = std::time::Instant::now();
