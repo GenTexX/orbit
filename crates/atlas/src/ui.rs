@@ -1344,6 +1344,58 @@ pub fn add_reparent_line(ui: &mut Ui, rows: &EditorRows, spot: DropSpot, color: 
     );
 }
 
+/// Add a hover tooltip for a file entry near the cursor, post-layout on the
+/// popup layer. Hit-transparent so it does not steal the hover from the entry
+/// beneath it. Shows the FULL name (wrapping, unlike the truncated grid label)
+/// and the type / size / modified details.
+pub fn add_file_tooltip(
+    ui: &mut Ui,
+    cursor: Vec2,
+    window: Vec2,
+    entry: &Entry,
+    theme: &EditorTheme,
+) {
+    // Anchor below-right of the cursor, nudged back inside the window edges.
+    let x = (cursor.x + 14.0).clamp(6.0, (window.x - FILE_TOOLTIP_W - 6.0).max(6.0));
+    let y = (cursor.y + 20.0).clamp(6.0, (window.y - 96.0).max(6.0));
+    let card = ui.popup(
+        Vec2::new(x, y),
+        Style::new()
+            .column()
+            .gap(3.0)
+            .padding(8.0)
+            .width(FILE_TOOLTIP_W)
+            .background(theme.menu_bg)
+            .corner_radius(6.0)
+            .border(1.0, theme.card_border)
+            .hit_transparent(),
+    );
+    ui.label(
+        card,
+        entry.name.clone(),
+        Style::new()
+            .width(FILE_TOOLTIP_W - 16.0)
+            .foreground(theme.heading),
+    );
+    tooltip_detail(ui, card, "Type", entry.type_label(), theme);
+    tooltip_detail(ui, card, "Size", entry.size_label(), theme);
+    let modified = entry.modified_label();
+    if !modified.is_empty() {
+        tooltip_detail(ui, card, "Modified", modified, theme);
+    }
+}
+
+/// One "Label: value" line in the file tooltip.
+fn tooltip_detail(ui: &mut Ui, parent: WidgetId, label: &str, value: String, theme: &EditorTheme) {
+    let row = ui.panel(parent, Style::new().row().gap(6.0));
+    ui.label(
+        row,
+        format!("{label}:"),
+        Style::new().width(58.0).foreground(theme.subhead),
+    );
+    ui.label(row, value, Style::new().grow(1.0).foreground(theme.heading));
+}
+
 /// The docked inspector panel: the selected node's transform and reflected
 /// component fields as editable rows, grouped into collapsible section cards.
 // A handful of small view inputs; named arguments read clearer than a struct.
@@ -1626,6 +1678,12 @@ const FILE_LIST_ICON: f32 = 22.0;
 const FILE_GRID_CELL: f32 = 84.0;
 const FILE_GRID_THUMB: f32 = 64.0;
 const FILE_GRID_GAP: f32 = 6.0;
+/// List-row detail column widths (type / size / modified).
+const FILE_COL_TYPE: f32 = 44.0;
+const FILE_COL_SIZE: f32 = 62.0;
+const FILE_COL_MODIFIED: f32 = 100.0;
+/// The hover tooltip's width.
+const FILE_TOOLTIP_W: f32 = 240.0;
 
 /// The number of grid columns that fit in a contents pane `width` px wide (at
 /// least one). `main` reads the pane's laid-out width back each frame and feeds
@@ -1889,10 +1947,23 @@ fn build_list_entry(
     let label = Style::new().grow(1.0).ellipsis().foreground(theme.heading);
     let field = Style::new().grow(1.0).padding(1.0);
     build_entry_name(ui, r, entry, ctx, rows, field, label);
-    if let Some(tag) = entry_tag(entry) {
-        ui.label(r, tag, Style::new().foreground(theme.subhead));
-    }
+    // Detail columns (muted, fixed-width so they line up down the list).
+    meta_col(ui, r, entry.type_label(), FILE_COL_TYPE, theme);
+    meta_col(ui, r, entry.size_label(), FILE_COL_SIZE, theme);
+    meta_col(ui, r, entry.modified_label(), FILE_COL_MODIFIED, theme);
     record_entry(entry, r, ctx, rows, draggable);
+}
+
+/// A fixed-width, muted detail column in a list row.
+fn meta_col(ui: &mut Ui, parent: WidgetId, text: String, width: f32, theme: &EditorTheme) {
+    ui.label(
+        parent,
+        text,
+        Style::new()
+            .width(width)
+            .ellipsis()
+            .foreground(theme.subhead),
+    );
 }
 
 /// A grid cell: a large thumbnail/icon over a centered, ellipsized name.
@@ -1986,19 +2057,6 @@ fn entry_icon(entry: &Entry) -> Icon {
         FileKind::Scene => Icon::FileScene,
         FileKind::Other => Icon::FileGeneric,
     }
-}
-
-/// The muted right-aligned tag for a file (its uppercase extension); none for a
-/// folder.
-fn entry_tag(entry: &Entry) -> Option<String> {
-    if entry.is_dir() {
-        return None;
-    }
-    entry
-        .path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_uppercase())
 }
 
 /// Whether an entry can be dragged into the viewport to spawn a sprite (a

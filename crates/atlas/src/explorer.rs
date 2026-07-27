@@ -10,6 +10,7 @@
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 /// Whether a scanned entry is a directory or a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +27,10 @@ pub struct Entry {
     /// The file or directory name (the last path component), for display.
     pub name: String,
     pub kind: EntryKind,
+    /// The file's size in bytes (0 for a directory).
+    pub size: u64,
+    /// Last-modified time, if the filesystem reported one.
+    pub modified: Option<SystemTime>,
     /// Child entries, directories first then files, each group alphabetical
     /// (case-insensitive). Always empty for a file.
     pub children: Vec<Entry>,
@@ -34,6 +39,78 @@ pub struct Entry {
 impl Entry {
     pub fn is_dir(&self) -> bool {
         self.kind == EntryKind::Dir
+    }
+
+    /// A short human label for the entry's type: "Folder", or the file's
+    /// uppercased extension (e.g. "PNG"), or "File" when it has none.
+    pub fn type_label(&self) -> String {
+        if self.is_dir() {
+            return "Folder".to_string();
+        }
+        match extension(&self.path) {
+            Some(ext) => ext.to_ascii_uppercase(),
+            None => "File".to_string(),
+        }
+    }
+
+    /// A human size: a folder's child count ("3 items"), or a file's byte size
+    /// ("2.0 KB").
+    pub fn size_label(&self) -> String {
+        if self.is_dir() {
+            let n = self.children.len();
+            return format!("{n} item{}", if n == 1 { "" } else { "s" });
+        }
+        format_size(self.size)
+    }
+
+    /// A relative last-modified label ("3 days ago"), or empty if unknown.
+    pub fn modified_label(&self) -> String {
+        self.modified.map(format_relative_time).unwrap_or_default()
+    }
+}
+
+/// A byte count as a short human string (B / KB / MB / GB).
+pub fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{bytes} B")
+    } else if b < MB {
+        format!("{:.1} KB", b / KB)
+    } else if b < GB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.1} GB", b / GB)
+    }
+}
+
+/// A coarse "N units ago" label for a past time relative to now (crate-free, so
+/// no timezone handling and no calendar math). Future times (clock skew) read as
+/// "just now".
+pub fn format_relative_time(modified: SystemTime) -> String {
+    relative_time_between(modified, SystemTime::now())
+}
+
+fn relative_time_between(modified: SystemTime, now: SystemTime) -> String {
+    let secs = now
+        .duration_since(modified)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ago = |n: u64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    const MONTH: u64 = 30 * DAY;
+    const YEAR: u64 = 365 * DAY;
+    match secs {
+        0..MIN => "just now".to_string(),
+        MIN..HOUR => ago(secs / MIN, "minute"),
+        HOUR..DAY => ago(secs / HOUR, "hour"),
+        DAY..MONTH => ago(secs / DAY, "day"),
+        MONTH..YEAR => ago(secs / MONTH, "month"),
+        _ => ago(secs / YEAR, "year"),
     }
 }
 
@@ -96,6 +173,9 @@ fn scan_dir(dir: &Path, depth: usize) -> Vec<Entry> {
         }
         let path = dirent.path();
         let is_dir = dirent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // Entry metadata (does not follow symlinks); missing is not fatal.
+        let meta = dirent.metadata().ok();
+        let modified = meta.as_ref().and_then(|m| m.modified().ok());
         if is_dir {
             if IGNORED_DIRS.contains(&name.as_str()) {
                 continue;
@@ -111,6 +191,8 @@ fn scan_dir(dir: &Path, depth: usize) -> Vec<Entry> {
                 path,
                 name,
                 kind: EntryKind::Dir,
+                size: 0,
+                modified,
                 children,
             });
         } else {
@@ -118,6 +200,8 @@ fn scan_dir(dir: &Path, depth: usize) -> Vec<Entry> {
                 path,
                 name,
                 kind: EntryKind::File,
+                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                modified,
                 children: Vec::new(),
             });
         }
@@ -515,10 +599,13 @@ fn root_entry(root: &Path) -> Entry {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| root.to_string_lossy().into_owned());
+    let modified = std::fs::metadata(root).ok().and_then(|m| m.modified().ok());
     Entry {
         path: root.to_path_buf(),
         name,
         kind: EntryKind::Dir,
+        size: 0,
+        modified,
         children: scan_dir(root, 0),
     }
 }
@@ -650,6 +737,29 @@ mod tests {
         // Navigating to another folder drops the selection.
         ex.select_dir(dir.path());
         assert!(ex.selected().is_empty());
+    }
+
+    #[test]
+    fn size_and_relative_time_format_readably() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(2048), "2.0 KB");
+        assert_eq!(format_size(1_500_000), "1.4 MB");
+        assert_eq!(format_size(3_221_225_472), "3.0 GB");
+
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let ago = |secs| relative_time_between(now - std::time::Duration::from_secs(secs), now);
+        assert_eq!(ago(5), "just now");
+        assert_eq!(ago(60), "1 minute ago");
+        assert_eq!(ago(3 * 3600), "3 hours ago");
+        assert_eq!(ago(2 * 86400), "2 days ago");
+        assert_eq!(ago(40 * 86400), "1 month ago");
+        assert_eq!(ago(800 * 86400), "2 years ago");
+        // A future time (clock skew) reads as "just now", never a huge number.
+        assert_eq!(
+            relative_time_between(now + std::time::Duration::from_secs(99), now),
+            "just now"
+        );
     }
 
     #[test]

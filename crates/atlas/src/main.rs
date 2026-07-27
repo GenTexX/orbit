@@ -61,6 +61,8 @@ const ALPHA_H: usize = 16;
 /// Two tree-row clicks within this window count as a double-click (start a
 /// rename), matching a typical desktop double-click speed.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+/// How long the cursor must rest on a file entry before its tooltip appears.
+const TOOLTIP_DELAY: std::time::Duration = std::time::Duration::from_millis(450);
 
 /// The editor's base window title; prefixed with "* " when there are unsaved
 /// changes.
@@ -371,6 +373,11 @@ struct State {
     /// Set when a file-rename field was just created, so the next rebuild focuses
     /// it once (mirrors `focus_rename` for scene nodes).
     focus_file_rename: bool,
+    /// The explorer entry the cursor is resting on and when it arrived, used to
+    /// show a details tooltip after a short hover.
+    hover_file: Option<(PathBuf, std::time::Instant)>,
+    /// The entry whose hover tooltip is currently shown (a rebuild adds it).
+    tooltip_target: Option<PathBuf>,
 }
 
 /// A tree row being dragged to reparent it; `target` is the current valid drop
@@ -693,6 +700,8 @@ impl State {
             file_clip: Vec::new(),
             file_clip_cut: false,
             focus_file_rename: false,
+            hover_file: None,
+            tooltip_target: None,
         })
     }
 
@@ -1133,6 +1142,54 @@ impl State {
             .any(|(w, ..)| *w == hit || self.ui.is_within(hit, *w));
         if in_contents && !on_entry && !self.explorer.selected().is_empty() {
             self.explorer.clear_selection();
+            self.dirty = true;
+        }
+    }
+
+    /// Track the hovered file entry and, after a short rest, show its details
+    /// tooltip (a rebuild adds the popup post-layout). Hovering off hides it; an
+    /// open menu suppresses it.
+    fn update_file_tooltip(&mut self) {
+        let hovered = if self.context_menu.is_some() {
+            None
+        } else {
+            self.ui.hovered().and_then(|h| {
+                self.rows
+                    .file_entries
+                    .iter()
+                    .find(|(w, ..)| *w == h)
+                    .map(|(_, p, _)| p.clone())
+            })
+        };
+        let Some(path) = hovered else {
+            self.hover_file = None;
+            self.hide_tooltip();
+            return;
+        };
+        // Whether the cursor is still on the same entry, and if so whether it has
+        // rested long enough (computed in a scoped borrow so `hover_file` is free
+        // to reassign below).
+        let rested = match &self.hover_file {
+            Some((p, since)) if *p == path => Some(since.elapsed() >= TOOLTIP_DELAY),
+            _ => None,
+        };
+        match rested {
+            Some(ready) => {
+                if ready && self.tooltip_target.as_deref() != Some(path.as_path()) {
+                    self.tooltip_target = Some(path);
+                    self.dirty = true;
+                }
+            }
+            None => {
+                self.hover_file = Some((path, std::time::Instant::now()));
+                self.hide_tooltip();
+            }
+        }
+    }
+
+    /// Hide the file tooltip if one is showing (marking the shell for rebuild).
+    fn hide_tooltip(&mut self) {
+        if self.tooltip_target.take().is_some() {
             self.dirty = true;
         }
     }
@@ -2582,6 +2639,7 @@ impl State {
         // they run before `dirty` is read.
         self.ensure_thumbnails();
         self.sync_explorer_view();
+        self.update_file_tooltip();
         let t_react = fstart.elapsed();
         let mut phase = std::time::Instant::now();
         // Whether this frame rebuilds the shell. The insertion-line overlay is
@@ -2697,6 +2755,16 @@ impl State {
         // one from the last rebuild (adding again would stack duplicates).
         if rebuilt && let Some(spot) = self.reparent.and_then(|r| r.target) {
             ui::add_reparent_line(&mut self.ui, &self.rows, spot, self.theme.row_drop);
+            self.ui.layout(window)?;
+        }
+
+        // The file-details tooltip is likewise overlaid post-layout near the
+        // cursor (only on rebuilt frames; a still frame keeps the last one).
+        if rebuilt
+            && let Some(path) = self.tooltip_target.clone()
+            && let Some(entry) = self.explorer.contents().iter().find(|e| e.path == path)
+        {
+            ui::add_file_tooltip(&mut self.ui, self.cursor, window, entry, &self.theme);
             self.ui.layout(window)?;
         }
 
