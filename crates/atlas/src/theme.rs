@@ -95,6 +95,7 @@ theme_tokens! {
     "caret": Color => aurora.caret,
     "placeholder": Color => aurora.placeholder,
     "icon_hover": Color => aurora.icon_hover,
+    "icon_active": Color => icon_active,
     "selection": Color => aurora.selection,
     "slider_track": Color => aurora.slider_track,
     "slider_fill": Color => aurora.slider_fill,

@@ -195,6 +195,12 @@ pub const TOKENS: &[Token] = &[
     t("checkbox_box", C, "Widgets", "Checkbox box fill"),
     t("checkbox_mark", C, "Widgets", "Checkbox checkmark"),
     t("icon_hover", C, "Widgets", "Icon-button icon on hover"),
+    t(
+        "icon_active",
+        C,
+        "Widgets",
+        "Icon color of an active/toggled toolbar button",
+    ),
     t("slider_track", C, "Widgets", "Slider track (unfilled)"),
     t(
         "slider_fill",

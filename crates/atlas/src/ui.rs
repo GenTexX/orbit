@@ -63,8 +63,10 @@ pub struct EditorTheme {
     pub field_border: Color,
     /// The active dock tab's outline (drawn on its top and sides only).
     pub tab_border: Color,
-    /// The active gizmo-mode toolbar button.
+    /// The active gizmo-mode toolbar button (its background), and the icon color
+    /// drawn on it (an active button's icon, else icons pass through white).
     pub mode_active: Color,
+    pub icon_active: Color,
     /// Engine axis palette (X red, Y green) for the inspector's Vec2 labels.
     pub axis_x: Color,
     pub axis_y: Color,
@@ -134,6 +136,7 @@ impl EditorTheme {
             field_border: Color::rgb(0.24, 0.26, 0.32),
             tab_border: Color::rgb(0.24, 0.26, 0.32),
             mode_active: Color::rgb(0.22, 0.38, 0.60),
+            icon_active: Color::WHITE,
             axis_x: Color::rgb(0.90, 0.32, 0.32),
             axis_y: Color::rgb(0.35, 0.70, 0.38),
             console_warn: default_console_warn(),
@@ -175,6 +178,7 @@ impl EditorTheme {
             field_border: Color::rgb(0.66, 0.68, 0.74),
             tab_border: Color::rgb(0.66, 0.68, 0.74),
             mode_active: Color::rgb(0.62, 0.76, 0.96),
+            icon_active: Color::WHITE,
             axis_x: Color::rgb(0.85, 0.30, 0.30),
             axis_y: Color::rgb(0.28, 0.62, 0.34),
             console_warn: Color::rgb(0.72, 0.55, 0.10),
@@ -1008,7 +1012,7 @@ fn build_toolbar(
         bar,
         "Add Sprite",
         icon(Icon::Add),
-        theme.panel_bg,
+        false,
         theme,
     ));
     rows.save = Some(toolbar_button(
@@ -1016,7 +1020,7 @@ fn build_toolbar(
         bar,
         "Save",
         icon(Icon::Save),
-        theme.panel_bg,
+        false,
         theme,
     ));
     rows.load = Some(toolbar_button(
@@ -1024,25 +1028,18 @@ fn build_toolbar(
         bar,
         "Load",
         icon(Icon::Load),
-        theme.panel_bg,
+        false,
         theme,
     ));
 
     // View toggles: highlighted (mode_active) when on, so their state reads at a
     // glance, like the gizmo-mode buttons.
-    let toggle_bg = |on: bool| {
-        if on {
-            theme.mode_active
-        } else {
-            theme.panel_bg
-        }
-    };
     rows.grid = Some(toolbar_button(
         ui,
         bar,
         "Grid",
         icon(Icon::Grid),
-        toggle_bg(show_grid),
+        show_grid,
         theme,
     ));
     rows.axes = Some(toolbar_button(
@@ -1050,7 +1047,7 @@ fn build_toolbar(
         bar,
         "Axes",
         icon(Icon::Axes),
-        toggle_bg(show_axes),
+        show_axes,
         theme,
     ));
     rows.snap = Some(toolbar_button(
@@ -1058,19 +1055,14 @@ fn build_toolbar(
         bar,
         "Snap",
         icon(Icon::Snap),
-        toggle_bg(snap_enabled),
+        snap_enabled,
         theme,
     ));
 
     // A spacer pushes the mode switches to the right edge of the bar.
     ui.panel(bar, Style::new().grow(1.0));
     for m in GizmoMode::ALL {
-        let background = if m == mode {
-            theme.mode_active
-        } else {
-            theme.panel_bg
-        };
-        let button = toolbar_button(ui, bar, m.label(), icon(mode_icon(m)), background, theme);
+        let button = toolbar_button(ui, bar, m.label(), icon(mode_icon(m)), m == mode, theme);
         rows.mode_buttons.push((button, m));
     }
     // The settings gear sits at the far right.
@@ -1079,21 +1071,29 @@ fn build_toolbar(
         bar,
         "Settings",
         icon(Icon::Settings),
-        theme.panel_bg,
+        false,
         theme,
     ));
 }
 
 /// A toolbar button: an icon inside a fixed square when an icon is given, else
-/// a text-captioned button (the headless-test / no-icon fallback).
+/// a text-captioned button (the headless-test / no-icon fallback). An `active`
+/// button (a toggled view/snap, the current gizmo mode) takes the `mode_active`
+/// background and tints its icon with `icon_active`; otherwise it sits on the
+/// bar and its icon passes through white.
 fn toolbar_button(
     ui: &mut Ui,
     bar: WidgetId,
     caption: &str,
     icon: Option<ImageHandle>,
-    background: Color,
+    active: bool,
     theme: &EditorTheme,
 ) -> WidgetId {
+    let background = if active {
+        theme.mode_active
+    } else {
+        theme.panel_bg
+    };
     match icon {
         Some(handle) => {
             let button = ui.button(
@@ -1104,10 +1104,17 @@ fn toolbar_button(
                     .background(background)
                     .corner_radius(theme.control_radius),
             );
+            let tint = if active {
+                theme.icon_active
+            } else {
+                Color::WHITE
+            };
             ui.image(
                 button,
                 handle,
-                Style::new().size(TOOLBAR_ICON, TOOLBAR_ICON),
+                Style::new()
+                    .size(TOOLBAR_ICON, TOOLBAR_ICON)
+                    .foreground(tint),
             );
             button
         }
@@ -2304,19 +2311,12 @@ fn build_file_explorer(
         }
     }
     let icon = |id: Icon| ctx.icons.map(|i| i.get(id));
-    let active = |on: bool| {
-        if on {
-            theme.mode_active
-        } else {
-            theme.panel_bg
-        }
-    };
     rows.file_view_list = Some(toolbar_button(
         ui,
         bar,
         "List",
         icon(Icon::ViewList),
-        active(ex.view() == FileView::List),
+        ex.view() == FileView::List,
         theme,
     ));
     rows.file_view_grid = Some(toolbar_button(
@@ -2324,7 +2324,7 @@ fn build_file_explorer(
         bar,
         "Grid",
         icon(Icon::ViewGrid),
-        active(ex.view() == FileView::Grid),
+        ex.view() == FileView::Grid,
         theme,
     ));
     rows.file_refresh = Some(toolbar_button(
@@ -2332,7 +2332,7 @@ fn build_file_explorer(
         bar,
         "Refresh",
         icon(Icon::Refresh),
-        theme.panel_bg,
+        false,
         theme,
     ));
 
