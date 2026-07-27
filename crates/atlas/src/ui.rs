@@ -20,12 +20,6 @@ use crate::modal::{Modal, ModalAction, ModalBody, SettingField, SettingsDraft};
 use crate::thumbnails::Thumbnails;
 use crate::viewport::GizmoMode;
 
-/// Corner radius for section cards, for controls (buttons and fields), and for
-/// small fields inset inside a row (e.g. an inline rename box).
-const CARD_RADIUS: f32 = 6.0;
-const CONTROL_RADIUS: f32 = 4.0;
-const INSET_RADIUS: f32 = 3.0;
-
 /// The newest console lines the pane builds a widget for (the ring stores more
 /// for scrollback; older lines are summarized with a count).
 const CONSOLE_TAIL: usize = 500;
@@ -34,11 +28,12 @@ const CONSOLE_TAIL: usize = 500;
 /// detail (arrowheads, gear teeth) stays legible rather than washing out.
 const TOOLBAR_ICON: f32 = 24.0;
 
-/// The editor's full color palette: the aurora widget [`Theme`] plus atlas's own
-/// surface, text, and accent colors. Swapped as a unit so the whole editor
-/// recolors at once (see [`build_editor_ui`]). Loaded from the user's settings
-/// file and editable there (see the `settings` module).
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+/// The editor's resolved runtime theme: the aurora widget [`Theme`] plus atlas's
+/// own surface/text/accent colors and shape radii. The UI reads these concrete
+/// values; they are produced by resolving the authored [`ThemeDoc`](crate::theme::ThemeDoc)
+/// loaded from the user's settings file (see the `theme` and `settings` modules),
+/// and swapped as a unit so the whole editor recolors at once.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EditorTheme {
     /// The palette aurora's built-in widgets draw with.
     pub aurora: Theme,
@@ -46,13 +41,9 @@ pub struct EditorTheme {
     pub panel_bg: Color,
     pub root_bg: Color,
     /// Bars (toolbar, the file-explorer breadcrumb bar): a distinct dark so a
-    /// bar reads as a strip, not part of the panel body. A serde default so
-    /// settings files written before it existed still load.
-    #[serde(default = "default_bar_bg")]
+    /// bar reads as a strip, not part of the panel body.
     pub bar_bg: Color,
-    /// An inspector section's title header bar (darker than the card body). A
-    /// serde default so older settings files still load.
-    #[serde(default = "default_header_bg")]
+    /// An inspector section's title header bar (darker than the card body).
     pub header_bg: Color,
     /// Primary and secondary text.
     pub heading: Color,
@@ -71,14 +62,15 @@ pub struct EditorTheme {
     pub axis_x: Color,
     pub axis_y: Color,
     /// The console pane's WARN-level line color (ERROR reuses `axis_x`, INFO
-    /// `heading`, lower levels `subhead`). A serde default so settings files
-    /// written before it existed still load.
-    #[serde(default = "default_console_warn")]
+    /// `heading`, lower levels `subhead`).
     pub console_warn: Color,
-    /// The translucent backdrop dimming the editor behind a modal dialog. A
-    /// serde default so settings files written before it existed still load.
-    #[serde(default = "default_scrim")]
+    /// The translucent backdrop dimming the editor behind a modal dialog.
     pub scrim: Color,
+    /// Corner radius for section cards, controls (buttons/fields), and small
+    /// inset fields (an inline rename box).
+    pub card_radius: f32,
+    pub control_radius: f32,
+    pub inset_radius: f32,
 }
 
 fn default_console_warn() -> Color {
@@ -118,6 +110,9 @@ impl EditorTheme {
             axis_y: Color::rgb(0.35, 0.70, 0.38),
             console_warn: default_console_warn(),
             scrim: default_scrim(),
+            card_radius: 6.0,
+            control_radius: 4.0,
+            inset_radius: 3.0,
         }
     }
 
@@ -143,6 +138,9 @@ impl EditorTheme {
             axis_y: Color::rgb(0.28, 0.62, 0.34),
             console_warn: Color::rgb(0.72, 0.55, 0.10),
             scrim: Color::rgba(0.05, 0.05, 0.08, 0.45),
+            card_radius: 6.0,
+            control_radius: 4.0,
+            inset_radius: 3.0,
         }
     }
 }
@@ -1031,7 +1029,7 @@ fn toolbar_button(
                 Style::new()
                     .padding(5.0)
                     .background(background)
-                    .corner_radius(CONTROL_RADIUS),
+                    .corner_radius(theme.control_radius),
             );
             ui.image(
                 button,
@@ -1047,7 +1045,7 @@ fn toolbar_button(
                 .padding(6.0)
                 .background(background)
                 .foreground(theme.heading)
-                .corner_radius(CONTROL_RADIUS),
+                .corner_radius(theme.control_radius),
         ),
     }
 }
@@ -1072,7 +1070,7 @@ fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, theme: &EditorTheme, rows
             .gap(2.0)
             .padding(4.0)
             .background(theme.menu_bg)
-            .corner_radius(CARD_RADIUS)
+            .corner_radius(theme.card_radius)
             .border(1.0, theme.card_border)
             .clip(),
     );
@@ -1085,7 +1083,7 @@ fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, theme: &EditorTheme, rows
                 .padding(6.0)
                 .background(theme.menu_bg)
                 .foreground(theme.heading)
-                .corner_radius(CONTROL_RADIUS),
+                .corner_radius(theme.control_radius),
         );
         rows.menu_items.push((item, action.clone()));
     }
@@ -1113,7 +1111,7 @@ pub fn build_color_picker(
             .gap(6.0)
             .padding(8.0)
             .background(theme.menu_bg)
-            .corner_radius(CARD_RADIUS)
+            .corner_radius(theme.card_radius)
             .border(1.0, theme.card_border)
             .clip(),
     );
@@ -1133,7 +1131,7 @@ pub fn build_color_picker(
         Style::new()
             .grow(1.0)
             .padding(4.0)
-            .corner_radius(CONTROL_RADIUS)
+            .corner_radius(theme.control_radius)
             .placeholder("#RRGGBBAA"),
     );
     let [r, g, b, a] = view.rgba;
@@ -1142,7 +1140,7 @@ pub fn build_color_picker(
         Style::new()
             .size(28.0, 24.0)
             .background(Color::rgba(r, g, b, a))
-            .corner_radius(CONTROL_RADIUS),
+            .corner_radius(theme.control_radius),
     );
 
     rows.picker_popup = Some(popup);
@@ -1187,7 +1185,7 @@ pub fn build_modal(
             .width(MODAL_W)
             .padding(16.0)
             .background(theme.card_bg)
-            .corner_radius(CARD_RADIUS)
+            .corner_radius(theme.card_radius)
             .border(1.0, theme.card_border),
     );
     rows.modal_card = Some(card);
@@ -1254,7 +1252,7 @@ pub fn build_modal(
                 .padding_y(6.0)
                 .background(background)
                 .foreground(theme.heading)
-                .corner_radius(CONTROL_RADIUS),
+                .corner_radius(theme.control_radius),
         );
         rows.modal_buttons.push((btn, action));
     }
@@ -1303,7 +1301,7 @@ fn build_settings_body(
             Style::new()
                 .grow(1.0)
                 .padding(3.0)
-                .corner_radius(CONTROL_RADIUS)
+                .corner_radius(theme.control_radius)
                 .border(1.0, theme.card_border),
         );
         rows.modal_inputs.push((input, field));
@@ -1360,7 +1358,7 @@ fn build_asset_chooser_body(
                     .padding(4.0)
                     .width(CHOOSER_CELL)
                     .flat()
-                    .corner_radius(CONTROL_RADIUS),
+                    .corner_radius(theme.control_radius),
             );
             if let Some(handle) = thumbnails.get(&asset.abs) {
                 ui.image(
@@ -1425,7 +1423,7 @@ fn build_scene_tree(
         Style::new()
             .foreground(theme.heading)
             .padding(5.0)
-            .corner_radius(CONTROL_RADIUS)
+            .corner_radius(theme.control_radius)
             .border(1.0, theme.row_selected)
             .placeholder("Search..."),
     );
@@ -1595,7 +1593,7 @@ fn add_tree_row(
                 .grow(1.0)
                 .padding(1.0)
                 .foreground(theme.heading)
-                .corner_radius(INSET_RADIUS)
+                .corner_radius(theme.inset_radius)
                 .border(1.0, theme.row_selected.lighten(0.2)),
         );
         rows.rename_field = Some((field, node));
@@ -1697,7 +1695,7 @@ pub fn add_file_tooltip(
             .padding(8.0)
             .width(FILE_TOOLTIP_W)
             .background(theme.menu_bg)
-            .corner_radius(CARD_RADIUS)
+            .corner_radius(theme.card_radius)
             .border(1.0, theme.card_border)
             .hit_transparent(),
     );
@@ -1860,7 +1858,7 @@ fn build_inspector(
                             .width(48.0)
                             .padding(6.0)
                             .background(Color::rgba(c[0], c[1], c[2], c[3]))
-                            .corner_radius(CONTROL_RADIUS),
+                            .corner_radius(theme.control_radius),
                     );
                     rows.color_swatches.push((
                         swatch,
@@ -1948,7 +1946,7 @@ fn add_asset_field(
             .grow(1.0)
             .padding(4.0)
             .foreground(theme.heading)
-            .corner_radius(CONTROL_RADIUS),
+            .corner_radius(theme.control_radius),
     );
     rows.field_rows.push((input, node, component, field));
 
@@ -1982,7 +1980,7 @@ fn asset_icon_button(
                 .padding(4.0)
                 .background(theme.menu_bg)
                 .foreground(theme.heading)
-                .corner_radius(CONTROL_RADIUS),
+                .corner_radius(theme.control_radius),
         ),
     }
 }
@@ -2070,7 +2068,7 @@ fn add_value_row(
         .grow(1.0)
         .padding(4.0)
         .foreground(theme.heading)
-        .corner_radius(CONTROL_RADIUS);
+        .corner_radius(theme.control_radius);
     let input = if numeric {
         ui.numeric_input(row, value_to_text(value), style)
     } else {
@@ -2115,7 +2113,7 @@ fn add_vec2_field(
                 .background(color)
                 .foreground(Color::WHITE)
                 .text_center()
-                .corner_radius(CONTROL_RADIUS),
+                .corner_radius(theme.control_radius),
         );
         rows.scrub_labels.push((label, field, axis));
         let input = ui.numeric_input(
@@ -2125,7 +2123,7 @@ fn add_vec2_field(
                 .grow(1.0)
                 .padding(4.0)
                 .foreground(theme.heading)
-                .corner_radius(CONTROL_RADIUS),
+                .corner_radius(theme.control_radius),
         );
         rows.vec_inputs.push((input, field, axis));
     }
@@ -2463,7 +2461,7 @@ fn build_grid_cell(
         .padding(4.0)
         .width(FILE_GRID_CELL)
         .flat()
-        .corner_radius(CONTROL_RADIUS)
+        .corner_radius(theme.control_radius)
         .background(background);
     if draggable {
         style = style.draggable();
@@ -2497,7 +2495,7 @@ fn build_entry_name(
             entry.name.clone(),
             field_style
                 .foreground(ctx.theme.heading)
-                .corner_radius(INSET_RADIUS)
+                .corner_radius(ctx.theme.inset_radius)
                 .border(1.0, ctx.theme.row_selected.lighten(0.2)),
         );
         rows.file_rename_field = Some((field, entry.path.clone()));

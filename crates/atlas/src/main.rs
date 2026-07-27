@@ -16,6 +16,7 @@ mod modal;
 mod project;
 mod settings;
 mod textures;
+mod theme;
 mod thumbnails;
 mod ui;
 mod viewport;
@@ -349,9 +350,12 @@ struct State {
     /// Collapsed inspector sections per node (editor state, kept across shell
     /// rebuilds).
     inspector_collapsed: HashSet<(NodeId, InspectorSection)>,
-    /// The editor's color theme, loaded from the user's settings file and
-    /// hot-reloaded when it changes.
+    /// The editor's resolved color theme (what the UI draws with), and the
+    /// authored document it came from. Both are loaded from the user's settings
+    /// file and hot-reloaded when it changes; the doc is kept so persisting other
+    /// settings does not clobber the user's authored theme.
     theme: EditorTheme,
+    theme_doc: theme::ThemeDoc,
     /// The settings file's mtime when the theme was last loaded, and the last
     /// time it was polled - the theme hot-reloads when the file changes.
     settings_mtime: Option<std::time::SystemTime>,
@@ -613,7 +617,8 @@ impl State {
         // Editor prefs come from the user's settings file (~/.config/orbit),
         // written with defaults on first run - see the `settings` module.
         let settings = settings::load();
-        let theme = settings.theme;
+        let theme_doc = settings.theme;
+        let theme = theme_doc.resolve();
         // Per-project view state (dock layout, camera, tool, scroll, collapsed
         // tree nodes) comes from <project>/.orbit/editor.ron if present; an
         // absent or invalid file just yields the defaults.
@@ -734,6 +739,7 @@ impl State {
             tree_collapsed,
             inspector_collapsed: HashSet::new(),
             theme,
+            theme_doc,
             settings_mtime: settings::modified(),
             settings_poll: std::time::Instant::now(),
             reparent: None,
@@ -1011,9 +1017,10 @@ impl State {
         }
         self.settings_mtime = mtime;
         if let Some(loaded) = settings::read()
-            && loaded.theme != self.theme
+            && loaded.theme != self.theme_doc
         {
-            self.theme = loaded.theme;
+            self.theme_doc = loaded.theme;
+            self.theme = self.theme_doc.resolve();
             self.dirty = true;
             tracing::info!("reloaded theme from settings");
         }
@@ -2423,7 +2430,9 @@ impl State {
     /// so they persist across restarts (best-effort; a failure is logged).
     fn persist_view_prefs(&self) {
         let settings = settings::Settings {
-            theme: self.theme,
+            // Write the authored theme back unchanged - resolving and re-authoring
+            // would drop the user's variables and references.
+            theme: self.theme_doc.clone(),
             show_grid: self.show_grid,
             show_axes: self.show_axes,
             snap: self.snap,
