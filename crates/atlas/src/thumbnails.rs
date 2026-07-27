@@ -47,6 +47,13 @@ impl Thumbnails {
         self.cache.get(path).copied().flatten()
     }
 
+    /// Whether `path` has already been attempted (decoded OR failed) - so a
+    /// caller can skip both without re-attempting, unlike [`get`](Self::get)
+    /// which cannot tell "failed" from "never tried".
+    pub fn contains(&self, path: &Path) -> bool {
+        self.cache.contains_key(path)
+    }
+
     /// Re-decode every cached thumbnail in place, reusing each path's existing
     /// GPU texture (`update_image_rgba`) rather than registering a new one.
     /// Called on a project reload or a Refresh, where the files at those paths

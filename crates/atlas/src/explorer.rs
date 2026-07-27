@@ -148,6 +148,16 @@ fn extension(path: &Path) -> Option<String> {
         .map(|e| e.to_ascii_lowercase())
 }
 
+/// A project image asset, for the asset chooser: the absolute path (to look up
+/// its thumbnail), the project-relative path (the value written into a field),
+/// and the display name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetRef {
+    pub abs: PathBuf,
+    pub rel: String,
+    pub name: String,
+}
+
 /// Directories skipped by the scan on top of every dotfile (which is skipped
 /// too): build output and dependency caches that are never project content.
 const IGNORED_DIRS: &[&str] = &["target", "node_modules"];
@@ -377,6 +387,38 @@ impl FileExplorer {
         self.find(&self.selected_dir)
             .map(|e| e.children.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Every previewable image in the project, sorted by relative path, for the
+    /// asset chooser. Only the decodable kind (PNG) is listed - those are the
+    /// images that both preview and actually load as a texture.
+    pub fn all_images(&self) -> Vec<AssetRef> {
+        let mut out = Vec::new();
+        self.collect_images(&self.root, &mut out);
+        out.sort_by(|a, b| a.rel.cmp(&b.rel));
+        out
+    }
+
+    fn collect_images(&self, dir: &Entry, out: &mut Vec<AssetRef>) {
+        for child in &dir.children {
+            if child.is_dir() {
+                self.collect_images(child, out);
+            } else if can_thumbnail(&child.path)
+                && let Some(rel) = self.project_relative(&child.path)
+            {
+                out.push(AssetRef {
+                    abs: child.path.clone(),
+                    rel,
+                    name: child.name.clone(),
+                });
+            }
+        }
+    }
+
+    /// Resolve a project-relative path (as stored in an asset field) to its
+    /// absolute path - e.g. to look up a field's thumbnail.
+    pub fn resolve_relative(&self, rel: &str) -> PathBuf {
+        resolve(&self.root.path, rel)
     }
 
     /// The path from the root down to the selected folder as clickable crumbs
@@ -760,6 +802,19 @@ mod tests {
             relative_time_between(now + std::time::Duration::from_secs(99), now),
             "just now"
         );
+    }
+
+    #[test]
+    fn all_images_flattens_previewable_images_project_wide() {
+        let dir = sample_project();
+        // Add a nested png and a non-png image, plus the existing assets/*.png.
+        std::fs::write(dir.path().join("sub/nested.png"), []).unwrap();
+        std::fs::write(dir.path().join("assets/photo.jpg"), []).unwrap();
+        let ex = FileExplorer::new(dir.path());
+        let rels: Vec<String> = ex.all_images().into_iter().map(|a| a.rel).collect();
+        // PNGs anywhere in the tree, sorted, project-relative; the .jpg is
+        // excluded (only PNG previews/loads) and .ron is not an image.
+        assert_eq!(rels, ["assets/a.png", "assets/b.png", "sub/nested.png"]);
     }
 
     #[test]

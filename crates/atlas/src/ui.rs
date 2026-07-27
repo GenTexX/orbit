@@ -12,7 +12,9 @@ use helios::{NodeId, Scene, Value};
 use crate::color;
 use crate::console::LogLine;
 use crate::dock::{DockNode, Fixed, Pane, SplitDir};
-use crate::explorer::{Entry, FileExplorer, FileKind, FileView, TreeRow, can_thumbnail, classify};
+use crate::explorer::{
+    AssetRef, Entry, FileExplorer, FileKind, FileView, TreeRow, can_thumbnail, classify,
+};
 use crate::icons::{Icon, Icons};
 use crate::modal::{Modal, ModalAction, ModalBody, SettingField, SettingsDraft};
 use crate::thumbnails::Thumbnails;
@@ -318,6 +320,15 @@ pub struct EditorRows {
     /// A submitted field row commits its current text to
     /// `(node, component index, field name)`.
     pub field_rows: Vec<(WidgetId, NodeId, usize, &'static str)>,
+    /// Inspector asset (`Value::Asset`) fields: each is a drop target that,
+    /// when an explorer image is dropped on it, sets `(node, component, field)`.
+    pub asset_fields: Vec<(WidgetId, NodeId, usize, &'static str)>,
+    /// The "browse" (open chooser) and "clear" buttons of each asset field.
+    pub asset_browse: Vec<(WidgetId, NodeId, usize, &'static str)>,
+    pub asset_clear: Vec<(WidgetId, NodeId, usize, &'static str)>,
+    /// The asset chooser's grid cells, each mapped to the project-relative image
+    /// path it selects.
+    pub asset_choices: Vec<(WidgetId, String)>,
     /// A submitted transform row commits to the node's Transform; the field is
     /// `"position"`, `"rotation"`, or `"scale"`.
     pub transform_rows: Vec<(WidgetId, NodeId, &'static str)>,
@@ -749,6 +760,8 @@ fn build_pane(ui: &mut Ui, parent: WidgetId, pane: Pane, ctx: &PaneCtx, rows: &m
             ctx.primary,
             ctx.icons,
             ctx.inspector,
+            ctx.explorer,
+            ctx.thumbnails,
             ctx.theme,
             rows,
         )),
@@ -1110,6 +1123,7 @@ pub fn build_modal(
     ui: &mut Ui,
     modal: &Modal,
     icons: Option<&Icons>,
+    thumbnails: &Thumbnails,
     theme: &EditorTheme,
     rows: &mut EditorRows,
 ) {
@@ -1167,6 +1181,9 @@ pub fn build_modal(
             );
         }
         ModalBody::Settings(draft) => build_settings_body(ui, card, draft, theme, rows),
+        ModalBody::AssetChooser(chooser) => {
+            build_asset_chooser_body(ui, card, &chooser.images, thumbnails, icons, theme, rows);
+        }
     }
 
     // Footer: action buttons pushed to the right; the last one is the accented
@@ -1179,6 +1196,8 @@ pub fn build_modal(
             ("Cancel", ModalAction::Close),
             ("Save", ModalAction::SaveSettings),
         ],
+        // The chooser commits by clicking an image; the footer just cancels.
+        ModalBody::AssetChooser(_) => &[("Cancel", ModalAction::Close)],
     };
     for (i, &(label, action)) in buttons.iter().enumerate() {
         let primary = i == buttons.len() - 1;
@@ -1248,6 +1267,84 @@ fn build_settings_body(
                 .border(1.0, theme.card_border),
         );
         rows.modal_inputs.push((input, field));
+    }
+}
+
+/// The asset chooser body: a scrollable grid of the project's images. Each cell
+/// is a button that selects that image (its project-relative path is recorded in
+/// `asset_choices`).
+const CHOOSER_H: f32 = 320.0;
+const CHOOSER_COLS: usize = 4;
+const CHOOSER_CELL: f32 = 92.0;
+const CHOOSER_THUMB: f32 = 72.0;
+
+fn build_asset_chooser_body(
+    ui: &mut Ui,
+    card: WidgetId,
+    images: &[AssetRef],
+    thumbnails: &Thumbnails,
+    icons: Option<&Icons>,
+    theme: &EditorTheme,
+    rows: &mut EditorRows,
+) {
+    if images.is_empty() {
+        ui.label(
+            card,
+            "No images in this project.".to_string(),
+            Style::new().width(MODAL_W - 32.0).foreground(theme.subhead),
+        );
+        return;
+    }
+    let grid = ui.panel(
+        card,
+        Style::new()
+            .column()
+            .gap(FILE_GRID_GAP)
+            .width(MODAL_W - 32.0)
+            .height(CHOOSER_H)
+            .scroll(),
+    );
+    for chunk in images.chunks(CHOOSER_COLS) {
+        let row = ui.panel(grid, Style::new().row().gap(FILE_GRID_GAP));
+        for asset in chunk {
+            let cell = ui.button(
+                row,
+                "",
+                Style::new()
+                    .column()
+                    .align_center()
+                    .gap(3.0)
+                    .padding(4.0)
+                    .width(CHOOSER_CELL)
+                    .flat()
+                    .corner_radius(4.0),
+            );
+            if let Some(handle) = thumbnails.get(&asset.abs) {
+                ui.image(
+                    cell,
+                    handle,
+                    Style::new().size(CHOOSER_THUMB, CHOOSER_THUMB),
+                );
+            } else if let Some(icons) = icons {
+                ui.image(
+                    cell,
+                    icons.get(Icon::FileImage),
+                    Style::new().size(CHOOSER_THUMB, CHOOSER_THUMB),
+                );
+            } else {
+                ui.panel(cell, Style::new().size(CHOOSER_THUMB, CHOOSER_THUMB));
+            }
+            ui.label(
+                cell,
+                asset.name.clone(),
+                Style::new()
+                    .width(CHOOSER_CELL - 8.0)
+                    .ellipsis()
+                    .text_center()
+                    .foreground(theme.heading),
+            );
+            rows.asset_choices.push((cell, asset.rel.clone()));
+        }
     }
 }
 
@@ -1590,6 +1687,8 @@ fn build_inspector(
     selected: Option<NodeId>,
     icons: Option<&Icons>,
     inspector: &InspectorView,
+    explorer: &FileExplorer,
+    thumbnails: &Thumbnails,
     theme: &EditorTheme,
     rows: &mut EditorRows,
 ) -> WidgetId {
@@ -1717,6 +1816,11 @@ fn build_inspector(
                         },
                     ));
                 }
+                Value::Asset(path) => {
+                    add_asset_field(
+                        ui, card, field, &path, node, i, icons, explorer, thumbnails, theme, rows,
+                    );
+                }
                 _ => {
                     let numeric = matches!(value, Value::F32(_));
                     let input = add_value_row(ui, card, field, &value, numeric, theme);
@@ -1726,6 +1830,99 @@ fn build_inspector(
         }
     }
     panel
+}
+
+/// The thumbnail/icon size in an inspector asset field.
+const ASSET_THUMB: f32 = 30.0;
+
+/// An inspector asset (image) field: a preview of the current asset (its
+/// thumbnail, or a file icon), its project-relative path (editable, committed
+/// like any field), and Browse / Clear buttons. The whole row is a drop target -
+/// dragging an explorer image onto it sets the field.
+#[allow(clippy::too_many_arguments)]
+fn add_asset_field(
+    ui: &mut Ui,
+    card: WidgetId,
+    field: &'static str,
+    path: &str,
+    node: NodeId,
+    component: usize,
+    icons: Option<&Icons>,
+    explorer: &FileExplorer,
+    thumbnails: &Thumbnails,
+    theme: &EditorTheme,
+    rows: &mut EditorRows,
+) {
+    let row = ui.panel(
+        card,
+        Style::new().row().gap(6.0).align_center().drop_target(),
+    );
+    rows.asset_fields.push((row, node, component, field));
+
+    // A preview: the asset's decoded thumbnail if we have it, else a file icon.
+    match thumbnails.get(&explorer.resolve_relative(path)) {
+        Some(handle) => {
+            ui.image(row, handle, Style::new().size(ASSET_THUMB, ASSET_THUMB));
+        }
+        None => match icons {
+            Some(icons) => {
+                ui.image(
+                    row,
+                    icons.get(Icon::FileImage),
+                    Style::new().size(ASSET_THUMB, ASSET_THUMB),
+                );
+            }
+            None => {
+                ui.panel(row, Style::new().size(ASSET_THUMB, ASSET_THUMB));
+            }
+        },
+    }
+
+    // The editable path (commits through the same field_rows path as any field).
+    let input = ui.text_input(
+        row,
+        path.to_string(),
+        Style::new()
+            .grow(1.0)
+            .padding(4.0)
+            .foreground(theme.heading)
+            .corner_radius(CONTROL_RADIUS),
+    );
+    rows.field_rows.push((input, node, component, field));
+
+    // Browse (opens the image chooser) and Clear (empties the field).
+    let browse = asset_icon_button(ui, row, icons, Icon::Load, "...", theme);
+    rows.asset_browse.push((browse, node, component, field));
+    let clear = asset_icon_button(ui, row, icons, Icon::Close, "x", theme);
+    rows.asset_clear.push((clear, node, component, field));
+}
+
+/// A small icon button for an asset field (falls back to a text caption when
+/// there is no icon set, as in headless tests).
+fn asset_icon_button(
+    ui: &mut Ui,
+    parent: WidgetId,
+    icons: Option<&Icons>,
+    icon: Icon,
+    caption: &str,
+    theme: &EditorTheme,
+) -> WidgetId {
+    match icons {
+        Some(icons) => {
+            let button = ui.button(parent, "", Style::new().icon_button().padding(4.0));
+            ui.image(button, icons.get(icon), Style::new().size(16.0, 16.0));
+            button
+        }
+        None => ui.button(
+            parent,
+            caption,
+            Style::new()
+                .padding(4.0)
+                .background(theme.menu_bg)
+                .foreground(theme.heading)
+                .corner_radius(CONTROL_RADIUS),
+        ),
+    }
 }
 
 /// Add a collapsible inspector section as a "card" (its own lighter background,
@@ -2321,7 +2518,8 @@ mod tests {
         ui.set_theme(theme.aurora);
         ui.root_panel(Style::new().fill());
         let mut rows = EditorRows::default();
-        build_modal(&mut ui, modal, None, &theme, &mut rows);
+        let thumbnails = Thumbnails::new();
+        build_modal(&mut ui, modal, None, &thumbnails, &theme, &mut rows);
         ui.layout(Vec2::new(1000.0, 700.0)).unwrap();
         rows
     }
@@ -2343,6 +2541,36 @@ mod tests {
         assert_eq!(rows.modal_checks.len(), 3, "grid / axes / snap");
         assert_eq!(rows.modal_inputs.len(), 3, "move / rotate / scale step");
         assert_eq!(rows.modal_buttons.len(), 2, "Cancel + Save");
+    }
+
+    #[test]
+    fn an_asset_chooser_modal_lays_out_a_grid_of_choices() {
+        let scene = Scene::new("root");
+        let target = crate::modal::AssetTarget {
+            node: scene.root(),
+            component: 0,
+            field: "texture",
+        };
+        let images = vec![
+            AssetRef {
+                abs: "/p/a.png".into(),
+                rel: "a.png".into(),
+                name: "a.png".into(),
+            },
+            AssetRef {
+                abs: "/p/b.png".into(),
+                rel: "b.png".into(),
+                name: "b.png".into(),
+            },
+        ];
+        let rows = laid_out_modal(&Modal::asset_chooser(target, images));
+        assert_eq!(rows.asset_choices.len(), 2, "one cell per image");
+        assert_eq!(
+            rows.asset_choices[0].1, "a.png",
+            "cell records its rel path"
+        );
+        assert!(rows.modal_close.is_some());
+        assert_eq!(rows.modal_buttons.len(), 1, "just Cancel");
     }
 
     /// Build the shell the way the tests did before docking: a single optional

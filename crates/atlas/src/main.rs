@@ -492,13 +492,7 @@ impl ApplicationHandler for App {
                 (MouseButton::Middle, ElementState::Released) => state.panning = false,
                 _ => {}
             },
-            WindowEvent::MouseWheel { delta, .. } => {
-                // Explicitly no wheel scroll/zoom while a modal owns the screen
-                // (otherwise only the backdrop's hit-test incidentally blocks it).
-                if state.modal.is_none() {
-                    state.wheel(delta);
-                }
-            }
+            WindowEvent::MouseWheel { delta, .. } => state.wheel(delta),
             WindowEvent::ModifiersChanged(m) => {
                 state.modifiers = m.state();
                 // Aurora needs shift to know whether movement keys extend a
@@ -1392,6 +1386,51 @@ impl State {
         self.close_modal();
     }
 
+    // ---- asset fields ----
+
+    /// Set an inspector asset (`Value::Asset`) field to a project-relative path,
+    /// through history (one undo step). Marks dirty so the field's preview and
+    /// the sprite both refresh. A no-op if the value is unchanged or the field is
+    /// not an asset.
+    fn commit_asset_field(
+        &mut self,
+        node: NodeId,
+        component: usize,
+        field: &'static str,
+        path: String,
+    ) {
+        let old = self
+            .project
+            .scene
+            .node(node)
+            .components
+            .get(component)
+            .and_then(|c| c.as_reflect().get(field));
+        if let Some(Value::Asset(current)) = old
+            && current != path
+        {
+            self.history.set_field(
+                &mut self.project.scene,
+                node,
+                component,
+                field,
+                Value::Asset(path),
+            );
+        }
+        self.dirty = true;
+    }
+
+    /// Open the image chooser for an asset field (all project images in a grid).
+    fn open_asset_chooser(&mut self, node: NodeId, component: usize, field: &'static str) {
+        let images = self.explorer.all_images();
+        let target = modal::AssetTarget {
+            node,
+            component,
+            field,
+        };
+        self.open_modal(modal::Modal::asset_chooser(target, images));
+    }
+
     /// The selection in scene order (root first), skipping the scene root (which
     /// cannot be deleted, duplicated, or copied). The order matters so a
     /// multi-node op reads naturally and duplicates land in a sensible order.
@@ -2274,13 +2313,11 @@ impl State {
         self.clipboard.as_mut()?.get_text().ok()
     }
 
-    /// Handle an Aurora `Dropped`: a PNG row (`source`) dragged onto the
-    /// viewport (`target`) spawns a sprite showing that texture at the drop
-    /// point. Any other source/target pair is ignored.
+    /// Handle an Aurora `Dropped`: a dragged explorer image (`source`) dropped
+    /// onto the viewport spawns a sprite at the drop point, or dropped onto an
+    /// inspector asset field sets that field's texture. Anything else is ignored.
     fn drop_file(&mut self, source: aurora::WidgetId, target: Option<aurora::WidgetId>) {
-        if target != self.rows.viewport {
-            return;
-        }
+        // Resolve the dragged explorer image to its project-relative path.
         let Some(path) = self
             .rows
             .file_rows
@@ -2290,18 +2327,29 @@ impl State {
         else {
             return;
         };
-        let Some(world) = self.cursor_world() else {
+        // Dropped onto the viewport: spawn a sprite there.
+        if target == self.rows.viewport {
+            let Some(world) = self.cursor_world() else {
+                return;
+            };
+            let node = actions::spawn_sprite(
+                &mut self.project.scene,
+                &mut self.history,
+                world,
+                &path,
+                self.texture_size,
+            );
+            self.selection.select_one(node);
+            self.dirty = true;
             return;
-        };
-        let node = actions::spawn_sprite(
-            &mut self.project.scene,
-            &mut self.history,
-            world,
-            &path,
-            self.texture_size,
-        );
-        self.selection.select_one(node);
-        self.dirty = true;
+        }
+        // Dropped onto an inspector asset field: set that field.
+        if let Some(t) = target
+            && let Some(&(_, node, component, field)) =
+                self.rows.asset_fields.iter().find(|(w, ..)| *w == t)
+        {
+            self.commit_asset_field(node, component, field, path);
+        }
     }
 
     /// The toolbar's Add Sprite: spawn at the center of the current view.
@@ -2445,6 +2493,46 @@ impl State {
             if !had && self.thumbnails.get(&path).is_some() {
                 self.dirty = true;
             }
+        }
+    }
+
+    /// Ensure thumbnails for the images shown outside the explorer: the asset
+    /// chooser's grid, and the selected node's asset fields (so the inspector
+    /// shows a preview). A newly decoded preview marks dirty to reveal it.
+    fn ensure_asset_thumbnails(&mut self) {
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(images) = self.modal.as_ref().and_then(|m| m.asset_images()) {
+            paths.extend(images.iter().map(|a| a.abs.clone()));
+        }
+        if let Some(node) = self.selection.primary() {
+            for comp in &self.project.scene.node(node).components {
+                let reflect = comp.as_reflect();
+                for &field in reflect.field_names() {
+                    if let Some(Value::Asset(rel)) = reflect.get(field)
+                        && !rel.is_empty()
+                    {
+                        paths.push(self.explorer.resolve_relative(&rel));
+                    }
+                }
+            }
+        }
+        // Decode a bounded number per frame so opening the chooser on a project
+        // with many images streams them in over a few frames instead of one long
+        // stall; `dirty` keeps the pump going until the queue drains.
+        const BUDGET: usize = 8;
+        let mut decoded = 0;
+        for path in paths {
+            if !explorer::can_thumbnail(&path) || self.thumbnails.contains(&path) {
+                continue;
+            }
+            if decoded >= BUDGET {
+                self.dirty = true;
+                break;
+            }
+            if self.thumbnails.ensure(&mut self.gui, &path).is_some() {
+                self.dirty = true;
+            }
+            decoded += 1;
         }
     }
 
@@ -2812,6 +2900,7 @@ impl State {
         // layout (tree scroll, grid columns); both can request a rebuild, so
         // they run before `dirty` is read.
         self.ensure_thumbnails();
+        self.ensure_asset_thumbnails();
         self.sync_explorer_view();
         self.update_file_tooltip();
         let t_react = fstart.elapsed();
@@ -2885,6 +2974,7 @@ impl State {
                     &mut self.ui,
                     m,
                     Some(&self.icons),
+                    &self.thumbnails,
                     &self.theme,
                     &mut self.rows,
                 );
@@ -3247,6 +3337,45 @@ impl State {
                         .map(|(_, t)| *t)
                         .expect("guarded by the match arm");
                     self.open_color_picker(target);
+                }
+                AuroraEvent::Clicked(id)
+                    if self.rows.asset_browse.iter().any(|(w, ..)| *w == id) =>
+                {
+                    let (node, component, field) = self
+                        .rows
+                        .asset_browse
+                        .iter()
+                        .find(|(w, ..)| *w == id)
+                        .map(|&(_, n, c, f)| (n, c, f))
+                        .expect("guarded by the match arm");
+                    self.open_asset_chooser(node, component, field);
+                }
+                AuroraEvent::Clicked(id)
+                    if self.rows.asset_clear.iter().any(|(w, ..)| *w == id) =>
+                {
+                    let (node, component, field) = self
+                        .rows
+                        .asset_clear
+                        .iter()
+                        .find(|(w, ..)| *w == id)
+                        .map(|&(_, n, c, f)| (n, c, f))
+                        .expect("guarded by the match arm");
+                    self.commit_asset_field(node, component, field, String::new());
+                }
+                AuroraEvent::Clicked(id)
+                    if self.rows.asset_choices.iter().any(|(w, _)| *w == id) =>
+                {
+                    let rel = self
+                        .rows
+                        .asset_choices
+                        .iter()
+                        .find(|(w, _)| *w == id)
+                        .map(|(_, p)| p.clone())
+                        .expect("guarded by the match arm");
+                    if let Some(t) = self.modal.as_ref().and_then(|m| m.asset_target()) {
+                        self.commit_asset_field(t.node, t.component, t.field, rel);
+                    }
+                    self.close_modal();
                 }
                 AuroraEvent::Clicked(id)
                     if self.rows.tree_toggles.iter().any(|(w, _)| *w == id) =>

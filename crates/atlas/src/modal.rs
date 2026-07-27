@@ -11,6 +11,9 @@
 
 use std::io;
 
+use helios::NodeId;
+
+use crate::explorer::AssetRef;
 use crate::settings::SnapSettings;
 
 /// An open modal dialog: a title, whether it can be dismissed without choosing a
@@ -27,6 +30,24 @@ pub enum ModalBody {
     Message(String),
     /// The settings form, editing a live draft applied on Save.
     Settings(SettingsDraft),
+    /// An image picker: a grid of the project's images; clicking one sets the
+    /// target field.
+    AssetChooser(AssetChooser),
+}
+
+/// Which reflected component field an asset chooser writes to.
+#[derive(Debug, Clone, Copy)]
+pub struct AssetTarget {
+    pub node: NodeId,
+    pub component: usize,
+    pub field: &'static str,
+}
+
+/// The state behind the asset chooser: the field being set and the images to
+/// choose among.
+pub struct AssetChooser {
+    pub target: AssetTarget,
+    pub images: Vec<AssetRef>,
 }
 
 /// What a modal footer button does when clicked.
@@ -70,11 +91,20 @@ impl Modal {
         }
     }
 
+    /// The asset chooser for an image field.
+    pub fn asset_chooser(target: AssetTarget, images: Vec<AssetRef>) -> Self {
+        Self {
+            title: "Choose an image".to_string(),
+            closable: true,
+            body: ModalBody::AssetChooser(AssetChooser { target, images }),
+        }
+    }
+
     /// The settings draft, if this is a settings modal (for mutation from events).
     pub fn settings_draft_mut(&mut self) -> Option<&mut SettingsDraft> {
         match &mut self.body {
             ModalBody::Settings(draft) => Some(draft),
-            ModalBody::Message(_) => None,
+            _ => None,
         }
     }
 
@@ -82,7 +112,24 @@ impl Modal {
     pub fn settings_draft(&self) -> Option<SettingsDraft> {
         match &self.body {
             ModalBody::Settings(draft) => Some(*draft),
-            ModalBody::Message(_) => None,
+            _ => None,
+        }
+    }
+
+    /// The asset chooser's target field, if this is an asset chooser.
+    pub fn asset_target(&self) -> Option<AssetTarget> {
+        match &self.body {
+            ModalBody::AssetChooser(c) => Some(c.target),
+            _ => None,
+        }
+    }
+
+    /// The asset chooser's images, if this is an asset chooser (to ensure their
+    /// thumbnails before rendering the grid).
+    pub fn asset_images(&self) -> Option<&[AssetRef]> {
+        match &self.body {
+            ModalBody::AssetChooser(c) => Some(&c.images),
+            _ => None,
         }
     }
 
@@ -90,7 +137,7 @@ impl Modal {
     pub fn default_action(&self) -> ModalAction {
         match self.body {
             ModalBody::Settings(_) => ModalAction::SaveSettings,
-            ModalBody::Message(_) => ModalAction::Close,
+            ModalBody::Message(_) | ModalBody::AssetChooser(_) => ModalAction::Close,
         }
     }
 }
