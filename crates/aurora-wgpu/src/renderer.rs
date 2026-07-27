@@ -6,7 +6,6 @@ use aether::Gpu;
 use aurora::cosmic_text::FontSystem;
 use aurora::{Color, DrawCommand, DrawList, ImageHandle, Rect};
 use glam::Vec2;
-use wgpu::util::DeviceExt;
 
 use crate::atlas::{Atlas, GlyphEntry};
 use crate::error::RenderError;
@@ -156,7 +155,17 @@ pub struct Renderer {
     atlas: Atlas,
     atlas_bind_group: wgpu::BindGroup,
     images: ImageRegistry,
+    /// Persistent, growable instance buffers reused every frame (grown by
+    /// power-of-two when a frame needs more) so a normal frame does no GPU
+    /// buffer allocation - just a `write_buffer` upload.
+    quad_instances: wgpu::Buffer,
+    quad_cap: u64,
+    image_instances: wgpu::Buffer,
+    image_cap: u64,
 }
+
+/// Initial instance-buffer capacity, in bytes (grown on demand).
+const INSTANCE_INIT_BYTES: u64 = 4096;
 
 impl Renderer {
     /// Create a self-contained renderer that presents to `target` (e.g. an
@@ -307,6 +316,18 @@ impl Renderer {
 
         let images = ImageRegistry::new(device);
 
+        let new_instance_buffer = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: INSTANCE_INIT_BYTES,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        // Bind these before moving `gpu` into the struct (they borrow `device`).
+        let quad_instances = new_instance_buffer("quad instances");
+        let image_instances = new_instance_buffer("image instances");
+
         Ok(Self {
             gpu,
             surface,
@@ -319,6 +340,10 @@ impl Renderer {
             atlas,
             atlas_bind_group,
             images,
+            quad_instances,
+            quad_cap: INSTANCE_INIT_BYTES,
+            image_instances,
+            image_cap: INSTANCE_INIT_BYTES,
         })
     }
 
@@ -460,10 +485,36 @@ impl Renderer {
             self.build_ops(list, font_system, sw, sh)
         };
 
-        let instance_buffer =
-            (!instances.is_empty()).then(|| self.upload_instances("quad instances", &instances));
-        let image_instance_buffer = (!image_instances.is_empty())
-            .then(|| self.upload_instances("image instances", &image_instances));
+        // Upload into the persistent, growable instance buffers (no per-frame
+        // GPU allocation unless a frame needs more room than before).
+        let have_quads = !instances.is_empty();
+        let have_images = !image_instances.is_empty();
+        if have_quads {
+            Self::ensure_instance_capacity(
+                &self.gpu.device,
+                &mut self.quad_instances,
+                &mut self.quad_cap,
+                std::mem::size_of_val(&instances[..]) as u64,
+                "quad instances",
+            );
+            self.gpu
+                .queue
+                .write_buffer(&self.quad_instances, 0, bytemuck::cast_slice(&instances));
+        }
+        if have_images {
+            Self::ensure_instance_capacity(
+                &self.gpu.device,
+                &mut self.image_instances,
+                &mut self.image_cap,
+                std::mem::size_of_val(&image_instances[..]) as u64,
+                "image instances",
+            );
+            self.gpu.queue.write_buffer(
+                &self.image_instances,
+                0,
+                bytemuck::cast_slice(&image_instances),
+            );
+        }
 
         let mut encoder = self
             .gpu
@@ -496,13 +547,13 @@ impl Renderer {
             for op in &ops {
                 match op {
                     Op::Quads { rect, range } => {
-                        let Some(buffer) = &instance_buffer else {
+                        if !have_quads {
                             continue;
-                        };
+                        }
                         pass.set_pipeline(&self.pipeline);
                         pass.set_bind_group(0, &self.screen_bind_group, &[]);
                         pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.set_vertex_buffer(0, self.quad_instances.slice(..));
                         pass.set_scissor_rect(rect[0], rect[1], rect[2], rect[3]);
                         pass.draw(0..6, range.clone());
                     }
@@ -511,15 +562,15 @@ impl Renderer {
                         handle,
                         instance,
                     } => {
-                        let (Some(buffer), Some(bind_group)) =
-                            (&image_instance_buffer, self.images.bind_group(*handle))
+                        let (true, Some(bind_group)) =
+                            (have_images, self.images.bind_group(*handle))
                         else {
                             continue;
                         };
                         pass.set_pipeline(&self.image_pipeline);
                         pass.set_bind_group(0, &self.screen_bind_group, &[]);
                         pass.set_bind_group(1, bind_group, &[]);
-                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.set_vertex_buffer(0, self.image_instances.slice(..));
                         pass.set_scissor_rect(rect[0], rect[1], rect[2], rect[3]);
                         pass.draw(0..6, *instance..*instance + 1);
                     }
@@ -545,14 +596,27 @@ impl Renderer {
         );
     }
 
-    fn upload_instances(&self, label: &str, instances: &[QuadInstance]) -> wgpu::Buffer {
-        self.gpu
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(instances),
-                usage: wgpu::BufferUsages::VERTEX,
-            })
+    /// Grow `buffer` to hold at least `needed` bytes if it is too small,
+    /// rounding up to a power of two so a growing frame reallocates rarely. The
+    /// buffer keeps `VERTEX | COPY_DST` usage so it can be written every frame.
+    fn ensure_instance_capacity(
+        device: &wgpu::Device,
+        buffer: &mut wgpu::Buffer,
+        cap: &mut u64,
+        needed: u64,
+        label: &str,
+    ) {
+        if needed <= *cap {
+            return;
+        }
+        let new_cap = needed.next_power_of_two().max(INSTANCE_INIT_BYTES);
+        *buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: new_cap,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        *cap = new_cap;
     }
 
     /// Translate the command list into the atlas-pipeline instances, the
