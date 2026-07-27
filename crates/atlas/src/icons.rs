@@ -49,6 +49,10 @@ pub enum Icon {
     Eye,
     /// A struck-through eye (a hidden node's visibility toggle).
     EyeOff,
+    /// A 3x3 grid (the viewport grid toggle).
+    Grid,
+    /// Two arrows from an origin (the world-axes toggle).
+    Axes,
 }
 
 /// An icon's coverage predicate over the normalized `[0, 1]` square.
@@ -68,6 +72,8 @@ const SPECS: &[(Icon, Predicate)] = &[
     (Icon::ChevronDown, icon_chevron_down),
     (Icon::Eye, icon_eye),
     (Icon::EyeOff, icon_eye_off),
+    (Icon::Grid, icon_grid),
+    (Icon::Axes, icon_axes),
 ];
 
 /// The registered icon images, looked up by [`Icon`].
@@ -296,6 +302,24 @@ fn icon_eye(x: f32, y: f32) -> bool {
 /// A struck-through eye (a hidden node): the eye plus a diagonal slash.
 fn icon_eye_off(x: f32, y: f32) -> bool {
     icon_eye(x, y) || line(x, y, (0.16, 0.16), (0.84, 0.84), 0.075)
+}
+
+/// A 3x3 grid of lines (the viewport grid toggle).
+fn icon_grid(x: f32, y: f32) -> bool {
+    let w = 0.08;
+    line(x, y, (0.35, 0.1), (0.35, 0.9), w)
+        || line(x, y, (0.65, 0.1), (0.65, 0.9), w)
+        || line(x, y, (0.1, 0.35), (0.9, 0.35), w)
+        || line(x, y, (0.1, 0.65), (0.9, 0.65), w)
+}
+
+/// Two arrows from a shared origin (up and right): the world X/Y axes.
+fn icon_axes(x: f32, y: f32) -> bool {
+    let o = (0.18, 0.82);
+    line(x, y, o, (0.18, 0.16), STROKE)
+        || line(x, y, o, (0.84, 0.82), STROKE)
+        || arrowhead(x, y, (0.18, 0.08), (0.0, -1.0), 0.18, 0.1)
+        || arrowhead(x, y, (0.92, 0.82), (1.0, 0.0), 0.18, 0.1)
 }
 
 /// A diagonal double-headed arrow (scale/resize), thin with sharp heads.

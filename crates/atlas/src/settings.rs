@@ -14,12 +14,36 @@ use serde::{Deserialize, Serialize};
 use crate::ui::EditorTheme;
 
 /// The user's editor settings.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// The editor color theme (every surface, text, and accent color). Defaults
     /// to [`EditorTheme::dark`] (which is `EditorTheme`'s `Default`).
     pub theme: EditorTheme,
+    /// Show the editor grid in the viewport (default on).
+    #[serde(default = "default_true")]
+    pub show_grid: bool,
+    /// Show the world origin axes in the viewport (default on).
+    #[serde(default = "default_true")]
+    pub show_axes: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+// A hand-written Default (not derived) so the grid/axes toggles default ON: a
+// derived Default would make the bools false, and load() returns Default when no
+// settings file exists yet (first run). The field-level serde defaults handle
+// old files that predate these fields.
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: EditorTheme::default(),
+            show_grid: true,
+            show_axes: true,
+        }
+    }
 }
 
 /// The `orbit` config directory: `$XDG_CONFIG_HOME/orbit`, else `~/.config/orbit`.
@@ -99,17 +123,47 @@ mod tests {
     fn settings_round_trip_through_ron() {
         let settings = Settings {
             theme: EditorTheme::light(),
+            show_grid: false,
+            show_axes: true,
         };
         let pretty = ron::ser::PrettyConfig::default();
         let text = ron::ser::to_string_pretty(&settings, pretty).unwrap();
         let back: Settings = ron::from_str(&text).unwrap();
         assert_eq!(back.theme, EditorTheme::light());
+        assert!(!back.show_grid);
+        assert!(back.show_axes);
     }
 
     #[test]
     fn an_empty_settings_file_falls_back_to_defaults() {
-        // #[serde(default)] fills the theme from EditorTheme::default() (dark).
+        // #[serde(default)] fills the theme from EditorTheme::default() (dark),
+        // and the grid/axes toggles default ON.
         let back: Settings = ron::from_str("()").unwrap();
         assert_eq!(back.theme, EditorTheme::dark());
+        assert!(back.show_grid, "grid defaults on");
+        assert!(back.show_axes, "axes default on");
+    }
+
+    #[test]
+    fn an_old_settings_file_without_the_grid_fields_defaults_them_on() {
+        // A file written before show_grid/show_axes existed: only `theme`.
+        let text = ron::ser::to_string_pretty(
+            &EditorThemeOnly {
+                theme: EditorTheme::light(),
+            },
+            ron::ser::PrettyConfig::default(),
+        )
+        .unwrap();
+        let back: Settings = ron::from_str(&text).unwrap();
+        assert_eq!(back.theme, EditorTheme::light());
+        assert!(
+            back.show_grid && back.show_axes,
+            "missing fields default on"
+        );
+    }
+
+    #[derive(Serialize)]
+    struct EditorThemeOnly {
+        theme: EditorTheme,
     }
 }

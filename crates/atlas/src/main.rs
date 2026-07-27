@@ -285,6 +285,9 @@ struct State {
     /// The active transform tool (select/move/rotate/scale), chosen from the
     /// toolbar; filters which gizmo handles show and are hittable.
     gizmo_mode: GizmoMode,
+    /// Viewport view toggles (from the toolbar; persisted in global settings).
+    show_grid: bool,
+    show_axes: bool,
     /// The OS clipboard (for text copy/cut/paste), or `None` if it could not
     /// be opened on this platform.
     clipboard: Option<arboard::Clipboard>,
@@ -482,9 +485,10 @@ impl State {
             build_viewport_target(&mut gui, &engine, (size.width, size.height));
         let dock = DockNode::default_layout();
         let pane_scrolls = HashMap::new();
-        // The editor theme comes from the user's settings file (~/.config/orbit),
+        // Editor prefs come from the user's settings file (~/.config/orbit),
         // written with defaults on first run - see the `settings` module.
-        let theme = settings::load().theme;
+        let settings = settings::load();
+        let theme = settings.theme;
         let (ui, rows) = build_editor_ui(
             &project.scene,
             &HashSet::new(),
@@ -495,6 +499,8 @@ impl State {
             &pane_scrolls,
             None,
             GizmoMode::default(),
+            settings.show_grid,
+            settings.show_axes,
             Some(&icons),
             &TreeView::default(),
             "",
@@ -543,6 +549,8 @@ impl State {
             applied_title: WINDOW_TITLE.to_string(),
             context_menu: None,
             gizmo_mode: GizmoMode::default(),
+            show_grid: settings.show_grid,
+            show_axes: settings.show_axes,
             clipboard: arboard::Clipboard::new()
                 .inspect_err(|err| tracing::warn!("no clipboard available: {err}"))
                 .ok(),
@@ -1819,6 +1827,19 @@ impl State {
         self.history.revision() != self.saved_revision
     }
 
+    /// Write the current viewport view toggles back to the global settings file
+    /// so they persist across restarts (best-effort; a failure is logged).
+    fn persist_view_prefs(&self) {
+        let settings = settings::Settings {
+            theme: self.theme,
+            show_grid: self.show_grid,
+            show_axes: self.show_axes,
+        };
+        if let Err(err) = settings::save(&settings) {
+            tracing::warn!("could not save view settings: {err}");
+        }
+    }
+
     /// The window title for the current state ("* " prefix when unsaved).
     fn title(&self) -> String {
         let mark = if self.is_modified() { "* " } else { "" };
@@ -1985,6 +2006,8 @@ impl State {
                 &self.pane_scrolls,
                 self.context_menu.as_ref(),
                 self.gizmo_mode,
+                self.show_grid,
+                self.show_axes,
                 Some(&self.icons),
                 &self.tree_view(),
                 &self.tree_filter,
@@ -2096,9 +2119,17 @@ impl State {
             .render_runs_to_target(&self.scene_target, clear, &camera, &run_refs);
 
         // Editor overlays, drawn over the scene in a second pass (LoadOp::Load)
-        // with the tintable white texture: the axis guide line first (under),
-        // then the selection's outline and gizmo handles.
+        // with the tintable white texture: the grid+axes first (furthest back),
+        // then the axis guide line, then the selection outline and gizmo handles.
         let mut overlay = Vec::new();
+        if self.show_grid || self.show_axes {
+            overlay.extend(viewport::grid_sprites(
+                &self.camera,
+                Vec2::new(w as f32, h as f32),
+                self.show_grid,
+                self.show_axes,
+            ));
+        }
         if let Some(drag) = &self.drag
             && let Some(guide) = viewport::axis_guide_sprite(
                 drag,
@@ -2192,6 +2223,16 @@ impl State {
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.save => self.save_project(),
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.load => self.load_project(),
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.grid => {
+                    self.show_grid = !self.show_grid;
+                    self.dirty = true;
+                    self.persist_view_prefs();
+                }
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.axes => {
+                    self.show_axes = !self.show_axes;
+                    self.dirty = true;
+                    self.persist_view_prefs();
+                }
                 AuroraEvent::Clicked(id)
                     if self.rows.mode_buttons.iter().any(|(w, _)| *w == id) =>
                 {

@@ -36,6 +36,20 @@ const GUIDE_PX: f32 = 1.5;
 /// The guide line's translucency (drawn in the dragged axis's color).
 const GUIDE_ALPHA: f32 = 0.55;
 
+/// Editor grid metrics. Lines are 1 screen-px; the origin axes a touch thicker.
+const GRID_LINE_PX: f32 = 1.0;
+const GRID_AXIS_PX: f32 = 1.5;
+/// Faint neutral grid over the scene: minor lines barely there, major lines a
+/// little brighter (both drawn on the tintable white overlay, so alpha is all).
+const GRID_MINOR: Color = Color::new(1.0, 1.0, 1.0, 0.05);
+const GRID_MAJOR: Color = Color::new(1.0, 1.0, 1.0, 0.12);
+/// Adaptive spacing target: the on-screen gap between major lines is kept at or
+/// above this, so the grid never gets denser than this as the view zooms out.
+const GRID_MIN_PX: f32 = 48.0;
+/// Minor (1/5) subdivisions are only drawn while their on-screen gap is at least
+/// this - below it they would read as noise.
+const GRID_MINOR_MIN_PX: f32 = 9.0;
+
 /// The editor's pan/zoom view of the scene: `pan` is the world coordinate at
 /// the viewport's top-left (photon's own camera anchor), `zoom` is screen
 /// pixels per world unit (1.0 = 1:1).
@@ -372,6 +386,90 @@ pub fn axis_guide_sprite(
     Some(s)
 }
 
+/// The smallest "nice" step (a 1/2/5 times a power of ten) that is at least
+/// `min`, so the grid spacing lands on round world units at every zoom.
+fn nice_step(min: f32) -> f32 {
+    if min <= 0.0 {
+        return 1.0;
+    }
+    let pow = 10f32.powf(min.log10().floor());
+    for m in [1.0, 2.0, 5.0] {
+        if m * pow >= min {
+            return m * pow;
+        }
+    }
+    10.0 * pow
+}
+
+/// Editor grid + origin axes as world-space overlay quads (drawn like the gizmo
+/// on the tintable white texture), bounded to the visible world rectangle so the
+/// line count stays proportional to the screen, not the world. Major lines fall
+/// on a 1/2/5 spacing chosen so their on-screen gap stays >= `GRID_MIN_PX`;
+/// minor (1/5) lines are added while they are not too dense. `show_axes` draws
+/// the world X (red) and Y (green) axes when the origin is in view.
+pub fn grid_sprites(
+    camera: &EditorCamera,
+    viewport_px: Vec2,
+    show_grid: bool,
+    show_axes: bool,
+) -> Vec<Sprite> {
+    let zoom = camera.zoom;
+    let min = camera.pan;
+    let max = camera.pan + viewport_px / zoom;
+    let (width, height) = (max.x - min.x, max.y - min.y);
+    let mut out = Vec::new();
+
+    let mut line = |along_x: bool, coord: f32, t: f32, color: Color| {
+        let mut s = if along_x {
+            // A vertical line at world x = coord, spanning the visible height.
+            Sprite::new(Vec2::new(coord - t * 0.5, min.y), Vec2::new(t, height))
+        } else {
+            // A horizontal line at world y = coord, spanning the visible width.
+            Sprite::new(Vec2::new(min.x, coord - t * 0.5), Vec2::new(width, t))
+        };
+        s.tint = color;
+        out.push(s);
+    };
+
+    if show_grid {
+        let step = nice_step(GRID_MIN_PX / zoom);
+        let minor = step / 5.0;
+        let show_minor = minor * zoom >= GRID_MINOR_MIN_PX;
+        let t = GRID_LINE_PX / zoom;
+        // Minor lines first (skipping those that coincide with a major line), so
+        // the brighter majors draw on top of them.
+        if show_minor {
+            for i in (min.x / minor).floor() as i64..=(max.x / minor).ceil() as i64 {
+                if i % 5 != 0 {
+                    line(true, i as f32 * minor, t, GRID_MINOR);
+                }
+            }
+            for j in (min.y / minor).floor() as i64..=(max.y / minor).ceil() as i64 {
+                if j % 5 != 0 {
+                    line(false, j as f32 * minor, t, GRID_MINOR);
+                }
+            }
+        }
+        for i in (min.x / step).floor() as i64..=(max.x / step).ceil() as i64 {
+            line(true, i as f32 * step, t, GRID_MAJOR);
+        }
+        for j in (min.y / step).floor() as i64..=(max.y / step).ceil() as i64 {
+            line(false, j as f32 * step, t, GRID_MAJOR);
+        }
+    }
+
+    if show_axes {
+        let t = GRID_AXIS_PX / zoom;
+        if (min.y..=max.y).contains(&0.0) {
+            line(false, 0.0, t, AXIS_X); // world X axis (horizontal) is red
+        }
+        if (min.x..=max.x).contains(&0.0) {
+            line(true, 0.0, t, AXIS_Y); // world Y axis (vertical) is green
+        }
+    }
+    out
+}
+
 /// An in-progress viewport drag. Each records the transform at press time and
 /// applies its math from that original - a release commits one clean undo step.
 /// With sprites centered on the node origin (ADR 0019), every drag edits
@@ -558,6 +656,59 @@ mod tests {
     use helios::{Node, SpriteComponent};
 
     const EPS: f32 = 1.0e-3;
+
+    #[test]
+    fn nice_step_snaps_up_the_one_two_five_ladder() {
+        assert_eq!(nice_step(1.0), 1.0);
+        assert_eq!(nice_step(1.5), 2.0);
+        assert_eq!(nice_step(3.0), 5.0);
+        assert_eq!(nice_step(6.0), 10.0);
+        assert_eq!(nice_step(0.3), 0.5);
+        assert_eq!(nice_step(120.0), 200.0);
+    }
+
+    #[test]
+    fn the_grid_stays_bounded_and_comfortably_spaced_across_zoom() {
+        let view = Vec2::new(1280.0, 720.0);
+        for zoom in [0.1, 0.5, 1.0, 3.0, 10.0] {
+            let cam = EditorCamera {
+                pan: Vec2::new(-123.0, 45.0),
+                zoom,
+            };
+            let sprites = grid_sprites(&cam, view, true, true);
+            // A screenful of lines, never the whole world: bounded well under a
+            // few hundred quads at any zoom (verticals+horizontals, minor+major).
+            assert!(
+                sprites.len() < 600,
+                "zoom {zoom}: {} grid sprites is too many",
+                sprites.len()
+            );
+            // The major spacing keeps its on-screen gap >= the target.
+            let step = nice_step(GRID_MIN_PX / zoom);
+            assert!(step * zoom >= GRID_MIN_PX - EPS, "zoom {zoom} too dense");
+        }
+    }
+
+    #[test]
+    fn axes_show_only_when_the_origin_is_in_view() {
+        let view = Vec2::new(800.0, 600.0);
+        // Origin visible (pan negative so 0,0 is inside [pan, pan+view]).
+        let cam = EditorCamera {
+            pan: Vec2::new(-100.0, -100.0),
+            zoom: 1.0,
+        };
+        // Axes-only (no grid) gives exactly the two origin axes.
+        assert_eq!(grid_sprites(&cam, view, false, true).len(), 2);
+        // Nothing when both are off.
+        assert!(grid_sprites(&cam, view, false, false).is_empty());
+        // Panned so the origin is off-screen (top-left far into +x,+y world):
+        // neither axis line is emitted.
+        let off = EditorCamera {
+            pan: Vec2::new(500.0, 500.0),
+            zoom: 1.0,
+        };
+        assert!(grid_sprites(&off, view, false, true).is_empty());
+    }
 
     fn scene_with_sprite(translation: Vec2, size: Vec2) -> (Scene, NodeId) {
         let mut scene = Scene::new("root");

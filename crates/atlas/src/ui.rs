@@ -319,6 +319,10 @@ pub struct EditorRows {
     pub add_sprite: Option<WidgetId>,
     pub save: Option<WidgetId>,
     pub load: Option<WidgetId>,
+    /// The toolbar's view toggles (grid, world axes): highlighted when active,
+    /// flipped on click.
+    pub grid: Option<WidgetId>,
+    pub axes: Option<WidgetId>,
     /// The toolbar's gizmo-mode buttons, each mapped to the mode it selects.
     pub mode_buttons: Vec<(WidgetId, GizmoMode)>,
     /// Numeric inputs for the x/y components of a Vec2 field: submitting one
@@ -414,6 +418,8 @@ pub fn build_editor_ui(
     scrolls: &HashMap<Pane, f32>,
     menu: Option<&ContextMenu>,
     gizmo_mode: GizmoMode,
+    show_grid: bool,
+    show_axes: bool,
     icons: Option<&Icons>,
     tree: &TreeView,
     filter: &str,
@@ -440,6 +446,8 @@ pub fn build_editor_ui(
         renaming,
         inspector,
         gizmo_mode,
+        show_grid,
+        show_axes,
         icons,
         viewport_handle,
         project_dir,
@@ -470,6 +478,8 @@ struct PaneCtx<'a> {
     renaming: Option<NodeId>,
     inspector: &'a InspectorView,
     gizmo_mode: GizmoMode,
+    show_grid: bool,
+    show_axes: bool,
     icons: Option<&'a Icons>,
     viewport_handle: ImageHandle,
     project_dir: &'a Path,
@@ -668,7 +678,16 @@ fn build_pane(ui: &mut Ui, parent: WidgetId, pane: Pane, ctx: &PaneCtx, rows: &m
 /// target (which travels with the pane wherever it docks).
 fn build_viewport_pane(ui: &mut Ui, parent: WidgetId, ctx: &PaneCtx, rows: &mut EditorRows) {
     let col = ui.panel(parent, Style::new().column().grow(1.0).clip());
-    build_toolbar(ui, col, ctx.gizmo_mode, ctx.icons, ctx.theme, rows);
+    build_toolbar(
+        ui,
+        col,
+        ctx.gizmo_mode,
+        ctx.show_grid,
+        ctx.show_axes,
+        ctx.icons,
+        ctx.theme,
+        rows,
+    );
     // A drop target so a PNG dragged from the file explorer can land here.
     let viewport = ui.image(
         col,
@@ -704,10 +723,13 @@ fn build_status_bar(ui: &mut Ui, parent: WidgetId, theme: &EditorTheme, rows: &m
 /// the gizmo-mode switches on the right (the active mode highlighted). Each
 /// button shows an icon when `icons` is available (falling back to its text
 /// caption, e.g. in headless tests). A natural home for more tool switches.
+#[allow(clippy::too_many_arguments)]
 fn build_toolbar(
     ui: &mut Ui,
     parent: WidgetId,
     mode: GizmoMode,
+    show_grid: bool,
+    show_axes: bool,
     icons: Option<&Icons>,
     theme: &EditorTheme,
     rows: &mut EditorRows,
@@ -744,6 +766,32 @@ fn build_toolbar(
         "Load",
         icon(Icon::Load),
         theme.panel_bg,
+        theme,
+    ));
+
+    // View toggles: highlighted (mode_active) when on, so their state reads at a
+    // glance, like the gizmo-mode buttons.
+    let toggle_bg = |on: bool| {
+        if on {
+            theme.mode_active
+        } else {
+            theme.panel_bg
+        }
+    };
+    rows.grid = Some(toolbar_button(
+        ui,
+        bar,
+        "Grid",
+        icon(Icon::Grid),
+        toggle_bg(show_grid),
+        theme,
+    ));
+    rows.axes = Some(toolbar_button(
+        ui,
+        bar,
+        "Axes",
+        icon(Icon::Axes),
+        toggle_bg(show_axes),
         theme,
     ));
 
@@ -1573,6 +1621,8 @@ mod tests {
             &HashMap::new(),
             menu,
             gizmo_mode,
+            true,
+            true,
             icons,
             tree,
             "",
@@ -1620,6 +1670,8 @@ mod tests {
             &HashMap::new(),
             None,
             GizmoMode::Select,
+            true,
+            true,
             None,
             &TreeView::default(),
             "",
@@ -2008,6 +2060,8 @@ mod tests {
             scrolls,
             None,
             GizmoMode::Select,
+            true,
+            true,
             None,
             &TreeView::default(),
             "",
@@ -2038,6 +2092,8 @@ mod tests {
             &HashMap::new(),
             None,
             GizmoMode::Select,
+            true,
+            true,
             None,
             &TreeView::default(),
             "",
