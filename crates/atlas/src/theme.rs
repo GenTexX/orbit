@@ -202,6 +202,7 @@ theme_tokens! {
     "menu_bg": Color => menu_bg,
     "card_bg": Color => card_bg,
     "card_border": Color => card_border,
+    "panel_border": Color => panel_border,
     "mode_active": Color => mode_active,
     "axis_x": Color => axis_x,
     "axis_y": Color => axis_y,
@@ -230,6 +231,8 @@ impl ThemeDoc {
             ("header".to_string(), ThemeValue::from(d.header_bg)),
             ("text".to_string(), ThemeValue::from(d.heading)),
             ("text_dim".to_string(), ThemeValue::from(d.subhead)),
+            ("select".to_string(), ThemeValue::from(d.row_selected)),
+            ("border".to_string(), ThemeValue::from(d.panel_border)),
             ("radius".to_string(), ThemeValue::Scalar(d.control_radius)),
         ]);
         let tokens = snapshot(&d)

@@ -60,6 +60,9 @@ pub struct Style {
     pub border_width: f32,
     /// Border color (drawn when `border_width` > 0).
     pub border_color: Color,
+    /// A bottom-edge-only border (0 = none), drawn beneath this widget's children.
+    pub border_bottom_width: f32,
+    pub border_bottom_color: Color,
     /// Whether this widget is a drag source: pressing and moving past a small
     /// threshold starts a drag carrying this widget (see `Event::DragStarted`).
     pub draggable: bool,
@@ -90,6 +93,8 @@ impl Default for Style {
             corner_radius: 0.0,
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
+            border_bottom_width: 0.0,
+            border_bottom_color: Color::TRANSPARENT,
             draggable: false,
             drop_target: false,
         }
@@ -375,6 +380,16 @@ impl Style {
     pub fn border(mut self, width: f32, color: Color) -> Self {
         self.border_width = width;
         self.border_color = color;
+        self
+    }
+
+    /// Draw a `width`-px line in `color` along this widget's bottom edge only,
+    /// under its children (so a child reaching the bottom - an active tab -
+    /// covers the segment beneath it). A bar underline that the active tab
+    /// interrupts.
+    pub fn border_bottom(mut self, width: f32, color: Color) -> Self {
+        self.border_bottom_width = width;
+        self.border_bottom_color = color;
         self
     }
 

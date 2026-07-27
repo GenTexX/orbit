@@ -56,6 +56,9 @@ pub struct EditorTheme {
     /// Inspector card fill and its 1px outline.
     pub card_bg: Color,
     pub card_border: Color,
+    /// Borders between panels: the draggable splitters, and the bottom underline
+    /// on bars (toolbar, breadcrumbs, the tab strip).
+    pub panel_border: Color,
     /// The active gizmo-mode toolbar button.
     pub mode_active: Color,
     /// Engine axis palette (X red, Y green) for the inspector's Vec2 labels.
@@ -107,6 +110,7 @@ impl EditorTheme {
             menu_bg: Color::rgb(0.11, 0.12, 0.15),
             card_bg: Color::rgb(0.128, 0.135, 0.165),
             card_border: Color::rgb(0.20, 0.22, 0.27),
+            panel_border: Color::rgb(0.24, 0.26, 0.32),
             mode_active: Color::rgb(0.22, 0.38, 0.60),
             axis_x: Color::rgb(0.90, 0.32, 0.32),
             axis_y: Color::rgb(0.35, 0.70, 0.38),
@@ -136,6 +140,7 @@ impl EditorTheme {
             menu_bg: Color::rgb(0.95, 0.96, 0.98),
             card_bg: Color::rgb(0.85, 0.86, 0.90),
             card_border: Color::rgb(0.72, 0.74, 0.80),
+            panel_border: Color::rgb(0.66, 0.68, 0.74),
             mode_active: Color::rgb(0.62, 0.76, 0.96),
             axis_x: Color::rgb(0.85, 0.30, 0.30),
             axis_y: Color::rgb(0.28, 0.62, 0.34),
@@ -670,16 +675,17 @@ fn build_dock_node(
             second,
         } => {
             let sw = ctx.theme.splitter_width;
+            let divider = || Style::new().background(ctx.theme.panel_border);
             let (row_style, orientation, splitter_style) = match dir {
                 SplitDir::Row => (
                     Style::new().row(),
                     Orientation::Vertical,
-                    Style::new().width(sw),
+                    divider().width(sw),
                 ),
                 SplitDir::Column => (
                     Style::new().column(),
                     Orientation::Horizontal,
-                    Style::new().height(sw),
+                    divider().height(sw),
                 ),
             };
             let container = ui.panel(parent, apply_sizing(row_style.clip(), sizing));
@@ -724,10 +730,22 @@ fn build_group(
             sizing,
         ),
     );
-    // The tab bar: tabs sit flush (no gap) on a darker strip. The active tab
-    // takes the content's background so it merges into the pane below it with no
-    // seam; inactive tabs are flat (just their text on the strip).
-    let bar = ui.panel(group, Style::new().row().background(theme.bar_bg));
+    // The tab bar: tabs sit flush (no gap) on a darker strip, inset from the top
+    // and sides so they do not jam the panel corner (no bottom padding, so the
+    // active tab still reaches the strip's bottom edge). The strip has a bottom
+    // underline the active tab punches through (its fill covers the line beneath
+    // it), so only the inactive-tab region shows the border. The active tab takes
+    // the content's background, merging into the pane below with no seam;
+    // inactive tabs are flat - just their text on the strip.
+    let bar = ui.panel(
+        group,
+        Style::new()
+            .row()
+            .padding_top(5.0)
+            .padding_x(6.0)
+            .background(theme.bar_bg)
+            .border_bottom(1.0, theme.panel_border),
+    );
     let active = active.min(panes.len().saturating_sub(1));
     for (i, &pane) in panes.iter().enumerate() {
         let selected = i == active;
@@ -933,7 +951,8 @@ fn build_toolbar(
             .gap(4.0)
             .padding(5.0)
             .align_center()
-            .background(theme.panel_bg),
+            .background(theme.panel_bg)
+            .border_bottom(1.0, theme.panel_border),
     );
     let icon = |id: Icon| icons.map(|i| i.get(id));
     rows.add_sprite = Some(toolbar_button(
@@ -2028,7 +2047,8 @@ fn add_inspector_section(
             .align_center()
             .padding_x(8.0)
             .padding_y(6.0)
-            .background(theme.header_bg),
+            .background(theme.header_bg)
+            .border_bottom(1.0, theme.card_border),
     );
     if let Some(icons) = icons {
         let chevron = if collapsed {
@@ -2048,14 +2068,10 @@ fn add_inspector_section(
         Style::new().grow(1.0).foreground(theme.heading),
     );
     rows.section_toggles.push((header, section));
-    if collapsed {
-        return None;
-    }
-    // A separator gives the header a bottom border, dividing it from the body;
-    // the fields then live in a padded body (the card has no padding, so the
-    // header bar reaches the edges).
-    ui.panel(card, Style::new().height(1.0).background(theme.card_border));
-    Some(ui.panel(card, Style::new().column().gap(6.0).padding(8.0)))
+    // The header's own bottom border (above) divides it from the body; the
+    // fields live in a padded body (the card has no padding, so the header bar
+    // reaches the edges).
+    (!collapsed).then(|| ui.panel(card, Style::new().column().gap(6.0).padding(8.0)))
 }
 
 /// One labeled, editable inspector row; returns the text input's id. `numeric`
@@ -2197,7 +2213,8 @@ fn build_file_explorer(
             .align_center()
             .gap(4.0)
             .padding(5.0)
-            .background(theme.panel_bg),
+            .background(theme.panel_bg)
+            .border_bottom(1.0, theme.panel_border),
     );
     let crumbs = ui.panel(
         bar,
@@ -2291,7 +2308,7 @@ fn build_file_explorer(
         1.0,
         Style::new()
             .width(theme.splitter_width)
-            .background(theme.card_border),
+            .background(theme.panel_border),
     );
     ui.set_splitter_target(splitter, tree);
     let contents = ui.panel(

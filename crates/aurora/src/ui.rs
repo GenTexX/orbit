@@ -782,6 +782,8 @@ impl Ui {
             corner_radius: style.corner_radius,
             border_width: style.border_width,
             border_color: style.border_color,
+            border_bottom_width: style.border_bottom_width,
+            border_bottom_color: style.border_bottom_color,
             draggable: style.draggable,
             drop_target: style.drop_target,
             flat: style.flat,
@@ -2121,6 +2123,21 @@ impl Ui {
                 self.emit_slider(id, rect, *value, *min, *max, list)
             }
             WidgetKind::Splitter { .. } => self.emit_splitter(id, rect, widget, list),
+        }
+
+        // A bottom-edge-only border, drawn AFTER the widget's own fill but BEFORE
+        // its children, so a child whose fill reaches the bottom edge (an active
+        // tab) paints over the segment beneath it - leaving the line only where
+        // the bar shows through.
+        if widget.border_bottom_width > 0.0 && widget.border_bottom_color.a > 0.0 {
+            let w = widget.border_bottom_width;
+            list.commands.push(DrawCommand::FillRect {
+                rect: Rect::new(
+                    Vec2::new(rect.pos.x, rect.max().y - w),
+                    Vec2::new(rect.size.x, w),
+                ),
+                color: widget.border_bottom_color,
+            });
         }
 
         // Children, optionally clipped to this widget's rectangle. Popup

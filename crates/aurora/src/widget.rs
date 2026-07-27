@@ -179,6 +179,11 @@ pub(crate) struct Widget {
     /// Background border width in px (0 = none) and its color.
     pub border_width: f32,
     pub border_color: Color,
+    /// A bottom-edge-only border (px width + color), drawn under this widget's
+    /// children so a child reaching the bottom edge covers the segment beneath
+    /// it - used for a tab bar's underline that the active tab interrupts.
+    pub border_bottom_width: f32,
+    pub border_bottom_color: Color,
     /// Whether this widget is a drag source (see [`crate::Style::draggable`]).
     pub draggable: bool,
     /// Whether this widget accepts drops (see [`crate::Style::drop_target`]).
