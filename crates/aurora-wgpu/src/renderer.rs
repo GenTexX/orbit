@@ -26,20 +26,24 @@ struct QuadInstance {
     color: [f32; 4],
     /// Border color, used only when `border` > 0 (quad pipeline only).
     border_color: [f32; 4],
-    /// Corner radius in px (0 = square) and border width in px (0 = none). The
-    /// image pipeline ignores both; the quad shader evaluates a rounded-rect SDF
-    /// when either is set.
-    radius: f32,
+    /// Per-corner radius in px, `[top_left, top_right, bottom_right, bottom_left]`
+    /// (0 = square). The image pipeline ignores it; the quad shader evaluates a
+    /// rounded-rect SDF when any corner or the border is set.
+    radius: [f32; 4],
+    /// Which edges the border draws on, `[top, right, bottom, left]` (1 = draw,
+    /// 0 = open). All ones is a normal all-around border.
+    border_sides: [f32; 4],
+    /// Border width in px (0 = none).
     border: f32,
 }
 
 impl QuadInstance {
     fn layout() -> wgpu::VertexBufferLayout<'static> {
-        // The quad shader reads all eight; the image shader reads only 0..=4 and
+        // The quad shader reads all nine; the image shader reads only 0..=4 and
         // ignores the border/shape attributes, which is allowed.
-        const ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
+        const ATTRS: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
             0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2, 4 => Float32x4,
-            5 => Float32x4, 6 => Float32, 7 => Float32];
+            5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 8 => Float32];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<QuadInstance>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
@@ -56,20 +60,22 @@ impl QuadInstance {
             uv_max: white_uv,
             color: [color.r, color.g, color.b, color.a],
             border_color: [0.0; 4],
-            radius: 0.0,
+            radius: [0.0; 4],
+            border_sides: [1.0; 4],
             border: 0.0,
         }
     }
 
     /// A rounded and/or bordered fill: like [`fill`](Self::fill) but the shader
-    /// rounds the corners to `radius` and paints the outer `border` px (if any)
-    /// in `border_color`.
+    /// rounds each corner to its `radius` and paints the outer `border` px (if
+    /// any) in `border_color`, only on the edges `sides` selects.
     fn rounded(
         rect: Rect,
         color: Color,
-        radius: f32,
+        radius: [f32; 4],
         border: f32,
         border_color: Color,
+        sides: [bool; 4],
         white_uv: [f32; 2],
     ) -> Self {
         Self {
@@ -85,6 +91,7 @@ impl QuadInstance {
                 border_color.a,
             ],
             radius,
+            border_sides: sides.map(|on| if on { 1.0 } else { 0.0 }),
             border,
         }
     }
@@ -99,7 +106,8 @@ impl QuadInstance {
             uv_max: entry.uv_max,
             color: [color.r, color.g, color.b, color.a],
             border_color: [0.0; 4],
-            radius: 0.0,
+            radius: [0.0; 4],
+            border_sides: [1.0; 4],
             border: 0.0,
         }
     }
@@ -114,7 +122,8 @@ impl QuadInstance {
             uv_max: [1.0, 1.0],
             color: [tint.r, tint.g, tint.b, tint.a],
             border_color: [0.0; 4],
-            radius: 0.0,
+            radius: [0.0; 4],
+            border_sides: [1.0; 4],
             border: 0.0,
         }
     }
@@ -665,6 +674,7 @@ impl Renderer {
                     radius,
                     border_width,
                     border_color,
+                    border_sides,
                 } => {
                     instances.push(QuadInstance::rounded(
                         *rect,
@@ -672,6 +682,7 @@ impl Renderer {
                         *radius,
                         *border_width,
                         *border_color,
+                        *border_sides,
                         white_uv,
                     ));
                 }

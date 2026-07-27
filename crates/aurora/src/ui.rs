@@ -779,9 +779,10 @@ impl Ui {
             text_center: style.text_center,
             icon_button: style.icon_button,
             ellipsis: style.ellipsis,
-            corner_radius: style.corner_radius,
+            corner_radii: style.corner_radii,
             border_width: style.border_width,
             border_color: style.border_color,
+            border_sides: style.border_sides,
             border_bottom_width: style.border_bottom_width,
             border_bottom_color: style.border_bottom_color,
             draggable: style.draggable,
@@ -2076,9 +2077,10 @@ impl Ui {
             list.commands.push(DrawCommand::RoundedRect {
                 rect,
                 color: self.theme.focus.fade(0.20),
-                radius: self.widgets[target].corner_radius,
+                radius: self.widgets[target].corner_radii,
                 border_width: 2.0,
                 border_color: self.theme.focus,
+                border_sides: [true; 4],
             });
         }
         // The ghost: re-emit the source's subtree, then translate it by the drag
@@ -2169,9 +2171,10 @@ impl Ui {
             list.commands.push(DrawCommand::RoundedRect {
                 rect: thumb,
                 color,
-                radius: theme::SCROLLBAR_WIDTH * 0.5,
+                radius: [theme::SCROLLBAR_WIDTH * 0.5; 4],
                 border_width: 0.0,
                 border_color: Color::TRANSPARENT,
+                border_sides: [true; 4],
             });
         }
 
@@ -2258,14 +2261,15 @@ impl Ui {
     fn fill_widget_bg(&self, id: WidgetId, rect: Rect, color: Color, list: &mut DrawList) {
         let w = &self.widgets[id];
         let has_border = w.border_width > 0.0 && w.border_color.a > 0.0;
-        if w.corner_radius > 0.0 || has_border {
+        if is_rounded(w.corner_radii) || has_border {
             if color.a > 0.0 || has_border {
                 list.commands.push(DrawCommand::RoundedRect {
                     rect,
                     color,
-                    radius: w.corner_radius,
+                    radius: w.corner_radii,
                     border_width: if has_border { w.border_width } else { 0.0 },
                     border_color: w.border_color,
+                    border_sides: w.border_sides,
                 });
             }
         } else {
@@ -2351,9 +2355,10 @@ impl Ui {
         list.commands.push(DrawCommand::RoundedRect {
             rect: box_rect,
             color: box_color,
-            radius: theme::CHECKBOX_RADIUS,
+            radius: [theme::CHECKBOX_RADIUS; 4],
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
+            border_sides: [true; 4],
         });
         // The check glyph, centered in the box (from its own buffer).
         if checked
@@ -2411,13 +2416,14 @@ impl Ui {
             (widget.border_width, widget.border_color)
         };
         let has_border = border_w > 0.0 && border_c.a > 0.0;
-        if widget.corner_radius > 0.0 || has_border {
+        if is_rounded(widget.corner_radii) || has_border {
             list.commands.push(DrawCommand::RoundedRect {
                 rect,
                 color: fill,
-                radius: widget.corner_radius,
+                radius: widget.corner_radii,
                 border_width: if has_border { border_w } else { 0.0 },
                 border_color: border_c,
+                border_sides: widget.border_sides,
             });
         } else {
             list.commands
@@ -2643,6 +2649,12 @@ fn next_boundary(s: &str, i: usize) -> usize {
 
 /// Offset a draw command's geometry by `delta` and fade its colors by `fade`
 /// (used to turn a re-emitted widget subtree into a drag ghost).
+/// Whether any of a widget's four corner radii is non-zero (so it needs a
+/// rounded-rect draw rather than a plain fill).
+fn is_rounded(radii: [f32; 4]) -> bool {
+    radii.iter().any(|&r| r > 0.0)
+}
+
 fn translate_and_fade(cmd: &mut DrawCommand, delta: Vec2, fade: f32) {
     match cmd {
         DrawCommand::FillRect { rect, color } => {
@@ -4072,7 +4084,7 @@ mod tests {
         assert!(
             ui.draw_list().commands.iter().any(|c| matches!(c,
                 DrawCommand::RoundedRect { radius, border_width, .. }
-                    if (*radius - 8.0).abs() < 1e-6 && (*border_width - 2.0).abs() < 1e-6)),
+                    if radius.iter().all(|r| (*r - 8.0).abs() < 1e-6) && (*border_width - 2.0).abs() < 1e-6)),
             "a rounded, bordered background should emit a RoundedRect"
         );
 

@@ -33,14 +33,19 @@ pub enum DrawCommand {
     /// Fill an axis-aligned rectangle with a solid color.
     FillRect { rect: Rect, color: Color },
     /// Fill a rectangle with rounded corners and/or a border. `radius` is the
-    /// corner radius in px (0 = square); `border_width` the border thickness in
-    /// px (0 = no border), painted in `border_color`. Corners are anti-aliased.
+    /// per-corner radius in px, `[top_left, top_right, bottom_right, bottom_left]`
+    /// (0 = square); `border_width` the border thickness in px (0 = no border),
+    /// painted in `border_color`. `border_sides` selects which edges the border
+    /// is drawn on, `[top, right, bottom, left]` - an open edge (e.g. the bottom
+    /// of a folder-style tab) leaves the fill reaching that edge with no stroke.
+    /// Corners are anti-aliased.
     RoundedRect {
         rect: Rect,
         color: Color,
-        radius: f32,
+        radius: [f32; 4],
         border_width: f32,
         border_color: Color,
+        border_sides: [bool; 4],
     },
     /// Draw a run of glyphs in one color (a shaped line of text).
     Text { glyphs: Vec<Glyph>, color: Color },

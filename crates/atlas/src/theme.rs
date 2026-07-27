@@ -115,6 +115,7 @@ theme_tokens! {
     "card_border": Color => card_border,
     "panel_border": Color => panel_border,
     "field_border": Color => field_border,
+    "tab_border": Color => tab_border,
     "mode_active": Color => mode_active,
     "axis_x": Color => axis_x,
     "axis_y": Color => axis_y,
@@ -122,6 +123,8 @@ theme_tokens! {
     "scrim": Color => scrim,
     // shape scalars.
     "card_radius": Scalar => card_radius,
+    "component_radius": Scalar => component_radius,
+    "tab_radius": Scalar => tab_radius,
     "control_radius": Scalar => control_radius,
     "inset_radius": Scalar => inset_radius,
     "splitter_width": Scalar => splitter_width,

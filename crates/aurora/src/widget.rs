@@ -174,11 +174,14 @@ pub(crate) struct Widget {
     /// Whether this widget's text truncates with a trailing "..." when it does
     /// not fit the widget's width. See [`crate::Style::ellipsis`].
     pub ellipsis: bool,
-    /// Background corner radius in px (0 = square).
-    pub corner_radius: f32,
-    /// Background border width in px (0 = none) and its color.
+    /// Per-corner background radius in px, `[top_left, top_right, bottom_right,
+    /// bottom_left]` (0 = square).
+    pub corner_radii: [f32; 4],
+    /// Background border width in px (0 = none), its color, and which edges it
+    /// draws on (`[top, right, bottom, left]`).
     pub border_width: f32,
     pub border_color: Color,
+    pub border_sides: [bool; 4],
     /// A bottom-edge-only border (px width + color), drawn under this widget's
     /// children so a child reaching the bottom edge covers the segment beneath
     /// it - used for a tab bar's underline that the active tab interrupts.

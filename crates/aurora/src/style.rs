@@ -54,12 +54,16 @@ pub struct Style {
     /// Truncate this widget's text with a trailing "..." when it does not fit
     /// the widget's width (a single line; needs a fixed or grow width).
     pub ellipsis: bool,
-    /// Corner radius in px for this widget's background (0 = square corners).
-    pub corner_radius: f32,
+    /// Per-corner radius in px for this widget's background,
+    /// `[top_left, top_right, bottom_right, bottom_left]` (0 = square corners).
+    pub corner_radii: [f32; 4],
     /// Border width in px around this widget's background (0 = no border).
     pub border_width: f32,
     /// Border color (drawn when `border_width` > 0).
     pub border_color: Color,
+    /// Which edges the border draws on, `[top, right, bottom, left]`; an open
+    /// edge leaves the fill reaching it with no stroke (a folder-style tab).
+    pub border_sides: [bool; 4],
     /// A bottom-edge-only border (0 = none), drawn beneath this widget's children.
     pub border_bottom_width: f32,
     pub border_bottom_color: Color,
@@ -90,9 +94,10 @@ impl Default for Style {
             text_center: false,
             icon_button: false,
             ellipsis: false,
-            corner_radius: 0.0,
+            corner_radii: [0.0; 4],
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
+            border_sides: [true; 4],
             border_bottom_width: 0.0,
             border_bottom_color: Color::TRANSPARENT,
             draggable: false,
@@ -370,9 +375,24 @@ impl Style {
         self
     }
 
-    /// Round this widget's background corners to `radius` px (anti-aliased).
+    /// Round all four of this widget's background corners to `radius` px
+    /// (anti-aliased).
     pub fn corner_radius(mut self, radius: f32) -> Self {
-        self.corner_radius = radius;
+        self.corner_radii = [radius; 4];
+        self
+    }
+
+    /// Round only the two top corners to `radius` px, leaving the bottom square
+    /// (a tab that meets the content below it).
+    pub fn round_top(mut self, radius: f32) -> Self {
+        self.corner_radii = [radius, radius, 0.0, 0.0];
+        self
+    }
+
+    /// Set each corner radius independently, `[top_left, top_right,
+    /// bottom_right, bottom_left]` px.
+    pub fn corner_radii(mut self, radii: [f32; 4]) -> Self {
+        self.corner_radii = radii;
         self
     }
 
@@ -380,6 +400,14 @@ impl Style {
     pub fn border(mut self, width: f32, color: Color) -> Self {
         self.border_width = width;
         self.border_color = color;
+        self
+    }
+
+    /// Restrict which edges the border draws on, `[top, right, bottom, left]`;
+    /// an open edge leaves the fill reaching it with no stroke. Pairs with
+    /// [`border`](Self::border) (which sets the width and color).
+    pub fn border_sides(mut self, sides: [bool; 4]) -> Self {
+        self.border_sides = sides;
         self
     }
 

@@ -161,6 +161,12 @@ pub const TOKENS: &[Token] = &[
         "Borders",
         "Splitters between panels, and bar underlines",
     ),
+    t(
+        "tab_border",
+        C,
+        "Borders",
+        "Active dock-tab outline (top and sides only)",
+    ),
     // Inputs.
     t("field_bg", C, "Inputs", "Text-input fill"),
     t(
@@ -214,7 +220,19 @@ pub const TOKENS: &[Token] = &[
         "card_radius",
         S,
         "Shape",
-        "Corner radius of cards, the color picker, and modals",
+        "Corner radius of popups (menus, color picker) and modals",
+    ),
+    t(
+        "component_radius",
+        S,
+        "Shape",
+        "Corner radius of inspector section cards",
+    ),
+    t(
+        "tab_radius",
+        S,
+        "Shape",
+        "Corner radius of a dock tab's top corners",
     ),
     t(
         "control_radius",

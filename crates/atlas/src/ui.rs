@@ -61,6 +61,8 @@ pub struct EditorTheme {
     pub panel_border: Color,
     /// A text input's resting outline (the tree search box).
     pub field_border: Color,
+    /// The active dock tab's outline (drawn on its top and sides only).
+    pub tab_border: Color,
     /// The active gizmo-mode toolbar button.
     pub mode_active: Color,
     /// Engine axis palette (X red, Y green) for the inspector's Vec2 labels.
@@ -71,9 +73,12 @@ pub struct EditorTheme {
     pub console_warn: Color,
     /// The translucent backdrop dimming the editor behind a modal dialog.
     pub scrim: Color,
-    /// Corner radius for section cards, controls (buttons/fields), and small
-    /// inset fields (an inline rename box).
+    /// Corner radius for popups (menus, the color picker) and modals; for
+    /// inspector section cards; for a dock tab's top corners; for controls
+    /// (buttons/fields); and for small inset fields (an inline rename box).
     pub card_radius: f32,
+    pub component_radius: f32,
+    pub tab_radius: f32,
     pub control_radius: f32,
     pub inset_radius: f32,
     /// Thickness of the draggable dividers between docked panels.
@@ -127,12 +132,15 @@ impl EditorTheme {
             card_border: Color::rgb(0.20, 0.22, 0.27),
             panel_border: Color::rgb(0.24, 0.26, 0.32),
             field_border: Color::rgb(0.24, 0.26, 0.32),
+            tab_border: Color::rgb(0.24, 0.26, 0.32),
             mode_active: Color::rgb(0.22, 0.38, 0.60),
             axis_x: Color::rgb(0.90, 0.32, 0.32),
             axis_y: Color::rgb(0.35, 0.70, 0.38),
             console_warn: default_console_warn(),
             scrim: default_scrim(),
             card_radius: 6.0,
+            component_radius: 6.0,
+            tab_radius: 5.0,
             control_radius: 4.0,
             inset_radius: 3.0,
             splitter_width: 2.0,
@@ -165,12 +173,15 @@ impl EditorTheme {
             card_border: Color::rgb(0.72, 0.74, 0.80),
             panel_border: Color::rgb(0.66, 0.68, 0.74),
             field_border: Color::rgb(0.66, 0.68, 0.74),
+            tab_border: Color::rgb(0.66, 0.68, 0.74),
             mode_active: Color::rgb(0.62, 0.76, 0.96),
             axis_x: Color::rgb(0.85, 0.30, 0.30),
             axis_y: Color::rgb(0.28, 0.62, 0.34),
             console_warn: Color::rgb(0.72, 0.55, 0.10),
             scrim: Color::rgba(0.05, 0.05, 0.08, 0.45),
             card_radius: 6.0,
+            component_radius: 6.0,
+            tab_radius: 5.0,
             control_radius: 4.0,
             inset_radius: 3.0,
             splitter_width: 2.0,
@@ -783,14 +794,20 @@ fn build_group(
         let base = Style::new()
             .padding_x(12.0)
             .padding_y(6.0)
+            .round_top(theme.tab_radius)
             .foreground(if selected {
                 theme.heading
             } else {
                 theme.subhead
             })
             .draggable();
+        // The active tab takes the content's background and a top-and-sides
+        // outline (open at the bottom, so it merges into the pane below); an
+        // inactive tab is flat, its rounded-top only showing on hover.
         let style = if selected {
             base.background(theme.panel_bg)
+                .border(theme.border_width, theme.tab_border)
+                .border_sides([true, true, false, true])
         } else {
             base.flat()
         };
@@ -2064,23 +2081,32 @@ fn add_inspector_section(
         Style::new()
             .column()
             .background(theme.card_bg)
+            .corner_radius(theme.component_radius)
             .border(theme.border_width, theme.card_border),
     );
     // A distinct darker header bar spanning the card, holding the section title
     // (and a disclosure chevron). Clicking anywhere on the bar toggles the
-    // section - it is the button, so its whole width is the hit area.
-    let header = ui.button(
-        card,
-        "",
-        Style::new()
-            .row()
-            .gap(6.0)
-            .align_center()
-            .padding_x(8.0)
-            .padding_y(6.0)
-            .background(theme.header_bg)
-            .border_bottom(theme.border_width, theme.card_border),
-    );
+    // section - it is the button, so its whole width is the hit area. The header
+    // carries the card's outline over its own top and sides (so the single
+    // rounded border reads as continuous around the whole component); expanded,
+    // it has no bottom edge, so there is no divider between header and body -
+    // collapsed, it rounds and closes all four corners as the whole card.
+    let header_style = Style::new()
+        .row()
+        .gap(6.0)
+        .align_center()
+        .padding_x(8.0)
+        .padding_y(6.0)
+        .background(theme.header_bg)
+        .border(theme.border_width, theme.card_border);
+    let header_style = if collapsed {
+        header_style.corner_radius(theme.component_radius)
+    } else {
+        header_style
+            .round_top(theme.component_radius)
+            .border_sides([true, true, false, true])
+    };
+    let header = ui.button(card, "", header_style);
     if let Some(icons) = icons {
         let chevron = if collapsed {
             Icon::ChevronRight
@@ -2099,9 +2125,9 @@ fn add_inspector_section(
         Style::new().grow(1.0).foreground(theme.heading),
     );
     rows.section_toggles.push((header, section));
-    // The header's own bottom border (above) divides it from the body; the
-    // fields live in a padded body (the card has no padding, so the header bar
-    // reaches the edges).
+    // The fields live in a transparent, padded body below the header (the card
+    // has no padding, so the header bar reaches the edges; the body shows the
+    // card fill through it, so the card's rounded border wraps it with no seam).
     (!collapsed).then(|| ui.panel(card, Style::new().column().gap(6.0).padding(8.0)))
 }
 
