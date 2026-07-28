@@ -9,7 +9,7 @@ use glam::Vec2;
 
 use crate::atlas::{Atlas, GlyphEntry};
 use crate::error::RenderError;
-use crate::image::ImageRegistry;
+use crate::image::{ImageRegistry, Mips};
 
 /// One quad as uploaded to the GPU: a pixel rectangle plus the UV span it
 /// samples. Shared by both pipelines - the atlas pipeline (fills sample a
@@ -408,7 +408,36 @@ impl Renderer {
     /// Register an image from raw RGBA8 bytes (`width * height * 4`, row-major),
     /// keeping the texture alive internally - for CPU-generated images like
     /// rasterized icons. Returns the handle Aurora's draw list references.
+    ///
+    /// The image gets a full mipmap chain, so it stays clean when drawn smaller
+    /// than its native size (a 64px icon in a 16px slot). For an image drawn at
+    /// its native size - especially one refilled often - use
+    /// [`register_image_rgba_unmipped`](Self::register_image_rgba_unmipped),
+    /// which skips the per-level CPU downsample on every upload.
     pub fn register_image_rgba(&mut self, rgba: &[u8], width: u32, height: u32) -> ImageHandle {
+        self.register_rgba_with(rgba, width, height, Mips::Chain)
+    }
+
+    /// Register an RGBA8 image with no mipmap chain - for an image drawn at its
+    /// native size, such as a color picker's gradient that is regenerated as the
+    /// user drags. Building mips would cost a CPU downsample per level on every
+    /// refill for levels that are never sampled.
+    pub fn register_image_rgba_unmipped(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> ImageHandle {
+        self.register_rgba_with(rgba, width, height, Mips::None)
+    }
+
+    fn register_rgba_with(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        mips: Mips,
+    ) -> ImageHandle {
         self.images.register_rgba(
             &self.gpu.device,
             &self.gpu.queue,
@@ -416,6 +445,7 @@ impl Renderer {
             rgba,
             width,
             height,
+            mips,
         )
     }
 

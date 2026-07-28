@@ -8,7 +8,42 @@ struct RegisteredImage {
     bind_group: wgpu::BindGroup,
     /// Kept alive for registry-owned textures (e.g. rasterized icons); `None`
     /// when the caller owns the texture (e.g. the viewport's render target).
-    _texture: Option<wgpu::Texture>,
+    texture: Option<wgpu::Texture>,
+    /// The registry-owned texture's shape, so [`ImageRegistry::update_rgba`] can
+    /// recognise a same-size refill and write into the existing texture instead
+    /// of building a new one. `None` when the caller owns the texture.
+    shape: Option<TextureShape>,
+}
+
+/// A registry-owned texture's dimensions and mip-level count.
+#[derive(Clone, Copy, PartialEq)]
+struct TextureShape {
+    width: u32,
+    height: u32,
+    mips: u32,
+}
+
+/// Whether an image carries a mipmap chain. Mips cost a CPU downsample per level
+/// on every upload, so they are worth it only for an image that is drawn
+/// *minified* (a 64px icon in a 16px slot). An image drawn at its native size -
+/// and especially one refilled every frame, like a color picker's gradient - is
+/// better off without them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Mips {
+    /// A full chain down to 1x1: for images that may be drawn smaller.
+    Chain,
+    /// Level 0 only: for images drawn at their native size.
+    None,
+}
+
+impl Mips {
+    /// How many levels this policy gives an image of `width` x `height`.
+    fn levels(self, width: u32, height: u32) -> u32 {
+        match self {
+            Mips::Chain => 1 + width.max(height).max(1).ilog2(),
+            Mips::None => 1,
+        }
+    }
 }
 
 /// The registered images, each holding a bind group (texture + sampler) built
@@ -74,13 +109,17 @@ impl ImageRegistry {
         let bind_group = self.build_bind_group(device, layout, view);
         self.images.insert(RegisteredImage {
             bind_group,
-            _texture: None,
+            texture: None,
+            shape: None,
         })
     }
 
     /// Register a registry-owned image from raw RGBA8 bytes (`width * height *
     /// 4`, row-major) - e.g. a rasterized icon. The texture is created, filled,
     /// and kept alive here, so the caller need not manage it.
+    // Mirrors make_rgba's GPU handles plus the pixel source; a params struct
+    // would not read more clearly.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_rgba(
         &mut self,
         device: &wgpu::Device,
@@ -89,17 +128,26 @@ impl ImageRegistry {
         rgba: &[u8],
         width: u32,
         height: u32,
+        mips: Mips,
     ) -> ImageHandle {
-        let (texture, bind_group) = self.make_rgba(device, queue, layout, rgba, width, height);
+        let (texture, bind_group, shape) =
+            self.make_rgba(device, queue, layout, rgba, width, height, mips);
         self.images.insert(RegisteredImage {
             bind_group,
-            _texture: Some(texture),
+            texture: Some(texture),
+            shape: Some(shape),
         })
     }
 
     /// Replace a registry-owned image's pixels (e.g. the color picker's SV
     /// square as the hue changes), keeping its handle valid. Returns `false`
     /// on an unknown handle.
+    ///
+    /// A refill at the same size writes straight into the existing texture -
+    /// no texture, view, or bind group is created, and the image keeps whatever
+    /// mip policy it was registered with. That matters because this is the
+    /// per-frame path for a live gradient: rebuilding the texture instead would
+    /// churn a GPU allocation (and a full CPU mip chain) on every mouse move.
     // Mirrors register_rgba's GPU handles plus the target handle; a params
     // struct would not read more clearly.
     #[allow(clippy::too_many_arguments)]
@@ -113,11 +161,29 @@ impl ImageRegistry {
         width: u32,
         height: u32,
     ) -> bool {
-        let (texture, bind_group) = self.make_rgba(device, queue, layout, rgba, width, height);
+        // In-place refill: same size, and the registry owns the texture.
+        if let Some(image) = self.images.get(handle)
+            && let (Some(texture), Some(shape)) = (&image.texture, image.shape)
+            && shape.width == width
+            && shape.height == height
+        {
+            write_levels(queue, texture, rgba, width, height, shape.mips);
+            return true;
+        }
+        // The size changed (or the caller owns the texture): build a new one,
+        // keeping the previous mip policy so a resize does not silently drop
+        // (or add) mips.
+        let mips = match self.images.get(handle).and_then(|i| i.shape) {
+            Some(s) if s.mips == 1 => Mips::None,
+            _ => Mips::Chain,
+        };
+        let (texture, bind_group, shape) =
+            self.make_rgba(device, queue, layout, rgba, width, height, mips);
         match self.images.get_mut(handle) {
             Some(image) => {
                 image.bind_group = bind_group;
-                image._texture = Some(texture);
+                image.texture = Some(texture);
+                image.shape = Some(shape);
                 true
             }
             None => false,
@@ -126,6 +192,7 @@ impl ImageRegistry {
 
     /// Create a texture from RGBA8 bytes and its bind group (shared by
     /// register/update).
+    #[allow(clippy::too_many_arguments)]
     fn make_rgba(
         &self,
         device: &wgpu::Device,
@@ -134,15 +201,14 @@ impl ImageRegistry {
         rgba: &[u8],
         width: u32,
         height: u32,
-    ) -> (wgpu::Texture, wgpu::BindGroup) {
+        mips: Mips,
+    ) -> (wgpu::Texture, wgpu::BindGroup, TextureShape) {
         let size = wgpu::Extent3d {
             width,
             height,
             depth_or_array_layers: 1,
         };
-        // A full mipmap chain (down to 1x1) so minified draws (a 64px icon in a
-        // 16px slot) pick a pre-filtered level rather than point-aliasing.
-        let mip_level_count = 1 + width.max(height).max(1).ilog2();
+        let mip_level_count = mips.levels(width, height);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("registered image"),
             size,
@@ -153,39 +219,18 @@ impl ImageRegistry {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        // Upload level 0, then box-downsample each successive level on the CPU
-        // and upload it. (The icon art is white with an alpha coverage mask, so
-        // averaging the bytes is correct; for photos it is the usual good-enough
-        // sRGB box filter.)
-        let mut level = rgba.to_vec();
-        let (mut lw, mut lh) = (width, height);
-        for mip in 0..mip_level_count {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: mip,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &level,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(lw * 4),
-                    rows_per_image: Some(lh),
-                },
-                wgpu::Extent3d {
-                    width: lw,
-                    height: lh,
-                    depth_or_array_layers: 1,
-                },
-            );
-            if mip + 1 < mip_level_count {
-                (level, lw, lh) = downsample_2x2(&level, lw, lh);
-            }
-        }
+        write_levels(queue, &texture, rgba, width, height, mip_level_count);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.build_bind_group(device, layout, &view);
-        (texture, bind_group)
+        (
+            texture,
+            bind_group,
+            TextureShape {
+                width,
+                height,
+                mips: mip_level_count,
+            },
+        )
     }
 
     /// Point an existing handle at a new texture view (e.g. the viewport's
@@ -216,6 +261,54 @@ impl ImageRegistry {
     }
 }
 
+/// Upload `rgba` as mip level 0 of `texture`, then box-downsample each further
+/// level on the CPU and upload it. (Icon art is white with an alpha coverage
+/// mask, so averaging is correct; for photos it is the usual good-enough sRGB
+/// box filter.) With `mip_level_count` of 1 this is a single `write_texture`.
+fn write_levels(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    mip_level_count: u32,
+) {
+    // Borrow level 0 (the common single-level case copies nothing); later levels
+    // own their downsampled buffer.
+    let mut level: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(rgba);
+    let (mut lw, mut lh) = (width, height);
+    for mip in 0..mip_level_count {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: mip,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &level,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(lw * 4),
+                rows_per_image: Some(lh),
+            },
+            wgpu::Extent3d {
+                width: lw,
+                height: lh,
+                depth_or_array_layers: 1,
+            },
+        );
+        if mip + 1 < mip_level_count {
+            let (next, nw, nh) = downsample_2x2(&level, lw, lh);
+            level = std::borrow::Cow::Owned(next);
+            (lw, lh) = (nw, nh);
+        }
+    }
+}
+
+/// The 256 sRGB byte values decoded to linear light, computed once.
+static SRGB_TO_LINEAR: std::sync::LazyLock<[f32; 256]> =
+    std::sync::LazyLock::new(|| std::array::from_fn(srgb_to_linear));
+
 /// Box-downsample an RGBA8 image to half size (each axis halved, floored at 1),
 /// averaging each 2x2 block per channel. Edge blocks on an odd dimension average
 /// only the texels that exist.
@@ -228,8 +321,9 @@ impl ImageRegistry {
 fn downsample_2x2(src: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
     let nw = (width / 2).max(1);
     let nh = (height / 2).max(1);
-    // Decode the 256 possible sRGB byte values to linear once, then reuse.
-    let to_linear: [f32; 256] = std::array::from_fn(srgb_to_linear);
+    // The 256 possible sRGB byte values decoded to linear. Built once for the
+    // whole process, not per call - this runs once per mip level per upload.
+    let to_linear = &*SRGB_TO_LINEAR;
     let mut dst = vec![0u8; (nw * nh * 4) as usize];
     for y in 0..nh {
         for x in 0..nw {
