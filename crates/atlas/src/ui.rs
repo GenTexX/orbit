@@ -3365,6 +3365,39 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_narrowing_drag_does_not_reshape_text_every_frame() {
+        // The regression this guards: a real splitter drag moves a pane a pixel
+        // at a time, and NARROWING is the direction that makes ellipsis labels
+        // re-fit. Keying a truncation on the exact box width missed on every
+        // frame, re-shaping several times per label per frame - which the old
+        // single-widening-step test could not see (widening is exactly the case
+        // the shape cache absorbs). Drive an actual drag and bound the total.
+        let (scene, handle) = demo_scene();
+        let dir = std::env::temp_dir();
+        let dock = DockNode::default_layout();
+        let (mut ui, rows) = build_with_dock(&scene, handle, &dir, &dock, &HashMap::new());
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+
+        let tree = pane_group(&rows, Pane::SceneTree);
+        let start = ui.rect(tree).unwrap().size.x;
+        // 60 one-pixel narrowing steps, as dragging the splitter left would.
+        let mut total = 0u32;
+        for step in 1..=60 {
+            ui.set_width(tree, start - step as f32);
+            ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+            total += ui.last_measure_count();
+        }
+        // Text only re-fits when the box crosses one more character's width, so
+        // a 60px drag may re-shape a label a handful of times - not every frame.
+        // Before the fix this was in the hundreds.
+        assert!(
+            total < 120,
+            "a 60-frame narrowing drag re-shaped text {total} times; \
+             it should re-fit only when crossing a character boundary"
+        );
+    }
+
+    #[test]
     fn a_cold_rebuild_shapes_each_text_once_not_the_whole_tree_repeatedly() {
         // taffy probes each text leaf several times per layout; the shape cache
         // must collapse those to one shape per distinct string, so even a full

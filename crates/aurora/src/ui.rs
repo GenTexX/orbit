@@ -61,6 +61,11 @@ struct ShapeCacheEntry {
     single_line_w: Option<f32>,
     wrap_bits: Option<u32>,
     size: Size<f32>,
+    /// The width the text needed on its widest line when last shaped. Unlike
+    /// `size`, this is kept even for one-line widgets (whose reported size is
+    /// deliberately 0 wide), so `ellipsize` can tell whether the full text fits
+    /// its box without re-shaping it just to measure.
+    natural_w: f32,
 }
 
 impl ShapeCacheEntry {
@@ -94,6 +99,34 @@ impl ShapeCacheEntry {
     }
 }
 
+/// The truncation `ellipsize` last left in a widget's buffer, and the range of
+/// content widths over which that truncation stays correct.
+///
+/// Keying on the exact width instead would miss on every frame of a panel drag
+/// (the box changes by ~1px per pointer move), re-shaping the text several times
+/// per label per frame. Because the chosen prefix only changes when the box
+/// crosses the width of one more character, a `[lo, hi)` bracket turns almost
+/// every drag frame into a float compare.
+struct EllipsisFit {
+    full: String,
+    font_bits: u32,
+    weight: FontWeight,
+    /// Content widths in `lo..hi` all yield the truncation now in the buffer.
+    lo: f32,
+    hi: f32,
+}
+
+impl EllipsisFit {
+    /// Whether the buffer's current contents are still right for these inputs.
+    fn hits(&self, full: &str, content_w: f32, font_bits: u32, weight: FontWeight) -> bool {
+        self.full == full
+            && self.font_bits == font_bits
+            && self.weight == weight
+            && content_w >= self.lo
+            && content_w < self.hi
+    }
+}
+
 /// A retained Aurora UI: owns the widget arena, the taffy layout tree, the font
 /// system, and the shaped text buffers; caches each widget's absolute rectangle
 /// after [`layout`](Self::layout).
@@ -119,12 +152,16 @@ pub struct Ui {
     /// re-measures a whole subtree on any resize, so without this a panel drag or
     /// any change re-shaped thousands of unchanged strings (see `ShapeCacheEntry`).
     shape_cache: SecondaryMap<WidgetId, ShapeCacheEntry>,
+    /// The splitters and sliders, the only widgets with a grab zone reaching
+    /// beyond their own rect. `hit_test` checks these before descending the tree,
+    /// so keeping the short list avoids scanning every widget on each hit test.
+    grab_widgets: Vec<WidgetId>,
     /// Per ellipsis widget, the (full text, content-box width bits, font-size
     /// bits, weight) it was last truncated for. `ellipsize` skips re-truncating
     /// when these are unchanged, and re-runs (re-expanding or shortening) when
     /// the width changes - which matters now that the shape cache no longer
     /// re-shapes the widget to its full text on every layout.
-    ellipsized: SecondaryMap<WidgetId, (String, u32, u32, FontWeight)>,
+    ellipsized: SecondaryMap<WidgetId, EllipsisFit>,
     /// A shaped buffer for each placeholder-bearing text input, produced after
     /// layout and drawn (dimmed) only while the input's own text is empty.
     placeholder_buffers: SecondaryMap<WidgetId, Buffer>,
@@ -198,6 +235,7 @@ impl Ui {
             font_system: text::make_font_system(),
             buffers: SecondaryMap::new(),
             shape_cache: SecondaryMap::new(),
+            grab_widgets: Vec::new(),
             ellipsized: SecondaryMap::new(),
             placeholder_buffers: SecondaryMap::new(),
             check_buffers: SecondaryMap::new(),
@@ -530,13 +568,17 @@ impl Ui {
             return;
         };
         let text = text.clone();
-        {
+        let natural_w = {
             let mut borrowed = self.buffers[id].borrow_with(&mut self.font_system);
             borrowed.set_metrics(metrics);
             borrowed.set_size(None, None);
             borrowed.set_text(&text, &attrs, Shaping::Advanced, None);
             borrowed.shape_until_scroll(false);
-        }
+            borrowed.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
+        };
+        // The buffer now holds the field's full text, so any truncation
+        // `ellipsize` had left in it is gone.
+        self.ellipsized.remove(id);
         // Keep the shape cache in step with the buffer we just re-shaped (a
         // single-line field: width-independent, intrinsic width 0), so a later
         // measure - e.g. a panel resize that dirties this node - sees a hit and
@@ -549,6 +591,7 @@ impl Ui {
                 weight,
                 one_line: true,
                 single_line_w: None,
+                natural_w,
                 wrap_bits: None,
                 size: Size {
                     width: 0.0,
@@ -762,6 +805,10 @@ impl Ui {
             layout.flex_shrink = 0.0;
         }
         let node = self.taffy.new_leaf(layout).expect("taffy new_leaf");
+        let grabby = matches!(
+            kind,
+            WidgetKind::Splitter { .. } | WidgetKind::Slider { .. }
+        );
         let id = self.widgets.insert(Widget {
             kind,
             taffy: node,
@@ -791,6 +838,9 @@ impl Ui {
             hit_transparent: style.hit_transparent,
             disabled: style.disabled,
         });
+        if grabby {
+            self.grab_widgets.push(id);
+        }
         self.taffy
             .set_node_context(node, Some(id))
             .expect("taffy set_node_context");
@@ -821,6 +871,7 @@ impl Ui {
         let check_buffers = &mut self.check_buffers;
         let font_system = &mut self.font_system;
         let shape_cache = &mut self.shape_cache;
+        let ellipsized = &mut self.ellipsized;
         // Counts actual cosmic-text re-shapes (cache misses), not measure calls,
         // so it reflects the work done - see `last_measure_count`.
         let mut reshapes = 0u32;
@@ -840,11 +891,14 @@ impl Ui {
                     check_buffers,
                     font_system,
                     shape_cache,
+                    ellipsized,
                     &mut reshapes,
                 )
             },
         )?;
         self.last_measure_count = reshapes;
+        // shape_placeholders and ellipsize below shape text too; they add to the
+        // count so it reflects all of layout's shaping work, not just measure's.
 
         self.rects.clear();
         self.content_origin.clear();
@@ -944,40 +998,65 @@ impl Ui {
         let buffers = &mut self.buffers;
         let font_system = &mut self.font_system;
         let cache = &mut self.ellipsized;
+        let shape_cache = &self.shape_cache;
+        let mut shapes = 0u32;
         for (id, full, content_w, font_size, weight) in jobs {
-            // Skip when the text, box width, and font are unchanged since the
-            // last truncation - the buffer already holds the right text. When
-            // any of these change (notably a panel resize), fall through and
-            // re-evaluate, so the label re-expands or shortens as needed.
-            let key = (
-                full.clone(),
-                content_w.to_bits(),
-                font_size.to_bits(),
-                weight,
-            );
-            if cache.get(id) == Some(&key) {
+            let font_bits = font_size.to_bits();
+            // Skip while the box width stays inside the range that produced the
+            // truncation already in the buffer (and the text and font are
+            // unchanged). A panel drag moves the width a pixel at a time, so this
+            // holds for all but the frames that cross a character boundary.
+            if cache
+                .get(id)
+                .is_some_and(|f| f.hits(&full, content_w, font_bits, weight))
+            {
                 continue;
             }
-            cache.insert(id, key);
+            // The full text's width, as measured when the buffer was last shaped
+            // by measure_widget. Any re-shape there clears this widget's fit, so
+            // a cached fit means the value still describes this text.
+            let natural_w = shape_cache
+                .get(id)
+                .filter(|e| e.content == full && e.font_bits == font_bits && e.weight == weight)
+                .map(|e| e.natural_w);
 
             let Some(buffer) = buffers.get_mut(id) else {
                 continue;
             };
             let metrics = text::metrics_for(font_size);
             let attrs = text::attrs_for(weight);
-            let shaped_w = |buffer: &mut Buffer, fs: &mut FontSystem, s: &str| -> f32 {
+            let mut shaped_w = |buffer: &mut Buffer, fs: &mut FontSystem, s: &str| -> f32 {
                 let mut b = buffer.borrow_with(fs);
                 b.set_metrics(metrics);
                 b.set_size(None, None);
                 b.set_text(s, &attrs, Shaping::Advanced, None);
                 b.shape_until_scroll(false);
+                shapes += 1;
                 b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
             };
-            // Re-shape to the FULL text and measure it: the shape cache may have
-            // left the buffer holding a previous truncation, so we cannot trust
-            // its current width. If the full text fits, the buffer now correctly
-            // holds it (a re-expand after a widen).
-            if shaped_w(buffer, font_system, &full) <= content_w {
+            // Does the whole text fit? Prefer the width measure_widget already
+            // took; only re-shape to measure when that is unavailable.
+            let full_w = match natural_w {
+                Some(w) => w,
+                None => shaped_w(buffer, font_system, &full),
+            };
+            if full_w <= content_w {
+                // It fits. Make sure the buffer holds the full text (it may still
+                // hold an older truncation), then record that any box at least
+                // this wide keeps it.
+                if natural_w.is_some() || cache.contains_key(id) {
+                    shaped_w(buffer, font_system, &full);
+                }
+                cache.insert(
+                    id,
+                    EllipsisFit {
+                        full,
+                        font_bits,
+                        weight,
+                        lo: full_w,
+                        hi: f32::INFINITY,
+                    },
+                );
                 continue;
             }
             // Char-boundary byte offsets, plus the end. Binary-search the longest
@@ -997,9 +1076,28 @@ impl Ui {
                     hi = mid - 1;
                 }
             }
+            // The next-longer truncation marks where this one stops being the
+            // answer; above that (and below the full text's width) the label
+            // gains a character. Measure it before leaving the buffer correct.
+            let next_w = if lo + 1 < bounds.len() {
+                shaped_w(buffer, font_system, &with_ellipsis(lo + 1)).min(full_w)
+            } else {
+                full_w
+            };
             // Leave the buffer shaped as the chosen truncation.
-            shaped_w(buffer, font_system, &with_ellipsis(lo));
+            let fit_w = shaped_w(buffer, font_system, &with_ellipsis(lo));
+            cache.insert(
+                id,
+                EllipsisFit {
+                    full,
+                    font_bits,
+                    weight,
+                    lo: fit_w,
+                    hi: next_w.max(fit_w),
+                },
+            );
         }
+        self.last_measure_count += shapes;
     }
 
     /// Translate a whole subtree's cached rects and text origins by `delta`
@@ -1388,6 +1486,10 @@ impl Ui {
     /// diagnostic: it should stay small when only a few widgets' text changed; a
     /// large count means shaping work is being repeated (e.g. the shape cache is
     /// being defeated, or many strings genuinely changed).
+    ///
+    /// Counts every shape layout performs, including the ones `ellipsize` does
+    /// while fitting truncated text - those are just as expensive, and leaving
+    /// them out once hid a resize regression from the tests that watch this.
     pub fn last_measure_count(&self) -> u32 {
         self.last_measure_count
     }
@@ -1908,7 +2010,11 @@ impl Ui {
                 return Some(hit);
             }
         }
-        for (id, widget) in &self.widgets {
+        // Only splitters and sliders have an extended grab zone, and there are a
+        // handful of them; walking the whole arena here would make every pointer
+        // move cost O(widgets).
+        for &id in &self.grab_widgets {
+            let widget = &self.widgets[id];
             // A disabled splitter/slider is inert; skip its extended grab zone so
             // it neither drags nor steals the hit from anything behind it.
             if widget.disabled {
@@ -2727,6 +2833,7 @@ fn measure_widget(
     check_buffers: &mut SecondaryMap<WidgetId, Buffer>,
     font_system: &mut FontSystem,
     shape_cache: &mut SecondaryMap<WidgetId, ShapeCacheEntry>,
+    ellipsized: &mut SecondaryMap<WidgetId, EllipsisFit>,
     reshapes: &mut u32,
 ) -> Size<f32> {
     let Some(&mut id) = ctx else {
@@ -2795,6 +2902,7 @@ fn measure_widget(
                     weight,
                     one_line: true,
                     single_line_w: None,
+                    natural_w: label_w,
                     wrap_bits: None,
                     size,
                 },
@@ -2884,6 +2992,9 @@ fn measure_widget(
         // its natural width so a panel resize that only widens is a cache hit.
         (size, (lines <= 1).then_some(width))
     };
+    // This buffer now holds the widget's full text. Any truncation `ellipsize`
+    // had left in it is gone, so drop its cached fit and let it re-truncate.
+    ellipsized.remove(id);
     shape_cache.insert(
         id,
         ShapeCacheEntry {
@@ -2892,6 +3003,7 @@ fn measure_widget(
             weight,
             one_line,
             single_line_w,
+            natural_w: width,
             wrap_bits: wrap_width.map(f32::to_bits),
             size,
         },
