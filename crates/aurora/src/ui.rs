@@ -506,6 +506,12 @@ impl Ui {
         self.widgets[id].translate = delta;
     }
 
+    /// A widget's draw-time offset (see [`Ui::set_translate`]). Add it to the
+    /// widget's rect to get where it is actually being drawn.
+    pub fn translate(&self, id: WidgetId) -> Vec2 {
+        self.widgets[id].translate
+    }
+
     /// A widget's background color (mostly for tests and introspection).
     pub fn background(&self, id: WidgetId) -> Color {
         self.widgets[id].background
@@ -2200,7 +2206,10 @@ impl Ui {
         // The ghost: re-emit the source's subtree, then translate it by the drag
         // delta (so it sits under the cursor as when grabbed) and fade it.
         if self.rect(drag.source).is_some() {
-            let delta = cursor - drag.start;
+            // The source may carry a draw-time offset of its own (a tab sliding
+            // along its bar). `emit` applies it, so cancel it here or the ghost
+            // drifts away from the pointer as the widget animates.
+            let delta = cursor - drag.start - self.widgets[drag.source].translate;
             let from = list.commands.len();
             self.emit(drag.source, list);
             for cmd in &mut list.commands[from..] {

@@ -55,6 +55,33 @@ use aurora::picker::{ColorPicker as AuroraPicker, Press};
 /// Two tree-row clicks within this window count as a double-click (start a
 /// rename), matching a typical desktop double-click speed.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+/// `a` blended toward `b` by `t` (0 = all `a`, 1 = all `b`).
+fn mix(a: aurora::Color, b: aurora::Color, t: f32) -> aurora::Color {
+    aurora::Color::rgba(
+        a.r + (b.r - a.r) * t,
+        a.g + (b.g - a.g) * t,
+        a.b + (b.b - a.b) * t,
+        a.a + (b.a - a.a) * t,
+    )
+}
+
+/// How far above and below a tab strip still counts as being "on" it while
+/// carrying a tab. The strip is thin, so aiming at it exactly is fussy; this
+/// makes the snap forgiving without reaching into the pane's body.
+const STRIP_GRAB_Y: f32 = 22.0;
+
+/// A tab strip's grab band: the bar, grown vertically so it is easy to hit.
+fn strip_band(rect: aurora::Rect) -> aurora::Rect {
+    aurora::Rect::new(
+        Vec2::new(rect.pos.x, rect.pos.y - STRIP_GRAB_Y),
+        Vec2::new(rect.size.x, rect.size.y + STRIP_GRAB_Y * 2.0),
+    )
+}
+
+/// The width of the gap a tab strip holds open for a tab being dragged into it.
+/// A rough tab width is enough: the gap only has to read as "it lands here".
+const CARRIED_TAB_W: f32 = 90.0;
+
 /// How long the cursor must rest on a file entry before its tooltip appears.
 const TOOLTIP_DELAY: std::time::Duration = std::time::Duration::from_millis(450);
 
@@ -381,6 +408,16 @@ struct State {
     /// One aurora tab bar per dock group, in dock-walk order: it owns dragging a
     /// tab along its strip to reorder, and the slide that follows.
     tab_bars: Vec<aurora::TabBar>,
+    /// The pane being dragged out of its tab bar. While set, the shell is built
+    /// without it - so the dock reflows as though it were already gone - and a
+    /// small preview of its tab follows the pointer instead.
+    carrying: Option<Pane>,
+    /// Where inside the tab the pointer grabbed it, so the carried copy sits
+    /// under the cursor the same way it did before it was lifted out.
+    carry_grab: Vec2,
+    /// A pane just dropped into a tab strip and the x it was dropped at, so its
+    /// tab can slide into place once the shell has been rebuilt with it.
+    arriving: Option<(Pane, f32)>,
 }
 
 /// A tree row being dragged to reparent it; `target` is the current valid drop
@@ -751,6 +788,9 @@ impl State {
             pointer_down: false,
             pending_cursor: None,
             tab_bars: Vec::new(),
+            carrying: None,
+            carry_grab: Vec2::ZERO,
+            arriving: None,
         })
     }
 
@@ -1784,15 +1824,25 @@ impl State {
         self.tab_bars
             .resize_with(self.rows.dock_tab_bars.len(), Default::default);
         for (group, rows) in self.rows.dock_tab_bars.iter().enumerate() {
-            if self.tab_bars[group].press(&self.ui, rows, cursor).is_some() {
-                return true;
+            let Some(index) = self.tab_bars[group].press(&self.ui, rows, cursor) else {
+                continue;
+            };
+            // Where in the tab it was grabbed. Captured now, while the pointer is
+            // genuinely on the tab: by the time it is dragged out of the bar the
+            // cursor has already left, and measuring then put the carried copy
+            // that far off the pointer for the rest of the drag.
+            if let Some(rect) = rows.tabs.get(index).and_then(|&t| self.ui.rect(t)) {
+                self.carry_grab = cursor - rect.pos;
             }
+            return true;
         }
         false
     }
 
-    /// Advance a live tab drag; a reorder is applied to the dock and the shell
-    /// rebuilt, after which the bar slides the displaced tabs into place.
+    /// Advance a live tab drag. This only rearranges how the tabs are *shown* -
+    /// nothing is committed and the shell is not rebuilt, because a rebuild
+    /// would drop Aurora's retained drag and the tab could no longer be pulled
+    /// out to another group afterwards. The move is applied on release.
     fn drag_tab_bar(&mut self) {
         let cursor = self.cursor;
         for group in 0..self.tab_bars.len() {
@@ -1802,11 +1852,78 @@ impl State {
             let Some(rows) = self.rows.dock_tab_bars.get(group) else {
                 continue;
             };
-            let Some(reorder) = self.tab_bars[group].drag_to(&self.ui, rows, cursor) else {
+            let outcome = self.tab_bars[group].drag_to(&self.ui, rows, cursor);
+            // Dragging clear of the strip lifts the pane out of the dock right
+            // away, so the remaining panes reflow and you can see where it would
+            // land. Nothing is committed: the shell is simply built without it
+            // until the drop (or until the gesture is abandoned).
+            if outcome == Some(aurora::TabDrag::TornOut)
+                && self.carrying.is_none()
+                && self.dock.panes().len() > 1
+                && let Some(&tab) = rows.tabs.first()
+                && let Some(pane) = self.dock_tab_pane(tab)
+            {
+                let held = self.tab_bars[group]
+                    .held_tab(rows)
+                    .and_then(|t| self.dock_tab_pane(t));
+                self.carrying = held.or(Some(pane));
+                // The pane is about to leave this bar, so the bar's own drag is
+                // over: its held index would otherwise point at whichever tab
+                // shifts into that slot.
+                self.tab_bars[group].cancel();
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// End any tab drag, committing a rearrangement the bar previewed. Records
+    /// that the drop was consumed, so the dock does not also treat the release
+    /// as a re-dock onto the group the tab already belongs to.
+    fn release_tab_bars(&mut self) {
+        // A carried pane lands wherever the pointer let go; if that is nowhere
+        // valid, dropping the carry alone restores it to where it came from,
+        // since the real dock was never changed.
+        if let Some(pane) = self.carrying.take() {
+            for bar in &mut self.tab_bars {
+                bar.set_insertion(None);
+            }
+            for rows in &self.rows.dock_tab_bars {
+                if let Some(bar) = rows.bar {
+                    self.ui.set_background(bar, self.theme.aurora.bar_bg);
+                }
+            }
+            if let Some((_, target, slot)) = self.tab_drop_target() {
+                // Merging into the group it already lives in is a no-op in
+                // move_pane, which is right: dropping a tab back on its own bar
+                // should only change its position, which the reorder below does.
+                self.dock.move_pane(pane, target, DropZone::Tab);
+                if let Some(from) = self.dock.index_in_group(pane) {
+                    // A slot past the end simply leaves it last.
+                    self.dock.reorder_in_group(pane, from, slot);
+                }
+                // It should settle from where it was dropped, not appear there.
+                self.arriving = Some((pane, self.cursor.x - self.carry_grab.x));
+                self.dirty = true;
+                self.view_dirty = true;
+            } else {
+                self.drop_dock_tab(pane);
+            }
+            for bar in &mut self.tab_bars {
+                bar.release();
+            }
+            self.dirty = true;
+            return;
+        }
+        for group in 0..self.tab_bars.len() {
+            let Some(reorder) = self.tab_bars[group].release() else {
                 continue;
             };
-            // Any tab of the group identifies which group to reorder within.
-            let Some(&tab) = rows.tabs.first() else {
+            let Some(&tab) = self
+                .rows
+                .dock_tab_bars
+                .get(group)
+                .and_then(|rows| rows.tabs.first())
+            else {
                 continue;
             };
             if let Some(pane) = self.dock_tab_pane(tab)
@@ -1814,13 +1931,6 @@ impl State {
             {
                 self.dirty = true;
             }
-        }
-    }
-
-    /// End any tab reorder drag.
-    fn release_tab_bars(&mut self) {
-        for bar in &mut self.tab_bars {
-            bar.release();
         }
     }
 
@@ -1833,6 +1943,28 @@ impl State {
     /// settled positions are known.
     fn tick_tab_bars(&mut self, dt: f32) {
         let cursor = self.cursor;
+        // A tab that has just arrived from another bar slides in from where it
+        // was dropped. Its group is only known now, after the rebuild.
+        if let Some((pane, from_x)) = self.arriving {
+            let found = self
+                .rows
+                .dock_tab_bars
+                .iter()
+                .enumerate()
+                .find_map(|(g, rows)| {
+                    let slot = rows
+                        .tabs
+                        .iter()
+                        .position(|&t| self.dock_tab_pane(t) == Some(pane))?;
+                    Some((g, slot))
+                });
+            if let Some((group, slot)) = found {
+                self.tab_bars
+                    .resize_with(self.rows.dock_tab_bars.len(), Default::default);
+                self.tab_bars[group].slide_in(slot, from_x);
+                self.arriving = None;
+            }
+        }
         self.tab_bars
             .resize_with(self.rows.dock_tab_bars.len(), Default::default);
         for (group, rows) in self.rows.dock_tab_bars.iter().enumerate() {
@@ -1847,6 +1979,52 @@ impl State {
             .iter()
             .find(|(w, _)| *w == id)
             .map(|(_, p)| *p)
+    }
+
+    /// The tab strip under the cursor, as (group index, a pane of that group,
+    /// the slot the carried tab would land in). Dropping here merges the pane
+    /// into that group rather than splitting it.
+    fn tab_drop_target(&self) -> Option<(usize, Pane, usize)> {
+        for (group, rows) in self.rows.dock_tab_bars.iter().enumerate() {
+            let Some(rect) = rows.bar.and_then(|b| self.ui.rect(b)) else {
+                continue;
+            };
+            if !strip_band(rect).contains(self.cursor) {
+                continue;
+            }
+            let pane = rows.tabs.first().and_then(|&t| self.dock_tab_pane(t))?;
+            let slot = self.tab_bars[group].drop_slot(&self.ui, rows, self.cursor);
+            return Some((group, pane, slot));
+        }
+        None
+    }
+
+    /// While carrying a pane, hold a gap open in whichever strip it is over and
+    /// lift that strip, so it is clear which bar would receive the tab.
+    fn update_carry_preview(&mut self) {
+        let target = self.tab_drop_target();
+        for group in 0..self.tab_bars.len() {
+            let insertion = match target {
+                Some((g, _, slot)) if g == group => Some((slot, CARRIED_TAB_W)),
+                _ => None,
+            };
+            self.tab_bars[group].set_insertion(insertion);
+            // Lift the target strip so it is obvious which bar would receive the
+            // tab. set_background edits the tree in place, so this costs no
+            // rebuild - which a live drag could not survive anyway.
+            if let Some(rows) = self.rows.dock_tab_bars.get(group)
+                && let Some(bar) = rows.bar
+            {
+                let base = self.theme.aurora.bar_bg;
+                let accent = self.theme.aurora.focus;
+                let fill = if insertion.is_some() {
+                    mix(base, accent, 0.22)
+                } else {
+                    base
+                };
+                self.ui.set_background(bar, fill);
+            }
+        }
     }
 
     /// The dock group under the cursor: the pane it shows and its content rect
@@ -1865,10 +2043,9 @@ impl State {
         let fy = ((cursor.y - rect.pos.y) / rect.size.y.max(1.0)).clamp(0.0, 1.0);
         let (left, right, top, bottom) = (fx, 1.0 - fx, fy, 1.0 - fy);
         let nearest = left.min(right).min(top).min(bottom);
-        // Within ~30% of no edge -> the central tab zone.
-        if nearest > 0.3 {
-            DropZone::Tab
-        } else if nearest == left {
+        // Merging as a tab is aimed at the tab strip now (see tab_drop_target),
+        // so anywhere in a pane's body splits it - the nearest edge wins.
+        if nearest == left {
             DropZone::Left
         } else if nearest == right {
             DropZone::Right
@@ -2984,6 +3161,17 @@ impl State {
             let filter_caret = self.ui.caret_offset();
             // Snapshot the log ring for the console pane (brief lock), recording
             // the generation so the poll below only rebuilds when it changes.
+            // While a tab is being carried out of its bar, the shell is built
+            // as if that pane were already removed - the real dock is untouched,
+            // so abandoning the drag simply restores it.
+            let dock_view = match self.carrying {
+                Some(pane) => self
+                    .dock
+                    .clone()
+                    .remove_pane(pane)
+                    .unwrap_or_else(|| self.dock.clone()),
+                None => self.dock.clone(),
+            };
             let logs: Vec<console::LogLine> = {
                 let ring = self.logs.lock().expect("log ring not poisoned");
                 self.last_log_gen = ring.generation;
@@ -2997,7 +3185,7 @@ impl State {
                 &self.explorer,
                 &self.thumbnails,
                 self.explorer_cols,
-                &self.dock,
+                &dock_view,
                 &self.pane_scrolls,
                 self.context_menu.as_ref(),
                 self.gizmo_mode,
@@ -3021,6 +3209,15 @@ impl State {
             // separately (refresh_picker_images).
             if let Some(open) = &self.picker {
                 self.rows.picker = open.picker.build(&mut self.ui, &self.theme.aurora);
+            }
+            // A carried tab: a small floating copy that follows the pointer, so
+            // there is something in hand while its pane is out of the layout.
+            if let Some(pane) = self.carrying {
+                self.rows.carried_tab = Some(ui::build_carried_tab(
+                    &mut self.ui,
+                    pane.title(),
+                    &self.theme,
+                ));
             }
             // The modal is the topmost popup: added last so its backdrop covers
             // (and blocks) the shell and any picker beneath it.
@@ -3103,6 +3300,26 @@ impl State {
         let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
         self.last_frame = std::time::Instant::now();
         self.tick_tab_bars(dt);
+        if let Some(id) = self.rows.carried_tab {
+            // The carried tab sits under the pointer at the same point it was
+            // grabbed by, tracking it exactly - no easing, which reads as lag.
+            // Over a tab strip it snaps into line with the tabs instead: moving
+            // along the bar stays 1:1 with the pointer, but the tab is either in
+            // the bar or it is not, and snapping is what makes that legible.
+            self.update_carry_preview();
+            let want = self.cursor - self.carry_grab;
+            let strip_y = self.rows.dock_tab_bars.iter().find_map(|r| {
+                r.bar
+                    .and_then(|b| self.ui.rect(b))
+                    .filter(|q| strip_band(*q).contains(self.cursor))
+                    .map(|q| q.pos.y + 5.0)
+            });
+            // translate is an offset from where the widget laid out, not an
+            // absolute position.
+            let base = self.ui.rect(id).map(|r| r.pos).unwrap_or(Vec2::ZERO);
+            let at = Vec2::new(want.x, strip_y.unwrap_or(want.y));
+            self.ui.set_translate(id, at - base);
+        }
 
         // Now the shell is laid out and the Ui matches self.dock exactly (this
         // frame's rebuild, if any, has already restructured the dock), read the
@@ -3207,8 +3424,8 @@ impl State {
         // group the pane would land in. Appended to the draw list each frame
         // rather than added as a popup, since a tab drag lives in Aurora's
         // retained state and must not trigger a rebuild (which would drop it).
-        if let Some(src) = self.ui.drag_source()
-            && self.dock_tab_pane(src).is_some()
+        if self.carrying.is_some()
+            && self.tab_drop_target().is_none()
             && let Some((_, rect)) = self.dock_group_at_cursor()
         {
             let zone = Self::dock_drop_zone(rect, self.cursor);
@@ -3543,13 +3760,9 @@ impl State {
                     self.commit_picker_hex(id);
                 }
                 AuroraEvent::Dropped { source, target } => {
-                    // A dragged dock tab re-docks into the group under the
-                    // cursor; anything else is a file-explorer drag.
-                    if let Some(pane) = self.dock_tab_pane(source) {
-                        self.drop_dock_tab(pane);
-                    } else {
-                        self.drop_file(source, target);
-                    }
+                    // Tab drags are routed by the tab bar, not by Aurora's
+                    // generic drag, so anything dropped here is a file.
+                    self.drop_file(source, target);
                 }
                 _ => {}
             }

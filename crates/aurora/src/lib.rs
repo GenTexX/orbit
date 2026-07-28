@@ -22,7 +22,7 @@ pub use input::{CursorHint, InputEvent, Key};
 pub use picker::ColorPicker;
 pub use rect::Rect;
 pub use style::Style;
-pub use tabs::{Reorder, TabBar, TabBarRows};
+pub use tabs::{Reorder, TabBar, TabBarRows, TabDrag};
 pub use theme::Theme;
 pub use ui::Ui;
 pub use widget::{FontWeight, Mask, Orientation, WidgetId, WidgetKind};

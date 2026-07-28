@@ -318,6 +318,8 @@ pub struct EditorRows {
     /// Each dock group's tab-strip widgets, in the order the dock is walked -
     /// the handle aurora's TabBar routes drags and animation through.
     pub dock_tab_bars: Vec<aurora::TabBarRows>,
+    /// The floating copy of a tab being dragged out of its bar.
+    pub carried_tab: Option<WidgetId>,
     /// Each tab group's content area mapped to the pane it currently shows: the
     /// drop region (and its rect gives the zones) a tab drag lands in.
     pub dock_groups: Vec<(WidgetId, Pane)>,
@@ -1050,6 +1052,29 @@ fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, theme: &EditorTheme, rows
         rows.menu_items.push((item, action.clone()));
     }
     rows.menu_popup = Some(popup);
+}
+
+/// Build the floating copy of a tab being dragged out of its bar. It is placed
+/// at the origin and moved to the pointer with a draw-time offset each frame, so
+/// following the cursor never costs a rebuild.
+pub fn build_carried_tab(ui: &mut Ui, title: &str, theme: &EditorTheme) -> WidgetId {
+    let card = ui.popup(
+        Vec2::ZERO,
+        Style::new()
+            .padding_x(12.0)
+            .padding_y(6.0)
+            .background(theme.aurora.panel_bg)
+            .foreground(theme.aurora.heading)
+            .corner_radius(theme.aurora.tab_radius)
+            .border(theme.aurora.border_width, theme.aurora.tab_border)
+            .hit_transparent(),
+    );
+    ui.label(
+        card,
+        title.to_string(),
+        Style::new().foreground(theme.aurora.heading),
+    );
+    card
 }
 
 /// A modal card's width.

@@ -235,9 +235,31 @@ impl DockNode {
         }
     }
 
+    /// The panes flattened in left-to-right, top-to-bottom order.
+    pub fn panes(&self) -> Vec<Pane> {
+        match self {
+            DockNode::Leaf { panes, .. } => panes.clone(),
+            DockNode::Split { first, second, .. } => {
+                let mut out = first.panes();
+                out.extend(second.panes());
+                out
+            }
+        }
+    }
+
+    /// `pane`'s index within its own tab group, if it is in the tree.
+    pub fn index_in_group(&self, pane: Pane) -> Option<usize> {
+        match self {
+            DockNode::Leaf { panes, .. } => panes.iter().position(|&p| p == pane),
+            DockNode::Split { first, second, .. } => first
+                .index_in_group(pane)
+                .or_else(|| second.index_in_group(pane)),
+        }
+    }
+
     /// Remove `pane`, returning the pruned tree (or `None` if the tree becomes
     /// empty). A split that loses one child collapses to the survivor.
-    fn remove_pane(self, pane: Pane) -> Option<DockNode> {
+    pub fn remove_pane(self, pane: Pane) -> Option<DockNode> {
         match self {
             DockNode::Leaf { mut panes, active } => {
                 panes.retain(|&p| p != pane);
@@ -367,18 +389,6 @@ impl DockNode {
         match self {
             DockNode::Leaf { panes, .. } => panes.contains(&pane),
             DockNode::Split { first, second, .. } => first.contains(pane) || second.contains(pane),
-        }
-    }
-
-    /// The panes flattened in left-to-right, top-to-bottom order.
-    fn panes(&self) -> Vec<Pane> {
-        match self {
-            DockNode::Leaf { panes, .. } => panes.clone(),
-            DockNode::Split { first, second, .. } => {
-                let mut out = first.panes();
-                out.extend(second.panes());
-                out
-            }
         }
     }
 }
