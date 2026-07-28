@@ -18,7 +18,6 @@ use crate::icons::{Icon, Icons};
 use crate::modal::{Modal, ModalAction, ModalBody, SettingField, SettingsDraft};
 use crate::thumbnails::Thumbnails;
 use crate::viewport::GizmoMode;
-use spectrum::color;
 
 /// The newest console lines the pane builds a widget for (the ring stores more
 /// for scrollback; older lines are summarized with a count).
@@ -205,17 +204,6 @@ pub fn set_field_color(scene: &mut Scene, t: ColorTarget, rgba: [f32; 4]) {
     scene.node_mut(t.node).components[t.index]
         .as_reflect_mut()
         .set(t.field, Value::Color(rgba));
-}
-
-/// What the app hands [`build_color_picker`] to draw the open picker: where it
-/// floats, the current color (for the hex field and swatch), and the handles
-/// of its three gradient images (which the app keeps updated).
-pub struct ColorPickerView {
-    pub anchor: Vec2,
-    pub rgba: [f32; 4],
-    pub sv: ImageHandle,
-    pub hue: ImageHandle,
-    pub alpha: ImageHandle,
 }
 
 /// Where a dragged tree row will drop, relative to the row under the cursor:
@@ -406,11 +394,8 @@ pub struct EditorRows {
     pub color_swatches: Vec<(WidgetId, ColorTarget)>,
     /// The open color picker: its popup (for dismiss), the three draggable
     /// gradient regions, and the hex input.
-    pub picker_popup: Option<WidgetId>,
-    pub picker_sv: Option<WidgetId>,
-    pub picker_hue: Option<WidgetId>,
-    pub picker_alpha: Option<WidgetId>,
-    pub picker_hex: Option<WidgetId>,
+    /// The open color picker's widgets (aurora fills these when it builds it).
+    pub picker: aurora::picker::PickerRows,
     /// The open modal dialog: its card (for backdrop-click dismiss detection),
     /// close button, footer action buttons, and settings-form controls.
     pub modal_card: Option<WidgetId>,
@@ -1084,66 +1069,6 @@ fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, theme: &EditorTheme, rows
         rows.menu_items.push((item, action.clone()));
     }
     rows.menu_popup = Some(popup);
-}
-
-/// The size of the color picker's SV square, and its bar dimensions (px).
-const PICKER_SV: f32 = 150.0;
-const PICKER_HUE_W: f32 = 18.0;
-const PICKER_ALPHA_H: f32 = 16.0;
-
-/// Build the open color picker on Aurora's popup layer: an SV square + hue bar
-/// (as gradient images the app keeps updated), an alpha bar, and a hex field
-/// with a preview swatch. The regions are recorded for the app's drag routing.
-pub fn build_color_picker(
-    ui: &mut Ui,
-    view: &ColorPickerView,
-    theme: &EditorTheme,
-    rows: &mut EditorRows,
-) {
-    let popup = ui.popup(
-        view.anchor,
-        Style::new()
-            .column()
-            .gap(6.0)
-            .padding(8.0)
-            .background(theme.aurora.menu_bg)
-            .corner_radius(theme.aurora.card_radius)
-            .border(theme.aurora.border_width, theme.aurora.card_border)
-            .clip(),
-    );
-    let top = ui.panel(popup, Style::new().row().gap(6.0));
-    let sv = ui.image(top, view.sv, Style::new().size(PICKER_SV, PICKER_SV));
-    let hue = ui.image(top, view.hue, Style::new().size(PICKER_HUE_W, PICKER_SV));
-    let alpha = ui.image(
-        popup,
-        view.alpha,
-        Style::new().size(PICKER_SV, PICKER_ALPHA_H),
-    );
-
-    let bottom = ui.panel(popup, Style::new().row().gap(6.0).align_center());
-    let hex = ui.text_input(
-        bottom,
-        color::to_hex(view.rgba),
-        Style::new()
-            .grow(1.0)
-            .padding(4.0)
-            .corner_radius(theme.aurora.control_radius)
-            .placeholder("#RRGGBBAA"),
-    );
-    let [r, g, b, a] = view.rgba;
-    ui.panel(
-        bottom,
-        Style::new()
-            .size(28.0, 24.0)
-            .background(Color::rgba(r, g, b, a))
-            .corner_radius(theme.aurora.control_radius),
-    );
-
-    rows.picker_popup = Some(popup);
-    rows.picker_sv = Some(sv);
-    rows.picker_hue = Some(hue);
-    rows.picker_alpha = Some(alpha);
-    rows.picker_hex = Some(hex);
 }
 
 /// A modal card's width.
@@ -3491,30 +3416,6 @@ mod tests {
         // The sprite's tint is a Color field, so the inspector has one swatch.
         assert_eq!(rows.color_swatches.len(), 1);
         assert_eq!(rows.color_swatches[0].1.field, "tint");
-
-        // The picker popup builds its three gradient regions and hex input,
-        // and hit-tests above the tree behind it.
-        let mut ui = Ui::new();
-        ui.root_panel(Style::new().fill());
-        let mut rows = EditorRows::default();
-        let view = ColorPickerView {
-            anchor: Vec2::new(200.0, 150.0),
-            rgba: [1.0, 0.5, 0.2, 1.0],
-            sv: handle,
-            hue: handle,
-            alpha: handle,
-        };
-        build_color_picker(&mut ui, &view, &EditorTheme::default(), &mut rows);
-        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
-
-        let popup = rows.picker_popup.unwrap();
-        assert!(ui.is_within(rows.picker_sv.unwrap(), popup));
-        assert!(ui.is_within(rows.picker_hue.unwrap(), popup));
-        assert!(ui.is_within(rows.picker_alpha.unwrap(), popup));
-        assert!(ui.is_within(rows.picker_hex.unwrap(), popup));
-        // A press on the SV square hits it (not something behind the popup).
-        let sv = ui.rect(rows.picker_sv.unwrap()).unwrap();
-        assert_eq!(ui.hit_test(sv.pos + sv.size * 0.5), rows.picker_sv);
     }
 
     #[test]

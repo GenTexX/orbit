@@ -44,21 +44,13 @@ use crate::icons::Icons;
 use crate::modal::ModalAction;
 use crate::textures::TextureCache;
 use crate::ui::{
-    Axis, ColorPickerView, ColorTarget, ContextMenu, DropSpot, EditorRows, EditorTheme, FieldRef,
-    InspectorSection, InspectorView, MenuAction, TreeView, axis_of, build_color_picker,
-    build_editor_ui, build_modal, capture_dock_scrolls, capture_dock_sizes, field_color,
-    field_vec2, grid_cols, parse_value, resolve_drop, set_field_color, set_field_vec2,
-    value_to_text, visible_nodes, with_axis,
+    Axis, ColorTarget, ContextMenu, DropSpot, EditorRows, EditorTheme, FieldRef, InspectorSection,
+    InspectorView, MenuAction, TreeView, axis_of, build_editor_ui, build_modal,
+    capture_dock_scrolls, capture_dock_sizes, field_color, field_vec2, grid_cols, parse_value,
+    resolve_drop, set_field_color, set_field_vec2, value_to_text, visible_nodes, with_axis,
 };
 use crate::viewport::{Drag, EditorCamera, GizmoHit, GizmoMode};
-use spectrum::color::{self, Hsva};
-
-/// The color picker's gradient image sizes (px): the SV square, the hue bar
-/// width, and the alpha bar height. Must match the widget sizes in
-/// `build_color_picker` for a crisp 1:1 draw.
-const SV: usize = 150;
-const HUE_W: usize = 18;
-const ALPHA_H: usize = 16;
+use aurora::picker::{ColorPicker as AuroraPicker, Press};
 
 /// Two tree-row clicks within this window count as a double-click (start a
 /// rename), matching a typical desktop double-click speed.
@@ -70,23 +62,13 @@ const TOOLTIP_DELAY: std::time::Duration = std::time::Duration::from_millis(450)
 /// changes.
 const WINDOW_TITLE: &str = "Orbit - Atlas";
 
-/// Which of the color picker's gradients a press is dragging.
-#[derive(Debug, Clone, Copy)]
-enum PickerDrag {
-    Sv,
-    Hue,
-    Alpha,
-}
-
-/// The open color picker: the field it edits, the color at open time (for one
-/// undo step on close), the working HSVA, where it floats, and any live drag.
-#[derive(Debug, Clone, Copy)]
+/// The open color picker: which field it edits, the color it had when opened
+/// (so the whole drag commits as one undo step), and aurora's picker - which
+/// owns the gradients, the drag routing, and the widgets.
 struct ColorPicker {
     target: ColorTarget,
     original: [f32; 4],
-    hsva: Hsva,
-    anchor: Vec2,
-    drag: Option<PickerDrag>,
+    picker: AuroraPicker,
 }
 
 /// The scene-tree selection: the nodes picked, in the order they were added,
@@ -341,9 +323,7 @@ struct State {
     modal: Option<modal::Modal>,
     /// The picker's three gradient images (registered once, updated in place as
     /// the color changes).
-    picker_sv: ImageHandle,
-    picker_hue: ImageHandle,
-    picker_alpha: ImageHandle,
+    picker_images: [ImageHandle; 3],
     /// Collapsed scene-tree nodes (editor state, kept across shell rebuilds).
     tree_collapsed: HashSet<NodeId>,
     /// Collapsed inspector sections per node (editor state, kept across shell
@@ -396,11 +376,6 @@ struct State {
     /// Hz); running the drag handlers per event repeated the same work many times
     /// between two presented frames.
     pending_cursor: Option<Vec2>,
-    /// The color the picker's gradient images were last generated for.
-    last_picker_images: Option<Hsva>,
-    /// The SV square's gradient for the current hue, so a drag inside the square
-    /// only re-stamps the marker.
-    picker_sv_field: Vec<u8>,
 }
 
 /// A tree row being dragged to reparent it; `target` is the current valid drop
@@ -600,21 +575,10 @@ impl State {
         let textures = TextureCache::new(&engine);
         let icons = Icons::build(&mut gui);
         // Placeholder color-picker gradients (regenerated when it opens).
-        let picker_sv = gui.register_image_rgba_unmipped(
-            &color::sv_square(0.0, SV, 0.0, 0.0),
-            SV as u32,
-            SV as u32,
-        );
-        let picker_hue = gui.register_image_rgba_unmipped(
-            &color::hue_bar(HUE_W, SV, 0.0),
-            HUE_W as u32,
-            SV as u32,
-        );
-        let picker_alpha = gui.register_image_rgba_unmipped(
-            &color::alpha_bar([0.0, 0.0, 0.0], SV, ALPHA_H, 1.0),
-            SV as u32,
-            ALPHA_H as u32,
-        );
+        // The picker's three gradients, registered once; aurora refills them in
+        // place as the color changes.
+        let picker_images = AuroraPicker::initial_bitmaps()
+            .map(|b| gui.register_image_rgba_unmipped(&b.rgba, b.width, b.height));
 
         let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo_project");
         let project = project::open_or_create(&project_dir)?;
@@ -755,9 +719,7 @@ impl State {
             icons,
             picker: None,
             modal: None,
-            picker_sv,
-            picker_hue,
-            picker_alpha,
+            picker_images,
             tree_collapsed,
             inspector_collapsed: HashSet::new(),
             theme,
@@ -776,8 +738,6 @@ impl State {
             tooltip_target: None,
             pointer_down: false,
             pending_cursor: None,
-            last_picker_images: None,
-            picker_sv_field: Vec::new(),
         })
     }
 
@@ -829,7 +789,7 @@ impl State {
         if self.scrub.is_some() {
             self.apply_scrub();
         }
-        if self.picker.is_some_and(|p| p.drag.is_some()) {
+        if self.picker.as_ref().is_some_and(|p| p.picker.is_dragging()) {
             self.apply_picker_drag();
         }
         if self.reparent.is_some() {
@@ -1965,9 +1925,7 @@ impl State {
         self.picker = Some(ColorPicker {
             target,
             original,
-            hsva: Hsva::from_rgba(original, 0.0),
-            anchor: self.cursor,
-            drag: None,
+            picker: AuroraPicker::new(self.picker_images, self.cursor, original),
         });
         self.refresh_picker_images();
         self.dirty = true;
@@ -1979,7 +1937,7 @@ impl State {
         let Some(picker) = self.picker.take() else {
             return;
         };
-        let final_rgba = picker.hsva.to_rgba();
+        let final_rgba = picker.picker.rgba();
         if final_rgba != picker.original {
             set_field_color(&mut self.project.scene, picker.target, picker.original);
             self.history.set_field(
@@ -1993,120 +1951,46 @@ impl State {
         self.dirty = true;
     }
 
-    /// Regenerate the picker's three gradient images from its current HSVA and
-    /// upload them in place (their handles stay valid across shell rebuilds).
-    ///
-    /// Only the images whose inputs actually moved are rebuilt: the square's
-    /// gradient is a function of hue (s/v just place its marker), and the hue bar
-    /// depends on nothing else - so an alpha drag rebuilds neither.
+    /// Upload whatever gradients aurora reports as changed since the last call.
     fn refresh_picker_images(&mut self) {
-        let Some(picker) = self.picker else {
+        let Some(open) = self.picker.as_mut() else {
             return;
         };
-        let hsva = picker.hsva;
-        let was = self.last_picker_images;
-        let changed = |f: fn(&Hsva) -> f32| was.is_none_or(|w| f(&w) != f(&hsva));
-        let hue_moved = changed(|c| c.h);
-        let sv_moved = changed(|c| c.s) || changed(|c| c.v);
-        if hue_moved || sv_moved {
-            if hue_moved || self.picker_sv_field.is_empty() {
-                self.picker_sv_field = color::sv_field(hsva.h, SV);
-            }
-            self.gui.update_image_rgba(
-                self.picker_sv,
-                &color::sv_square_from(&self.picker_sv_field, SV, hsva.s, hsva.v),
-                SV as u32,
-                SV as u32,
-            );
+        for (handle, bitmap) in open.picker.dirty_bitmaps() {
+            self.gui
+                .update_image_rgba(handle, &bitmap.rgba, bitmap.width, bitmap.height);
         }
-        if hue_moved {
-            self.gui.update_image_rgba(
-                self.picker_hue,
-                &color::hue_bar(HUE_W, SV, hsva.h),
-                HUE_W as u32,
-                SV as u32,
-            );
-        }
-        if hue_moved || sv_moved || changed(|c| c.a) {
-            let [r, g, b, _] = hsva.to_rgba();
-            self.gui.update_image_rgba(
-                self.picker_alpha,
-                &color::alpha_bar([r, g, b], SV, ALPHA_H, hsva.a),
-                SV as u32,
-                ALPHA_H as u32,
-            );
-        }
-        self.last_picker_images = Some(hsva);
     }
 
     /// A left press with the picker open: dismiss it (committing) if the press
     /// is outside its popup, else start a gradient drag if on one. Returns
     /// whether it consumed the press.
     fn handle_picker_press(&mut self) -> bool {
-        if self.picker.is_none() {
+        let (ui, rows, cursor) = (&self.ui, self.rows.picker, self.cursor);
+        let Some(open) = self.picker.as_mut() else {
             return false;
-        }
-        let hit = self.ui.hit_test(self.cursor);
-        let inside = self
-            .rows
-            .picker_popup
-            .is_some_and(|p| hit.is_some_and(|h| self.ui.is_within(h, p)));
-        if !inside {
-            self.close_color_picker();
-            return true;
-        }
-        let drag = if hit == self.rows.picker_sv {
-            Some(PickerDrag::Sv)
-        } else if hit == self.rows.picker_hue {
-            Some(PickerDrag::Hue)
-        } else if hit == self.rows.picker_alpha {
-            Some(PickerDrag::Alpha)
-        } else {
-            None
         };
-        if let Some(drag) = drag {
-            if let Some(picker) = self.picker.as_mut() {
-                picker.drag = Some(drag);
-            }
-            self.apply_picker_drag();
+        match open.picker.press(ui, &rows, cursor) {
+            Press::Grabbed(_) => self.apply_picker_drag(),
+            Press::Inside => {}
+            Press::Outside => self.close_color_picker(),
         }
         true
     }
 
-    /// Apply the current cursor to the active picker gradient drag: read the
-    /// value out of the region's rect, update the working HSVA, and push it to
-    /// the scene live (committed as one step when the picker closes).
+    /// Apply the current cursor to the active gradient drag and push the new
+    /// color to the scene live (committed as one undo step when the picker
+    /// closes).
     fn apply_picker_drag(&mut self) {
-        let Some(mut picker) = self.picker else {
+        let (ui, rows, cursor) = (&self.ui, self.rows.picker, self.cursor);
+        let Some(open) = self.picker.as_mut() else {
             return;
         };
-        let Some(drag) = picker.drag else {
+        if !open.picker.drag_to(ui, &rows, cursor) {
             return;
-        };
-        let region = match drag {
-            PickerDrag::Sv => self.rows.picker_sv,
-            PickerDrag::Hue => self.rows.picker_hue,
-            PickerDrag::Alpha => self.rows.picker_alpha,
-        };
-        let Some(rect) = region.and_then(|id| self.ui.rect(id)) else {
-            return;
-        };
-        let fx = ((self.cursor.x - rect.pos.x) / rect.size.x).clamp(0.0, 1.0);
-        let fy = ((self.cursor.y - rect.pos.y) / rect.size.y).clamp(0.0, 1.0);
-        match drag {
-            PickerDrag::Sv => {
-                picker.hsva.s = fx;
-                picker.hsva.v = 1.0 - fy;
-            }
-            PickerDrag::Hue => picker.hsva.h = fy,
-            PickerDrag::Alpha => picker.hsva.a = fx,
         }
-        self.picker = Some(picker);
-        set_field_color(
-            &mut self.project.scene,
-            picker.target,
-            picker.hsva.to_rgba(),
-        );
+        let (target, rgba) = (open.target, open.picker.rgba());
+        set_field_color(&mut self.project.scene, target, rgba);
         self.refresh_picker_images();
         self.dirty = true;
     }
@@ -2114,25 +1998,26 @@ impl State {
     /// End a picker gradient drag (the picker stays open).
     fn end_picker_drag(&mut self) {
         if let Some(picker) = self.picker.as_mut() {
-            picker.drag = None;
+            picker.picker.end_drag();
         }
     }
 
     /// Commit the picker's hex input into its working color.
     fn commit_picker_hex(&mut self, id: aurora::WidgetId) {
-        if self.rows.picker_hex != Some(id) {
+        if self.rows.picker.hex != Some(id) {
             return;
         }
         let WidgetKind::TextInput(text) = self.ui.kind(id) else {
             return;
         };
-        let Some(rgba) = color::from_hex(&text.clone()) else {
+        let Some(picker) = self.picker.as_mut() else {
             return;
         };
-        if let Some(picker) = self.picker.as_mut() {
-            picker.hsva = Hsva::from_rgba(rgba, picker.hsva.h);
+        if !picker.picker.commit_hex(text.as_str()) {
+            return;
         }
-        set_field_color(&mut self.project.scene, self.picker.unwrap().target, rgba);
+        let (target, rgba) = (picker.target, picker.picker.rgba());
+        set_field_color(&mut self.project.scene, target, rgba);
         self.refresh_picker_images();
         self.dirty = true;
     }
@@ -3054,15 +2939,8 @@ impl State {
             // The color picker floats on the popup layer, added after the shell
             // so it draws on top; its gradient images are kept up to date
             // separately (refresh_picker_images).
-            if let Some(picker) = self.picker {
-                let view = ColorPickerView {
-                    anchor: picker.anchor,
-                    rgba: picker.hsva.to_rgba(),
-                    sv: self.picker_sv,
-                    hue: self.picker_hue,
-                    alpha: self.picker_alpha,
-                };
-                build_color_picker(&mut self.ui, &view, &self.theme, &mut self.rows);
+            if let Some(open) = &self.picker {
+                self.rows.picker = open.picker.build(&mut self.ui, &self.theme.aurora);
             }
             // The modal is the topmost popup: added last so its backdrop covers
             // (and blocks) the shell and any picker beneath it.

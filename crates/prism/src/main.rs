@@ -13,10 +13,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use aurora::picker::{ColorPicker, PickerRows, Press};
 use aurora::{Color, Event, ImageHandle, InputEvent, Key, Rect, Style, Theme, Ui, WidgetId};
 use aurora_wgpu::Renderer;
 use glam::Vec2;
-use spectrum::color::{self, Hsva};
 use spectrum::settings;
 use spectrum::theme::{self, Bind, Kind, ThemeDoc, Value};
 use winit::{
@@ -26,12 +26,6 @@ use winit::{
     keyboard::{Key as WinitKey, ModifiersState, NamedKey},
     window::{Window, WindowId},
 };
-
-/// Color-picker gradient sizes (px): the SV square side, the hue bar width, the
-/// alpha bar height. The hue bar is SV tall; the alpha bar is SV wide.
-const SV: usize = 176;
-const HUE_W: usize = 16;
-const ALPHA_H: usize = 16;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -58,20 +52,11 @@ enum Target {
     Token(String),
 }
 
-/// An open color picker editing one target.
+/// An open color picker, and which theme value it edits. The picker itself -
+/// its gradients, drag routing, and widgets - is aurora's.
 struct Picker {
     target: Target,
-    hsva: Hsva,
-    anchor: Vec2,
-    drag: Option<Region>,
-}
-
-/// Which picker gradient a press/drag is on.
-#[derive(Clone, Copy, PartialEq)]
-enum Region {
-    Sv,
-    Hue,
-    Alpha,
+    picker: ColorPicker,
 }
 
 /// Widget handles the app maps events back to after building the tree.
@@ -94,12 +79,9 @@ struct Rows {
     /// The bottom help line, and each token row's description (shown on hover).
     help: Option<WidgetId>,
     token_rows: Vec<(WidgetId, &'static str)>,
-    /// Picker sub-widgets (present only while the picker is open).
-    pk_card: Option<WidgetId>,
-    pk_sv: Option<WidgetId>,
-    pk_hue: Option<WidgetId>,
-    pk_alpha: Option<WidgetId>,
-    pk_hex: Option<WidgetId>,
+    /// The open picker's widgets (aurora fills these in when it builds it).
+    pk: PickerRows,
+    /// The picker's Done button.
     pk_done: Option<WidgetId>,
 }
 
@@ -110,22 +92,14 @@ struct State {
     rows: Rows,
     doc: ThemeDoc,
     picker: Option<Picker>,
-    /// The picker's gradient images (registered once, updated in place).
-    img_sv: ImageHandle,
-    img_hue: ImageHandle,
-    img_alpha: ImageHandle,
+    /// The picker's gradient images, registered once and refilled in place.
+    picker_images: [ImageHandle; 3],
     cursor: Vec2,
     modifiers: ModifiersState,
     save_pending: bool,
     last_save: Instant,
     /// Set when the tree must be rebuilt (structure changed / picker opened).
     dirty: bool,
-    /// The color the gradient bitmaps were last generated for, so `refresh_images`
-    /// can skip the ones whose inputs did not move.
-    last_images: Option<Hsva>,
-    /// The SV square's gradient for the current hue, kept so a drag inside the
-    /// square only re-stamps the marker instead of recomputing every pixel.
-    sv_field: Vec<u8>,
     /// Set by a pointer move; the move is applied once per frame rather than per
     /// event. A mouse reports at 125-1000 Hz while the window presents at ~60, so
     /// doing the picker's regeneration per event did the same work many times
@@ -147,23 +121,10 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         let mut renderer =
             Renderer::new(window.clone(), (size.width, size.height)).expect("renderer");
-        // Register the picker's three gradient images once; they are updated in
-        // place as the picker's color changes.
-        let img_sv = renderer.register_image_rgba_unmipped(
-            &color::sv_square(0.0, SV, 0.0, 0.0),
-            SV as u32,
-            SV as u32,
-        );
-        let img_hue = renderer.register_image_rgba_unmipped(
-            &color::hue_bar(HUE_W, SV, 0.0),
-            HUE_W as u32,
-            SV as u32,
-        );
-        let img_alpha = renderer.register_image_rgba_unmipped(
-            &color::alpha_bar([0.0, 0.0, 0.0], SV, ALPHA_H, 1.0),
-            SV as u32,
-            ALPHA_H as u32,
-        );
+        // Register the picker's three gradients once; aurora refills them in
+        // place as the color changes.
+        let picker_images = ColorPicker::initial_bitmaps()
+            .map(|b| renderer.register_image_rgba_unmipped(&b.rgba, b.width, b.height));
         let doc = settings::read().unwrap_or_default().theme;
         let mut state = State {
             window,
@@ -172,17 +133,13 @@ impl ApplicationHandler for App {
             rows: Rows::default(),
             doc,
             picker: None,
-            img_sv,
-            img_hue,
-            img_alpha,
+            picker_images,
             cursor: Vec2::ZERO,
             modifiers: ModifiersState::default(),
             save_pending: false,
             last_save: Instant::now(),
             dirty: false,
             pointer_moved: false,
-            last_images: None,
-            sv_field: Vec::new(),
         };
         state.rebuild();
         self.state = Some(state);
@@ -231,7 +188,7 @@ impl ApplicationHandler for App {
                     }
                     ElementState::Released => {
                         if let Some(p) = state.picker.as_mut() {
-                            p.drag = None;
+                            p.picker.end_drag();
                         }
                         state.ui.handle_input(InputEvent::PointerReleased);
                         state.flush_save();
@@ -297,13 +254,17 @@ impl State {
     /// one is open.
     fn rebuild(&mut self) {
         let (mut ui, mut rows) = build_ui(&self.doc);
-        if let Some(picker) = &self.picker {
-            build_picker(
-                &mut ui,
-                picker,
-                [self.img_sv, self.img_hue, self.img_alpha],
-                &mut rows,
-            );
+        if let Some(open) = &self.picker {
+            rows.pk = open.picker.build(&mut ui, &Theme::dark());
+            // aurora hands back the popup's card, so an app can add its own
+            // controls inside the picker - here, a Done button.
+            if let Some(card) = rows.pk.card {
+                rows.pk_done = Some(ui.button(
+                    card,
+                    "Done".to_string(),
+                    Style::new().padding(4.0).foreground(Color::WHITE),
+                ));
+            }
         }
         self.ui = ui;
         self.rows = rows;
@@ -334,11 +295,10 @@ impl State {
 
     fn submitted(&mut self, id: WidgetId) {
         // The picker's hex field.
-        if Some(id) == self.rows.pk_hex {
-            if let Some(rgba) = color::from_hex(&text_of(&self.ui, id)) {
-                let keep = self.picker.as_ref().map(|p| p.hsva.h).unwrap_or(0.0);
-                if let Some(p) = self.picker.as_mut() {
-                    p.hsva = Hsva::from_rgba(rgba, keep);
+        if Some(id) == self.rows.pk.hex {
+            if let Some(rgba) = aurora::from_hex(&text_of(&self.ui, id)) {
+                if let Some(open) = self.picker.as_mut() {
+                    open.picker.set_rgba(rgba);
                 }
                 self.commit_color();
             }
@@ -381,14 +341,11 @@ impl State {
                 .rect(sw)
                 .map(|r| r.pos + Vec2::new(0.0, r.size.y + 4.0))
                 .unwrap_or(self.cursor);
-            let keep = self.picker.as_ref().map(|p| p.hsva.h).unwrap_or(0.0);
             self.picker = Some(Picker {
                 target,
-                hsva: Hsva::from_rgba(rgba, keep),
-                anchor,
-                drag: None,
+                picker: ColorPicker::new(self.picker_images, anchor, rgba),
             });
-            self.refresh_images();
+            self.upload_picker_images();
             self.dirty = true;
             return;
         }
@@ -442,33 +399,26 @@ impl State {
         }
     }
 
-    /// A left press while the picker is open: if it landed on a gradient, start a
-    /// drag there and apply it.
+    /// Route a press while the picker is open: aurora reports whether it landed
+    /// on a gradient (starting a drag), elsewhere inside the popup, or outside
+    /// it - and an outside press dismisses the picker, except on a swatch, which
+    /// switches to that target on release.
     fn press_picker(&mut self) {
-        if self.picker.is_none() {
+        let (ui, rows, cursor) = (&self.ui, self.rows.pk, self.cursor);
+        let Some(open) = self.picker.as_mut() else {
             return;
-        }
-        let hit = self.ui.hit_test(self.cursor);
-        let inside = self
-            .rows
-            .pk_card
-            .is_some_and(|c| hit == Some(c) || hit.is_some_and(|h| self.ui.is_within(h, c)));
-        if inside {
-            // A press on a gradient starts (and applies) a drag.
-            if let Some(region) = self.region_at(self.cursor) {
-                if let Some(p) = self.picker.as_mut() {
-                    p.drag = Some(region);
+        };
+        match open.picker.press(ui, &rows, cursor) {
+            Press::Grabbed(_) => self.commit_color(),
+            Press::Inside => {}
+            Press::Outside => {
+                let hit = self.ui.hit_test(self.cursor);
+                let on_swatch = self.rows.swatches.iter().any(|(w, _)| Some(*w) == hit);
+                if !on_swatch {
+                    self.picker = None;
+                    self.dirty = true;
                 }
-                self.drag_picker();
             }
-            return;
-        }
-        // Outside the popup: a press on a color swatch opens/switches on release,
-        // so leave it; any other outside press dismisses the picker.
-        let on_swatch = self.rows.swatches.iter().any(|(w, _)| Some(*w) == hit);
-        if !on_swatch {
-            self.picker = None;
-            self.dirty = true;
         }
     }
 
@@ -481,52 +431,20 @@ impl State {
         }
         self.pointer_moved = false;
         self.ui.handle_input(InputEvent::PointerMoved(self.cursor));
-        if self.picker.as_ref().is_some_and(|p| p.drag.is_some()) {
+        if self.picker.as_ref().is_some_and(|p| p.picker.is_dragging()) {
             self.drag_picker();
         }
     }
 
     /// Apply the active gradient drag from the cursor.
     fn drag_picker(&mut self) {
-        let Some(region) = self.picker.as_ref().and_then(|p| p.drag) else {
-            return;
-        };
-        let rect = match region {
-            Region::Sv => self.rows.pk_sv,
-            Region::Hue => self.rows.pk_hue,
-            Region::Alpha => self.rows.pk_alpha,
-        }
-        .and_then(|id| self.ui.rect(id));
-        let Some(rect) = rect else { return };
-        let fx = ((self.cursor.x - rect.pos.x) / rect.size.x).clamp(0.0, 1.0);
-        let fy = ((self.cursor.y - rect.pos.y) / rect.size.y).clamp(0.0, 1.0);
-        if let Some(p) = self.picker.as_mut() {
-            match region {
-                Region::Sv => {
-                    p.hsva.s = fx;
-                    p.hsva.v = 1.0 - fy;
-                }
-                Region::Hue => p.hsva.h = fy,
-                Region::Alpha => p.hsva.a = fx,
-            }
-        }
-        self.commit_color();
-    }
-
-    /// Which gradient rect (if any) `p` is over.
-    fn region_at(&self, p: Vec2) -> Option<Region> {
-        let hit = |id: Option<WidgetId>| {
-            id.and_then(|i| self.ui.rect(i))
-                .is_some_and(|r| within(r, p))
-        };
-        if hit(self.rows.pk_sv) {
-            Some(Region::Sv)
-        } else if hit(self.rows.pk_hue) {
-            Some(Region::Hue)
-        } else if hit(self.rows.pk_alpha) {
-            Some(Region::Alpha)
-        } else {
-            None
+        let (ui, rows, cursor) = (&self.ui, self.rows.pk, self.cursor);
+        let changed = self
+            .picker
+            .as_mut()
+            .is_some_and(|open| open.picker.drag_to(ui, &rows, cursor));
+        if changed {
+            self.commit_color();
         }
     }
 
@@ -536,7 +454,7 @@ impl State {
         let Some((target, rgba)) = self
             .picker
             .as_ref()
-            .map(|p| (p.target.clone(), p.hsva.to_rgba()))
+            .map(|p| (p.target.clone(), p.picker.rgba()))
         else {
             return;
         };
@@ -547,56 +465,19 @@ impl State {
             self.ui
                 .set_background(*sw, Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3]));
         }
-        self.refresh_images();
+        self.upload_picker_images();
         self.save_pending = true;
     }
 
-    /// Regenerate the picker's gradient bitmaps for its current color.
-    ///
-    /// Each bitmap depends on a different slice of the color, so only the ones
-    /// whose inputs actually moved are rebuilt: dragging the alpha bar leaves
-    /// the SV square and the hue bar byte-identical, and dragging inside the SV
-    /// square leaves the hue bar identical. Regenerating all three every time
-    /// meant most of the per-move pixel work produced the image already on screen.
-    fn refresh_images(&mut self) {
-        let Some(hsva) = self.picker.as_ref().map(|p| p.hsva) else {
+    /// Upload whatever gradients aurora says changed since the last upload.
+    fn upload_picker_images(&mut self) {
+        let Some(open) = self.picker.as_mut() else {
             return;
         };
-        let was = self.last_images;
-        let changed = |f: fn(&Hsva) -> f32| was.is_none_or(|w| f(&w) != f(&hsva));
-        let hue_moved = changed(|c| c.h);
-        // The square's gradient is a function of hue; s/v only place its marker.
-        if hue_moved || changed(|c| c.s) || changed(|c| c.v) {
-            if hue_moved || self.sv_field.is_empty() {
-                self.sv_field = color::sv_field(hsva.h, SV);
-            }
-            self.renderer.update_image_rgba(
-                self.img_sv,
-                &color::sv_square_from(&self.sv_field, SV, hsva.s, hsva.v),
-                SV as u32,
-                SV as u32,
-            );
+        for (handle, bitmap) in open.picker.dirty_bitmaps() {
+            self.renderer
+                .update_image_rgba(handle, &bitmap.rgba, bitmap.width, bitmap.height);
         }
-        if hue_moved {
-            self.renderer.update_image_rgba(
-                self.img_hue,
-                &color::hue_bar(HUE_W, SV, hsva.h),
-                HUE_W as u32,
-                SV as u32,
-            );
-        }
-        // The alpha bar's checkerboard is tinted by the current rgb, so it
-        // follows h/s/v as well as a.
-        if hue_moved || changed(|c| c.s) || changed(|c| c.v) || changed(|c| c.a) {
-            let [r, g, b, _] = hsva.to_rgba();
-            self.renderer.update_image_rgba(
-                self.img_alpha,
-                &color::alpha_bar([r, g, b], SV, ALPHA_H, hsva.a),
-                SV as u32,
-                ALPHA_H as u32,
-            );
-        }
-        self.last_images = Some(hsva);
     }
 
     /// The current RGBA of a target that holds a color.
@@ -836,7 +717,7 @@ fn build_variable(ui: &mut Ui, parent: WidgetId, name: &str, value: Value, rows:
             rows.swatches.push((sw, Target::Var(name.to_string())));
             ui.label(
                 card,
-                color::to_hex([r, g, b, a]),
+                aurora::to_hex([r, g, b, a]),
                 Style::new().grow(1.0).foreground(DIM),
             );
         }
@@ -928,39 +809,11 @@ fn build_token(
         Bind::Lit(Value::Color(r, g, b, a)) => {
             ui.label(
                 row,
-                color::to_hex([*r, *g, *b, *a]),
+                aurora::to_hex([*r, *g, *b, *a]),
                 Style::new().grow(1.0).foreground(DIM),
             );
         }
     }
-}
-
-/// The floating color picker: SV square + hue bar + alpha bar + hex + Done.
-fn build_picker(ui: &mut Ui, picker: &Picker, imgs: [ImageHandle; 3], rows: &mut Rows) {
-    let [sv, hue, alpha] = imgs;
-    let pop = ui.popup(
-        picker.anchor,
-        Style::new()
-            .column()
-            .gap(6.0)
-            .padding(8.0)
-            .background(CARD)
-            .corner_radius(6.0)
-            .border(1.0, Color::rgb(0.28, 0.30, 0.36)),
-    );
-    rows.pk_card = Some(pop);
-    let top = ui.panel(pop, Style::new().row().gap(6.0));
-    rows.pk_sv = Some(ui.image(top, sv, Style::new().size(SV as f32, SV as f32)));
-    rows.pk_hue = Some(ui.image(top, hue, Style::new().size(HUE_W as f32, SV as f32)));
-    rows.pk_alpha = Some(ui.image(pop, alpha, Style::new().size(SV as f32, ALPHA_H as f32)));
-    let bottom = ui.panel(pop, Style::new().row().gap(6.0).align_center());
-    let hex = ui.text_input(
-        bottom,
-        color::to_hex(picker.hsva.to_rgba()),
-        value_field().width(120.0),
-    );
-    rows.pk_hex = Some(hex);
-    rows.pk_done = Some(ui.button(bottom, "Done", small_button()));
 }
 
 fn swatch_button(ui: &mut Ui, parent: WidgetId, color: Color, size: f32) -> WidgetId {
