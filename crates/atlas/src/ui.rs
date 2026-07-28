@@ -28,65 +28,28 @@ const CONSOLE_TAIL: usize = 500;
 /// detail (arrowheads, gear teeth) stays legible rather than washing out.
 const TOOLBAR_ICON: f32 = 24.0;
 
-/// The editor's resolved runtime theme: the aurora widget [`Theme`] plus atlas's
-/// own surface/text/accent colors and shape radii. The UI reads these concrete
-/// values; they are produced by resolving the authored [`ThemeDoc`](crate::theme::ThemeDoc)
-/// loaded from the user's settings file (see the `theme` and `settings` modules),
-/// and swapped as a unit so the whole editor recolors at once.
+/// The editor's resolved runtime theme: aurora's [`Theme`] (which carries the
+/// whole general-purpose palette - controls, chrome surfaces, text, borders, and
+/// shape radii) plus the few colors that only mean something in a scene editor.
+/// The UI reads these concrete values; they are produced by resolving the
+/// authored [`ThemeDoc`](crate::theme::ThemeDoc) loaded from the user's settings
+/// file (see the `theme` and `settings` modules), and swapped as a unit so the
+/// whole editor recolors at once.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EditorTheme {
-    /// The palette aurora's built-in widgets draw with.
+    /// The general UI palette: every color and radius that is not specific to
+    /// editing a scene. Widgets that live in aurora are themed entirely by this.
     pub aurora: Theme,
-    /// Docked-panel background, and the darker window/root background behind it.
-    pub panel_bg: Color,
-    pub root_bg: Color,
-    /// Bars (toolbar, the file-explorer breadcrumb bar): a distinct dark so a
-    /// bar reads as a strip, not part of the panel body.
-    pub bar_bg: Color,
-    /// An inspector section's title header bar (darker than the card body).
-    pub header_bg: Color,
-    /// Primary and secondary text.
-    pub heading: Color,
-    pub subhead: Color,
-    /// Selected tree-row fill, and the reparent drop-line/into highlight.
-    pub row_selected: Color,
+    /// The reparent drop-line / drop-into highlight.
     pub row_drop: Color,
-    /// Menu / popup surface.
-    pub menu_bg: Color,
-    /// Inspector card fill and its 1px outline.
-    pub card_bg: Color,
-    pub card_border: Color,
-    /// Borders between panels: the draggable splitters, and the bottom underline
-    /// on bars (toolbar, breadcrumbs, the tab strip).
-    pub panel_border: Color,
-    /// A text input's resting outline (the tree search box).
-    pub field_border: Color,
-    /// The active dock tab's outline (drawn on its top and sides only).
-    pub tab_border: Color,
-    /// The active gizmo-mode toolbar button (its background), and the icon color
-    /// drawn on it (an active button's icon, else icons pass through white).
+    /// The active gizmo-mode toolbar button's background.
     pub mode_active: Color,
-    pub icon_active: Color,
     /// Engine axis palette (X red, Y green) for the inspector's Vec2 labels.
     pub axis_x: Color,
     pub axis_y: Color,
     /// The console pane's WARN-level line color (ERROR reuses `axis_x`, INFO
-    /// `heading`, lower levels `subhead`).
+    /// the theme's heading, lower levels its subhead).
     pub console_warn: Color,
-    /// The translucent backdrop dimming the editor behind a modal dialog.
-    pub scrim: Color,
-    /// Corner radius for popups (menus, the color picker) and modals; for
-    /// inspector section cards; for a dock tab's top corners; for controls
-    /// (buttons/fields); and for small inset fields (an inline rename box).
-    pub card_radius: f32,
-    pub component_radius: f32,
-    pub tab_radius: f32,
-    pub control_radius: f32,
-    pub inset_radius: f32,
-    /// Thickness of the draggable dividers between docked panels.
-    pub splitter_width: f32,
-    /// Width of drawn UI borders (card outlines, bar underlines).
-    pub border_width: f32,
     /// Viewport (scene-view) colors. Stored as [`Color`] like the rest of the
     /// theme, converted to photon colors where the scene is drawn.
     /// The clear color behind the scene.
@@ -104,50 +67,16 @@ fn default_console_warn() -> Color {
     Color::rgb(0.85, 0.72, 0.30)
 }
 
-fn default_scrim() -> Color {
-    Color::rgba(0.0, 0.0, 0.0, 0.5)
-}
-
-fn default_bar_bg() -> Color {
-    Color::rgb(0.062, 0.066, 0.082)
-}
-
-fn default_header_bg() -> Color {
-    Color::rgb(0.078, 0.082, 0.105)
-}
-
 impl EditorTheme {
     /// The default dark editor theme.
     pub fn dark() -> Self {
         Self {
             aurora: Theme::dark(),
-            panel_bg: Color::rgb(0.095, 0.10, 0.122),
-            root_bg: Color::rgb(0.038, 0.04, 0.05),
-            bar_bg: default_bar_bg(),
-            header_bg: default_header_bg(),
-            heading: Color::rgb(0.95, 0.96, 1.0),
-            subhead: Color::rgb(0.52, 0.57, 0.68),
-            row_selected: Color::rgb(0.19, 0.27, 0.42),
             row_drop: Color::rgb(0.18, 0.40, 0.30),
-            menu_bg: Color::rgb(0.11, 0.12, 0.15),
-            card_bg: Color::rgb(0.128, 0.135, 0.165),
-            card_border: Color::rgb(0.20, 0.22, 0.27),
-            panel_border: Color::rgb(0.24, 0.26, 0.32),
-            field_border: Color::rgb(0.24, 0.26, 0.32),
-            tab_border: Color::rgb(0.24, 0.26, 0.32),
             mode_active: Color::rgb(0.22, 0.38, 0.60),
-            icon_active: Color::WHITE,
             axis_x: Color::rgb(0.90, 0.32, 0.32),
             axis_y: Color::rgb(0.35, 0.70, 0.38),
             console_warn: default_console_warn(),
-            scrim: default_scrim(),
-            card_radius: 6.0,
-            component_radius: 6.0,
-            tab_radius: 5.0,
-            control_radius: 4.0,
-            inset_radius: 3.0,
-            splitter_width: 2.0,
-            border_width: 1.0,
             viewport_bg: Color::rgb(0.052, 0.052, 0.055),
             grid_line: Color::rgba(0.0, 0.0, 0.0, 0.10),
             grid_line_strong: Color::rgba(0.0, 0.0, 0.0, 0.22),
@@ -163,33 +92,11 @@ impl EditorTheme {
     pub fn light() -> Self {
         Self {
             aurora: Theme::light(),
-            panel_bg: Color::rgb(0.90, 0.91, 0.94),
-            root_bg: Color::rgb(0.82, 0.83, 0.86),
-            bar_bg: Color::rgb(0.86, 0.87, 0.90),
-            header_bg: Color::rgb(0.80, 0.82, 0.86),
-            heading: Color::rgb(0.10, 0.12, 0.16),
-            subhead: Color::rgb(0.38, 0.42, 0.50),
-            row_selected: Color::rgb(0.72, 0.80, 0.94),
             row_drop: Color::rgb(0.55, 0.82, 0.66),
-            menu_bg: Color::rgb(0.95, 0.96, 0.98),
-            card_bg: Color::rgb(0.85, 0.86, 0.90),
-            card_border: Color::rgb(0.72, 0.74, 0.80),
-            panel_border: Color::rgb(0.66, 0.68, 0.74),
-            field_border: Color::rgb(0.66, 0.68, 0.74),
-            tab_border: Color::rgb(0.66, 0.68, 0.74),
             mode_active: Color::rgb(0.62, 0.76, 0.96),
-            icon_active: Color::WHITE,
             axis_x: Color::rgb(0.85, 0.30, 0.30),
             axis_y: Color::rgb(0.28, 0.62, 0.34),
             console_warn: Color::rgb(0.72, 0.55, 0.10),
-            scrim: Color::rgba(0.05, 0.05, 0.08, 0.45),
-            card_radius: 6.0,
-            component_radius: 6.0,
-            tab_radius: 5.0,
-            control_radius: 4.0,
-            inset_radius: 3.0,
-            splitter_width: 2.0,
-            border_width: 1.0,
             viewport_bg: Color::rgb(0.86, 0.87, 0.89),
             grid_line: Color::rgba(0.0, 0.0, 0.0, 0.08),
             grid_line_strong: Color::rgba(0.0, 0.0, 0.0, 0.16),
@@ -611,7 +518,12 @@ pub fn build_editor_ui(
     ui.set_theme(theme.aurora);
     let mut rows = EditorRows::default();
 
-    let root = ui.root_panel(Style::new().fill().column().background(theme.root_bg));
+    let root = ui.root_panel(
+        Style::new()
+            .fill()
+            .column()
+            .background(theme.aurora.root_bg),
+    );
     // The dock area fills the window above the status bar. It clips
     // (Overflow::Hidden) so the scroll panes inside stay window-sized instead of
     // ballooning the row to their tall content (see aurora's nested-row test).
@@ -720,8 +632,8 @@ fn build_dock_node(
             first,
             second,
         } => {
-            let sw = ctx.theme.splitter_width;
-            let divider = || Style::new().background(ctx.theme.panel_border);
+            let sw = ctx.theme.aurora.splitter_width;
+            let divider = || Style::new().background(ctx.theme.aurora.panel_border);
             let (row_style, orientation, splitter_style) = match dir {
                 SplitDir::Row => (
                     Style::new().row(),
@@ -772,7 +684,10 @@ fn build_group(
     let group = ui.panel(
         parent,
         apply_sizing(
-            Style::new().column().clip().background(theme.panel_bg),
+            Style::new()
+                .column()
+                .clip()
+                .background(theme.aurora.panel_bg),
             sizing,
         ),
     );
@@ -789,8 +704,8 @@ fn build_group(
             .row()
             .padding_top(5.0)
             .padding_x(6.0)
-            .background(theme.bar_bg)
-            .border_bottom(theme.border_width, theme.panel_border),
+            .background(theme.aurora.bar_bg)
+            .border_bottom(theme.aurora.border_width, theme.aurora.panel_border),
     );
     let active = active.min(panes.len().saturating_sub(1));
     for (i, &pane) in panes.iter().enumerate() {
@@ -798,19 +713,19 @@ fn build_group(
         let base = Style::new()
             .padding_x(12.0)
             .padding_y(6.0)
-            .round_top(theme.tab_radius)
+            .round_top(theme.aurora.tab_radius)
             .foreground(if selected {
-                theme.heading
+                theme.aurora.heading
             } else {
-                theme.subhead
+                theme.aurora.subhead
             })
             .draggable();
         // The active tab takes the content's background and a top-and-sides
         // outline (open at the bottom, so it merges into the pane below); an
         // inactive tab is flat, its rounded-top only showing on hover.
         let style = if selected {
-            base.background(theme.panel_bg)
-                .border(theme.border_width, theme.tab_border)
+            base.background(theme.aurora.panel_bg)
+                .border(theme.aurora.border_width, theme.aurora.tab_border)
                 .border_sides([true, true, false, true])
         } else {
             base.flat()
@@ -903,7 +818,7 @@ fn build_console_pane(
         ui.label(
             panel,
             "No output yet.",
-            Style::new().foreground(theme.subhead),
+            Style::new().foreground(theme.aurora.subhead),
         );
         return panel;
     }
@@ -916,15 +831,15 @@ fn build_console_pane(
         ui.label(
             panel,
             format!("{start} earlier line{plural} not shown"),
-            Style::new().foreground(theme.subhead),
+            Style::new().foreground(theme.aurora.subhead),
         );
     }
     for line in &logs[start..] {
         let color = match line.level {
             tracing::Level::ERROR => theme.axis_x,
             tracing::Level::WARN => theme.console_warn,
-            tracing::Level::INFO => theme.heading,
-            _ => theme.subhead,
+            tracing::Level::INFO => theme.aurora.heading,
+            _ => theme.aurora.subhead,
         };
         // Just the last path segment of the target keeps lines readable.
         let target = line.target.rsplit("::").next().unwrap_or(&line.target);
@@ -968,16 +883,17 @@ fn build_status_bar(ui: &mut Ui, parent: WidgetId, theme: &EditorTheme, rows: &m
             .gap(18.0)
             .padding(4.0)
             .align_center()
-            .background(theme.panel_bg),
+            .background(theme.aurora.panel_bg),
     );
-    let readout =
-        |ui: &mut Ui, text: &str| ui.label(bar, text, Style::new().foreground(theme.subhead));
+    let readout = |ui: &mut Ui, text: &str| {
+        ui.label(bar, text, Style::new().foreground(theme.aurora.subhead))
+    };
     rows.status_cursor = Some(readout(ui, "x -, y -"));
     rows.status_zoom = Some(readout(ui, "zoom 100%"));
     rows.status_selected = Some(readout(ui, "nothing selected"));
     rows.status_fps = Some(readout(ui, "- fps"));
     // Brighter than the neutral readouts so unsaved state stands out.
-    rows.status_modified = Some(ui.label(bar, "", Style::new().foreground(theme.heading)));
+    rows.status_modified = Some(ui.label(bar, "", Style::new().foreground(theme.aurora.heading)));
 }
 
 /// The toolbar directly above the viewport: the editor's actions on the left,
@@ -1003,8 +919,8 @@ fn build_toolbar(
             .gap(4.0)
             .padding(5.0)
             .align_center()
-            .background(theme.panel_bg)
-            .border_bottom(theme.border_width, theme.panel_border),
+            .background(theme.aurora.panel_bg)
+            .border_bottom(theme.aurora.border_width, theme.aurora.panel_border),
     );
     let icon = |id: Icon| icons.map(|i| i.get(id));
     rows.add_sprite = Some(toolbar_button(
@@ -1092,7 +1008,7 @@ fn toolbar_button(
     let background = if active {
         theme.mode_active
     } else {
-        theme.panel_bg
+        theme.aurora.panel_bg
     };
     match icon {
         Some(handle) => {
@@ -1102,10 +1018,10 @@ fn toolbar_button(
                 Style::new()
                     .padding(5.0)
                     .background(background)
-                    .corner_radius(theme.control_radius),
+                    .corner_radius(theme.aurora.control_radius),
             );
             let tint = if active {
-                theme.icon_active
+                theme.aurora.icon_active
             } else {
                 Color::WHITE
             };
@@ -1124,8 +1040,8 @@ fn toolbar_button(
             Style::new()
                 .padding(6.0)
                 .background(background)
-                .foreground(theme.heading)
-                .corner_radius(theme.control_radius),
+                .foreground(theme.aurora.heading)
+                .corner_radius(theme.aurora.control_radius),
         ),
     }
 }
@@ -1149,9 +1065,9 @@ fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, theme: &EditorTheme, rows
             .column()
             .gap(2.0)
             .padding(4.0)
-            .background(theme.menu_bg)
-            .corner_radius(theme.card_radius)
-            .border(theme.border_width, theme.card_border)
+            .background(theme.aurora.menu_bg)
+            .corner_radius(theme.aurora.card_radius)
+            .border(theme.aurora.border_width, theme.aurora.card_border)
             .clip(),
     );
     for (label, action) in &menu.items {
@@ -1161,9 +1077,9 @@ fn build_context_menu(ui: &mut Ui, menu: &ContextMenu, theme: &EditorTheme, rows
             Style::new()
                 .width(150.0)
                 .padding(6.0)
-                .background(theme.menu_bg)
-                .foreground(theme.heading)
-                .corner_radius(theme.control_radius),
+                .background(theme.aurora.menu_bg)
+                .foreground(theme.aurora.heading)
+                .corner_radius(theme.aurora.control_radius),
         );
         rows.menu_items.push((item, action.clone()));
     }
@@ -1190,9 +1106,9 @@ pub fn build_color_picker(
             .column()
             .gap(6.0)
             .padding(8.0)
-            .background(theme.menu_bg)
-            .corner_radius(theme.card_radius)
-            .border(theme.border_width, theme.card_border)
+            .background(theme.aurora.menu_bg)
+            .corner_radius(theme.aurora.card_radius)
+            .border(theme.aurora.border_width, theme.aurora.card_border)
             .clip(),
     );
     let top = ui.panel(popup, Style::new().row().gap(6.0));
@@ -1211,7 +1127,7 @@ pub fn build_color_picker(
         Style::new()
             .grow(1.0)
             .padding(4.0)
-            .corner_radius(theme.control_radius)
+            .corner_radius(theme.aurora.control_radius)
             .placeholder("#RRGGBBAA"),
     );
     let [r, g, b, a] = view.rgba;
@@ -1220,7 +1136,7 @@ pub fn build_color_picker(
         Style::new()
             .size(28.0, 24.0)
             .background(Color::rgba(r, g, b, a))
-            .corner_radius(theme.control_radius),
+            .corner_radius(theme.aurora.control_radius),
     );
 
     rows.picker_popup = Some(popup);
@@ -1252,7 +1168,7 @@ pub fn build_modal(
         Vec2::ZERO,
         Style::new()
             .fill()
-            .background(theme.scrim)
+            .background(theme.aurora.scrim)
             .column()
             .align_center(),
     );
@@ -1264,9 +1180,9 @@ pub fn build_modal(
             .gap(12.0)
             .width(MODAL_W)
             .padding(16.0)
-            .background(theme.card_bg)
-            .corner_radius(theme.card_radius)
-            .border(theme.border_width, theme.card_border),
+            .background(theme.aurora.card_bg)
+            .corner_radius(theme.aurora.card_radius)
+            .border(theme.aurora.border_width, theme.aurora.card_border),
     );
     rows.modal_card = Some(card);
 
@@ -1275,7 +1191,10 @@ pub fn build_modal(
     ui.label(
         bar,
         modal.title.clone(),
-        Style::new().grow(1.0).ellipsis().foreground(theme.heading),
+        Style::new()
+            .grow(1.0)
+            .ellipsis()
+            .foreground(theme.aurora.heading),
     );
     if modal.closable {
         let close = ui.button(bar, "", Style::new().icon_button().padding(3.0));
@@ -1284,7 +1203,7 @@ pub fn build_modal(
                 ui.image(close, icons.get(Icon::Close), Style::new().size(16.0, 16.0));
             }
             None => {
-                ui.label(close, "x", Style::new().foreground(theme.heading));
+                ui.label(close, "x", Style::new().foreground(theme.aurora.heading));
             }
         }
         rows.modal_close = Some(close);
@@ -1295,7 +1214,9 @@ pub fn build_modal(
             ui.label(
                 card,
                 text.clone(),
-                Style::new().width(MODAL_W - 32.0).foreground(theme.subhead),
+                Style::new()
+                    .width(MODAL_W - 32.0)
+                    .foreground(theme.aurora.subhead),
             );
         }
         ModalBody::Settings(draft) => build_settings_body(ui, card, draft, theme, rows),
@@ -1322,7 +1243,7 @@ pub fn build_modal(
         let background = if primary {
             theme.mode_active
         } else {
-            theme.menu_bg
+            theme.aurora.menu_bg
         };
         let btn = ui.button(
             footer,
@@ -1331,8 +1252,8 @@ pub fn build_modal(
                 .padding_x(14.0)
                 .padding_y(6.0)
                 .background(background)
-                .foreground(theme.heading)
-                .corner_radius(theme.control_radius),
+                .foreground(theme.aurora.heading)
+                .corner_radius(theme.aurora.control_radius),
         );
         rows.modal_buttons.push((btn, action));
     }
@@ -1359,7 +1280,7 @@ fn build_settings_body(
             col,
             draft.checked(field),
             label,
-            Style::new().foreground(theme.heading),
+            Style::new().foreground(theme.aurora.heading),
         );
         rows.modal_checks.push((cb, field));
     }
@@ -1372,7 +1293,7 @@ fn build_settings_body(
         ui.label(
             row,
             label,
-            Style::new().width(140.0).foreground(theme.subhead),
+            Style::new().width(140.0).foreground(theme.aurora.subhead),
         );
         let value = draft.number(field).unwrap_or(0.0);
         let input = ui.numeric_input(
@@ -1381,8 +1302,8 @@ fn build_settings_body(
             Style::new()
                 .grow(1.0)
                 .padding(3.0)
-                .corner_radius(theme.control_radius)
-                .border(theme.border_width, theme.card_border),
+                .corner_radius(theme.aurora.control_radius)
+                .border(theme.aurora.border_width, theme.aurora.card_border),
         );
         rows.modal_inputs.push((input, field));
     }
@@ -1408,7 +1329,9 @@ fn build_asset_chooser_body(
         ui.label(
             card,
             "No images in this project.".to_string(),
-            Style::new().width(MODAL_W - 32.0).foreground(theme.subhead),
+            Style::new()
+                .width(MODAL_W - 32.0)
+                .foreground(theme.aurora.subhead),
         );
         return;
     }
@@ -1438,7 +1361,7 @@ fn build_asset_chooser_body(
                     .padding(4.0)
                     .width(CHOOSER_CELL)
                     .flat()
-                    .corner_radius(theme.control_radius),
+                    .corner_radius(theme.aurora.control_radius),
             );
             if let Some(handle) = thumbnails.get(&asset.abs) {
                 ui.image(
@@ -1462,7 +1385,7 @@ fn build_asset_chooser_body(
                     .width(CHOOSER_CELL - 8.0)
                     .ellipsis()
                     .text_center()
-                    .foreground(theme.heading),
+                    .foreground(theme.aurora.heading),
             );
             rows.asset_choices.push((cell, asset.rel.clone()));
         }
@@ -1501,10 +1424,10 @@ fn build_scene_tree(
         panel,
         filter,
         Style::new()
-            .foreground(theme.heading)
+            .foreground(theme.aurora.heading)
             .padding(5.0)
-            .corner_radius(theme.control_radius)
-            .border(theme.border_width, theme.field_border)
+            .corner_radius(theme.aurora.control_radius)
+            .border(theme.aurora.border_width, theme.aurora.field_border)
             .placeholder("Search..."),
     );
     rows.tree_filter = Some(search);
@@ -1525,7 +1448,7 @@ fn build_scene_tree(
         ui.label(
             panel,
             "No matching nodes.",
-            Style::new().padding(4.0).foreground(theme.subhead),
+            Style::new().padding(4.0).foreground(theme.aurora.subhead),
         );
     } else {
         add_tree_row(ui, panel, scene, scene.root(), 0, &ctx, rows);
@@ -1610,9 +1533,9 @@ fn add_tree_row(
     let background = if ctx.tree.drop_target == Some(DropSpot::Into(node)) {
         theme.row_drop
     } else if ctx.primary == Some(node) {
-        theme.row_selected.lighten(0.12)
+        theme.aurora.row_selected.lighten(0.12)
     } else if ctx.selected.contains(&node) {
-        theme.row_selected
+        theme.aurora.row_selected
     } else {
         Color::TRANSPARENT
     };
@@ -1672,9 +1595,9 @@ fn add_tree_row(
             Style::new()
                 .grow(1.0)
                 .padding(1.0)
-                .foreground(theme.heading)
-                .corner_radius(theme.inset_radius)
-                .border(theme.border_width, theme.aurora.focus),
+                .foreground(theme.aurora.heading)
+                .corner_radius(theme.aurora.inset_radius)
+                .border(theme.aurora.border_width, theme.aurora.focus),
         );
         rows.rename_field = Some((field, node));
     } else {
@@ -1682,9 +1605,9 @@ fn add_tree_row(
             row,
             scene.node(node).name.clone(),
             Style::new().grow(1.0).ellipsis().foreground(if visible {
-                theme.heading
+                theme.aurora.heading
             } else {
-                theme.subhead
+                theme.aurora.subhead
             }),
         );
     }
@@ -1774,9 +1697,9 @@ pub fn add_file_tooltip(
             .gap(3.0)
             .padding(8.0)
             .width(FILE_TOOLTIP_W)
-            .background(theme.menu_bg)
-            .corner_radius(theme.card_radius)
-            .border(theme.border_width, theme.card_border)
+            .background(theme.aurora.menu_bg)
+            .corner_radius(theme.aurora.card_radius)
+            .border(theme.aurora.border_width, theme.aurora.card_border)
             .hit_transparent(),
     );
     ui.label(
@@ -1784,7 +1707,7 @@ pub fn add_file_tooltip(
         entry.name.clone(),
         Style::new()
             .width(FILE_TOOLTIP_W - 16.0)
-            .foreground(theme.heading),
+            .foreground(theme.aurora.heading),
     );
     tooltip_detail(ui, card, "Type", entry.type_label(), theme);
     tooltip_detail(ui, card, "Size", entry.size_label(), theme);
@@ -1802,9 +1725,13 @@ fn tooltip_detail(ui: &mut Ui, parent: WidgetId, label: &str, value: String, the
     ui.label(
         row,
         format!("{label}:"),
-        Style::new().foreground(theme.subhead),
+        Style::new().foreground(theme.aurora.subhead),
     );
-    ui.label(row, value, Style::new().grow(1.0).foreground(theme.heading));
+    ui.label(
+        row,
+        value,
+        Style::new().grow(1.0).foreground(theme.aurora.heading),
+    );
 }
 
 /// The docked inspector panel: the selected node's transform and reflected
@@ -1837,14 +1764,14 @@ fn build_inspector(
         ui.label(
             panel,
             "Nothing selected",
-            Style::new().foreground(theme.subhead),
+            Style::new().foreground(theme.aurora.subhead),
         );
         return panel;
     };
     ui.label(
         panel,
         scene.node(node).name.clone(),
-        Style::new().foreground(theme.heading).ellipsis(),
+        Style::new().foreground(theme.aurora.heading).ellipsis(),
     );
 
     // The node's own transform first: it is what viewport drags edit, so its
@@ -1929,7 +1856,7 @@ fn build_inspector(
                     ui.label(
                         row,
                         field,
-                        Style::new().width(70.0).foreground(theme.heading),
+                        Style::new().width(70.0).foreground(theme.aurora.heading),
                     );
                     let swatch = ui.button(
                         row,
@@ -1938,7 +1865,7 @@ fn build_inspector(
                             .width(48.0)
                             .padding(6.0)
                             .background(Color::rgba(c[0], c[1], c[2], c[3]))
-                            .corner_radius(theme.control_radius),
+                            .corner_radius(theme.aurora.control_radius),
                     );
                     rows.color_swatches.push((
                         swatch,
@@ -1996,7 +1923,7 @@ fn add_asset_field(
     ui.label(
         row,
         field,
-        Style::new().width(70.0).foreground(theme.heading),
+        Style::new().width(70.0).foreground(theme.aurora.heading),
     );
 
     // A preview: the asset's decoded thumbnail if we have it, else a file icon.
@@ -2025,8 +1952,8 @@ fn add_asset_field(
         Style::new()
             .grow(1.0)
             .padding(4.0)
-            .foreground(theme.heading)
-            .corner_radius(theme.control_radius),
+            .foreground(theme.aurora.heading)
+            .corner_radius(theme.aurora.control_radius),
     );
     rows.field_rows.push((input, node, component, field));
 
@@ -2058,9 +1985,9 @@ fn asset_icon_button(
             caption,
             Style::new()
                 .padding(4.0)
-                .background(theme.menu_bg)
-                .foreground(theme.heading)
-                .corner_radius(theme.control_radius),
+                .background(theme.aurora.menu_bg)
+                .foreground(theme.aurora.heading)
+                .corner_radius(theme.aurora.control_radius),
         ),
     }
 }
@@ -2087,9 +2014,9 @@ fn add_inspector_section(
         panel,
         Style::new()
             .column()
-            .background(theme.card_bg)
-            .corner_radius(theme.component_radius)
-            .border(theme.border_width, theme.card_border),
+            .background(theme.aurora.card_bg)
+            .corner_radius(theme.aurora.component_radius)
+            .border(theme.aurora.border_width, theme.aurora.card_border),
     );
     // A distinct darker header bar spanning the card, holding the section title
     // (and a disclosure chevron). Clicking anywhere on the bar toggles the
@@ -2104,13 +2031,13 @@ fn add_inspector_section(
         .align_center()
         .padding_x(8.0)
         .padding_y(6.0)
-        .background(theme.header_bg)
-        .border(theme.border_width, theme.card_border);
+        .background(theme.aurora.header_bg)
+        .border(theme.aurora.border_width, theme.aurora.card_border);
     let header_style = if collapsed {
-        header_style.corner_radius(theme.component_radius)
+        header_style.corner_radius(theme.aurora.component_radius)
     } else {
         header_style
-            .round_top(theme.component_radius)
+            .round_top(theme.aurora.component_radius)
             .border_sides([true, true, false, true])
     };
     let header = ui.button(card, "", header_style);
@@ -2129,7 +2056,7 @@ fn add_inspector_section(
     ui.label(
         header,
         title,
-        Style::new().grow(1.0).foreground(theme.heading),
+        Style::new().grow(1.0).foreground(theme.aurora.heading),
     );
     rows.section_toggles.push((header, section));
     // The fields live in a transparent, padded body below the header (the card
@@ -2153,13 +2080,13 @@ fn add_value_row(
     ui.label(
         row,
         label,
-        Style::new().width(70.0).foreground(theme.heading),
+        Style::new().width(70.0).foreground(theme.aurora.heading),
     );
     let style = Style::new()
         .grow(1.0)
         .padding(4.0)
-        .foreground(theme.heading)
-        .corner_radius(theme.control_radius);
+        .foreground(theme.aurora.heading)
+        .corner_radius(theme.aurora.control_radius);
     let input = if numeric {
         ui.numeric_input(row, value_to_text(value), style)
     } else {
@@ -2168,7 +2095,7 @@ fn add_value_row(
     // An optional unit hint after the field (e.g. rotation in degrees), muted so
     // it reads as an annotation rather than part of the value.
     if let Some(unit) = unit {
-        ui.label(row, unit, Style::new().foreground(theme.subhead));
+        ui.label(row, unit, Style::new().foreground(theme.aurora.subhead));
     }
     input
 }
@@ -2192,7 +2119,7 @@ fn add_vec2_field(
     ui.label(
         row,
         name,
-        Style::new().width(70.0).foreground(theme.heading),
+        Style::new().width(70.0).foreground(theme.aurora.heading),
     );
     for (axis, caption, color) in [(Axis::X, "X", theme.axis_x), (Axis::Y, "Y", theme.axis_y)] {
         let label = ui.button(
@@ -2204,7 +2131,7 @@ fn add_vec2_field(
                 .background(color)
                 .foreground(Color::WHITE)
                 .text_center()
-                .corner_radius(theme.control_radius),
+                .corner_radius(theme.aurora.control_radius),
         );
         rows.scrub_labels.push((label, field, axis));
         let input = ui.numeric_input(
@@ -2213,8 +2140,8 @@ fn add_vec2_field(
             Style::new()
                 .grow(1.0)
                 .padding(4.0)
-                .foreground(theme.heading)
-                .corner_radius(theme.control_radius),
+                .foreground(theme.aurora.heading)
+                .corner_radius(theme.aurora.control_radius),
         );
         rows.vec_inputs.push((input, field, axis));
     }
@@ -2277,8 +2204,8 @@ fn build_file_explorer(
             .align_center()
             .gap(4.0)
             .padding(5.0)
-            .background(theme.panel_bg)
-            .border_bottom(theme.border_width, theme.panel_border),
+            .background(theme.aurora.panel_bg)
+            .border_bottom(theme.aurora.border_width, theme.aurora.panel_border),
     );
     let crumbs = ui.panel(
         bar,
@@ -2288,9 +2215,9 @@ fn build_file_explorer(
     let last = trail.len().saturating_sub(1);
     for (i, (name, path)) in trail.into_iter().enumerate() {
         let fg = if i == last {
-            theme.heading
+            theme.aurora.heading
         } else {
-            theme.subhead
+            theme.aurora.subhead
         };
         let crumb = ui.button(
             crumbs,
@@ -2306,7 +2233,7 @@ fn build_file_explorer(
             ui.label(
                 crumbs,
                 "/".to_string(),
-                Style::new().foreground(theme.subhead),
+                Style::new().foreground(theme.aurora.subhead),
             );
         }
     }
@@ -2347,7 +2274,7 @@ fn build_file_explorer(
             .gap(TREE_ROW_GAP)
             .padding(4.0)
             .scroll()
-            .background(theme.root_bg),
+            .background(theme.aurora.root_bg),
     );
     for row in ex.tree_rows() {
         build_folder_row(ui, tree, &row, ctx, rows);
@@ -2364,8 +2291,8 @@ fn build_file_explorer(
         Orientation::Vertical,
         1.0,
         Style::new()
-            .width(theme.splitter_width)
-            .background(theme.panel_border),
+            .width(theme.aurora.splitter_width)
+            .background(theme.aurora.panel_border),
     );
     ui.set_splitter_target(splitter, tree);
     let contents = ui.panel(
@@ -2393,7 +2320,7 @@ fn build_folder_row(
 ) {
     let theme = ctx.theme;
     let background = if row.selected {
-        theme.row_selected
+        theme.aurora.row_selected
     } else {
         Color::TRANSPARENT
     };
@@ -2448,7 +2375,10 @@ fn build_folder_row(
     ui.label(
         r,
         row.name.clone(),
-        Style::new().grow(1.0).ellipsis().foreground(theme.heading),
+        Style::new()
+            .grow(1.0)
+            .ellipsis()
+            .foreground(theme.aurora.heading),
     );
     rows.file_tree_rows.push((r, row.path.clone()));
 }
@@ -2460,7 +2390,9 @@ fn build_contents(ui: &mut Ui, contents: WidgetId, ctx: &PaneCtx, rows: &mut Edi
         ui.label(
             contents,
             "This folder is empty".to_string(),
-            Style::new().padding(4.0).foreground(ctx.theme.subhead),
+            Style::new()
+                .padding(4.0)
+                .foreground(ctx.theme.aurora.subhead),
         );
         return;
     }
@@ -2491,7 +2423,7 @@ fn build_list_entry(
 ) {
     let theme = ctx.theme;
     let background = if ctx.explorer.is_selected(&entry.path) {
-        theme.row_selected
+        theme.aurora.row_selected
     } else {
         Color::TRANSPARENT
     };
@@ -2508,7 +2440,10 @@ fn build_list_entry(
     }
     let r = ui.button(parent, "", style);
     place_entry_icon(ui, r, entry, ctx, FILE_LIST_ICON);
-    let label = Style::new().grow(1.0).ellipsis().foreground(theme.heading);
+    let label = Style::new()
+        .grow(1.0)
+        .ellipsis()
+        .foreground(theme.aurora.heading);
     let field = Style::new().grow(1.0).padding(1.0);
     build_entry_name(ui, r, entry, ctx, rows, field, label);
     // Detail columns (muted, fixed-width so they line up down the list).
@@ -2526,7 +2461,7 @@ fn meta_col(ui: &mut Ui, parent: WidgetId, text: String, width: f32, theme: &Edi
         Style::new()
             .width(width)
             .ellipsis()
-            .foreground(theme.subhead),
+            .foreground(theme.aurora.subhead),
     );
 }
 
@@ -2540,7 +2475,7 @@ fn build_grid_cell(
 ) {
     let theme = ctx.theme;
     let background = if ctx.explorer.is_selected(&entry.path) {
-        theme.row_selected
+        theme.aurora.row_selected
     } else {
         Color::TRANSPARENT
     };
@@ -2552,7 +2487,7 @@ fn build_grid_cell(
         .padding(4.0)
         .width(FILE_GRID_CELL)
         .flat()
-        .corner_radius(theme.control_radius)
+        .corner_radius(theme.aurora.control_radius)
         .background(background);
     if draggable {
         style = style.draggable();
@@ -2563,7 +2498,7 @@ fn build_grid_cell(
         .width(FILE_GRID_CELL - 8.0)
         .ellipsis()
         .text_center()
-        .foreground(theme.heading);
+        .foreground(theme.aurora.heading);
     let field = Style::new().width(FILE_GRID_CELL - 8.0).padding(1.0);
     build_entry_name(ui, cell, entry, ctx, rows, field, label);
     record_entry(entry, cell, ctx, rows, draggable);
@@ -2585,9 +2520,9 @@ fn build_entry_name(
             parent,
             entry.name.clone(),
             field_style
-                .foreground(ctx.theme.heading)
-                .corner_radius(ctx.theme.inset_radius)
-                .border(ctx.theme.border_width, ctx.theme.aurora.focus),
+                .foreground(ctx.theme.aurora.heading)
+                .corner_radius(ctx.theme.aurora.inset_radius)
+                .border(ctx.theme.aurora.border_width, ctx.theme.aurora.focus),
         );
         rows.file_rename_field = Some((field, entry.path.clone()));
     } else {
@@ -3026,11 +2961,11 @@ mod tests {
         };
         // Each theme paints its own root background; the other's does not appear.
         let dark = build(&EditorTheme::dark());
-        assert!(has_fill(&dark, EditorTheme::dark().root_bg));
-        assert!(!has_fill(&dark, EditorTheme::light().root_bg));
+        assert!(has_fill(&dark, EditorTheme::dark().aurora.root_bg));
+        assert!(!has_fill(&dark, EditorTheme::light().aurora.root_bg));
 
         let light = build(&EditorTheme::light());
-        assert!(has_fill(&light, EditorTheme::light().root_bg));
+        assert!(has_fill(&light, EditorTheme::light().aurora.root_bg));
     }
 
     #[test]
@@ -3486,7 +3421,10 @@ mod tests {
             if *m == GizmoMode::Rotate {
                 assert_eq!(bg, theme.mode_active, "the active mode is highlighted");
             } else {
-                assert_eq!(bg, theme.panel_bg, "inactive modes blend into the toolbar");
+                assert_eq!(
+                    bg, theme.aurora.panel_bg,
+                    "inactive modes blend into the toolbar"
+                );
             }
         }
     }

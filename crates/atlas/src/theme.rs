@@ -95,7 +95,7 @@ theme_tokens! {
     "caret": Color => aurora.caret,
     "placeholder": Color => aurora.placeholder,
     "icon_hover": Color => aurora.icon_hover,
-    "icon_active": Color => icon_active,
+    "icon_active": Color => aurora.icon_active,
     "selection": Color => aurora.selection,
     "slider_track": Color => aurora.slider_track,
     "slider_fill": Color => aurora.slider_fill,
@@ -103,33 +103,33 @@ theme_tokens! {
     "scrollbar_thumb": Color => aurora.scrollbar_thumb,
     "disabled_fade": Scalar => aurora.disabled_fade,
     // atlas surfaces, text, and accents.
-    "panel_bg": Color => panel_bg,
-    "root_bg": Color => root_bg,
-    "bar_bg": Color => bar_bg,
-    "header_bg": Color => header_bg,
-    "heading": Color => heading,
-    "subhead": Color => subhead,
-    "row_selected": Color => row_selected,
+    "panel_bg": Color => aurora.panel_bg,
+    "root_bg": Color => aurora.root_bg,
+    "bar_bg": Color => aurora.bar_bg,
+    "header_bg": Color => aurora.header_bg,
+    "heading": Color => aurora.heading,
+    "subhead": Color => aurora.subhead,
+    "row_selected": Color => aurora.row_selected,
     "row_drop": Color => row_drop,
-    "menu_bg": Color => menu_bg,
-    "card_bg": Color => card_bg,
-    "card_border": Color => card_border,
-    "panel_border": Color => panel_border,
-    "field_border": Color => field_border,
-    "tab_border": Color => tab_border,
+    "menu_bg": Color => aurora.menu_bg,
+    "card_bg": Color => aurora.card_bg,
+    "card_border": Color => aurora.card_border,
+    "panel_border": Color => aurora.panel_border,
+    "field_border": Color => aurora.field_border,
+    "tab_border": Color => aurora.tab_border,
     "mode_active": Color => mode_active,
     "axis_x": Color => axis_x,
     "axis_y": Color => axis_y,
     "console_warn": Color => console_warn,
-    "scrim": Color => scrim,
+    "scrim": Color => aurora.scrim,
     // shape scalars.
-    "card_radius": Scalar => card_radius,
-    "component_radius": Scalar => component_radius,
-    "tab_radius": Scalar => tab_radius,
-    "control_radius": Scalar => control_radius,
-    "inset_radius": Scalar => inset_radius,
-    "splitter_width": Scalar => splitter_width,
-    "border_width": Scalar => border_width,
+    "card_radius": Scalar => aurora.card_radius,
+    "component_radius": Scalar => aurora.component_radius,
+    "tab_radius": Scalar => aurora.tab_radius,
+    "control_radius": Scalar => aurora.control_radius,
+    "inset_radius": Scalar => aurora.inset_radius,
+    "splitter_width": Scalar => aurora.splitter_width,
+    "border_width": Scalar => aurora.border_width,
     // viewport (scene view) colors.
     "viewport_bg": Color => viewport_bg,
     "grid_line": Color => grid_line,
@@ -148,15 +148,15 @@ pub fn default_doc() -> ThemeDoc {
     // The palette. A token whose default equals one of these binds to it.
     let variables = BTreeMap::from([
         ("accent".to_string(), color_value(d.aurora.focus)),
-        ("surface".to_string(), color_value(d.panel_bg)),
-        ("surface_dim".to_string(), color_value(d.root_bg)),
-        ("bar".to_string(), color_value(d.bar_bg)),
-        ("header".to_string(), color_value(d.header_bg)),
-        ("text".to_string(), color_value(d.heading)),
-        ("text_dim".to_string(), color_value(d.subhead)),
-        ("select".to_string(), color_value(d.row_selected)),
-        ("border".to_string(), color_value(d.panel_border)),
-        ("radius".to_string(), Value::Scalar(d.control_radius)),
+        ("surface".to_string(), color_value(d.aurora.panel_bg)),
+        ("surface_dim".to_string(), color_value(d.aurora.root_bg)),
+        ("bar".to_string(), color_value(d.aurora.bar_bg)),
+        ("header".to_string(), color_value(d.aurora.header_bg)),
+        ("text".to_string(), color_value(d.aurora.heading)),
+        ("text_dim".to_string(), color_value(d.aurora.subhead)),
+        ("select".to_string(), color_value(d.aurora.row_selected)),
+        ("border".to_string(), color_value(d.aurora.panel_border)),
+        ("radius".to_string(), Value::Scalar(d.aurora.control_radius)),
     ]);
     let tokens = snapshot(&d)
         .into_iter()
@@ -228,10 +228,18 @@ mod tests {
             ]),
         };
         let theme = resolve(&doc);
-        assert_eq!(theme.panel_bg, Color::rgb(0.1, 0.2, 0.3), "var reference");
-        assert_eq!(theme.root_bg, Color::rgb(0.9, 0.8, 0.7), "literal");
-        assert_eq!(theme.control_radius, 9.0, "scalar literal");
-        assert_eq!(theme.bar_bg, EditorTheme::dark().bar_bg, "unset falls back");
+        assert_eq!(
+            theme.aurora.panel_bg,
+            Color::rgb(0.1, 0.2, 0.3),
+            "var reference"
+        );
+        assert_eq!(theme.aurora.root_bg, Color::rgb(0.9, 0.8, 0.7), "literal");
+        assert_eq!(theme.aurora.control_radius, 9.0, "scalar literal");
+        assert_eq!(
+            theme.aurora.bar_bg,
+            EditorTheme::dark().aurora.bar_bg,
+            "unset falls back"
+        );
     }
 
     #[test]
@@ -244,8 +252,8 @@ mod tests {
             ]),
         };
         let theme = resolve(&doc);
-        assert_eq!(theme.panel_bg, EditorTheme::dark().panel_bg);
-        assert_eq!(theme.root_bg, EditorTheme::dark().root_bg);
+        assert_eq!(theme.aurora.panel_bg, EditorTheme::dark().aurora.panel_bg);
+        assert_eq!(theme.aurora.root_bg, EditorTheme::dark().aurora.root_bg);
     }
 
     #[test]
@@ -285,8 +293,8 @@ mod tests {
         doc.tokens.remove("tab_radius");
         assert!(backfill_missing_tokens(&mut doc), "a token was added back");
         assert_eq!(
-            resolve(&doc).tab_radius,
-            EditorTheme::dark().tab_radius,
+            resolve(&doc).aurora.tab_radius,
+            EditorTheme::dark().aurora.tab_radius,
             "backfilled token resolves to its default"
         );
         assert_eq!(doc, default_doc(), "backfill restores the full default doc");
