@@ -102,16 +102,34 @@ pub fn from_hex(text: &str) -> Option<[f32; 4]> {
 
 /// The saturation/value square for a given `hue`: saturation left->right,
 /// value bottom->top. A ring marks the current `(s, v)`.
+///
+/// The gradient itself depends only on `hue`, so a caller dragging inside the
+/// square (which changes `s`/`v` but not the hue) should keep the field from
+/// [`sv_field`] and re-stamp it with [`sv_square_from`] instead of calling this -
+/// that turns a `size * size` recompute per mouse move into a copy.
 pub fn sv_square(hue: f32, size: usize, s: f32, v: f32) -> Vec<u8> {
+    sv_square_from(&sv_field(hue, size), size, s, v)
+}
+
+/// The saturation/value square's gradient for `hue`, with no marker: a reusable
+/// field for every `(s, v)` at that hue.
+pub fn sv_field(hue: f32, size: usize) -> Vec<u8> {
     let mut px = vec![0u8; size * size * 4];
     for y in 0..size {
+        let val = 1.0 - y as f32 / (size - 1) as f32;
         for x in 0..size {
             let sat = x as f32 / (size - 1) as f32;
-            let val = 1.0 - y as f32 / (size - 1) as f32;
             let [r, g, b] = hsv_to_rgb(hue, sat, val);
             put(&mut px, size, x, y, [byte(r), byte(g), byte(b), 255]);
         }
     }
+    px
+}
+
+/// A copy of `field` (from [`sv_field`]) with the selection ring stamped at
+/// `(s, v)`.
+pub fn sv_square_from(field: &[u8], size: usize, s: f32, v: f32) -> Vec<u8> {
+    let mut px = field.to_vec();
     let mx = (s * (size - 1) as f32) as i32;
     let my = ((1.0 - v) * (size - 1) as f32) as i32;
     draw_ring(&mut px, size, size, mx, my, 4.0);
@@ -165,9 +183,18 @@ fn put(px: &mut [u8], stride: usize, x: usize, y: usize, rgba: [u8; 4]) {
 }
 
 /// A hollow ring marker (white core, dark edge for contrast on any color).
+///
+/// Only pixels within `r + 1.6` of the centre can be painted, so the scan is
+/// clamped to that bounding box rather than sweeping the whole image - for the
+/// picker's SV square that is a ~13x13 box instead of 176x176.
 fn draw_ring(px: &mut [u8], w: usize, h: usize, cx: i32, cy: i32, r: f32) {
-    for y in 0..h as i32 {
-        for x in 0..w as i32 {
+    let reach = (r + 1.6).ceil() as i32;
+    let y0 = (cy - reach).max(0);
+    let y1 = (cy + reach).min(h as i32 - 1);
+    let x0 = (cx - reach).max(0);
+    let x1 = (cx + reach).min(w as i32 - 1);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
             let d = (((x - cx) * (x - cx) + (y - cy) * (y - cy)) as f32).sqrt();
             let ring = (d - r).abs();
             if ring <= 1.6 {

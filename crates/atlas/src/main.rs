@@ -391,6 +391,16 @@ struct State {
     /// logic is frozen: a tooltip appears via a rebuild, and rebuilding mid-press
     /// would invalidate Aurora's retained drag state and kill a file drag.
     pointer_down: bool,
+    /// The newest pointer position reported since the last frame, applied by
+    /// `flush_pointer`. Motion events arrive at the mouse's report rate (125-1000
+    /// Hz); running the drag handlers per event repeated the same work many times
+    /// between two presented frames.
+    pending_cursor: Option<Vec2>,
+    /// The color the picker's gradient images were last generated for.
+    last_picker_images: Option<Hsva>,
+    /// The SV square's gradient for the current hue, so a drag inside the square
+    /// only re-stamps the marker.
+    picker_sv_field: Vec<u8>,
 }
 
 /// A tree row being dragged to reparent it; `target` is the current valid drop
@@ -426,75 +436,82 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize((size.width, size.height)),
             WindowEvent::CursorMoved { position, .. } => {
-                let p = Vec2::new(position.x as f32, position.y as f32);
-                state.pointer_moved(p);
+                // Record only; draw() applies the newest position once per frame
+                // (see flush_pointer). A mouse reports far faster than the editor
+                // presents, and the drag handlers below are not cheap.
+                state.pending_cursor = Some(Vec2::new(position.x as f32, position.y as f32));
             }
             WindowEvent::CursorLeft { .. } => state.ui.handle_input(InputEvent::PointerLeft),
             WindowEvent::MouseInput {
                 state: btn_state,
                 button,
                 ..
-            } => match (button, btn_state) {
-                (MouseButton::Left, ElementState::Pressed) => {
-                    // A modal takes over: the backdrop already blocks the shell,
-                    // and this routes the press to the dialog (button/input) or
-                    // dismisses it on a backdrop click.
-                    if state.modal.is_some() {
-                        state.handle_modal_press();
-                        return;
+            } => {
+                // Any button acts on the position it was pressed/released at, so
+                // apply a pending move first (see flush_pointer).
+                state.flush_pointer();
+                match (button, btn_state) {
+                    (MouseButton::Left, ElementState::Pressed) => {
+                        // A modal takes over: the backdrop already blocks the shell,
+                        // and this routes the press to the dialog (button/input) or
+                        // dismisses it on a backdrop click.
+                        if state.modal.is_some() {
+                            state.handle_modal_press();
+                            return;
+                        }
+                        // While the button is held the tooltip logic is frozen (see
+                        // update_file_tooltip): a rebuild here - even to hide a shown
+                        // tooltip - would re-id the widgets and break a file drag.
+                        state.pointer_down = true;
+                        let hit = state.ui.hit_test(state.cursor);
+                        // Keyboard focus follows the press: the shared shortcuts
+                        // (delete/copy/rename) act on files when the press lands in
+                        // the explorer pane, on the scene otherwise.
+                        state.explorer_focused = state.hit_in_explorer_pane(hit);
+                        // A press on empty space in the contents area clears the file
+                        // selection (click "nothing" to deselect).
+                        state.clear_file_selection_on_empty_press(hit);
+                        // A press outside an open menu dismisses it (before the
+                        // viewport/gizmo logic, so a click on empty space just
+                        // closes the menu without also deselecting).
+                        if state.close_menu_if_outside() {
+                            return;
+                        }
+                        state.ui.handle_input(InputEvent::PointerPressed);
+                        // The color picker (if open) claims the press: a drag on a
+                        // gradient, or a dismiss when the press lands outside it.
+                        if state.handle_picker_press() {
+                            return;
+                        }
+                        // A press on an inspector axis label starts a value scrub
+                        // and consumes the press (no viewport pick behind it).
+                        if state.begin_scrub() {
+                            return;
+                        }
+                        // A press on a tree row arms a reparent drag (non-consuming:
+                        // a plain click still selects via the row's Clicked event).
+                        state.begin_reparent();
+                        state.viewport_press();
                     }
-                    // While the button is held the tooltip logic is frozen (see
-                    // update_file_tooltip): a rebuild here - even to hide a shown
-                    // tooltip - would re-id the widgets and break a file drag.
-                    state.pointer_down = true;
-                    let hit = state.ui.hit_test(state.cursor);
-                    // Keyboard focus follows the press: the shared shortcuts
-                    // (delete/copy/rename) act on files when the press lands in
-                    // the explorer pane, on the scene otherwise.
-                    state.explorer_focused = state.hit_in_explorer_pane(hit);
-                    // A press on empty space in the contents area clears the file
-                    // selection (click "nothing" to deselect).
-                    state.clear_file_selection_on_empty_press(hit);
-                    // A press outside an open menu dismisses it (before the
-                    // viewport/gizmo logic, so a click on empty space just
-                    // closes the menu without also deselecting).
-                    if state.close_menu_if_outside() {
-                        return;
+                    (MouseButton::Left, ElementState::Released) => {
+                        state.pointer_down = false;
+                        state.finish_reparent();
+                        state.end_picker_drag();
+                        state.end_scrub();
+                        state.end_drag();
+                        // Aurora's PointerReleased may emit Event::Dropped for a
+                        // file-explorer drag onto the viewport (handled in react).
+                        state.ui.handle_input(InputEvent::PointerReleased);
                     }
-                    state.ui.handle_input(InputEvent::PointerPressed);
-                    // The color picker (if open) claims the press: a drag on a
-                    // gradient, or a dismiss when the press lands outside it.
-                    if state.handle_picker_press() {
-                        return;
+                    (MouseButton::Right, ElementState::Pressed) => state.open_context_menu(),
+                    (MouseButton::Middle, ElementState::Pressed) => {
+                        // A modal takes over: no viewport pan behind it.
+                        state.panning = state.modal.is_none() && state.over_viewport();
                     }
-                    // A press on an inspector axis label starts a value scrub
-                    // and consumes the press (no viewport pick behind it).
-                    if state.begin_scrub() {
-                        return;
-                    }
-                    // A press on a tree row arms a reparent drag (non-consuming:
-                    // a plain click still selects via the row's Clicked event).
-                    state.begin_reparent();
-                    state.viewport_press();
+                    (MouseButton::Middle, ElementState::Released) => state.panning = false,
+                    _ => {}
                 }
-                (MouseButton::Left, ElementState::Released) => {
-                    state.pointer_down = false;
-                    state.finish_reparent();
-                    state.end_picker_drag();
-                    state.end_scrub();
-                    state.end_drag();
-                    // Aurora's PointerReleased may emit Event::Dropped for a
-                    // file-explorer drag onto the viewport (handled in react).
-                    state.ui.handle_input(InputEvent::PointerReleased);
-                }
-                (MouseButton::Right, ElementState::Pressed) => state.open_context_menu(),
-                (MouseButton::Middle, ElementState::Pressed) => {
-                    // A modal takes over: no viewport pan behind it.
-                    state.panning = state.modal.is_none() && state.over_viewport();
-                }
-                (MouseButton::Middle, ElementState::Released) => state.panning = false,
-                _ => {}
-            },
+            }
             WindowEvent::MouseWheel { delta, .. } => state.wheel(delta),
             WindowEvent::ModifiersChanged(m) => {
                 state.modifiers = m.state();
@@ -583,11 +600,17 @@ impl State {
         let textures = TextureCache::new(&engine);
         let icons = Icons::build(&mut gui);
         // Placeholder color-picker gradients (regenerated when it opens).
-        let picker_sv =
-            gui.register_image_rgba(&color::sv_square(0.0, SV, 0.0, 0.0), SV as u32, SV as u32);
-        let picker_hue =
-            gui.register_image_rgba(&color::hue_bar(HUE_W, SV, 0.0), HUE_W as u32, SV as u32);
-        let picker_alpha = gui.register_image_rgba(
+        let picker_sv = gui.register_image_rgba_unmipped(
+            &color::sv_square(0.0, SV, 0.0, 0.0),
+            SV as u32,
+            SV as u32,
+        );
+        let picker_hue = gui.register_image_rgba_unmipped(
+            &color::hue_bar(HUE_W, SV, 0.0),
+            HUE_W as u32,
+            SV as u32,
+        );
+        let picker_alpha = gui.register_image_rgba_unmipped(
             &color::alpha_bar([0.0, 0.0, 0.0], SV, ALPHA_H, 1.0),
             SV as u32,
             ALPHA_H as u32,
@@ -752,6 +775,9 @@ impl State {
             hover_file: None,
             tooltip_target: None,
             pointer_down: false,
+            pending_cursor: None,
+            last_picker_images: None,
+            picker_sv_field: Vec::new(),
         })
     }
 
@@ -777,6 +803,15 @@ impl State {
     fn cursor_world(&self) -> Option<Vec2> {
         let rect = self.viewport_rect()?;
         Some(self.camera.screen_to_world(self.cursor - rect.pos))
+    }
+
+    /// Apply the newest pointer position reported since the last call, if any.
+    /// Called once per frame, and before a button event so a click acts on the
+    /// position the user made it at.
+    fn flush_pointer(&mut self) {
+        if let Some(p) = self.pending_cursor.take() {
+            self.pointer_moved(p);
+        }
     }
 
     /// Route a pointer move: Aurora always sees it; a live pan or drag applies
@@ -1960,30 +1995,48 @@ impl State {
 
     /// Regenerate the picker's three gradient images from its current HSVA and
     /// upload them in place (their handles stay valid across shell rebuilds).
+    ///
+    /// Only the images whose inputs actually moved are rebuilt: the square's
+    /// gradient is a function of hue (s/v just place its marker), and the hue bar
+    /// depends on nothing else - so an alpha drag rebuilds neither.
     fn refresh_picker_images(&mut self) {
         let Some(picker) = self.picker else {
             return;
         };
         let hsva = picker.hsva;
-        let [r, g, b, _] = hsva.to_rgba();
-        self.gui.update_image_rgba(
-            self.picker_sv,
-            &color::sv_square(hsva.h, SV, hsva.s, hsva.v),
-            SV as u32,
-            SV as u32,
-        );
-        self.gui.update_image_rgba(
-            self.picker_hue,
-            &color::hue_bar(HUE_W, SV, hsva.h),
-            HUE_W as u32,
-            SV as u32,
-        );
-        self.gui.update_image_rgba(
-            self.picker_alpha,
-            &color::alpha_bar([r, g, b], SV, ALPHA_H, hsva.a),
-            SV as u32,
-            ALPHA_H as u32,
-        );
+        let was = self.last_picker_images;
+        let changed = |f: fn(&Hsva) -> f32| was.is_none_or(|w| f(&w) != f(&hsva));
+        let hue_moved = changed(|c| c.h);
+        let sv_moved = changed(|c| c.s) || changed(|c| c.v);
+        if hue_moved || sv_moved {
+            if hue_moved || self.picker_sv_field.is_empty() {
+                self.picker_sv_field = color::sv_field(hsva.h, SV);
+            }
+            self.gui.update_image_rgba(
+                self.picker_sv,
+                &color::sv_square_from(&self.picker_sv_field, SV, hsva.s, hsva.v),
+                SV as u32,
+                SV as u32,
+            );
+        }
+        if hue_moved {
+            self.gui.update_image_rgba(
+                self.picker_hue,
+                &color::hue_bar(HUE_W, SV, hsva.h),
+                HUE_W as u32,
+                SV as u32,
+            );
+        }
+        if hue_moved || sv_moved || changed(|c| c.a) {
+            let [r, g, b, _] = hsva.to_rgba();
+            self.gui.update_image_rgba(
+                self.picker_alpha,
+                &color::alpha_bar([r, g, b], SV, ALPHA_H, hsva.a),
+                SV as u32,
+                ALPHA_H as u32,
+            );
+        }
+        self.last_picker_images = Some(hsva);
     }
 
     /// A left press with the picker open: dismiss it (committing) if the press
@@ -2927,6 +2980,7 @@ impl State {
     fn draw(&mut self) -> Result<()> {
         profiling::scope!("editor_frame");
         let fstart = std::time::Instant::now();
+        self.flush_pointer();
         self.poll_settings();
         self.react();
         self.sync_tree_filter();

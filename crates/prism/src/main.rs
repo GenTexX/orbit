@@ -120,6 +120,18 @@ struct State {
     last_save: Instant,
     /// Set when the tree must be rebuilt (structure changed / picker opened).
     dirty: bool,
+    /// The color the gradient bitmaps were last generated for, so `refresh_images`
+    /// can skip the ones whose inputs did not move.
+    last_images: Option<Hsva>,
+    /// The SV square's gradient for the current hue, kept so a drag inside the
+    /// square only re-stamps the marker instead of recomputing every pixel.
+    sv_field: Vec<u8>,
+    /// Set by a pointer move; the move is applied once per frame rather than per
+    /// event. A mouse reports at 125-1000 Hz while the window presents at ~60, so
+    /// doing the picker's regeneration per event did the same work many times
+    /// over between two presented frames - and once that outpaced the report
+    /// rate the event queue grew without bound and the picker lagged the cursor.
+    pointer_moved: bool,
 }
 
 impl ApplicationHandler for App {
@@ -137,14 +149,17 @@ impl ApplicationHandler for App {
             Renderer::new(window.clone(), (size.width, size.height)).expect("renderer");
         // Register the picker's three gradient images once; they are updated in
         // place as the picker's color changes.
-        let img_sv = renderer.register_image_rgba(
+        let img_sv = renderer.register_image_rgba_unmipped(
             &color::sv_square(0.0, SV, 0.0, 0.0),
             SV as u32,
             SV as u32,
         );
-        let img_hue =
-            renderer.register_image_rgba(&color::hue_bar(HUE_W, SV, 0.0), HUE_W as u32, SV as u32);
-        let img_alpha = renderer.register_image_rgba(
+        let img_hue = renderer.register_image_rgba_unmipped(
+            &color::hue_bar(HUE_W, SV, 0.0),
+            HUE_W as u32,
+            SV as u32,
+        );
+        let img_alpha = renderer.register_image_rgba_unmipped(
             &color::alpha_bar([0.0, 0.0, 0.0], SV, ALPHA_H, 1.0),
             SV as u32,
             ALPHA_H as u32,
@@ -165,6 +180,9 @@ impl ApplicationHandler for App {
             save_pending: false,
             last_save: Instant::now(),
             dirty: false,
+            pointer_moved: false,
+            last_images: None,
+            sv_field: Vec::new(),
         };
         state.rebuild();
         self.state = Some(state);
@@ -181,13 +199,10 @@ impl ApplicationHandler for App {
                 state.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
+                // Record the position and let the redraw apply it: see
+                // `pointer_moved` / `flush_pointer`.
                 state.cursor = Vec2::new(position.x as f32, position.y as f32);
-                state
-                    .ui
-                    .handle_input(InputEvent::PointerMoved(state.cursor));
-                if state.picker.as_ref().is_some_and(|p| p.drag.is_some()) {
-                    state.drag_picker();
-                }
+                state.pointer_moved = true;
                 state.window.request_redraw();
             }
             WindowEvent::CursorLeft { .. } => {
@@ -207,6 +222,7 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                state.flush_pointer();
                 match btn {
                     ElementState::Pressed => {
                         state.ui.handle_input(InputEvent::PointerPressed);
@@ -234,6 +250,7 @@ impl ApplicationHandler for App {
                 state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
+                state.flush_pointer();
                 state.react();
                 if state.dirty {
                     let scroll = state
@@ -455,6 +472,20 @@ impl State {
         }
     }
 
+    /// Apply a pending pointer move, if any: hand it to aurora and advance a
+    /// live picker drag. Called once per frame (and before a button event, so a
+    /// click acts on the position it was made at), never once per motion event.
+    fn flush_pointer(&mut self) {
+        if !self.pointer_moved {
+            return;
+        }
+        self.pointer_moved = false;
+        self.ui.handle_input(InputEvent::PointerMoved(self.cursor));
+        if self.picker.as_ref().is_some_and(|p| p.drag.is_some()) {
+            self.drag_picker();
+        }
+    }
+
     /// Apply the active gradient drag from the cursor.
     fn drag_picker(&mut self) {
         let Some(region) = self.picker.as_ref().and_then(|p| p.drag) else {
@@ -521,29 +552,51 @@ impl State {
     }
 
     /// Regenerate the picker's gradient bitmaps for its current color.
+    ///
+    /// Each bitmap depends on a different slice of the color, so only the ones
+    /// whose inputs actually moved are rebuilt: dragging the alpha bar leaves
+    /// the SV square and the hue bar byte-identical, and dragging inside the SV
+    /// square leaves the hue bar identical. Regenerating all three every time
+    /// meant most of the per-move pixel work produced the image already on screen.
     fn refresh_images(&mut self) {
         let Some(hsva) = self.picker.as_ref().map(|p| p.hsva) else {
             return;
         };
-        let [r, g, b, _] = hsva.to_rgba();
-        self.renderer.update_image_rgba(
-            self.img_sv,
-            &color::sv_square(hsva.h, SV, hsva.s, hsva.v),
-            SV as u32,
-            SV as u32,
-        );
-        self.renderer.update_image_rgba(
-            self.img_hue,
-            &color::hue_bar(HUE_W, SV, hsva.h),
-            HUE_W as u32,
-            SV as u32,
-        );
-        self.renderer.update_image_rgba(
-            self.img_alpha,
-            &color::alpha_bar([r, g, b], SV, ALPHA_H, hsva.a),
-            SV as u32,
-            ALPHA_H as u32,
-        );
+        let was = self.last_images;
+        let changed = |f: fn(&Hsva) -> f32| was.is_none_or(|w| f(&w) != f(&hsva));
+        let hue_moved = changed(|c| c.h);
+        // The square's gradient is a function of hue; s/v only place its marker.
+        if hue_moved || changed(|c| c.s) || changed(|c| c.v) {
+            if hue_moved || self.sv_field.is_empty() {
+                self.sv_field = color::sv_field(hsva.h, SV);
+            }
+            self.renderer.update_image_rgba(
+                self.img_sv,
+                &color::sv_square_from(&self.sv_field, SV, hsva.s, hsva.v),
+                SV as u32,
+                SV as u32,
+            );
+        }
+        if hue_moved {
+            self.renderer.update_image_rgba(
+                self.img_hue,
+                &color::hue_bar(HUE_W, SV, hsva.h),
+                HUE_W as u32,
+                SV as u32,
+            );
+        }
+        // The alpha bar's checkerboard is tinted by the current rgb, so it
+        // follows h/s/v as well as a.
+        if hue_moved || changed(|c| c.s) || changed(|c| c.v) || changed(|c| c.a) {
+            let [r, g, b, _] = hsva.to_rgba();
+            self.renderer.update_image_rgba(
+                self.img_alpha,
+                &color::alpha_bar([r, g, b], SV, ALPHA_H, hsva.a),
+                SV as u32,
+                ALPHA_H as u32,
+            );
+        }
+        self.last_images = Some(hsva);
     }
 
     /// The current RGBA of a target that holds a color.
