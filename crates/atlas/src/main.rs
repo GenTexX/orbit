@@ -266,6 +266,8 @@ struct State {
     /// Frame counting for the once-a-second fps log.
     frames: u32,
     fps_since: std::time::Instant,
+    /// When the previous frame ran, for animation timing.
+    last_frame: std::time::Instant,
     /// The fps figure currently shown in the status bar.
     last_fps: f32,
     /// Per-frame profiling (set by the ORBIT_FRAME_LOG env var): logs a timing
@@ -376,6 +378,9 @@ struct State {
     /// Hz); running the drag handlers per event repeated the same work many times
     /// between two presented frames.
     pending_cursor: Option<Vec2>,
+    /// One aurora tab bar per dock group, in dock-walk order: it owns dragging a
+    /// tab along its strip to reorder, and the slide that follows.
+    tab_bars: Vec<aurora::TabBar>,
 }
 
 /// A tree row being dragged to reparent it; `target` is the current valid drop
@@ -453,6 +458,10 @@ impl ApplicationHandler for App {
                             return;
                         }
                         state.ui.handle_input(InputEvent::PointerPressed);
+                        // A press on a dock tab arms a reorder drag along its own
+                        // bar. Non-consuming: a plain click still activates the
+                        // tab, and dragging off the bar still becomes a dock move.
+                        state.press_tab_bar();
                         // The color picker (if open) claims the press: a drag on a
                         // gradient, or a dismiss when the press lands outside it.
                         if state.handle_picker_press() {
@@ -470,6 +479,7 @@ impl ApplicationHandler for App {
                     }
                     (MouseButton::Left, ElementState::Released) => {
                         state.pointer_down = false;
+                        state.release_tab_bars();
                         state.finish_reparent();
                         state.end_picker_drag();
                         state.end_scrub();
@@ -660,6 +670,7 @@ impl State {
             &InspectorView::default(),
             &[],
             true,
+            &[],
             &theme,
         );
 
@@ -694,6 +705,7 @@ impl State {
             texture_size: Vec2::new(w as f32, h as f32),
             frames: 0,
             fps_since: std::time::Instant::now(),
+            last_frame: std::time::Instant::now(),
             last_fps: 0.0,
             frame_log: std::env::var_os("ORBIT_FRAME_LOG").is_some(),
             pointer_events: 0,
@@ -738,6 +750,7 @@ impl State {
             tooltip_target: None,
             pointer_down: false,
             pending_cursor: None,
+            tab_bars: Vec::new(),
         })
     }
 
@@ -791,6 +804,9 @@ impl State {
         }
         if self.picker.as_ref().is_some_and(|p| p.picker.is_dragging()) {
             self.apply_picker_drag();
+        }
+        if self.tab_drag_active() {
+            self.drag_tab_bar();
         }
         if self.reparent.is_some() {
             self.update_reparent_target();
@@ -1759,6 +1775,69 @@ impl State {
             self.inspector_collapsed.insert((node, section));
         }
         self.dirty = true;
+    }
+
+    /// Start a tab reorder drag if the press landed on a tab. Returns whether
+    /// it did, so the caller can let the press fall through otherwise.
+    fn press_tab_bar(&mut self) -> bool {
+        let cursor = self.cursor;
+        self.tab_bars
+            .resize_with(self.rows.dock_tab_bars.len(), Default::default);
+        for (group, rows) in self.rows.dock_tab_bars.iter().enumerate() {
+            if self.tab_bars[group].press(&self.ui, rows, cursor).is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Advance a live tab drag; a reorder is applied to the dock and the shell
+    /// rebuilt, after which the bar slides the displaced tabs into place.
+    fn drag_tab_bar(&mut self) {
+        let cursor = self.cursor;
+        for group in 0..self.tab_bars.len() {
+            if !self.tab_bars[group].is_dragging() {
+                continue;
+            }
+            let Some(rows) = self.rows.dock_tab_bars.get(group) else {
+                continue;
+            };
+            let Some(reorder) = self.tab_bars[group].drag_to(&self.ui, rows, cursor) else {
+                continue;
+            };
+            // Any tab of the group identifies which group to reorder within.
+            let Some(&tab) = rows.tabs.first() else {
+                continue;
+            };
+            if let Some(pane) = self.dock_tab_pane(tab)
+                && self.dock.reorder_in_group(pane, reorder.from, reorder.to)
+            {
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// End any tab reorder drag.
+    fn release_tab_bars(&mut self) {
+        for bar in &mut self.tab_bars {
+            bar.release();
+        }
+    }
+
+    /// Whether a tab is being dragged along its bar right now.
+    fn tab_drag_active(&self) -> bool {
+        self.tab_bars.iter().any(|b| b.is_dragging())
+    }
+
+    /// Advance each tab bar's animation. Called after layout, when the tabs'
+    /// settled positions are known.
+    fn tick_tab_bars(&mut self, dt: f32) {
+        let cursor = self.cursor;
+        self.tab_bars
+            .resize_with(self.rows.dock_tab_bars.len(), Default::default);
+        for (group, rows) in self.rows.dock_tab_bars.iter().enumerate() {
+            self.tab_bars[group].tick(dt, &mut self.ui, rows, cursor);
+        }
     }
 
     /// The pane a dock tab (by widget) shows, if `id` is one.
@@ -2932,6 +3011,7 @@ impl State {
                 &self.inspector_view(),
                 &logs,
                 self.console_follow,
+                &self.tab_bars,
                 &self.theme,
             );
             self.ui = ui;
@@ -3017,6 +3097,12 @@ impl State {
             ui::add_file_tooltip(&mut self.ui, self.cursor, window, entry, &self.theme);
             self.ui.layout(window)?;
         }
+
+        // With the tabs at their settled positions, advance the slide that plays
+        // after a reorder (and keep a dragged tab pinned under the pointer).
+        let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
+        self.last_frame = std::time::Instant::now();
+        self.tick_tab_bars(dt);
 
         // Now the shell is laid out and the Ui matches self.dock exactly (this
         // frame's rebuild, if any, has already restructured the dock), read the

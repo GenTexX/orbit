@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use aurora::TabBar;
 use aurora::{Color, ImageHandle, Orientation, Style, Theme, Ui, WidgetId};
 use glam::Vec2;
 use helios::{NodeId, Scene, Value};
@@ -314,6 +315,9 @@ pub struct EditorRows {
     /// Dock tabs mapped to the pane each shows: a click activates it, a drag
     /// re-docks it.
     pub dock_tabs: Vec<(WidgetId, Pane)>,
+    /// Each dock group's tab-strip widgets, in the order the dock is walked -
+    /// the handle aurora's TabBar routes drags and animation through.
+    pub dock_tab_bars: Vec<aurora::TabBarRows>,
     /// Each tab group's content area mapped to the pane it currently shows: the
     /// drop region (and its rect gives the zones) a tab drag lands in.
     pub dock_groups: Vec<(WidgetId, Pane)>,
@@ -497,6 +501,7 @@ pub fn build_editor_ui(
     inspector: &InspectorView,
     logs: &[LogLine],
     console_follow: bool,
+    tab_bars: &[TabBar],
     theme: &EditorTheme,
 ) -> (Ui, EditorRows) {
     let mut ui = Ui::new();
@@ -534,6 +539,7 @@ pub fn build_editor_ui(
         scrolls,
         logs,
         console_follow,
+        tab_bars,
         theme,
     };
     build_dock_node(&mut ui, dock_area, dock, Sizing::Grow, &ctx, &mut rows);
@@ -574,6 +580,9 @@ struct PaneCtx<'a> {
     /// Whether the console pane should stick to the newest line (the user has
     /// not scrolled up).
     console_follow: bool,
+    /// One tab bar per dock group, in the order the dock is walked. aurora owns
+    /// their interaction and animation state; the shell just hands them over.
+    tab_bars: &'a [TabBar],
     theme: &'a EditorTheme,
 }
 
@@ -676,48 +685,20 @@ fn build_group(
             sizing,
         ),
     );
-    // The tab bar: tabs sit flush (no gap) on a darker strip, inset from the top
-    // and sides so they do not jam the panel corner (no bottom padding, so the
-    // active tab still reaches the strip's bottom edge). The strip has a bottom
-    // underline the active tab punches through (its fill covers the line beneath
-    // it), so only the inactive-tab region shows the border. The active tab takes
-    // the content's background, merging into the pane below with no seam;
-    // inactive tabs are flat - just their text on the strip.
-    let bar = ui.panel(
-        group,
-        Style::new()
-            .row()
-            .padding_top(5.0)
-            .padding_x(6.0)
-            .background(theme.aurora.bar_bg)
-            .border_bottom(theme.aurora.border_width, theme.aurora.panel_border),
-    );
-    let active = active.min(panes.len().saturating_sub(1));
-    for (i, &pane) in panes.iter().enumerate() {
-        let selected = i == active;
-        let base = Style::new()
-            .padding_x(12.0)
-            .padding_y(6.0)
-            .round_top(theme.aurora.tab_radius)
-            .foreground(if selected {
-                theme.aurora.heading
-            } else {
-                theme.aurora.subhead
-            })
-            .draggable();
-        // The active tab takes the content's background and a top-and-sides
-        // outline (open at the bottom, so it merges into the pane below); an
-        // inactive tab is flat, its rounded-top only showing on hover.
-        let style = if selected {
-            base.background(theme.aurora.panel_bg)
-                .border(theme.aurora.border_width, theme.aurora.tab_border)
-                .border_sides([true, true, false, true])
-        } else {
-            base.flat()
-        };
-        let tab = ui.button(bar, pane.title(), style);
+    // The tab strip is aurora's: it draws the tabs, and owns dragging one along
+    // the bar to reorder plus the slide that follows.
+    let group_index = rows.dock_tab_bars.len();
+    let labels: Vec<String> = panes.iter().map(|p| p.title().to_string()).collect();
+    let bar_rows = ctx
+        .tab_bars
+        .get(group_index)
+        .cloned()
+        .unwrap_or_default()
+        .build(ui, group, &labels, active, &theme.aurora);
+    for (&pane, &tab) in panes.iter().zip(&bar_rows.tabs) {
         rows.dock_tabs.push((tab, pane));
     }
+    rows.dock_tab_bars.push(bar_rows);
     // The active pane's content fills the rest of the group.
     let content = ui.panel(group, Style::new().column().grow(1.0).clip());
     let pane = panes[active];
@@ -2660,6 +2641,7 @@ mod tests {
             inspector,
             &[],
             true,
+            &[],
             theme,
         )
     }
@@ -2715,6 +2697,7 @@ mod tests {
             &InspectorView::default(),
             &[],
             true,
+            &[],
             &EditorTheme::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
@@ -3112,6 +3095,7 @@ mod tests {
             &InspectorView::default(),
             &[],
             true,
+            &[],
             &EditorTheme::default(),
         )
     }
@@ -3159,6 +3143,7 @@ mod tests {
             &InspectorView::default(),
             &logs,
             true,
+            &[],
             &EditorTheme::default(),
         );
         assert!(rows.console_panel.is_some());
@@ -3207,6 +3192,7 @@ mod tests {
             &InspectorView::default(),
             &[],
             true,
+            &[],
             &EditorTheme::default(),
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();

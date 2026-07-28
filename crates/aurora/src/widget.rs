@@ -1,5 +1,6 @@
 //! aurora widget: one node type for the whole UI tree, tagged by kind (ADR 0014).
 
+use glam::Vec2;
 use slotmap::new_key_type;
 use taffy::NodeId;
 
@@ -182,6 +183,9 @@ pub(crate) struct Widget {
     pub border_width: f32,
     pub border_color: Color,
     pub border_sides: [bool; 4],
+    /// A draw-time offset for this widget and its subtree (see
+    /// [`crate::Style::translate`]); layout and hit-testing ignore it.
+    pub translate: Vec2,
     /// A bottom-edge-only border (px width + color), drawn under this widget's
     /// children so a child reaching the bottom edge covers the segment beneath
     /// it - used for a tab bar's underline that the active tab interrupts.

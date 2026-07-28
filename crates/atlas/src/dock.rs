@@ -172,6 +172,33 @@ impl DockNode {
         }
     }
 
+    /// Move the pane at index `from` to index `to` within the group that holds
+    /// `pane`, keeping the same pane active. This is a tab dragged along its own
+    /// bar to reorder, as opposed to `move_pane`, which drags it to another
+    /// group. Returns whether anything moved.
+    pub fn reorder_in_group(&mut self, pane: Pane, from: usize, to: usize) -> bool {
+        match self {
+            DockNode::Leaf { panes, active } => {
+                if !panes.contains(&pane) || from >= panes.len() || to >= panes.len() {
+                    return false;
+                }
+                if from == to {
+                    return false;
+                }
+                // Follow the pane that was showing, so reordering tabs never
+                // switches which one you are looking at.
+                let showing = panes[*active];
+                let moved = panes.remove(from);
+                panes.insert(to, moved);
+                *active = panes.iter().position(|&p| p == showing).unwrap_or(*active);
+                true
+            }
+            DockNode::Split { first, second, .. } => {
+                first.reorder_in_group(pane, from, to) || second.reorder_in_group(pane, from, to)
+            }
+        }
+    }
+
     /// Move `pane` to land at `zone` relative to the group holding `target`
     /// (a tab drag-and-drop). Removing `pane` first may collapse the split it
     /// left behind; the pane is then re-inserted beside `target`. A no-op if

@@ -3,6 +3,8 @@
 use taffy::prelude::{length, percent};
 use taffy::{AlignItems, Display, FlexDirection, Overflow, Rect as TaffyRect, Size};
 
+use glam::Vec2;
+
 use crate::color::Color;
 use crate::widget::{FontWeight, Mask};
 
@@ -64,6 +66,11 @@ pub struct Style {
     /// Which edges the border draws on, `[top, right, bottom, left]`; an open
     /// edge leaves the fill reaching it with no stroke (a folder-style tab).
     pub border_sides: [bool; 4],
+    /// A draw-time offset for this widget and its subtree, in px. Layout and
+    /// hit-testing ignore it, so a widget can be slid around - a tab following
+    /// the pointer, or easing into a new position - without disturbing the
+    /// layout it will settle into.
+    pub translate: Vec2,
     /// A bottom-edge-only border (0 = none), drawn beneath this widget's children.
     pub border_bottom_width: f32,
     pub border_bottom_color: Color,
@@ -98,6 +105,7 @@ impl Default for Style {
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
             border_sides: [true; 4],
+            translate: Vec2::ZERO,
             border_bottom_width: 0.0,
             border_bottom_color: Color::TRANSPARENT,
             draggable: false,
@@ -400,6 +408,13 @@ impl Style {
     pub fn border(mut self, width: f32, color: Color) -> Self {
         self.border_width = width;
         self.border_color = color;
+        self
+    }
+
+    /// Offset this widget and its subtree by `delta` px when drawing, without
+    /// moving it for layout or hit-testing. See [`Style::translate`].
+    pub fn translate(mut self, delta: Vec2) -> Self {
+        self.translate = delta;
         self
     }
 

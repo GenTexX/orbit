@@ -499,6 +499,13 @@ impl Ui {
         self.widgets[id].background = color;
     }
 
+    /// Offset a widget and its subtree by `delta` px when drawing, leaving
+    /// layout and hit-testing alone. Set per frame to animate a widget toward
+    /// the position layout already gave it (see [`Style::translate`]).
+    pub fn set_translate(&mut self, id: WidgetId, delta: Vec2) {
+        self.widgets[id].translate = delta;
+    }
+
     /// A widget's background color (mostly for tests and introspection).
     pub fn background(&self, id: WidgetId) -> Color {
         self.widgets[id].background
@@ -830,6 +837,7 @@ impl Ui {
             border_width: style.border_width,
             border_color: style.border_color,
             border_sides: style.border_sides,
+            translate: style.translate,
             border_bottom_width: style.border_bottom_width,
             border_bottom_color: style.border_bottom_color,
             draggable: style.draggable,
@@ -2209,6 +2217,10 @@ impl Ui {
         // A disabled widget fades its whole subtree: remember where this
         // widget's commands start, then scale their alpha down at the end.
         let dim_from = widget.disabled.then_some(list.commands.len());
+        // Same trick for a draw-time offset: emit in place, then slide the whole
+        // subtree. Layout already put the widget where it belongs, so this only
+        // moves pixels - useful for animating toward a settled position.
+        let move_from = (widget.translate != Vec2::ZERO).then_some(list.commands.len());
 
         // The widget's own visuals, by kind.
         match &widget.kind {
@@ -2282,6 +2294,13 @@ impl Ui {
                 border_color: Color::TRANSPARENT,
                 border_sides: [true; 4],
             });
+        }
+
+        // Slide everything this widget and its subtree drew.
+        if let Some(from) = move_from {
+            for cmd in &mut list.commands[from..] {
+                translate_and_fade(cmd, widget.translate, 1.0);
+            }
         }
 
         // Fade the fills and text this disabled widget (and its subtree) emitted.
