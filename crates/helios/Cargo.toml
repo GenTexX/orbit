@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# The script host compiles a node's .cmt through comet and runs it on wasmtime.
+# comet writes WebAssembly and never executes it; owning the Engine is this
+# crate's job (ADR 0002 - the editor embeds the same runtime a shipped game does).
+comet = { version = "0.1.0", path = "../comet" }
+wasmtime = "39"
 glam = { version = "0.33.2", features = ["serde"] }
 photon = { version = "0.1.0", path = "../photon" }
 ron = "0.12.2"

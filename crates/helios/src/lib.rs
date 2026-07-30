@@ -14,6 +14,7 @@ mod project;
 mod reflect;
 mod render;
 mod scene;
+mod script;
 mod serialize;
 mod transform;
 
@@ -24,4 +25,5 @@ pub use project::{Manifest, Project};
 pub use reflect::{Reflect, Value};
 pub use render::SpriteDraw;
 pub use scene::{Node, NodeId, Scene};
+pub use script::{ScriptError, ScriptHost, ScriptInstance};
 pub use transform::Transform;

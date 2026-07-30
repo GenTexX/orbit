@@ -1,0 +1,18 @@
+// Bounces the node along X between -200 and 200.
+let speed = 120.0;
+let direction = 1.0;
+
+func update(dt: f32) {
+    
+    print("Hello Comet!");
+
+    pos.x += speed * direction * dt;
+
+    if pos.x > 200.0 {
+        direction = -1.0;
+    }
+    if pos.x < -200.0 {
+        direction = 1.0;
+    }
+}
+
