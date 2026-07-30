@@ -45,15 +45,19 @@ pub fn spawn_sprite(
 /// The source path starts empty. Picking the `.cmt` file is the inspector's job,
 /// through the same asset field a sprite's texture uses.
 pub fn attach_script(scene: &mut Scene, history: &mut History, node: NodeId) -> Option<usize> {
-    if scene
-        .node(node)
-        .components
-        .iter()
-        .any(|c| matches!(c, Component::Script(_)))
-    {
+    if script_index(scene, node).is_some() {
         return None;
     }
     Some(history.add_component(scene, node, Component::Script(ScriptComponent::default())))
+}
+
+/// Which of `node`'s components is its script, if it has one.
+pub fn script_index(scene: &Scene, node: NodeId) -> Option<usize> {
+    scene
+        .node(node)
+        .components
+        .iter()
+        .position(|c| matches!(c, Component::Script(_)))
 }
 
 /// Deep-clone the subtree rooted at `src` as a new sibling right after it,
@@ -267,6 +271,27 @@ mod tests {
         // One undo takes it back off.
         assert!(history.undo(&mut scene));
         assert_eq!(scene.node(node).components.len(), 1);
+    }
+
+    #[test]
+    fn script_index_finds_the_script_wherever_it_sits() {
+        let mut scene = Scene::new("Root");
+        let mut history = History::new();
+        let root = scene.root();
+        let bare = history.add_node(&mut scene, root, Node::new("Bare"));
+        assert_eq!(script_index(&scene, bare), None);
+
+        // Behind a sprite, not at index 0 - which is exactly the case that
+        // would break a lookup written as "the first component".
+        let node = spawn_sprite(
+            &mut scene,
+            &mut history,
+            Vec2::ZERO,
+            "assets/sprite.png",
+            Vec2::splat(64.0),
+        );
+        attach_script(&mut scene, &mut history, node);
+        assert_eq!(script_index(&scene, node), Some(1));
     }
 
     #[test]

@@ -21,7 +21,7 @@ mod ui;
 mod viewport;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aether::Gpu;
@@ -936,7 +936,7 @@ impl State {
         }
         // Interacting with the viewport moves keyboard focus off the explorer.
         self.explorer_focused = false;
-        let (Some(rect), Some(world)) = (self.viewport_rect(), self.cursor_world()) else {
+        let Some(world) = self.cursor_world() else {
             return;
         };
         let scene = &self.project.scene;
@@ -1006,27 +1006,8 @@ impl State {
             return;
         }
 
-        let local = self.cursor - rect.pos;
-        let camera = self.camera.camera(rect.size);
-        // Pick against the same per-texture runs the scene renders with, so
-        // alpha-discard uses each sprite's real texture; the returned index is
-        // into the flattened draw order, which matches `draws`. (Re-borrow the
-        // scene here so the `scene` binding above is free for `texture_runs`.)
-        let draws = self.project.scene.sprite_draws();
-        let runs = self.texture_runs(&draws);
-        let run_refs: Vec<(&Texture, &[Sprite])> = runs
-            .iter()
-            .map(|(path, sprites)| (self.textures.get(path), sprites.as_slice()))
-            .collect();
-        let picked = self.engine.pick_runs(
-            (self.scene_target.width, self.scene_target.height),
-            &camera,
-            &run_refs,
-            (local.x.max(0.0) as u32, local.y.max(0.0) as u32),
-        );
-        match picked {
-            Ok(Some(index)) => {
-                let mut node = draws[index].node;
+        match self.pick_node_at_cursor() {
+            Some(mut node) => {
                 // Alt-drag duplicates: leave the original in place and drag a
                 // fresh copy (which starts exactly on top of it).
                 if self.modifiers.alt_key()
@@ -1043,13 +1024,40 @@ impl State {
                 });
                 self.dirty = true;
             }
-            Ok(None) => {
+            None => {
                 if !self.selection.is_empty() {
                     self.selection.clear();
                     self.dirty = true;
                 }
             }
-            Err(err) => tracing::error!("pick failed: {err}"),
+        }
+    }
+
+    /// GPU-pick the sprite under the cursor, or `None` for empty space (or a
+    /// cursor outside the viewport). Picks against the same per-texture runs the
+    /// scene renders with, so alpha-discard uses each sprite's real texture; the
+    /// returned index is into the flattened draw order, which matches `draws`.
+    fn pick_node_at_cursor(&mut self) -> Option<NodeId> {
+        let rect = self.viewport_rect()?;
+        let local = self.cursor - rect.pos;
+        let camera = self.camera.camera(rect.size);
+        let draws = self.project.scene.sprite_draws();
+        let runs = self.texture_runs(&draws);
+        let run_refs: Vec<(&Texture, &[Sprite])> = runs
+            .iter()
+            .map(|(path, sprites)| (self.textures.get(path), sprites.as_slice()))
+            .collect();
+        match self.engine.pick_runs(
+            (self.scene_target.width, self.scene_target.height),
+            &camera,
+            &run_refs,
+            (local.x.max(0.0) as u32, local.y.max(0.0) as u32),
+        ) {
+            Ok(picked) => picked.map(|index| draws[index].node),
+            Err(err) => {
+                tracing::error!("pick failed: {err}");
+                None
+            }
         }
     }
 
@@ -1482,17 +1490,7 @@ impl State {
     /// owns the field, not from the field's name - a Script's source takes a
     /// `.cmt`, and offering it the project's textures would be a dead end.
     fn open_asset_chooser(&mut self, node: NodeId, component: usize, field: &'static str) {
-        let kind = match self
-            .project
-            .scene
-            .node(node)
-            .components
-            .get(component)
-            .map(|c| c.as_reflect().type_name())
-        {
-            Some("Script") => modal::AssetKind::Script,
-            _ => modal::AssetKind::Image,
-        };
+        let kind = self.asset_kind_of(node, component);
         let assets = match kind {
             modal::AssetKind::Image => self.explorer.all_images(),
             modal::AssetKind::Script => self.explorer.all_scripts(),
@@ -2530,11 +2528,13 @@ impl State {
         self.clipboard.as_mut()?.get_text().ok()
     }
 
-    /// Handle an Aurora `Dropped`: a dragged explorer image (`source`) dropped
-    /// onto the viewport spawns a sprite at the drop point, or dropped onto an
-    /// inspector asset field sets that field's texture. Anything else is ignored.
+    /// Handle an Aurora `Dropped`: a file dragged out of the explorer, released
+    /// somewhere in the editor. What it does depends on what was dragged - an
+    /// image makes or retextures a sprite, a script gives a node something to
+    /// run - so the file's kind picks the route, and a drop that would write a
+    /// path a field can never use is refused rather than committed.
     fn drop_file(&mut self, source: aurora::WidgetId, target: Option<aurora::WidgetId>) {
-        // Resolve the dragged explorer image to its project-relative path.
+        // Resolve the dragged explorer entry to its project-relative path.
         let Some(path) = self
             .rows
             .file_rows
@@ -2544,7 +2544,15 @@ impl State {
         else {
             return;
         };
-        // Dropped onto the viewport: spawn a sprite there.
+        match explorer::classify(Path::new(&path)) {
+            explorer::FileKind::Script => self.drop_script(path, target),
+            _ => self.drop_image(path, target),
+        }
+    }
+
+    /// An image dropped on the viewport spawns a sprite there; dropped on an
+    /// image asset field, it sets that field.
+    fn drop_image(&mut self, path: String, target: Option<aurora::WidgetId>) {
         if target == self.rows.viewport {
             let Some(world) = self.cursor_world() else {
                 return;
@@ -2559,13 +2567,88 @@ impl State {
             self.select_new_node(node);
             return;
         }
-        // Dropped onto an inspector asset field: set that field.
-        if let Some(t) = target
-            && let Some(&(_, node, component, field)) =
-                self.rows.asset_fields.iter().find(|(w, ..)| *w == t)
+        if let Some((node, component, field)) = self.asset_field_at(target, modal::AssetKind::Image)
         {
             self.commit_asset_field(node, component, field, path);
         }
+    }
+
+    /// A script dropped on a node - its row in the scene tree, its sprite in the
+    /// viewport, or its script field in the inspector - points that node at the
+    /// script. Dropped anywhere else it does nothing: a script with no node to
+    /// move has nothing to be.
+    fn drop_script(&mut self, path: String, target: Option<aurora::WidgetId>) {
+        if let Some((node, component, field)) =
+            self.asset_field_at(target, modal::AssetKind::Script)
+        {
+            self.commit_asset_field(node, component, field, path);
+            return;
+        }
+        // The scene tree runs its own reparent drag rather than aurora drop
+        // targets, so a row is found under the cursor rather than in `target`.
+        if let Some(node) = self.tree_row_at_cursor() {
+            self.set_node_script(node, path);
+            return;
+        }
+        if target == self.rows.viewport
+            && let Some(node) = self.pick_node_at_cursor()
+        {
+            self.set_node_script(node, path);
+        }
+    }
+
+    /// The asset field under `target`, if there is one and it holds `want`.
+    /// Refusing the mismatch is the point: a Script's source cannot use a `.png`
+    /// and a Sprite's texture cannot use a `.cmt`, and silently writing either
+    /// leaves a field that looks set but can never load.
+    fn asset_field_at(
+        &self,
+        target: Option<aurora::WidgetId>,
+        want: modal::AssetKind,
+    ) -> Option<(NodeId, usize, &'static str)> {
+        let target = target?;
+        let &(_, node, component, field) =
+            self.rows.asset_fields.iter().find(|(w, ..)| *w == target)?;
+        (self.asset_kind_of(node, component) == want).then_some((node, component, field))
+    }
+
+    /// Which kind of asset a component's fields hold. Asked of the component
+    /// rather than derived from a field name, so the answer stays right as
+    /// components grow fields.
+    fn asset_kind_of(&self, node: NodeId, component: usize) -> modal::AssetKind {
+        match self
+            .project
+            .scene
+            .node(node)
+            .components
+            .get(component)
+            .map(|c| c.as_reflect().type_name())
+        {
+            Some("Script") => modal::AssetKind::Script,
+            _ => modal::AssetKind::Image,
+        }
+    }
+
+    /// Point `node`'s script at `path`, attaching a Script component first if it
+    /// has none. One undo step either way, so dropping a script on a bare node
+    /// undoes in one press rather than leaving an empty component behind.
+    fn set_node_script(&mut self, node: NodeId, path: String) {
+        self.history.begin_group();
+        let index = actions::script_index(&self.project.scene, node).unwrap_or_else(|| {
+            actions::attach_script(&mut self.project.scene, &mut self.history, node)
+                .expect("no script found above, so attaching one cannot be refused")
+        });
+        self.history.set_field(
+            &mut self.project.scene,
+            node,
+            index,
+            "source",
+            Value::Asset(path),
+        );
+        self.history.end_group(&mut self.project.scene);
+        self.selection.select_one(node);
+        self.explorer_focused = false;
+        self.dirty = true;
     }
 
     /// Select a just-created scene node and move keyboard focus to the scene, so

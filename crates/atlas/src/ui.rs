@@ -2504,10 +2504,12 @@ fn entry_icon(entry: &Entry) -> Icon {
     }
 }
 
-/// Whether an entry can be dragged into the viewport to spawn a sprite (a
-/// decodable image only - the same gate the sprite loader uses).
+/// Whether an entry can be dragged out of the explorer at all - which means
+/// whether dropping it anywhere would do something. A decodable image (the same
+/// gate the sprite loader uses) spawns or retextures a sprite; a `.cmt` gives a
+/// node a script. Anything else stays put rather than dragging to no effect.
 fn entry_draggable(entry: &Entry) -> bool {
-    !entry.is_dir() && can_thumbnail(&entry.path)
+    !entry.is_dir() && (can_thumbnail(&entry.path) || classify(&entry.path) == FileKind::Script)
 }
 
 /// Record an entry's widget for event routing: every entry for click handling,
@@ -2568,6 +2570,32 @@ mod tests {
     use super::*;
     use helios::{Component, Node, SpriteComponent, Transform};
     use std::path::Path;
+
+    /// A bare file entry at `path`, for the classification tests.
+    fn file_entry(path: &str) -> Entry {
+        Entry {
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            kind: crate::explorer::EntryKind::File,
+            size: 0,
+            modified: None,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_file_is_draggable_when_dropping_it_would_do_something() {
+        // Images spawn or retexture a sprite; scripts give a node something to
+        // run. Anything else would drag to no effect, so it does not drag.
+        assert!(entry_draggable(&file_entry("/p/assets/hero.png")));
+        assert!(entry_draggable(&file_entry("/p/scripts/bounce.cmt")));
+        assert!(!entry_draggable(&file_entry("/p/notes.txt")));
+        assert!(!entry_draggable(&file_entry("/p/scenes/main.ron")));
+
+        let mut folder = file_entry("/p/assets");
+        folder.kind = crate::explorer::EntryKind::Dir;
+        assert!(!entry_draggable(&folder));
+    }
 
     /// A file explorer over a path that does not exist, so its scan is empty and
     /// instant - the shell tests exercise the dock/inspector, not the file pane,
