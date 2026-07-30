@@ -342,6 +342,9 @@ struct State {
     /// The text stays; the header says so, and Save is unavailable until it is
     /// opened somewhere real again.
     script_orphaned: bool,
+    /// Focus the find bar's query field after the next rebuild, and select what
+    /// is in it. Consumed there, like `refocus_filter`.
+    focus_find: bool,
     /// Text undo for the Code pane: snapshots of the buffer and where the caret
     /// was, newest last.
     ///
@@ -933,6 +936,7 @@ impl State {
             script_encoding: TextEncoding::default(),
             quit_requested: false,
             script_orphaned: false,
+            focus_find: false,
             script_undo: Vec::new(),
             script_redo: Vec::new(),
             script_caret: 0,
@@ -2622,7 +2626,10 @@ impl State {
             }
             return true;
         }
-        if c.eq_ignore_ascii_case("f") && self.rows.code_editor.is_some() {
+        // Only when the code editor or the find bar itself has focus. It used
+        // to fire whenever a Code pane existed at all, so ctrl+f while renaming
+        // a node or filtering the scene tree opened a find bar over the editor.
+        if c.eq_ignore_ascii_case("f") && self.code_context_focused() {
             self.toggle_find();
             return true;
         }
@@ -3549,6 +3556,32 @@ impl State {
         }
     }
 
+    /// Fold the find bar's live field text back into the bar, so a query typed
+    /// but not submitted is what a step or a replace acts on.
+    fn commit_find_fields(&mut self) {
+        let query = self
+            .rows
+            .find
+            .query
+            .and_then(|id| self.ui.text_of(id))
+            .map(str::to_string);
+        let replacement = self
+            .rows
+            .find
+            .replacement
+            .and_then(|id| self.ui.text_of(id))
+            .map(str::to_string);
+        let text = self.script_text.clone();
+        if let Some(find) = &mut self.find {
+            if let Some(query) = query {
+                find.set_query(query, &text);
+            }
+            if let Some(replacement) = replacement {
+                find.set_replacement(replacement);
+            }
+        }
+    }
+
     /// Which find-bar button `id` is, if any.
     fn find_button(&self, id: aurora::WidgetId) -> Option<FindAction> {
         let rows = &self.rows.find;
@@ -3568,6 +3601,7 @@ impl State {
         let (Some(action), Some(editor)) = (self.find_button(id), self.rows.code_editor) else {
             return;
         };
+        self.commit_find_fields();
         let Some(find) = &mut self.find else {
             return;
         };
@@ -3647,9 +3681,23 @@ impl State {
         true
     }
 
+    /// Whether focus is in the code editor or in the find bar over it - the
+    /// only places a code-pane shortcut should fire from.
+    fn code_context_focused(&self) -> bool {
+        let focused = self.ui.focused();
+        focused.is_some()
+            && (focused == self.rows.code_editor
+                || focused == self.rows.find.query
+                || focused == self.rows.find.replacement)
+    }
+
     /// Open the find bar over the Code pane, or close it if it is already there.
     fn toggle_find(&mut self) {
-        if self.find.take().is_some() {
+        if self.find.is_some() {
+            // ctrl+f with the bar already open re-focuses and re-selects the
+            // query, which is what every editor does - closing it would fight
+            // the reflex of pressing it again to search for something else.
+            self.focus_find = true;
             self.dirty = true;
             return;
         }
@@ -3667,6 +3715,9 @@ impl State {
             find.set_query(selected, &self.script_text);
         }
         self.find = Some(find);
+        // The point of ctrl+f is to type a query. Without this the caret stays
+        // in the source file and the query is typed into the code.
+        self.focus_find = true;
         self.dirty = true;
     }
 
@@ -3676,6 +3727,27 @@ impl State {
         let WinitKey::Named(named) = &event.logical_key else {
             return false;
         };
+        // Enter in the find bar steps matches. Left to aurora it would step
+        // focus out of the single-line query field, and the submit that follows
+        // would put the caret in the source - so the next keystroke was typed
+        // into the code.
+        if *named == NamedKey::Enter
+            && (self.ui.focused() == self.rows.find.query
+                || self.ui.focused() == self.rows.find.replacement)
+        {
+            let shift = self.modifiers.shift_key();
+            // Commit what is in the field first, so Enter searches for what you
+            // just typed rather than for the last committed query.
+            self.commit_find_fields();
+            if let Some(find) = &mut self.find
+                && find.key(aurora::Key::Enter, shift) == aurora::find::FindKey::Stepped
+            {
+                self.reveal_find_match();
+                self.focus_find = true;
+                self.dirty = true;
+            }
+            return true;
+        }
         // Escape closes what is open, innermost first.
         if *named == NamedKey::Escape {
             if self.completions.take().is_some() || self.find.take().is_some() {
@@ -3897,6 +3969,28 @@ impl State {
         }
     }
 
+    /// Re-search as the query is typed, rather than only on Enter.
+    fn sync_find_query(&mut self) {
+        let Some(query_id) = self.rows.find.query else {
+            return;
+        };
+        let Some(text) = self.ui.text_of(query_id).map(str::to_string) else {
+            return;
+        };
+        let script = self.script_text.clone();
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        if find.query() == text {
+            return;
+        }
+        find.set_query(text, &script);
+        // Show where the matches are while typing, but do not drag the caret
+        // into the file on every keystroke - that would steal focus from the
+        // query box being typed into.
+        self.dirty = true;
+    }
+
     /// Read the live dock splitter sizes and per-pane scroll offsets back out of
     /// the laid-out `Ui` into `self.dock`/`self.pane_scrolls`, so the next
     /// rebuild restores them. Called each frame after layout, when the Ui and
@@ -4016,9 +4110,9 @@ impl State {
             // Same for the code editor: the one rebuild typing causes is the
             // first edit (the header gains its modified mark), and losing the
             // caret on that keystroke would be maddening.
-            let code_caret = (self.ui.focused() == self.rows.code_editor)
-                .then(|| self.ui.caret_offset())
-                .flatten();
+            let in_code = self.ui.focused() == self.rows.code_editor;
+            let code_caret = in_code.then(|| self.ui.caret_offset()).flatten();
+            let code_anchor = in_code.then(|| self.ui.selection_anchor()).flatten();
             // Snapshot the log ring for the console pane (brief lock), recording
             // the generation so the poll below only rebuilds when it changes.
             // While a tab is being carried out of its bar, the shell is built
@@ -4132,8 +4226,19 @@ impl State {
                 self.ui.focus_caret(field, offset);
                 self.refocus_filter = false;
             }
-            if let (Some(offset), Some(editor)) = (code_caret, self.rows.code_editor) {
-                self.ui.focus_caret(editor, offset);
+            if self.focus_find
+                && let Some(query) = self.rows.find.query
+            {
+                let len = self.ui.text_of(query).map_or(0, str::len);
+                self.ui.focus_selection(query, 0, len);
+                self.focus_find = false;
+            } else if let (Some(offset), Some(editor)) = (code_caret, self.rows.code_editor) {
+                // Restore the selection, not only the caret: a rebuild used to
+                // silently empty it, so ctrl+c after one copied nothing.
+                match code_anchor {
+                    Some(anchor) => self.ui.focus_selection(editor, anchor, offset),
+                    None => self.ui.focus_caret(editor, offset),
+                }
             }
         }
         let t_rebuild = phase.elapsed();
@@ -4199,6 +4304,7 @@ impl State {
         // live splitter sizes and pane scroll back so the next rebuild restores
         // them - the docking equivalent of the old capture_panel_sizes.
         self.sync_script_buffer();
+        self.sync_find_query();
         self.apply_script_marks();
         self.sync_dock_state();
         self.maybe_save_editor_state();
