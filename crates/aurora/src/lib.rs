@@ -5,6 +5,7 @@ mod draw;
 mod error;
 mod event;
 mod input;
+pub mod list;
 pub mod picker;
 mod rect;
 mod style;

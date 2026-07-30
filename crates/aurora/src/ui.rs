@@ -2787,25 +2787,14 @@ impl Ui {
             );
         }
         self.emit_decorations(id, origin, false, list);
-        if focused && self.caret_on {
-            let caret = if widget.multiline {
-                self.multiline_caret(id).map(|(cx, top)| {
-                    let line_h = text::metrics_for(widget.font_size).line_height;
-                    Rect::new(origin + Vec2::new(cx, top), Vec2::new(1.5, line_h))
-                })
-            } else {
-                let x = origin.x + self.caret_x_offset(id);
-                Some(Rect::new(
-                    Vec2::new(x, rect.pos.y + 3.0),
-                    Vec2::new(1.5, (rect.size.y - 6.0).max(0.0)),
-                ))
-            };
-            if let Some(caret) = caret {
-                list.commands.push(DrawCommand::FillRect {
-                    rect: caret,
-                    color: self.theme.caret,
-                });
-            }
+        if focused
+            && self.caret_on
+            && let Some(caret) = self.caret_rect(id)
+        {
+            list.commands.push(DrawCommand::FillRect {
+                rect: caret,
+                color: self.theme.caret,
+            });
         }
         list.commands.push(DrawCommand::PopClip);
     }
@@ -2952,6 +2941,36 @@ impl Ui {
             for rect in self.range_rects(id, decoration.range.start, decoration.range.end, origin) {
                 emit_decoration(rect, decoration, list);
             }
+        }
+    }
+
+    /// Where the focused field's caret sits on screen, in draw coordinates.
+    ///
+    /// Public because a popup anchored to the caret - an autocomplete list, a
+    /// signature hint - needs the same point the caret is drawn at, and would
+    /// otherwise have to reconstruct it from the field's scroll and line layout.
+    /// `None` unless `id` is the focused field and shaped.
+    pub fn caret_rect(&self, id: WidgetId) -> Option<Rect> {
+        if self.focused != Some(id) {
+            return None;
+        }
+        let widget = &self.widgets[id];
+        let rect = self.rect(id)?;
+        let base = self.content_origin.get(id).copied().unwrap_or(rect.pos);
+        let origin = base - Vec2::new(self.hscroll_of(id), self.vscroll_of(id));
+        if widget.multiline {
+            let (cx, top) = self.multiline_caret(id)?;
+            let line_h = text::metrics_for(widget.font_size).line_height;
+            Some(Rect::new(
+                origin + Vec2::new(cx, top),
+                Vec2::new(1.5, line_h),
+            ))
+        } else {
+            let x = origin.x + self.caret_x_offset(id);
+            Some(Rect::new(
+                Vec2::new(x, rect.pos.y + 3.0),
+                Vec2::new(1.5, (rect.size.y - 6.0).max(0.0)),
+            ))
         }
     }
 
@@ -4600,6 +4619,33 @@ mod tests {
                     if *color == ghost && rect.pos != src_pos)),
             "a faded, offset ghost of the source should be drawn"
         );
+    }
+
+    #[test]
+    fn the_caret_rect_is_where_a_caret_relative_popup_anchors() {
+        // An autocomplete list hangs off this. It has to be the same point the
+        // caret is drawn at, or the popup drifts from the text it belongs to.
+        let (mut ui, field) = text_area("aaa\nbbb\nccc");
+        assert_eq!(ui.caret_rect(field), None, "not focused, no caret");
+
+        ui.focus_caret(field, 0);
+        let first = ui.caret_rect(field).expect("focused fields have a caret");
+        ui.focus_caret(field, 5);
+        let second = ui.caret_rect(field).expect("still");
+        assert!(second.pos.y > first.pos.y, "moved down a line");
+        assert!(second.pos.x > first.pos.x, "and one column along");
+
+        // It is the rect actually drawn: the caret fill matches it.
+        let drawn = ui
+            .draw_list()
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                DrawCommand::FillRect { rect, color } if *color == ui.theme.caret => Some(*rect),
+                _ => None,
+            })
+            .expect("a caret is drawn");
+        assert_eq!(drawn, second);
     }
 
     /// A gutter text area holding `text`, laid out and ready to draw.
