@@ -10,6 +10,7 @@ arboard = "3.6.1"
 aurora = { version = "0.1.0", path = "../aurora" }
 aurora-wgpu = { version = "0.1.0", path = "../aurora-wgpu" }
 glam = "0.33.2"
+comet = { version = "0.1.0", path = "../comet" }
 helios = { version = "0.1.0", path = "../helios" }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 photon = { version = "0.1.0", path = "../photon" }

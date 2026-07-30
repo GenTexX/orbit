@@ -50,6 +50,17 @@ pub struct EditorTheme {
     /// The console pane's WARN-level line color (ERROR reuses `axis_x`, INFO
     /// the theme's heading, lower levels its subhead).
     pub console_warn: Color,
+    /// Syntax colors for the Code pane. Identifiers and punctuation use the
+    /// theme's own heading color, so only what should stand out is named here.
+    pub code_keyword: Color,
+    pub code_number: Color,
+    pub code_string: Color,
+    pub code_comment: Color,
+    pub code_function: Color,
+    pub code_type: Color,
+    /// The squiggle under an error and under a warning.
+    pub code_error: Color,
+    pub code_warning: Color,
     /// Viewport (scene-view) colors. Stored as [`Color`] like the rest of the
     /// theme, converted to photon colors where the scene is drawn.
     /// The clear color behind the scene.
@@ -77,6 +88,14 @@ impl EditorTheme {
             axis_x: Color::rgb(0.90, 0.32, 0.32),
             axis_y: Color::rgb(0.35, 0.70, 0.38),
             console_warn: default_console_warn(),
+            code_keyword: Color::rgb(0.78, 0.55, 0.90),
+            code_number: Color::rgb(0.72, 0.85, 0.62),
+            code_string: Color::rgb(0.82, 0.68, 0.45),
+            code_comment: Color::rgb(0.45, 0.50, 0.48),
+            code_function: Color::rgb(0.45, 0.72, 0.95),
+            code_type: Color::rgb(0.40, 0.80, 0.78),
+            code_error: Color::rgb(0.92, 0.36, 0.36),
+            code_warning: Color::rgb(0.90, 0.72, 0.32),
             viewport_bg: Color::rgb(0.052, 0.052, 0.055),
             grid_line: Color::rgba(0.0, 0.0, 0.0, 0.10),
             grid_line_strong: Color::rgba(0.0, 0.0, 0.0, 0.22),
@@ -97,6 +116,14 @@ impl EditorTheme {
             axis_x: Color::rgb(0.85, 0.30, 0.30),
             axis_y: Color::rgb(0.28, 0.62, 0.34),
             console_warn: Color::rgb(0.72, 0.55, 0.10),
+            code_keyword: Color::rgb(0.50, 0.20, 0.62),
+            code_number: Color::rgb(0.20, 0.45, 0.18),
+            code_string: Color::rgb(0.60, 0.35, 0.10),
+            code_comment: Color::rgb(0.48, 0.53, 0.50),
+            code_function: Color::rgb(0.12, 0.38, 0.70),
+            code_type: Color::rgb(0.05, 0.48, 0.46),
+            code_error: Color::rgb(0.78, 0.16, 0.16),
+            code_warning: Color::rgb(0.70, 0.50, 0.10),
             viewport_bg: Color::rgb(0.86, 0.87, 0.89),
             grid_line: Color::rgba(0.0, 0.0, 0.0, 0.08),
             grid_line_strong: Color::rgba(0.0, 0.0, 0.0, 0.16),
@@ -365,6 +392,9 @@ pub struct EditorRows {
     /// The explorer pane's root widget: a press inside it gives the explorer
     /// keyboard focus (so its shortcuts act on files, not scene nodes).
     pub file_pane: Option<WidgetId>,
+    /// The Code pane's editor and its Save button.
+    pub code_editor: Option<WidgetId>,
+    pub code_save: Option<WidgetId>,
     /// The toolbar actions.
     pub add_sprite: Option<WidgetId>,
     pub add_script: Option<WidgetId>,
@@ -403,6 +433,9 @@ pub struct EditorRows {
     /// gradient regions, and the hex input.
     /// The open color picker's widgets (aurora fills these when it builds it).
     pub picker: aurora::picker::PickerRows,
+    /// The Code pane's autocomplete popup and find bar, while open.
+    pub completions: aurora::list::ListRows,
+    pub find: aurora::find::FindRows,
     /// The open modal dialog: its card (for backdrop-click dismiss detection),
     /// close button, footer action buttons, and settings-form controls.
     pub modal_card: Option<WidgetId>,
@@ -504,6 +537,9 @@ pub fn build_editor_ui(
     inspector: &InspectorView,
     logs: &[LogLine],
     console_follow: bool,
+    open_script: Option<&str>,
+    script_text: &str,
+    script_modified: bool,
     tab_bars: &[TabBar],
     theme: &EditorTheme,
 ) -> (Ui, EditorRows) {
@@ -542,6 +578,9 @@ pub fn build_editor_ui(
         scrolls,
         logs,
         console_follow,
+        open_script,
+        script_text,
+        script_modified,
         tab_bars,
         theme,
     };
@@ -583,6 +622,12 @@ struct PaneCtx<'a> {
     /// Whether the console pane should stick to the newest line (the user has
     /// not scrolled up).
     console_follow: bool,
+    /// The script the Code pane is showing: its project-relative path and the
+    /// buffer's current text. `None` when nothing is open.
+    open_script: Option<&'a str>,
+    script_text: &'a str,
+    /// Whether the open script has unsaved edits.
+    script_modified: bool,
     /// One tab bar per dock group, in the order the dock is walked. aurora owns
     /// their interaction and animation state; the shell just hands them over.
     tab_bars: &'a [TabBar],
@@ -743,6 +788,10 @@ fn build_pane(ui: &mut Ui, parent: WidgetId, pane: Pane, ctx: &PaneCtx, rows: &m
             build_viewport_pane(ui, parent, ctx, rows);
             None
         }
+        Pane::Code => {
+            build_code_pane(ui, parent, ctx, rows);
+            None
+        }
         Pane::Console => {
             // The console handles its own scroll: follow the newest line unless
             // the user has scrolled up (then restore where they were).
@@ -762,6 +811,81 @@ fn build_pane(ui: &mut Ui, parent: WidgetId, pane: Pane, ctx: &PaneCtx, rows: &m
             ui.set_scroll_offset(scroll, offset);
         }
     }
+}
+
+/// The Code pane: a monospace, gutter-lined editor for one script, above a
+/// header saying which one.
+///
+/// The editor itself is one aurora text area with every code capability turned
+/// on - the shell's whole job here is to place it and say what file it holds.
+fn build_code_pane(ui: &mut Ui, parent: WidgetId, ctx: &PaneCtx, rows: &mut EditorRows) {
+    let theme = ctx.theme;
+    let panel = ui.panel(
+        parent,
+        Style::new()
+            .column()
+            .grow(1.0)
+            .background(theme.aurora.panel_bg),
+    );
+
+    let header = ui.panel(
+        panel,
+        Style::new()
+            .row()
+            .gap(6.0)
+            .align_center()
+            .padding_x(8.0)
+            .padding_y(4.0)
+            .border_bottom(theme.aurora.border_width, theme.aurora.panel_border),
+    );
+    let caption = match ctx.open_script {
+        Some(path) if ctx.script_modified => format!("{path} *"),
+        Some(path) => path.to_string(),
+        None => "No script open - double-click a .cmt file".to_string(),
+    };
+    ui.label(
+        header,
+        caption,
+        Style::new()
+            .grow(1.0)
+            .ellipsis()
+            .foreground(if ctx.open_script.is_some() {
+                theme.aurora.heading
+            } else {
+                theme.aurora.subhead
+            }),
+    );
+    if ctx.open_script.is_some() {
+        rows.code_save = Some(
+            ui.button(
+                header,
+                "Save",
+                Style::new()
+                    .padding_x(8.0)
+                    .padding_y(2.0)
+                    .corner_radius(theme.aurora.control_radius),
+            ),
+        );
+    }
+
+    // Without a script open there is nothing to edit - an empty editor would
+    // invite typing into a buffer with nowhere to go.
+    if ctx.open_script.is_none() {
+        return;
+    }
+    let editor = ui.text_input(
+        panel,
+        ctx.script_text.to_string(),
+        Style::new()
+            .grow(1.0)
+            .multiline()
+            .monospace()
+            .gutter()
+            .padding(6.0)
+            .background(theme.aurora.panel_bg)
+            .foreground(theme.aurora.heading),
+    );
+    rows.code_editor = Some(editor);
 }
 
 /// The console pane: recent log lines, newest at the bottom, colored by level.
@@ -2784,6 +2908,9 @@ mod tests {
             inspector,
             &[],
             true,
+            None,
+            "",
+            false,
             &[],
             theme,
         )
@@ -2840,6 +2967,9 @@ mod tests {
             &InspectorView::default(),
             &[],
             true,
+            None,
+            "",
+            false,
             &[],
             &EditorTheme::default(),
         );
@@ -3238,6 +3368,9 @@ mod tests {
             &InspectorView::default(),
             &[],
             true,
+            None,
+            "",
+            false,
             &[],
             &EditorTheme::default(),
         )
@@ -3286,6 +3419,9 @@ mod tests {
             &InspectorView::default(),
             &logs,
             true,
+            None,
+            "",
+            false,
             &[],
             &EditorTheme::default(),
         );
@@ -3335,6 +3471,9 @@ mod tests {
             &InspectorView::default(),
             &[],
             true,
+            None,
+            "",
+            false,
             &[],
             &EditorTheme::default(),
         );

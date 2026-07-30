@@ -87,7 +87,7 @@ use Kind::{Color as C, Scalar as S};
 
 /// The token groups, in display order.
 pub const GROUPS: &[&str] = &[
-    "Surfaces", "Text", "Accents", "Borders", "Inputs", "Widgets", "Shape", "Viewport",
+    "Surfaces", "Text", "Code", "Accents", "Borders", "Inputs", "Widgets", "Shape", "Viewport",
 ];
 
 /// Every themeable token, with its kind, group, and description. This is the
@@ -121,6 +121,15 @@ pub const TOKENS: &[Token] = &[
     t("heading", C, "Text", "Primary text color"),
     t("subhead", C, "Text", "Secondary / dimmed text color"),
     t("console_warn", C, "Text", "Console WARN-level line color"),
+    // Code.
+    t("code_keyword", C, "Code", "Script keywords (func, let, if)"),
+    t("code_number", C, "Code", "Script number literals"),
+    t("code_string", C, "Code", "Script string literals"),
+    t("code_comment", C, "Code", "Script comments"),
+    t("code_function", C, "Code", "Script function names"),
+    t("code_type", C, "Code", "Script type names"),
+    t("code_error", C, "Code", "The squiggle under an error"),
+    t("code_warning", C, "Code", "The squiggle under a warning"),
     // Accents.
     t(
         "accent",

@@ -320,6 +320,38 @@ struct State {
     last_log_gen: u64,
     last_log_poll: std::time::Instant,
     console_follow: bool,
+    /// The script the Code pane shows: its project-relative path, its current
+    /// buffer, and whether that buffer differs from the file on disk. One script
+    /// at a time is milestone 4's cut, so this is single-valued editor state
+    /// rather than anything the dock knows about.
+    open_script: Option<String>,
+    script_text: String,
+    script_modified: bool,
+    /// The open script's diagnostics from the last service run, for the status
+    /// bar. The squiggles themselves are already on the Ui.
+    script_diagnostics: Vec<comet::Diagnostic>,
+    /// The open script's syntax colors from the last service run.
+    script_spans: Vec<aurora::TextSpan>,
+    /// Text undo for the Code pane: snapshots of the buffer and where the caret
+    /// was, newest last.
+    ///
+    /// Here rather than in aurora because a rebuild swaps the whole Ui, and an
+    /// undo history that vanished whenever a node got selected would be worse
+    /// than none. atlas owns the document; aurora owns the widget showing it.
+    script_undo: Vec<(String, usize)>,
+    script_redo: Vec<(String, usize)>,
+    /// Where the caret was last time the buffer was read, so an undo step
+    /// records the position the edit started from rather than where it ended.
+    script_caret: usize,
+    /// Whether the last edit joined the open undo step. A run only continues a
+    /// run: without this, the first letter after a space would fold into the
+    /// space's step and one undo would swallow both.
+    script_coalescing: bool,
+    /// The autocomplete popup over the Code pane, while one is open, and the
+    /// byte offset the word it is completing starts at.
+    completions: Option<(aurora::list::ListPopup, usize)>,
+    /// The find bar over the Code pane, while one is open.
+    find: Option<aurora::find::FindBar>,
     /// Set when the per-project view state (dock, camera, tool, collapse) changed
     /// since the last editor-state save; a debounced save writes it out. Kept
     /// separate from `dirty` (the UI-rebuild flag). `editor_state_saved` is when
@@ -426,6 +458,45 @@ struct State {
 struct ReparentDrag {
     source: NodeId,
     target: Option<DropSpot>,
+}
+
+/// How many text-undo steps the Code pane keeps. Deep enough that a session
+/// never notices, bounded so a long one cannot grow without limit.
+const MAX_TEXT_UNDO: usize = 200;
+
+/// Whether an edit from `before` to `after` should join the previous undo step
+/// rather than start a new one: a run of ordinary typing, so undo goes back a
+/// word at a time instead of a letter at a time. Whitespace ends a run, which is
+/// what makes "a word" the unit.
+fn coalesces(before: &str, after: &str) -> bool {
+    if after.len() != before.len() + 1 || !after.starts_with(before) {
+        return false;
+    }
+    after
+        .as_bytes()
+        .last()
+        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// What a find-bar button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindAction {
+    Next,
+    Previous,
+    Replace,
+    ReplaceAll,
+    Close,
+}
+
+/// The identifier the caret sits in or just after: where it starts, and its
+/// text. An empty name means the caret is not in one.
+fn word_before(text: &str, caret: usize) -> (usize, &str) {
+    let caret = caret.min(text.len());
+    let before = &text[..caret];
+    let start = before
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map_or(0, |at| at + 1);
+    (start, &before[start..])
 }
 
 impl ApplicationHandler for App {
@@ -560,6 +631,12 @@ impl ApplicationHandler for App {
                     for ev in translate_key(&event, state.modifiers.control_key()) {
                         state.ui.handle_input(ev);
                     }
+                    return;
+                }
+                // The code pane's popups go first: an open completion list owns
+                // the arrows and Enter, and Escape closes whichever is open -
+                // otherwise Enter would insert a newline behind the popup.
+                if state.handle_code_key(&event) {
                     return;
                 }
                 if !state.handle_shortcut(&event)
@@ -707,6 +784,9 @@ impl State {
             &InspectorView::default(),
             &[],
             true,
+            None,
+            "",
+            false,
             &[],
             &theme,
         );
@@ -754,6 +834,17 @@ impl State {
             last_log_gen: 0,
             last_log_poll: std::time::Instant::now(),
             console_follow: true,
+            open_script: None,
+            script_text: String::new(),
+            script_modified: false,
+            script_diagnostics: Vec::new(),
+            script_spans: Vec::new(),
+            script_undo: Vec::new(),
+            script_redo: Vec::new(),
+            script_caret: 0,
+            script_coalescing: false,
+            completions: None,
+            find: None,
             view_dirty: false,
             editor_state_saved: std::time::Instant::now(),
             context_menu: None,
@@ -2344,9 +2435,32 @@ impl State {
         let WinitKey::Character(c) = &event.logical_key else {
             return false;
         };
+        // With the code editor focused, ctrl+s saves the script rather than the
+        // scene: it is the file you are looking at.
         if c.eq_ignore_ascii_case("s") {
-            self.save_project();
+            if self.ui.focused() == self.rows.code_editor && self.open_script.is_some() {
+                self.save_script();
+            } else {
+                self.save_project();
+            }
             return true;
+        }
+        if c.eq_ignore_ascii_case("f") && self.rows.code_editor.is_some() {
+            self.toggle_find();
+            return true;
+        }
+        // With the code editor focused, ctrl+z/y walk the script's own text
+        // history rather than the scene's - undoing a typo should not also undo
+        // moving a sprite.
+        if self.ui.focused() == self.rows.code_editor && self.rows.code_editor.is_some() {
+            if c.eq_ignore_ascii_case("z") {
+                self.script_history(self.modifiers.shift_key());
+                return true;
+            }
+            if c.eq_ignore_ascii_case("y") {
+                self.script_history(true);
+                return true;
+            }
         }
         // With a text field focused, ctrl+a/c/x/v edit its text (and only text).
         if self.ui.focused().is_some() {
@@ -2944,6 +3058,13 @@ impl State {
             self.select_explorer_dir(path);
             return;
         }
+        // Double-clicking a script opens it in the Code pane, and brings that
+        // pane to the front - opening a file into a tab you cannot see is the
+        // same as not opening it.
+        if double && explorer::classify(path) == explorer::FileKind::Script {
+            self.open_script_file(path);
+            return;
+        }
         if self.modifiers.shift_key() {
             self.explorer.select_range(path);
         } else if self.modifiers.control_key() {
@@ -2952,6 +3073,43 @@ impl State {
             self.explorer.select_one(path);
         }
         self.dirty = true;
+    }
+
+    /// Open `path` in the Code pane, reading it from disk. A read failure is
+    /// reported rather than leaving a stale buffer claiming to be the new file.
+    fn open_script_file(&mut self, path: &std::path::Path) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) => {
+                self.open_modal(modal::Modal::error("Cannot open script", &err));
+                return;
+            }
+        };
+        let relative = self
+            .explorer
+            .project_relative(path)
+            .unwrap_or_else(|| path.display().to_string());
+        self.open_script = Some(relative);
+        self.script_text = text;
+        self.script_modified = false;
+        self.analyze_script();
+        self.dock.activate(dock::Pane::Code);
+        self.dirty = true;
+    }
+
+    /// Write the Code pane's buffer back to its file.
+    fn save_script(&mut self) {
+        let Some(relative) = self.open_script.clone() else {
+            return;
+        };
+        let path = self.project_dir.join(&relative);
+        match std::fs::write(&path, &self.script_text) {
+            Ok(()) => {
+                self.script_modified = false;
+                self.dirty = true;
+            }
+            Err(err) => self.open_modal(modal::Modal::error("Cannot save script", &err)),
+        }
     }
 
     /// Select every entry in the current folder (explorer ctrl+a).
@@ -3182,6 +3340,354 @@ impl State {
         }
     }
 
+    /// Which find-bar button `id` is, if any.
+    fn find_button(&self, id: aurora::WidgetId) -> Option<FindAction> {
+        let rows = &self.rows.find;
+        [
+            (rows.previous, FindAction::Previous),
+            (rows.next, FindAction::Next),
+            (rows.replace, FindAction::Replace),
+            (rows.replace_all, FindAction::ReplaceAll),
+            (rows.close, FindAction::Close),
+        ]
+        .into_iter()
+        .find(|(widget, _)| *widget == Some(id))
+        .map(|(_, action)| action)
+    }
+
+    fn find_action(&mut self, id: aurora::WidgetId) {
+        let (Some(action), Some(editor)) = (self.find_button(id), self.rows.code_editor) else {
+            return;
+        };
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        match action {
+            FindAction::Next => {
+                find.find_next();
+            }
+            FindAction::Previous => {
+                find.find_previous();
+            }
+            FindAction::Replace => {
+                find.replace_current(&mut self.ui, editor);
+            }
+            FindAction::ReplaceAll => {
+                find.replace_all(&mut self.ui, editor);
+            }
+            FindAction::Close => {
+                self.find = None;
+                self.dirty = true;
+                return;
+            }
+        }
+        self.reveal_find_match();
+        self.sync_script_buffer();
+        self.dirty = true;
+    }
+
+    /// Select the current match, so stepping through them moves the caret and
+    /// scrolls it into view. The highlights themselves are drawn by
+    /// [`apply_script_marks`](Self::apply_script_marks), which
+    /// owns the editor's decorations.
+    fn reveal_find_match(&mut self) {
+        let (Some(find), Some(editor)) = (&self.find, self.rows.code_editor) else {
+            return;
+        };
+        find.reveal(&mut self.ui, editor);
+    }
+
+    /// The completion label a click on `id` would insert.
+    fn completion_row(&self, id: aurora::WidgetId) -> Option<String> {
+        let (list, _) = self.completions.as_ref()?;
+        let index = self
+            .rows
+            .completions
+            .rows
+            .iter()
+            .find(|(widget, _)| *widget == id)
+            .map(|(_, index)| *index)?;
+        list.item(index).map(str::to_string)
+    }
+
+    /// Step the Code pane's text history. Returns whether anything moved.
+    fn script_history(&mut self, redo: bool) -> bool {
+        let Some(editor) = self.rows.code_editor else {
+            return false;
+        };
+        let (from, to) = if redo {
+            (&mut self.script_redo, &mut self.script_undo)
+        } else {
+            (&mut self.script_undo, &mut self.script_redo)
+        };
+        let Some((text, caret)) = from.pop() else {
+            return false;
+        };
+        to.push((self.script_text.clone(), self.script_caret));
+        self.script_text = text;
+        // Straight onto the widget: going through the normal edit path would
+        // record this as a fresh edit and undo would never make progress.
+        self.ui.set_text_input(editor, self.script_text.clone());
+        let caret = caret.min(self.script_text.len());
+        self.ui.focus_caret(editor, caret);
+        self.script_caret = caret;
+        self.script_modified = true;
+        self.script_coalescing = false;
+        self.analyze_script();
+        self.dirty = true;
+        true
+    }
+
+    /// Open the find bar over the Code pane, or close it if it is already there.
+    fn toggle_find(&mut self) {
+        if self.find.take().is_some() {
+            self.dirty = true;
+            return;
+        }
+        // Top-right of the editor, the corner a find bar traditionally hides in
+        // and the one least likely to cover what is being searched.
+        let anchor = self
+            .rows
+            .code_editor
+            .and_then(|editor| self.ui.rect(editor))
+            .map(|r| Vec2::new(r.pos.x + r.size.x - 320.0, r.pos.y + 6.0))
+            .unwrap_or_default();
+        let mut find = aurora::find::FindBar::new(anchor);
+        // Pre-fill from the selection, the way every editor does.
+        if let Some(selected) = self.ui.selected_text() {
+            find.set_query(selected, &self.script_text);
+        }
+        self.find = Some(find);
+        self.dirty = true;
+    }
+
+    /// Keys the Code pane's popups claim before anything else sees them.
+    /// Returns whether one was consumed.
+    fn handle_code_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        let WinitKey::Named(named) = &event.logical_key else {
+            return false;
+        };
+        // Escape closes what is open, innermost first.
+        if *named == NamedKey::Escape {
+            if self.completions.take().is_some() || self.find.take().is_some() {
+                self.dirty = true;
+                return true;
+            }
+            return false;
+        }
+        let Some((list, _)) = &mut self.completions else {
+            return false;
+        };
+        let key = match named {
+            NamedKey::ArrowDown => aurora::Key::Down,
+            NamedKey::ArrowUp => aurora::Key::Up,
+            NamedKey::Enter => aurora::Key::Enter,
+            NamedKey::Tab => aurora::Key::Tab,
+            _ => return false,
+        };
+        match list.key(key) {
+            aurora::list::ListKey::Moved => {
+                self.dirty = true;
+                true
+            }
+            aurora::list::ListKey::Accepted(index) => {
+                let Some(label) = list.item(index).map(str::to_string) else {
+                    return false;
+                };
+                self.accept_completion(&label);
+                true
+            }
+            aurora::list::ListKey::Ignored => false,
+        }
+    }
+
+    /// Open, refresh, or close the completion popup for the word the caret is
+    /// in. Called after every edit, so the offered set follows what is typed.
+    fn refresh_completions(&mut self) {
+        let (Some(editor), true) = (self.rows.code_editor, self.open_script.is_some()) else {
+            self.completions = None;
+            return;
+        };
+        if self.ui.focused() != Some(editor) {
+            self.completions = None;
+            return;
+        }
+        let Some(caret) = self.ui.caret_offset() else {
+            self.completions = None;
+            return;
+        };
+        let (start, prefix) = word_before(&self.script_text, caret);
+        // A popup over an empty prefix would open on every space. `.` is the
+        // exception: field completions are the whole point of asking there.
+        let after_dot = start > 0 && self.script_text.as_bytes()[start - 1] == b'.';
+        if prefix.is_empty() && !after_dot {
+            self.completions = None;
+            return;
+        }
+        let items: Vec<String> = comet::service::completions_at(&self.script_text, caret)
+            .into_iter()
+            .map(|item| item.label)
+            .collect();
+        // Anchor below the caret so the popup does not cover the word being
+        // typed; layout nudges it back on screen near an edge.
+        let anchor = self
+            .ui
+            .caret_rect(editor)
+            .map(|r| r.pos + Vec2::new(0.0, r.size.y + 2.0))
+            .unwrap_or_default();
+        match &mut self.completions {
+            Some((list, at)) => {
+                *at = start;
+                list.set_items(items);
+                list.set_filter(prefix);
+                list.set_anchor(anchor);
+            }
+            None => {
+                let mut list = aurora::list::ListPopup::new(items, anchor);
+                list.set_filter(prefix);
+                self.completions = Some((list, start));
+            }
+        }
+        // Nothing left to offer is the same as nothing to show.
+        if self.completions.as_ref().is_some_and(|(l, _)| l.is_empty()) {
+            self.completions = None;
+        }
+        self.dirty = true;
+    }
+
+    /// Replace the word the popup was completing with `label`.
+    fn accept_completion(&mut self, label: &str) {
+        let (Some(editor), Some((_, start))) = (self.rows.code_editor, self.completions.as_ref())
+        else {
+            return;
+        };
+        let start = *start;
+        let Some(caret) = self.ui.caret_offset() else {
+            return;
+        };
+        self.ui.select_range(editor, start, caret);
+        self.ui.insert_str(label);
+        self.completions = None;
+        self.sync_script_buffer();
+        self.dirty = true;
+    }
+
+    /// Re-run the language service over the open script, caching what it found.
+    ///
+    /// Called when the buffer changes, not every frame: the pipeline is fast on
+    /// a script-sized file, but re-lexing it sixty times a second to learn
+    /// nothing new is still work nobody asked for.
+    fn analyze_script(&mut self) {
+        if self.open_script.is_none() {
+            self.script_spans.clear();
+            self.script_diagnostics.clear();
+            return;
+        }
+        let theme = &self.theme;
+        self.script_spans = comet::service::highlight(&self.script_text)
+            .into_iter()
+            .filter_map(|token| {
+                let color = match token.class {
+                    comet::service::TokenClass::Keyword => theme.code_keyword,
+                    comet::service::TokenClass::Number => theme.code_number,
+                    comet::service::TokenClass::Str => theme.code_string,
+                    comet::service::TokenClass::Comment => theme.code_comment,
+                    comet::service::TokenClass::Function => theme.code_function,
+                    comet::service::TokenClass::Type => theme.code_type,
+                    // Identifiers, operators and punctuation are the widget's
+                    // own color - a span for each would be noise and cost a
+                    // draw command apiece.
+                    _ => return None,
+                };
+                Some(aurora::TextSpan {
+                    range: token.span.start as usize..token.span.end as usize,
+                    color,
+                })
+            })
+            .collect();
+        self.script_diagnostics = comet::service::diagnostics(&self.script_text);
+    }
+
+    /// Push the cached syntax colors and diagnostics onto the live Ui, along
+    /// with the find bar's matches.
+    ///
+    /// Every frame, and deliberately so: a rebuild hands back a fresh Ui with
+    /// none of this on it, and both are read when the draw list is built rather
+    /// than when the text is shaped - so re-applying costs a regroup of glyphs
+    /// already laid out, and no rebuild of our own.
+    fn apply_script_marks(&mut self) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        self.ui.set_text_spans(editor, self.script_spans.clone());
+        let theme = &self.theme;
+        let diagnostics = &self.script_diagnostics;
+        // One owner for the editor's decorations, set fresh each frame: find
+        // matches behind (they fill), squiggles over them. Two callers each
+        // setting their own would mean whichever ran last erased the other.
+        let mut decorations: Vec<aurora::Decoration> = self
+            .find
+            .as_ref()
+            .map(|find| find.decorations(&theme.aurora))
+            .unwrap_or_default();
+        decorations.extend(diagnostics.iter().map(|d| aurora::Decoration {
+            range: d.span.start as usize..d.span.end as usize,
+            color: match d.severity {
+                comet::Severity::Error => theme.code_error,
+                comet::Severity::Warning => theme.code_warning,
+            },
+            style: aurora::DecorationStyle::Squiggle,
+        }));
+        self.ui.set_decorations(editor, decorations);
+    }
+
+    /// Read the Code pane's live text back out of the Ui.
+    ///
+    /// Deliberately does not mark the shell dirty per keystroke: the only thing
+    /// a rebuild would change is the header's modified mark, and rebuilding
+    /// while someone types is how a caret gets lost. Everything else the editor
+    /// shows - squiggles, syntax colors - is set on the live Ui and needs no
+    /// rebuild at all.
+    fn sync_script_buffer(&mut self) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let Some(text) = self.ui.text_of(editor) else {
+            return;
+        };
+        if text == self.script_text {
+            return;
+        }
+        let text = text.to_string();
+        let caret_before = self.script_caret.min(self.script_text.len());
+        let text = text.as_str();
+        // Snapshot what it was before adopting the change, so undo has somewhere
+        // to go back to. A run of ordinary typing collapses into one step -
+        // undoing a word at a time, not a letter at a time.
+        let previous = std::mem::replace(&mut self.script_text, text.to_string());
+        let joins = coalesces(&previous, &self.script_text) && self.script_coalescing;
+        self.script_coalescing = coalesces(&previous, &self.script_text);
+        if !joins {
+            self.script_undo.push((previous, caret_before));
+            if self.script_undo.len() > MAX_TEXT_UNDO {
+                self.script_undo.remove(0);
+            }
+        }
+        self.script_redo.clear();
+        self.analyze_script();
+        self.script_caret = self.ui.caret_offset().unwrap_or(self.script_text.len());
+        if !self.script_modified {
+            self.script_modified = true;
+            self.dirty = true;
+        }
+        self.refresh_completions();
+        // A find bar over a buffer that just changed is showing stale matches.
+        if let Some(find) = &mut self.find {
+            find.refresh(&self.script_text);
+            self.dirty = true;
+        }
+    }
+
     /// Read the live dock splitter sizes and per-pane scroll offsets back out of
     /// the laid-out `Ui` into `self.dock`/`self.pane_scrolls`, so the next
     /// rebuild restores them. Called each frame after layout, when the Ui and
@@ -3298,6 +3804,12 @@ impl State {
             // (sync_dock_state), when the Ui and dock are guaranteed to match -
             // a rearrange this frame has already restructured self.dock.
             let filter_caret = self.ui.caret_offset();
+            // Same for the code editor: the one rebuild typing causes is the
+            // first edit (the header gains its modified mark), and losing the
+            // caret on that keystroke would be maddening.
+            let code_caret = (self.ui.focused() == self.rows.code_editor)
+                .then(|| self.ui.caret_offset())
+                .flatten();
             // Snapshot the log ring for the console pane (brief lock), recording
             // the generation so the poll below only rebuilds when it changes.
             // While a tab is being carried out of its bar, the shell is built
@@ -3338,6 +3850,9 @@ impl State {
                 &self.inspector_view(),
                 &logs,
                 self.console_follow,
+                self.open_script.as_deref(),
+                &self.script_text,
+                self.script_modified,
                 &self.tab_bars,
                 &self.theme,
             );
@@ -3348,6 +3863,12 @@ impl State {
             // separately (refresh_picker_images).
             if let Some(open) = &self.picker {
                 self.rows.picker = open.picker.build(&mut self.ui, &self.theme.aurora);
+            }
+            if let Some((list, _)) = &self.completions {
+                self.rows.completions = list.build(&mut self.ui, &self.theme.aurora);
+            }
+            if let Some(find) = &self.find {
+                self.rows.find = find.build(&mut self.ui, &self.theme.aurora);
             }
             // A carried tab: a small floating copy that follows the pointer, so
             // there is something in hand while its pane is out of the layout.
@@ -3400,6 +3921,9 @@ impl State {
                 let offset = filter_caret.unwrap_or(self.tree_filter.len());
                 self.ui.focus_caret(field, offset);
                 self.refocus_filter = false;
+            }
+            if let (Some(offset), Some(editor)) = (code_caret, self.rows.code_editor) {
+                self.ui.focus_caret(editor, offset);
             }
         }
         let t_rebuild = phase.elapsed();
@@ -3464,6 +3988,8 @@ impl State {
         // frame's rebuild, if any, has already restructured the dock), read the
         // live splitter sizes and pane scroll back so the next rebuild restores
         // them - the docking equivalent of the old capture_panel_sizes.
+        self.sync_script_buffer();
+        self.apply_script_marks();
         self.sync_dock_state();
         self.maybe_save_editor_state();
 
@@ -3633,6 +4159,36 @@ impl State {
             match event {
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.add_sprite => {
                     self.add_sprite_action();
+                }
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.code_save => {
+                    self.save_script();
+                }
+                AuroraEvent::Clicked(id) if self.find_button(id).is_some() => {
+                    self.find_action(id);
+                }
+                AuroraEvent::Clicked(id) if self.completion_row(id).is_some() => {
+                    if let Some(label) = self.completion_row(id) {
+                        self.accept_completion(&label);
+                    }
+                }
+                AuroraEvent::Submitted(id) if Some(id) == self.rows.find.query => {
+                    let text = self.ui.text_of(id).unwrap_or_default().to_string();
+                    if let Some(find) = &mut self.find {
+                        find.set_query(text, &self.script_text);
+                        self.reveal_find_match();
+                    }
+                }
+                AuroraEvent::Submitted(id) if Some(id) == self.rows.find.replacement => {
+                    let text = self.ui.text_of(id).unwrap_or_default().to_string();
+                    if let Some(find) = &mut self.find {
+                        find.set_replacement(text);
+                    }
+                }
+                AuroraEvent::Toggled { id, checked } if Some(id) == self.rows.find.match_case => {
+                    if let Some(find) = &mut self.find {
+                        find.set_match_case(checked, &self.script_text);
+                        self.reveal_find_match();
+                    }
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.add_script => {
                     self.add_script_action();
@@ -4091,4 +4647,34 @@ fn translate_key(event: &winit::event::KeyEvent, ctrl: bool) -> Vec<InputEvent> 
         .filter(|c| !c.is_control())
         .map(InputEvent::Text)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{coalesces, word_before};
+
+    #[test]
+    fn typing_a_word_joins_one_undo_step_and_anything_else_starts_a_new_one() {
+        // Undo should go back a word at a time, not a letter at a time.
+        assert!(coalesces("let x", "let xy"));
+        assert!(coalesces("let x", "let x_"));
+        // Whitespace and punctuation end a run - they are where words end.
+        assert!(!coalesces("let x", "let x "));
+        assert!(!coalesces("let x", "let x."));
+        // A deletion, a paste, or an edit anywhere but the end is its own step.
+        assert!(!coalesces("let xy", "let x"));
+        assert!(!coalesces("let x", "let xyz"));
+        assert!(!coalesces("let x", "Xlet x"));
+    }
+
+    #[test]
+    fn the_word_before_the_caret_is_what_a_completion_replaces() {
+        assert_eq!(word_before("pos.x", 5), (4, "x"));
+        assert_eq!(word_before("let speed", 9), (4, "speed"));
+        // Right after a separator there is no word yet.
+        assert_eq!(word_before("pos.", 4), (4, ""));
+        assert_eq!(word_before("", 0), (0, ""));
+        // Past the end is clamped rather than panicking.
+        assert_eq!(word_before("abc", 99), (0, "abc"));
+    }
 }
