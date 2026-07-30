@@ -10,8 +10,9 @@ and repeat for as long as we want. Iteration work is not part of the
 milestone itself. When an idea ships, delete its entry (git history
 remembers); when one dies, delete it too.
 
-Seeded after M3 (2026-07-23) and swept on 2026-07-28, when a full audit of
-aurora and atlas retired about half the original list. What remains is
+Seeded after M3 (2026-07-23), swept on 2026-07-28, and swept again on
+2026-07-30 after the six iteration-phase reports (3.1-3.6) were written - the
+writing itself was an audit, and it retired a further round of entries. What remains is
 grouped below, with three new sections the first pass did not have: the work
 that unblocks Comet (M4), the teaching surface the project is named for, and
 the tooling that keeps quality from silently regressing.
@@ -21,8 +22,9 @@ the tooling that keeps quality from silently regressing.
 Worth stating plainly, because it should steer what we pick next.
 
 The editor and the GUI framework are the mature part of Orbit: atlas is
-~13k lines and aurora ~6k, against ~1.9k for helios and ~1.6k for photon.
-`comet` and `voyager` are still one-line stubs. Concretely, that means:
+~13k lines and aurora ~7.5k, against ~1.9k for helios and ~1.6k for photon -
+roughly six times as much authoring tool as engine. `comet` and `voyager` are
+still one-line stubs. Concretely, that means:
 
 - **helios has exactly one component: `Sprite`.** The Node/Component model,
   reflection, serialization, and undo all work - but there is only one kind of
@@ -121,12 +123,75 @@ explain itself:
   highlight panels and wait for the user to act. Expensive, but it is the thing
   that would make "educational" true rather than aspirational.
 
+## Extraction: still in atlas, but framework-shaped
+
+Milestone 3.6 moved the chrome palette, the colour picker and the tab bar into
+aurora, on a rule worth keeping: **aurora grows when a second caller proves the
+need, not when the first one suspects it.** The picker moved because it had been
+written twice and had started to drift. Everything below has been written once,
+which is exactly why it has not moved - but a second aurora application would
+change that overnight, and this is the list to reach for when one appears.
+
+The boundary that decided the last round still applies: aurora consumes input and
+produces draw lists, so anything that touches the filesystem, decodes an image, or
+hooks `tracing` stays out however reusable it looks. That rules out `file_ops`,
+`explorer`, `console` and the decode half of `thumbnails` permanently, not just
+for now.
+
+- **Tooltips.** atlas hand-rolls a hover timer, a delay, and a popup, and has to
+  freeze the whole thing while a button is held or it kills a drag. That freeze
+  is framework knowledge living in an app.
+- **The context menu**: open at a point, dismiss on an outside press, dispatch an
+  action. atlas has it; aurora has only the popup layer it is built on.
+- **The modal shell** - a scrim, a centred card, input blocking, Escape and
+  backdrop dismissal. Only the shell: `ModalBody`'s settings form and asset
+  chooser are atlas's domain and should stay.
+- **The icon rasterizer.** Coverage predicates, the primitive vocabulary, and the
+  preview-sheet review loop are all general; the icon *set* is half editor-specific
+  (gizmo modes, axes, grid, snap), and the upload helper reaches for aurora-wgpu.
+  Splitting the machine from the art is the work.
+- **Property-panel widgets**: a collapsible section card, a labelled row, a
+  drag-scrub numeric field, breadcrumbs, a toolbar button. Every editor has these.
+  The drag-scrub field is the most obviously reusable and the most entangled - it
+  writes through a `FieldRef` into a scene and commits through `History`.
+- **Docking.** `dock.rs` is already a pure data model - a tree of splits and tab
+  groups with drop-zone resolution - which is why it is testable without a UI. To
+  move it would need to become generic over the app's pane type. The strongest
+  remaining candidate and the largest blast radius; the tab bar and the tear-out
+  gesture would go with it.
+
+## Performance
+
+Milestone 3.5 fixed what was measured. These are the costs it identified and did
+not pay off, plus the instruments it wished existed.
+
+- **Virtualize long lists.** Nothing culls off-screen rows: a scene tree, a file
+  listing, or a console with a thousand lines lays out and emits every row, every
+  frame, including the ones scrolled out of view. This is the next wall for a big
+  project, and it is what would make a panel drag cheap regardless of content.
+- **A dirty-driven redraw.** atlas runs `ControlFlow::Poll` with an unconditional
+  `request_redraw`, so it re-lays-out and re-draws at full speed on a completely
+  idle screen and pegs a core. prism uses `ControlFlow::Wait` and does not. The
+  risk is a missed redraw trigger making the UI feel frozen, which is why it has
+  not been done casually.
+- **A CI performance gate.** `cargo bench --no-run` compiles the benchmarks so
+  they cannot rot, but nothing runs them, and timings are machine-dependent. The
+  workable version is not wall-clock but counted work: re-shapes, draw-list
+  length, widget count, rebuilds per gesture - cheap, deterministic, and exactly
+  the class of assertion that would have caught the resize regression.
+- **Nothing measures the GPU.** Every `timestamp_writes` is `None`, so all
+  profiling is CPU-side and a GPU-bound frame would look free.
+- **Cross-texture batching** still breaks on painter's order (see Engine), and
+  photon's instance buffer is still rebuilt per frame rather than written in place.
+
 ## Aurora: missing capabilities (framework-level)
 
-The audit retired most of the original list (scrollbar drag and track-click,
-Enter-to-next-row, font weights, text-area scrolling, SDF anti-aliasing,
-theming-as-data, ellipsis, drag ghost and drop highlight all shipped). What is
-genuinely still missing:
+Two sweeps have retired most of the original list: scrollbar drag and
+track-click, Enter-to-next-row, font weights, text-area scrolling, SDF
+anti-aliasing, theming-as-data, ellipsis, the drag ghost and drop highlight, and
+- in the extraction phase - a tab bar, a colour picker, and a draw-time offset
+that layout ignores (`Style::translate`), which is the seed of an animation
+system. What is genuinely still missing:
 
 - **Dropdown/select widget.** Still the biggest hole: it gates the Add
   Component UI, asset-kind pickers, and Comet's autocomplete.
@@ -138,18 +203,21 @@ genuinely still missing:
 - **Numeric steppers** (+/- arrows on a numeric field). The slider and the
   drag-scrub shipped; discrete nudging did not.
 - **Toggle switch** as a friendlier boolean than the checkbox.
-- **Tabs widget.** atlas's dock grew its own tab bar (with per-corner radii and
-  per-side borders underneath it); the reusable widget never got extracted.
 - **Keyboard scrolling** for scroll containers (PgUp/PgDn/Home/End) - there are
   no key variants for page movement yet.
 - **DPI awareness.** Font sizes and metrics are physical-pixel constants and
   nothing reads winit's scale factor; on a hidpi display the whole editor will
   be tiny. This will bite the first time Orbit runs on someone else's laptop.
-- **Icon polish**: node-type icons in the scene tree, and the file-type icons
-  that are already defined but never wired into the explorer rows. Disabled
-  state has no icon tint (hover does).
+- **Icon polish**: node-type icons in the scene tree (the file-type icons are
+  wired into the explorer now; the tree still shows none). Disabled state has no
+  icon tint, though hover and active do.
 - **Disabled state at call sites**: `Style::disabled()` works; Save-when-clean
   and Load-when-no-project still do not use it.
+- **An animation story beyond one offset.** `Style::translate` and
+  `TabBar::tick` prove the shape - a draw-time offset layout ignores, eased per
+  frame, with a bool that says "still moving, schedule another frame". What is
+  missing is anything general: no tween or spring type, no way to animate a
+  colour or a size, and every animated widget hand-rolls its own decay constant.
 - **Node editor**: a pan/zoom canvas of nodes with draggable ports and wires,
   for a future visual scripting / shader / state-machine graph. A big one; the
   popup, drag-and-drop, and splitter groundwork now exists.
@@ -218,10 +286,10 @@ genuinely still missing:
 Prompted by a perf session on 2026-07-28 that found a resize regression which
 had been live for some time behind a test that could not see it.
 
-- **Frame-budget regression tests.** `Ui::last_measure_count` now counts all
-  shaping, and a narrowing-drag test guards it. The same treatment would suit
-  draw-list size, widget count, and rebuild frequency: cheap headless
-  assertions that fail when an interaction gets quietly expensive.
+- **More counted-work assertions.** `Ui::last_measure_count` now counts all
+  shaping and a narrowing-drag test guards it; the picker has a test asserting
+  that an alpha change re-uploads one bitmap rather than three. Those are the two
+  that exist. See Performance for the rest.
 - **Golden-image tests for the UI.** photon pixel-tests its output; aurora and
   atlas have no visual regression net, so theming and layout changes can only
   be checked by eye - and several recent ones could not be verified headlessly
@@ -234,3 +302,10 @@ had been live for some time behind a test that could not see it.
   inspector (hover a widget, see its rect, id, and style).
 - **An aurora layout debug overlay**: a key that outlines every widget rect with
   its id. Useful for building atlas, and it is also a teaching artifact.
+- **A way to test feel, or an honest admission that there is none.** The six
+  reports kept arriving at the same division: the mechanism is testable, the
+  tuning is not. Every interaction adjustment in the tab work - pin versus ease,
+  snap versus glide, the size of a grab band - was found by a person dragging a
+  tab and saying it felt wrong. Recorded input traces replayed against the widget
+  tree would at least pin *behaviour* under a synthetic pointer, which is more
+  than exists today.
