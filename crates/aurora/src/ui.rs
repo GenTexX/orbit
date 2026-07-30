@@ -848,6 +848,8 @@ impl Ui {
             border_bottom_color: style.border_bottom_color,
             draggable: style.draggable,
             drop_target: style.drop_target,
+            drag_kind: style.drag_kind,
+            accepts: style.accepts,
             flat: style.flat,
             hit_transparent: style.hit_transparent,
             disabled: style.disabled,
@@ -1375,7 +1377,8 @@ impl Ui {
                 if let Some(drag) = self.drag.take()
                     && drag.active
                 {
-                    let target = self.cursor.and_then(|p| self.drop_target_at(p));
+                    let kind = self.widgets[drag.source].drag_kind;
+                    let target = self.cursor.and_then(|p| self.drop_target_for(p, kind));
                     self.events.push(Event::Dropped {
                         source: drag.source,
                         target,
@@ -1934,13 +1937,29 @@ impl Ui {
         self.drag.filter(|d| d.active).map(|d| d.source)
     }
 
-    /// The drop-target widget under `point`: a hit-test bubbled to the nearest
-    /// ancestor marked [`drop_target`](crate::Style::drop_target). Exposed so an
+    /// The drop-target widget under `point` for the live drag: a hit-test
+    /// bubbled to the nearest ancestor marked
+    /// [`drop_target`](crate::Style::drop_target) that also
+    /// [`accepts`](crate::Style::accepts) what the drag carries. Exposed so an
     /// app can highlight the target it is hovering during a drag.
+    ///
+    /// A target that turns the drag down is passed over as though it were not a
+    /// target at all, so an enclosing one can still take it.
     pub fn drop_target_at(&self, point: Vec2) -> Option<WidgetId> {
+        let kind = self
+            .drag
+            .map_or(u32::MAX, |d| self.widgets[d.source].drag_kind);
+        self.drop_target_for(point, kind)
+    }
+
+    /// The drop target under `point` for a drag carrying `kind`. Taken
+    /// explicitly rather than read from `self.drag`, because the release path
+    /// resolves its target after taking the drag - reading it there would find
+    /// no drag and let every target accept.
+    fn drop_target_for(&self, point: Vec2, kind: u32) -> Option<WidgetId> {
         let mut cur = self.hit_test(point);
         while let Some(w) = cur {
-            if self.widgets[w].drop_target {
+            if self.widgets[w].drop_target && self.widgets[w].accepts & kind != 0 {
                 return Some(w);
             }
             cur = self.widgets[w].parent;
@@ -4185,6 +4204,92 @@ mod tests {
                     if *color == ghost && rect.pos != src_pos)),
             "a faded, offset ghost of the source should be drawn"
         );
+    }
+
+    #[test]
+    fn a_target_that_turns_a_drag_down_neither_highlights_nor_takes_it() {
+        // Two targets side by side, each taking a different kind. Dragging a
+        // source of one kind must light up exactly one of them - offering both
+        // would promise something a release does not deliver.
+        const IMAGE: u32 = 1;
+        const SCRIPT: u32 = 2;
+
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 200.0).row());
+        let source = ui.button(
+            root,
+            "hero.png",
+            Style::new().size(100.0, 24.0).draggable().drag_kind(IMAGE),
+        );
+        let takes_images = ui.panel(
+            root,
+            Style::new().size(100.0, 200.0).drop_target().accepts(IMAGE),
+        );
+        let takes_scripts = ui.panel(
+            root,
+            Style::new()
+                .size(100.0, 200.0)
+                .drop_target()
+                .accepts(SCRIPT),
+        );
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(20.0, 12.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+
+        // Over the target that takes images: reported and highlighted.
+        let over_images = {
+            let r = ui.rect(takes_images).unwrap();
+            r.pos + r.size * 0.5
+        };
+        ui.handle_input(InputEvent::PointerMoved(over_images));
+        assert_eq!(ui.drop_target_at(over_images), Some(takes_images));
+        let highlighted = |ui: &Ui, id: crate::WidgetId| {
+            let rect = ui.rect(id).unwrap();
+            ui.draw_list().commands.iter().any(|c| {
+                matches!(c,
+                DrawCommand::RoundedRect { rect: r, border_width, .. }
+                    if *border_width > 0.0 && *r == rect)
+            })
+        };
+        assert!(highlighted(&ui, takes_images));
+
+        // Over the one that does not: no report, no highlight, and the drop
+        // names nothing rather than naming a target that refused it.
+        let over_scripts = {
+            let r = ui.rect(takes_scripts).unwrap();
+            r.pos + r.size * 0.5
+        };
+        ui.handle_input(InputEvent::PointerMoved(over_scripts));
+        assert_eq!(ui.drop_target_at(over_scripts), None);
+        assert!(!highlighted(&ui, takes_scripts));
+
+        ui.drain_events();
+        ui.handle_input(InputEvent::PointerReleased);
+        assert!(ui.drain_events().contains(&Event::Dropped {
+            source,
+            target: None
+        }));
+    }
+
+    #[test]
+    fn an_untagged_drag_still_lands_anywhere_that_takes_drops() {
+        // The default is every bit set on both sides, so code written before
+        // kinds existed behaves exactly as it did.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 200.0).row());
+        ui.button(root, "x", Style::new().size(100.0, 24.0).draggable());
+        let target = ui.panel(root, Style::new().size(200.0, 200.0).drop_target());
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(20.0, 12.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        let over = {
+            let r = ui.rect(target).unwrap();
+            r.pos + r.size * 0.5
+        };
+        ui.handle_input(InputEvent::PointerMoved(over));
+        assert_eq!(ui.drop_target_at(over), Some(target));
     }
 
     #[test]

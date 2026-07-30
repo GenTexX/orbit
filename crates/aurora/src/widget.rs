@@ -195,6 +195,10 @@ pub(crate) struct Widget {
     pub draggable: bool,
     /// Whether this widget accepts drops (see [`crate::Style::drop_target`]).
     pub drop_target: bool,
+    /// What a drag of this widget carries (see [`crate::Style::drag_kind`]).
+    pub drag_kind: u32,
+    /// Which drag kinds this target takes (see [`crate::Style::accepts`]).
+    pub accepts: u32,
     /// Whether this button renders flat (no raised fill; hover/press only).
     pub flat: bool,
     /// Whether hit-testing ignores this widget (decorative overlays).

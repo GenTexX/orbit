@@ -293,6 +293,50 @@ pub fn hit_gizmo(gizmo: &Gizmo, world: Vec2, mode: GizmoMode) -> Option<GizmoHit
 /// selection outline always, plus the handles the `mode` shows (move arrows,
 /// rotate lollipop, scale handles), all sized in screen pixels so they stay
 /// constant under zoom.
+impl Gizmo {
+    /// Whether `world` lies inside this node's quad, ignoring per-pixel alpha.
+    ///
+    /// A cheap CPU stand-in for the GPU pick: exact enough to say "this is the
+    /// node you are hovering", without a render pass and a readback stall on
+    /// every pointer move. The drop itself still uses the real pick.
+    pub fn contains(&self, world: Vec2) -> bool {
+        let offset = world - self.center;
+        let half = self.size * 0.5;
+        offset.dot(self.axis_x).abs() <= half.x && offset.dot(self.axis_y).abs() <= half.y
+    }
+}
+
+/// The topmost node in `order` (back to front, as drawn) whose quad covers
+/// `world`.
+pub fn node_at(scene: &Scene, order: &[NodeId], world: Vec2, zoom: f32) -> Option<NodeId> {
+    order
+        .iter()
+        .rev()
+        .copied()
+        .find(|&node| gizmo(scene, node, zoom).is_some_and(|g| g.contains(world)))
+}
+
+/// Just the four edges of a node's quad, in `color`: the cue for "this is the
+/// node a drop would land on", without any of the gizmo's handles.
+pub fn outline_sprites(gizmo: &Gizmo, zoom: f32, color: Color) -> Vec<Sprite> {
+    let t = OUTLINE_PX / zoom;
+    let (w, h) = (gizmo.size.x, gizmo.size.y);
+    let rot = Vec2::from_angle(gizmo.angle);
+    let at = |local: Vec2| gizmo.anchor + rot.rotate(local);
+    let quad = |pos: Vec2, size: Vec2| {
+        let mut s = Sprite::new(pos, size);
+        s.rotation = gizmo.angle;
+        s.tint = color;
+        s
+    };
+    vec![
+        quad(at(Vec2::ZERO), Vec2::new(w, t)),
+        quad(at(Vec2::ZERO), Vec2::new(t, h)),
+        quad(at(Vec2::new(0.0, h - t)), Vec2::new(w, t)),
+        quad(at(Vec2::new(w - t, 0.0)), Vec2::new(t, h)),
+    ]
+}
+
 pub fn gizmo_sprites(gizmo: &Gizmo, zoom: f32, mode: GizmoMode, pal: &Palette) -> Vec<Sprite> {
     let t = OUTLINE_PX / zoom;
     let half = HANDLE_HALF_PX / zoom;
@@ -781,6 +825,57 @@ mod tests {
     use helios::{Node, SpriteComponent};
 
     const EPS: f32 = 1.0e-3;
+
+    #[test]
+    fn a_quad_contains_the_points_it_covers_and_rotates_with_the_node() {
+        let (mut scene, node) = scene_with_sprite(Vec2::ZERO, Vec2::splat(100.0));
+        let g = gizmo(&scene, node, 1.0).expect("a sprite has a quad");
+        assert!(g.contains(Vec2::ZERO), "the center");
+        assert!(g.contains(Vec2::new(49.0, 49.0)), "just inside a corner");
+        assert!(!g.contains(Vec2::new(51.0, 0.0)), "just past the edge");
+
+        // Rotated 45 degrees, a point past the corner falls outside while the
+        // same distance along the new axis is still in - which is the whole
+        // reason the test projects onto the axes instead of comparing bounds.
+        scene.node_mut(node).transform.rotation = std::f32::consts::FRAC_PI_4;
+        let g = gizmo(&scene, node, 1.0).unwrap();
+        assert!(!g.contains(Vec2::new(48.0, 48.0)), "the corner swung away");
+        assert!(g.contains(Vec2::new(0.0, 68.0)), "and the edge swung out");
+    }
+
+    #[test]
+    fn node_at_finds_the_topmost_cover_and_nothing_over_empty_space() {
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        let mut add = |x: f32| {
+            let mut node = Node::new("sprite");
+            node.transform = Transform::from_translation(Vec2::new(x, 0.0));
+            node.components.push(Component::Sprite(SpriteComponent {
+                texture: String::new(),
+                tint: [1.0; 4],
+                size: Vec2::splat(100.0),
+            }));
+            scene.add_child(root, node)
+        };
+        let under = add(0.0);
+        let over = add(20.0); // overlaps `under`, drawn after it
+
+        // In the overlap the later-drawn node wins - what you see on top is what
+        // a drop lands on.
+        assert_eq!(
+            node_at(&scene, &[under, over], Vec2::new(10.0, 0.0), 1.0),
+            Some(over)
+        );
+        assert_eq!(
+            node_at(&scene, &[under, over], Vec2::new(-40.0, 0.0), 1.0),
+            Some(under),
+            "where only the lower one reaches"
+        );
+        assert_eq!(
+            node_at(&scene, &[under, over], Vec2::new(500.0, 0.0), 1.0),
+            None
+        );
+    }
 
     #[test]
     fn snapping_rounds_only_the_property_the_drag_edits() {

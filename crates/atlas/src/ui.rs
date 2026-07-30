@@ -3,7 +3,7 @@
 //! (M3 step 6 - "the editor looks like an editor").
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aurora::TabBar;
 use aurora::{Color, ImageHandle, Orientation, Style, Theme, Ui, WidgetId};
@@ -837,7 +837,7 @@ fn build_viewport_pane(ui: &mut Ui, parent: WidgetId, ctx: &PaneCtx, rows: &mut 
     let viewport = ui.image(
         col,
         ctx.viewport_handle,
-        Style::new().grow(1.0).drop_target(),
+        Style::new().grow(1.0).drop_target().accepts(DRAG_IMAGE),
     );
     rows.viewport = Some(viewport);
 }
@@ -1767,6 +1767,13 @@ fn build_inspector(
 
     for (i, component) in scene.node(node).components.iter().enumerate() {
         let reflect = component.as_reflect();
+        // Which kind this component's asset fields hold - asked of the
+        // component, so a Script's source neither shows a picture nor offers
+        // itself to one being dragged.
+        let asset_kind = match reflect.type_name() {
+            "Script" => AssetKind::Script,
+            _ => AssetKind::Image,
+        };
         let Some(card) = add_inspector_section(
             ui,
             panel,
@@ -1823,7 +1830,8 @@ fn build_inspector(
                 }
                 Value::Asset(path) => {
                     add_asset_field(
-                        ui, card, field, &path, node, i, icons, explorer, thumbnails, theme, rows,
+                        ui, card, field, &path, asset_kind, node, i, icons, explorer, thumbnails,
+                        theme, rows,
                     );
                 }
                 _ => {
@@ -1835,6 +1843,21 @@ fn build_inspector(
         }
     }
     panel
+}
+
+/// The icon standing in for an asset field with no thumbnail. Read off the path
+/// where there is one, so a `.cmt` never shows up as a picture; `kind` covers
+/// the empty field, which has no path to read.
+fn asset_field_icon(path: &str, kind: AssetKind) -> Icon {
+    match classify(Path::new(path)) {
+        FileKind::Image => Icon::FileImage,
+        FileKind::Script => Icon::FileScript,
+        FileKind::Scene => Icon::FileScene,
+        FileKind::Other => match kind {
+            AssetKind::Image => Icon::FileImage,
+            AssetKind::Script => Icon::FileScript,
+        },
+    }
 }
 
 /// The thumbnail/icon size in an inspector asset field.
@@ -1850,6 +1873,7 @@ fn add_asset_field(
     card: WidgetId,
     field: &'static str,
     path: &str,
+    kind: AssetKind,
     node: NodeId,
     component: usize,
     icons: Option<&Icons>,
@@ -1860,7 +1884,15 @@ fn add_asset_field(
 ) {
     let row = ui.panel(
         card,
-        Style::new().row().gap(6.0).align_center().drop_target(),
+        Style::new()
+            .row()
+            .gap(6.0)
+            .align_center()
+            .drop_target()
+            .accepts(match kind {
+                AssetKind::Image => DRAG_IMAGE,
+                AssetKind::Script => DRAG_SCRIPT,
+            }),
     );
     rows.asset_fields.push((row, node, component, field));
 
@@ -1880,7 +1912,7 @@ fn add_asset_field(
             Some(icons) => {
                 ui.image(
                     row,
-                    icons.get(Icon::FileImage),
+                    icons.get(asset_field_icon(path, kind)),
                     Style::new().size(ASSET_THUMB, ASSET_THUMB),
                 );
             }
@@ -2381,7 +2413,7 @@ fn build_list_entry(
         .flat()
         .background(background);
     if draggable {
-        style = style.draggable();
+        style = style.draggable().drag_kind(drag_kind(&entry.path));
     }
     let r = ui.button(parent, "", style);
     place_entry_icon(ui, r, entry, ctx, FILE_LIST_ICON);
@@ -2435,7 +2467,7 @@ fn build_grid_cell(
         .corner_radius(theme.aurora.control_radius)
         .background(background);
     if draggable {
-        style = style.draggable();
+        style = style.draggable().drag_kind(drag_kind(&entry.path));
     }
     let cell = ui.button(parent, "", style);
     place_entry_icon(ui, cell, entry, ctx, FILE_GRID_THUMB);
@@ -2501,6 +2533,21 @@ fn entry_icon(entry: &Entry) -> Icon {
         FileKind::Scene => Icon::FileScene,
         FileKind::Script => Icon::FileScript,
         FileKind::Other => Icon::FileGeneric,
+    }
+}
+
+/// What a dragged file carries, so a drop target can turn it down before the
+/// release rather than after (aurora's `Style::drag_kind` / `Style::accepts`).
+/// Offering a target that would refuse the drop promises something a release
+/// does not deliver.
+pub const DRAG_IMAGE: u32 = 1 << 0;
+pub const DRAG_SCRIPT: u32 = 1 << 1;
+
+/// The kind a dragged file carries.
+fn drag_kind(path: &Path) -> u32 {
+    match classify(path) {
+        FileKind::Script => DRAG_SCRIPT,
+        _ => DRAG_IMAGE,
     }
 }
 
@@ -2581,6 +2628,34 @@ mod tests {
             modified: None,
             children: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_asset_field_shows_the_icon_for_what_it_holds() {
+        // The bug this pins: every asset field used to show the image icon, so a
+        // script component looked like it held a picture.
+        assert_eq!(
+            asset_field_icon("scripts/bounce.cmt", AssetKind::Script),
+            Icon::FileScript
+        );
+        assert_eq!(
+            asset_field_icon("assets/hero.png", AssetKind::Image),
+            Icon::FileImage
+        );
+        // Empty field: nothing to read off the path, so the component decides.
+        assert_eq!(asset_field_icon("", AssetKind::Script), Icon::FileScript);
+        assert_eq!(asset_field_icon("", AssetKind::Image), Icon::FileImage);
+    }
+
+    #[test]
+    fn a_dragged_file_is_tagged_with_what_it_is() {
+        assert_eq!(drag_kind(Path::new("a/bounce.cmt")), DRAG_SCRIPT);
+        assert_eq!(drag_kind(Path::new("a/hero.png")), DRAG_IMAGE);
+        assert_eq!(
+            DRAG_SCRIPT & DRAG_IMAGE,
+            0,
+            "the kinds must not overlap, or every target would take everything"
+        );
     }
 
     #[test]

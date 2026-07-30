@@ -80,6 +80,13 @@ pub struct Style {
     /// Whether this widget accepts drops: a drag released over it reports it as
     /// the target (see `Event::Dropped`).
     pub drop_target: bool,
+    /// What a drag of this widget carries, as a caller-defined bitmask. A target
+    /// takes the drop only if this and its [`accepts`](Self::accepts) share a
+    /// bit. Both default to every bit set, so a drag with nothing to say lands
+    /// anywhere that takes drops.
+    pub drag_kind: u32,
+    /// Which [`drag_kind`](Self::drag_kind)s this target takes.
+    pub accepts: u32,
 }
 
 impl Default for Style {
@@ -110,6 +117,8 @@ impl Default for Style {
             border_bottom_color: Color::TRANSPARENT,
             draggable: false,
             drop_target: false,
+            drag_kind: u32::MAX,
+            accepts: u32::MAX,
         }
     }
 }
@@ -454,6 +463,26 @@ impl Style {
     /// target (see [`Event::Dropped`](crate::Event)).
     pub fn drop_target(mut self) -> Self {
         self.drop_target = true;
+        self
+    }
+
+    /// Tag what a drag of this widget carries, so targets can turn it down.
+    ///
+    /// Only the app knows whether a particular drag can land on a particular
+    /// target - aurora sees widget ids. Without a tag it offers every drop
+    /// target under the cursor, which overstates what a release would actually
+    /// do. `mask` is caller-defined; a target takes the drop when its
+    /// [`accepts`](Self::accepts) shares a bit with it.
+    pub fn drag_kind(mut self, mask: u32) -> Self {
+        self.drag_kind = mask;
+        self
+    }
+
+    /// Restrict which [`drag_kind`](Self::drag_kind)s this target takes. A drag
+    /// that shares no bit with `mask` passes over it as if it were not a target
+    /// at all: no highlight, and no `Dropped` naming it.
+    pub fn accepts(mut self, mask: u32) -> Self {
+        self.accepts = mask;
         self
     }
 

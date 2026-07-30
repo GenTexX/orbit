@@ -2590,11 +2590,38 @@ impl State {
             self.set_node_script(node, path);
             return;
         }
-        if target == self.rows.viewport
-            && let Some(node) = self.pick_node_at_cursor()
-        {
+        // The viewport turns script drags down (a script lands on a node, not on
+        // the pane), so the release names no target - the outlined node is what
+        // it landed on. Deliberately the same test that drew the outline, not
+        // the finer GPU pick: dropping somewhere other than where the cue said
+        // is worse than ignoring per-pixel transparency.
+        if let Some(node) = self.script_drop_node() {
             self.set_node_script(node, path);
         }
+    }
+
+    /// The node a script drag hovering the viewport would land on, or `None`
+    /// when no script is being dragged or the cursor is over empty space. Uses
+    /// the cheap CPU quad test rather than the GPU pick, because this runs every
+    /// frame the drag is live.
+    fn script_drop_node(&self) -> Option<NodeId> {
+        let source = self.ui.drag_source()?;
+        let (_, path) = self.rows.file_rows.iter().find(|(w, _)| *w == source)?;
+        if explorer::classify(Path::new(path)) != explorer::FileKind::Script {
+            return None;
+        }
+        if self.ui.hit_test(self.cursor) != self.rows.viewport {
+            return None;
+        }
+        let world = self.cursor_world()?;
+        let order: Vec<NodeId> = self
+            .project
+            .scene
+            .sprite_draws()
+            .iter()
+            .map(|d| d.node)
+            .collect();
+        viewport::node_at(&self.project.scene, &order, world, self.camera.zoom)
     }
 
     /// The asset field under `target`, if there is one and it holds `want`.
@@ -3520,6 +3547,19 @@ impl State {
                 self.camera.zoom,
                 self.gizmo_mode,
                 &pal,
+            ));
+        }
+        // A script being dragged over the viewport lands on one node, not on the
+        // viewport at large, so it outlines that node rather than letting the
+        // whole pane light up (which is what aurora's drop highlight would do,
+        // and why the viewport turns script drags down).
+        if let Some(node) = self.script_drop_node()
+            && let Some(g) = viewport::gizmo(&self.project.scene, node, self.camera.zoom)
+        {
+            overlay.extend(viewport::outline_sprites(
+                &g,
+                self.camera.zoom,
+                pal.rotate_handle,
             ));
         }
         if !overlay.is_empty() {
