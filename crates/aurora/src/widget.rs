@@ -4,6 +4,8 @@ use glam::Vec2;
 use slotmap::new_key_type;
 use taffy::NodeId;
 
+use std::ops::Range;
+
 use crate::color::Color;
 use crate::draw::ImageHandle;
 
@@ -108,6 +110,24 @@ pub enum FontWeight {
     Normal,
     /// Bold (DejaVu Sans Bold), for emphasis and headings.
     Bold,
+}
+
+/// A range of a widget's text drawn in its own color - one token of syntax
+/// highlighting, one search match, one anything.
+///
+/// Spans are consulted when the draw list is built, never when the text is
+/// shaped. Recoloring therefore costs nothing but a regrouping of glyphs
+/// already laid out, which is what makes re-highlighting on every keystroke
+/// affordable. (cosmic-text can carry a color per glyph through its rich-text
+/// attributes, but going that way would re-shape the whole buffer every time a
+/// color changed - the one thing an editor does constantly.)
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextSpan {
+    /// Byte range into the widget's text. Spans must not overlap; the one
+    /// covering a byte decides its color, and anything uncovered draws in the
+    /// widget's own foreground.
+    pub range: Range<usize>,
+    pub color: Color,
 }
 
 /// Which bundled family a widget's text shapes with.

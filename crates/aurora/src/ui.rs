@@ -14,7 +14,7 @@ use crate::input::{CursorHint, InputEvent, Key};
 use crate::rect::Rect;
 use crate::style::Style;
 use crate::theme::Theme;
-use crate::widget::{Face, Mask, Orientation, Widget, WidgetId, WidgetKind};
+use crate::widget::{Face, Mask, Orientation, TextSpan, Widget, WidgetId, WidgetKind};
 use crate::{text, theme};
 
 /// The visual state of an interactive widget, derived from the pointer each
@@ -165,6 +165,9 @@ pub struct Ui {
     /// A shaped buffer for each placeholder-bearing text input, produced after
     /// layout and drawn (dimmed) only while the input's own text is empty.
     placeholder_buffers: SecondaryMap<WidgetId, Buffer>,
+    /// Per-widget color spans, kept sorted by start. Consulted only when the
+    /// draw list is built, so setting them never invalidates a shape.
+    text_spans: SecondaryMap<WidgetId, Vec<TextSpan>>,
     /// A shaped check-glyph buffer per checkbox (its main buffer holds the label
     /// caption instead), produced during measure and drawn when checked.
     check_buffers: SecondaryMap<WidgetId, Buffer>,
@@ -238,6 +241,7 @@ impl Ui {
             grab_widgets: Vec::new(),
             ellipsized: SecondaryMap::new(),
             placeholder_buffers: SecondaryMap::new(),
+            text_spans: SecondaryMap::new(),
             check_buffers: SecondaryMap::new(),
             text_vscroll: SecondaryMap::new(),
             scroll_offsets: SecondaryMap::new(),
@@ -497,6 +501,27 @@ impl Ui {
     /// Replace a widget's background color. Takes effect on the next draw.
     pub fn set_background(&mut self, id: WidgetId, color: Color) {
         self.widgets[id].background = color;
+    }
+
+    /// Color parts of a widget's text differently from the rest - syntax
+    /// highlighting, search matches, anything per-range.
+    ///
+    /// Bytes no span covers draw in the widget's own foreground. Spans are read
+    /// when the draw list is built and never when the text is shaped, so
+    /// recoloring costs a regroup of glyphs that are already laid out; changing
+    /// them every keystroke is affordable in a way re-shaping would not be.
+    ///
+    /// Overlapping spans are not defined - a highlighter emits disjoint tokens.
+    pub fn set_text_spans(&mut self, id: WidgetId, mut spans: Vec<TextSpan>) {
+        // Sorted once here so the per-glyph lookup at draw time is a binary
+        // search rather than a scan of every span.
+        spans.sort_by_key(|span| span.range.start);
+        self.text_spans.insert(id, spans);
+    }
+
+    /// Drop a widget's color spans, so all its text draws in one color again.
+    pub fn clear_text_spans(&mut self, id: WidgetId) {
+        self.text_spans.remove(id);
     }
 
     /// Offset a widget and its subtree by `delta` px when drawing, leaving
@@ -2617,7 +2642,14 @@ impl Ui {
             }
         }
         if let Some(buffer) = self.buffers.get(id) {
-            self.emit_buffer(buffer, origin, widget.foreground, None, list);
+            self.emit_buffer_spans(
+                buffer,
+                origin,
+                widget.foreground,
+                None,
+                self.spans_of(id),
+                list,
+            );
         }
         if focused && self.caret_on {
             let caret = if widget.multiline {
@@ -2709,7 +2741,19 @@ impl Ui {
         } else {
             None
         };
-        self.emit_buffer(buffer, origin, color, center_width, list);
+        self.emit_buffer_spans(buffer, origin, color, center_width, self.spans_of(id), list);
+    }
+
+    /// A widget's text and its color spans, when it has both. The placeholder
+    /// deliberately does not get them: it is not the widget's text.
+    fn spans_of(&self, id: WidgetId) -> Option<(&str, &[TextSpan])> {
+        let spans = self.text_spans.get(id)?;
+        let text = match &self.widgets[id].kind {
+            WidgetKind::Label(s) | WidgetKind::Button(s) | WidgetKind::TextInput(s) => s,
+            WidgetKind::Checkbox { label, .. } => label,
+            _ => return None,
+        };
+        Some((text, spans.as_slice()))
     }
 
     /// Emit a `Text` command for a shaped `buffer` drawn from `origin` (its
@@ -2724,11 +2768,48 @@ impl Ui {
         center_width: Option<f32>,
         list: &mut DrawList,
     ) {
-        let mut glyphs = Vec::new();
+        self.emit_buffer_spans(buffer, origin, color, center_width, None, list);
+    }
+
+    /// The same, with per-range colors. Glyphs are emitted in order and
+    /// coalesced into one `Text` command per run of neighbours sharing a color -
+    /// the same batch-while-the-state-holds shape the sprite renderer uses, so
+    /// colored code costs one command per token run rather than one per glyph.
+    ///
+    /// `text` is the widget's source string, needed only to map a glyph back to
+    /// its byte offset: cosmic-text indexes a glyph within its own line, so the
+    /// line's start has to be added back.
+    fn emit_buffer_spans(
+        &self,
+        buffer: &Buffer,
+        origin: Vec2,
+        color: Color,
+        center_width: Option<f32>,
+        spans: Option<(&str, &[TextSpan])>,
+        list: &mut DrawList,
+    ) {
+        let line_starts = spans.map(|(text, _)| line_starts(text));
+        let mut glyphs: Vec<Glyph> = Vec::new();
+        let mut run_color = color;
+
         for run in buffer.layout_runs() {
             // Center this line by shifting its pen x by half the slack.
             let x0 = origin.x + center_width.map_or(0.0, |w| ((w - run.line_w) * 0.5).max(0.0));
+            let line_start = line_starts
+                .as_ref()
+                .and_then(|starts| starts.get(run.line_i).copied())
+                .unwrap_or(0);
             for glyph in run.glyphs {
+                if let Some((_, spans)) = spans {
+                    let want = color_at(spans, line_start + glyph.start).unwrap_or(color);
+                    if want != run_color && !glyphs.is_empty() {
+                        list.commands.push(DrawCommand::Text {
+                            glyphs: std::mem::take(&mut glyphs),
+                            color: run_color,
+                        });
+                    }
+                    run_color = want;
+                }
                 // Bake the content origin and the run's baseline into the pen
                 // position; the backend adds each glyph's bitmap bearing.
                 let physical = glyph.physical((x0, origin.y + run.line_y), 1.0);
@@ -2740,7 +2821,10 @@ impl Ui {
             }
         }
         if !glyphs.is_empty() {
-            list.commands.push(DrawCommand::Text { glyphs, color });
+            list.commands.push(DrawCommand::Text {
+                glyphs,
+                color: run_color,
+            });
         }
     }
 }
@@ -2749,6 +2833,24 @@ impl Default for Ui {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The byte offset each line of `text` starts at. cosmic-text numbers a glyph
+/// from the start of its own line, so this is what turns that back into an
+/// offset into the whole string.
+fn line_starts(text: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    starts.extend(text.match_indices('\n').map(|(at, _)| at + 1));
+    starts
+}
+
+/// The color covering `offset`, or `None` where no span does. `spans` is sorted
+/// by start, so this is the last span starting at or before `offset` - which is
+/// the covering one when spans are disjoint.
+fn color_at(spans: &[TextSpan], offset: usize) -> Option<Color> {
+    let at = spans.partition_point(|span| span.range.start <= offset);
+    let span = spans.get(at.checked_sub(1)?)?;
+    (offset < span.range.end).then_some(span.color)
 }
 
 /// A splitter's grab rectangle: its visual rect expanded along the drag axis
@@ -3069,6 +3171,7 @@ mod tests {
     use crate::rect::Rect;
     use crate::style::Style;
     use crate::theme::Theme;
+    use crate::widget::TextSpan;
     use crate::widget::{Mask, Orientation, WidgetKind};
     use glam::Vec2;
 
@@ -4204,6 +4307,188 @@ mod tests {
                 DrawCommand::FillRect { rect, color }
                     if *color == ghost && rect.pos != src_pos)),
             "a faded, offset ghost of the source should be drawn"
+        );
+    }
+
+    /// The `(color, glyph count)` of every text command a one-label Ui emits.
+    fn text_runs(text: &str, spans: Vec<TextSpan>) -> Vec<(Color, usize)> {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 100.0));
+        let label = ui.label(root, text.to_string(), Style::new().monospace());
+        ui.layout(Vec2::new(400.0, 100.0)).unwrap();
+        if !spans.is_empty() {
+            ui.set_text_spans(label, spans);
+        }
+        ui.draw_list()
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Text { glyphs, color } => Some((*color, glyphs.len())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const RED: Color = Color::rgb(1.0, 0.0, 0.0);
+    const BLUE: Color = Color::rgb(0.0, 0.0, 1.0);
+
+    #[test]
+    fn text_with_no_spans_is_still_a_single_run() {
+        let runs = text_runs("func main", vec![]);
+        assert_eq!(runs.len(), 1, "unstyled text must not fragment: {runs:?}");
+        assert_eq!(runs[0].1, 9);
+    }
+
+    #[test]
+    fn a_span_splits_the_text_into_runs_and_leaves_the_rest_alone() {
+        // "func" colored, " main" not: three runs would mean the uncovered tail
+        // got its own color; two is right, and the covered part comes first.
+        let runs = text_runs(
+            "func main",
+            vec![TextSpan {
+                range: 0..4,
+                color: RED,
+            }],
+        );
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!(runs[0], (RED, 4), "the span");
+        assert_eq!(runs[1].1, 5, "and the rest, in the widget's own color");
+        assert_ne!(runs[1].0, RED);
+    }
+
+    #[test]
+    fn neighbouring_spans_of_one_color_coalesce_into_one_command() {
+        // The point of chunking rather than emitting per glyph: a run of tokens
+        // that happen to share a color costs one command, not one each.
+        let runs = text_runs(
+            "abcdef",
+            vec![
+                TextSpan {
+                    range: 0..2,
+                    color: RED,
+                },
+                TextSpan {
+                    range: 2..4,
+                    color: RED,
+                },
+                TextSpan {
+                    range: 4..6,
+                    color: RED,
+                },
+            ],
+        );
+        assert_eq!(runs, vec![(RED, 6)]);
+    }
+
+    #[test]
+    fn spans_are_found_wherever_they_sit_in_the_text() {
+        let runs = text_runs(
+            "aabbcc",
+            vec![
+                TextSpan {
+                    range: 2..4,
+                    color: BLUE,
+                },
+                // Deliberately out of order: the setter sorts them, because the
+                // per-glyph lookup binary-searches.
+                TextSpan {
+                    range: 0..2,
+                    color: RED,
+                },
+            ],
+        );
+        assert_eq!(runs.len(), 3, "{runs:?}");
+        assert_eq!(runs[0], (RED, 2));
+        assert_eq!(runs[1], (BLUE, 2));
+        assert_eq!(runs[2].1, 2);
+    }
+
+    #[test]
+    fn a_span_on_a_later_line_lands_on_that_line() {
+        // The bug this pins: cosmic-text numbers a glyph from the start of its
+        // own line, so without adding the line's offset back every line would be
+        // colored as though it were the first.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 200.0));
+        let field = ui.text_input(
+            root,
+            "aaa\nbbb".to_string(),
+            Style::new().size(300.0, 100.0).multiline().monospace(),
+        );
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        // "bbb" is bytes 4..7 - on the second line, at line-local 0..3.
+        ui.set_text_spans(
+            field,
+            vec![TextSpan {
+                range: 4..7,
+                color: RED,
+            }],
+        );
+        let runs: Vec<(Color, usize)> = ui
+            .draw_list()
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Text { glyphs, color } => Some((*color, glyphs.len())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_ne!(runs[0].0, RED, "the first line is not the colored one");
+        assert_eq!(runs[1], (RED, 3), "the second line is");
+    }
+
+    #[test]
+    fn clearing_spans_returns_the_text_to_one_color() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 100.0));
+        let label = ui.label(root, "func main".to_string(), Style::new());
+        ui.layout(Vec2::new(400.0, 100.0)).unwrap();
+        ui.set_text_spans(
+            label,
+            vec![TextSpan {
+                range: 0..4,
+                color: RED,
+            }],
+        );
+        let count = |ui: &Ui| {
+            ui.draw_list()
+                .commands
+                .iter()
+                .filter(|c| matches!(c, DrawCommand::Text { .. }))
+                .count()
+        };
+        assert_eq!(count(&ui), 2);
+        ui.clear_text_spans(label);
+        assert_eq!(count(&ui), 1);
+    }
+
+    #[test]
+    fn recoloring_does_not_reshape_the_text() {
+        // The reason spans are read at draw time instead of going through
+        // cosmic-text's rich-text attributes: a highlighter re-colors on every
+        // keystroke, and re-shaping that often is exactly what we cannot afford.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 100.0));
+        let label = ui.label(root, "func main".to_string(), Style::new().monospace());
+        ui.layout(Vec2::new(400.0, 100.0)).unwrap();
+        ui.draw_list();
+
+        let before = ui.last_measure_count();
+        for i in 0..20 {
+            ui.set_text_spans(
+                label,
+                vec![TextSpan {
+                    range: 0..(i % 8) + 1,
+                    color: RED,
+                }],
+            );
+            ui.draw_list();
+        }
+        assert_eq!(
+            ui.last_measure_count(),
+            before,
+            "twenty recolors must not have re-shaped anything"
         );
     }
 
