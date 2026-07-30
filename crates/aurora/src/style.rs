@@ -76,6 +76,9 @@ pub struct Style {
     /// A bottom-edge-only border (0 = none), drawn beneath this widget's children.
     pub border_bottom_width: f32,
     pub border_bottom_color: Color,
+    /// Whether a multi-line text input draws a line-number gutter down its left
+    /// edge. Ignored by other kinds.
+    pub gutter: bool,
     /// Whether this widget is a drag source: pressing and moving past a small
     /// threshold starts a drag carrying this widget (see `Event::DragStarted`).
     pub draggable: bool,
@@ -118,6 +121,7 @@ impl Default for Style {
             translate: Vec2::ZERO,
             border_bottom_width: 0.0,
             border_bottom_color: Color::TRANSPARENT,
+            gutter: false,
             draggable: false,
             drop_target: false,
             drag_kind: u32::MAX,
@@ -362,6 +366,17 @@ impl Style {
     /// Set this widget's text weight (light / normal / bold).
     pub fn weight(mut self, weight: FontWeight) -> Self {
         self.font_weight = weight;
+        self
+    }
+
+    /// Give a multi-line text input a line-number gutter down its left edge.
+    ///
+    /// Aurora sizes it to the widest line number, keeps it aligned as the text
+    /// wraps and scrolls, marks the line the caret is on, and turns a click in
+    /// it into [`Event::GutterClicked`](crate::Event) - so an app never has to
+    /// reproduce the text area's line layout beside it.
+    pub fn gutter(mut self) -> Self {
+        self.gutter = true;
         self
     }
 

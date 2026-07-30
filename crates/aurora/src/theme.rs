@@ -211,6 +211,14 @@ pub(crate) const CHECKBOX_RADIUS: f32 = 4.0;
 /// The gap between the checkbox box and its caption, in pixels.
 pub(crate) const CHECKBOX_GAP: f32 = 8.0;
 
+/// Horizontal padding either side of a gutter's line numbers, in pixels.
+pub(crate) const GUTTER_PAD: f32 = 8.0;
+/// How much dimmer a gutter's line numbers are than the text beside them, and
+/// how faint the current-line band is. Derived from the theme's own colors
+/// rather than added as tokens: a gutter is chrome, not a new palette.
+pub(crate) const GUTTER_NUMBER_FADE: f32 = 0.55;
+pub(crate) const GUTTER_CURRENT_FADE: f32 = 0.35;
+
 /// The smallest a splitter will resize its target down to, in pixels.
 pub(crate) const SPLITTER_MIN_TARGET: f32 = 40.0;
 /// Extra grab zone per side beyond the splitter's visual bar, in pixels - the

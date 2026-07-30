@@ -173,6 +173,13 @@ pub struct Ui {
     /// Per-widget decorations (squiggles, match highlights). Draw-time only,
     /// for the same reason.
     decorations: SecondaryMap<WidgetId, Vec<Decoration>>,
+    /// A gutter field's line numbers, shaped as one buffer whose run `i` is the
+    /// number for logical line `i`.
+    gutter_numbers: SecondaryMap<WidgetId, Buffer>,
+    /// How wide each gutter strip is, measured from its widest number. Read by
+    /// measure (the text wraps in what is left) and by accumulate (the text
+    /// starts after it), so it has to be known before either runs.
+    gutter_widths: SecondaryMap<WidgetId, f32>,
     /// A shaped check-glyph buffer per checkbox (its main buffer holds the label
     /// caption instead), produced during measure and drawn when checked.
     check_buffers: SecondaryMap<WidgetId, Buffer>,
@@ -248,6 +255,8 @@ impl Ui {
             placeholder_buffers: SecondaryMap::new(),
             text_spans: SecondaryMap::new(),
             decorations: SecondaryMap::new(),
+            gutter_numbers: SecondaryMap::new(),
+            gutter_widths: SecondaryMap::new(),
             check_buffers: SecondaryMap::new(),
             text_vscroll: SecondaryMap::new(),
             scroll_offsets: SecondaryMap::new(),
@@ -884,6 +893,7 @@ impl Ui {
             font_size: style.font_size.unwrap_or(text::FONT_SIZE),
             font_weight: style.font_weight,
             font_family: style.font_family,
+            gutter: style.gutter,
             multiline: style.multiline,
             text_center: style.text_center,
             icon_button: style.icon_button,
@@ -929,6 +939,11 @@ impl Ui {
         };
         let root_node = self.widgets[root].taffy;
 
+        // Before measuring: the gutter's width depends only on the line count
+        // and the font, but the text wraps into what is left of the box, so the
+        // strip has to be sized first.
+        self.shape_gutters();
+
         // Split the borrows so the measure closure can shape text (widgets +
         // buffers + font_system) while taffy computes layout.
         let widgets = &self.widgets;
@@ -937,6 +952,7 @@ impl Ui {
         let font_system = &mut self.font_system;
         let shape_cache = &mut self.shape_cache;
         let ellipsized = &mut self.ellipsized;
+        let gutter_widths = &self.gutter_widths;
         // Counts actual cosmic-text re-shapes (cache misses), not measure calls,
         // so it reflects the work done - see `last_measure_count`.
         let mut reshapes = 0u32;
@@ -957,6 +973,7 @@ impl Ui {
                     font_system,
                     shape_cache,
                     ellipsized,
+                    gutter_widths,
                     &mut reshapes,
                 )
             },
@@ -1003,6 +1020,83 @@ impl Ui {
     /// its own buffer, wrapped to the field's content width. Runs after layout,
     /// when those widths are known; the result is drawn only while the field is
     /// empty (see [`emit_text_input`](Self::emit_text_input)).
+    /// Shape every gutter field's line numbers into one buffer - run `i` is the
+    /// number for logical line `i` - and record how wide the strip has to be.
+    ///
+    /// One buffer rather than one per line: the numbers never wrap, so a
+    /// multi-line buffer's runs line up with the numbers by index, and a file
+    /// with a thousand lines costs one shape instead of a thousand.
+    fn shape_gutters(&mut self) {
+        let jobs: Vec<(WidgetId, String, f32, Face)> = self
+            .widgets
+            .iter()
+            .filter(|(_, w)| w.gutter && w.multiline)
+            .filter_map(|(id, w)| match &w.kind {
+                WidgetKind::TextInput(text) => {
+                    // split, not lines(): cosmic-text keeps the empty line after
+                    // a trailing newline, and lines() drops it - which would
+                    // leave the last line of a file with no number.
+                    let lines = text.split('\n').count();
+                    let numbers = (1..=lines)
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Some((id, numbers, w.font_size, w.face()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let buffers = &mut self.gutter_numbers;
+        let widths = &mut self.gutter_widths;
+        let font_system = &mut self.font_system;
+        for (id, numbers, font_size, face) in jobs {
+            let metrics = text::metrics_for(font_size);
+            if !buffers.contains_key(id) {
+                buffers.insert(id, Buffer::new(font_system, metrics));
+            }
+            let mut borrowed = buffers[id].borrow_with(font_system);
+            borrowed.set_metrics(metrics);
+            borrowed.set_size(None, None);
+            borrowed.set_text(&numbers, &text::attrs_for(face), Shaping::Advanced, None);
+            borrowed.shape_until_scroll(false);
+            let widest = borrowed
+                .layout_runs()
+                .map(|r| r.line_w)
+                .fold(0.0f32, f32::max);
+            widths.insert(id, (widest + theme::GUTTER_PAD * 2.0).ceil());
+        }
+    }
+
+    /// The logical line the cursor is over, if it is inside `id`'s gutter strip.
+    /// `None` when the field has no gutter, the cursor is past the strip, or it
+    /// is below the last line.
+    fn gutter_line_at_cursor(&self, id: WidgetId) -> Option<usize> {
+        let width = self.gutter_width(id);
+        let cursor = self.cursor?;
+        let rect = self.rect(id)?;
+        let origin = self.content_origin.get(id).copied()?;
+        // The strip runs from the field's left edge to where the text starts -
+        // the padding right of the numbers is still the gutter, and a click
+        // there should land on a line rather than fall through to the text.
+        if width <= 0.0 || cursor.x < rect.pos.x || cursor.x >= origin.x {
+            return None;
+        }
+        // Map through the same y the text uses, so a click lands on the line it
+        // looks like it landed on however far the field is scrolled.
+        let y = cursor.y - (origin.y - self.vscroll_of(id));
+        let buffer = self.buffers.get(id)?;
+        buffer
+            .layout_runs()
+            .find(|run| y >= run.line_top && y < run.line_top + run.line_height)
+            .map(|run| run.line_i)
+    }
+
+    /// How wide `id`'s gutter is, or 0 for a field without one.
+    fn gutter_width(&self, id: WidgetId) -> f32 {
+        self.gutter_widths.get(id).copied().unwrap_or(0.0)
+    }
+
     fn shape_placeholders(&mut self) {
         // Collect the work first (text + field width), then split the buffer and
         // font-system borrows to shape - the same borrow dance as layout().
@@ -1193,6 +1287,11 @@ impl Ui {
             layout.padding.left + layout.border.left,
             layout.padding.top + layout.border.top,
         );
+        // A gutter takes its strip off the left of the content box. Shifting the
+        // origin here is the whole integration: text, selection, caret,
+        // decorations, and click-to-caret all derive from it, so none of them
+        // needs to know a gutter exists.
+        let inset = inset + Vec2::new(self.gutter_width(id), 0.0);
         self.content_origin.insert(id, pos + inset);
 
         // Iterate children by index, re-borrowing each step, so this per-frame
@@ -1454,6 +1553,15 @@ impl Ui {
     fn focus_from_press(&mut self) {
         let previous = self.focused;
         match self.hovered {
+            // A press in the gutter is about the line, not about editing it:
+            // report which line and leave the caret and focus alone, so clicking
+            // a breakpoint does not also move the cursor out from under you.
+            Some(id) if self.gutter_line_at_cursor(id).is_some() => {
+                if let Some(line) = self.gutter_line_at_cursor(id) {
+                    self.events.push(Event::GutterClicked { id, line });
+                }
+                return;
+            }
             Some(id) if matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) => {
                 self.focused = Some(id);
                 // A field starts unscrolled; reset before mapping the click so
@@ -2645,6 +2753,7 @@ impl Ui {
         if empty && let Some(buffer) = self.placeholder_buffers.get(id) {
             self.emit_buffer(buffer, base, self.theme.placeholder, None, list);
         }
+        self.emit_gutter(id, rect, origin, widget, list);
         // Decorations that sit behind the text go under the selection: the
         // selection is what the user is doing right now, and should win.
         self.emit_decorations(id, origin, true, list);
@@ -2759,6 +2868,77 @@ impl Ui {
             WidgetKind::Label(s) | WidgetKind::Button(s) | WidgetKind::TextInput(s) => Some(s),
             WidgetKind::Checkbox { label, .. } => Some(label),
             _ => None,
+        }
+    }
+
+    /// Draw a text area's gutter: a band marking the caret's line across the
+    /// whole field, then the line numbers, right-aligned in their strip.
+    ///
+    /// The numbers ride the *text's* line positions rather than their own, so
+    /// they follow the text through wrapping and vertical scrolling for free -
+    /// and a wrapped line gets one number, on its first visual row, because that
+    /// is the row its `line_i` first appears on.
+    fn emit_gutter(
+        &self,
+        id: WidgetId,
+        rect: Rect,
+        origin: Vec2,
+        widget: &Widget,
+        list: &mut DrawList,
+    ) {
+        let width = self.gutter_width(id);
+        if width <= 0.0 {
+            return;
+        }
+        let (Some(buffer), Some(numbers)) = (self.buffers.get(id), self.gutter_numbers.get(id))
+        else {
+            return;
+        };
+        let Some(text) = self.text_of(id) else {
+            return;
+        };
+        let caret_line = (self.focused == Some(id)).then(|| byte_to_cursor(text, self.caret).line);
+        let right = origin.x - theme::GUTTER_PAD;
+
+        let mut last_line = None;
+        for run in buffer.layout_runs() {
+            // The current-line band spans the whole field, gutter included, so
+            // it reads as one row rather than two.
+            if caret_line == Some(run.line_i) {
+                list.commands.push(DrawCommand::FillRect {
+                    rect: Rect::new(
+                        Vec2::new(rect.pos.x, origin.y + run.line_top),
+                        Vec2::new(rect.size.x, run.line_height),
+                    ),
+                    color: self.theme.selection.fade(theme::GUTTER_CURRENT_FADE),
+                });
+            }
+            // One number per logical line, on the first visual row it occupies.
+            if last_line == Some(run.line_i) {
+                continue;
+            }
+            last_line = Some(run.line_i);
+            let Some(number) = numbers.layout_runs().nth(run.line_i) else {
+                continue;
+            };
+            let x0 = right - number.line_w;
+            let mut glyphs = Vec::new();
+            for glyph in number.glyphs {
+                let physical = glyph.physical((x0, origin.y + run.line_y), 1.0);
+                glyphs.push(Glyph {
+                    cache_key: physical.cache_key,
+                    x: physical.x as f32,
+                    y: physical.y as f32,
+                });
+            }
+            if !glyphs.is_empty() {
+                let color = if caret_line == Some(run.line_i) {
+                    widget.foreground
+                } else {
+                    widget.foreground.fade(theme::GUTTER_NUMBER_FADE)
+                };
+                list.commands.push(DrawCommand::Text { glyphs, color });
+            }
         }
     }
 
@@ -3088,6 +3268,7 @@ fn measure_widget(
     font_system: &mut FontSystem,
     shape_cache: &mut SecondaryMap<WidgetId, ShapeCacheEntry>,
     ellipsized: &mut SecondaryMap<WidgetId, EllipsisFit>,
+    gutter_widths: &SecondaryMap<WidgetId, f32>,
     reshapes: &mut u32,
 ) -> Size<f32> {
     let Some(&mut id) = ctx else {
@@ -3182,14 +3363,20 @@ fn measure_widget(
     let one_line = (matches!(widgets[id].kind, WidgetKind::TextInput(_)) && !widgets[id].multiline)
         || widgets[id].ellipsis;
 
-    // Wrap to a known width if taffy gives one, else the available width.
+    // Wrap to a known width if taffy gives one, else the available width - less
+    // whatever a gutter takes off the left, or the text would wrap as though the
+    // strip were not there and run off the right edge under the clip.
+    let gutter = gutter_widths.get(id).copied().unwrap_or(0.0);
     let wrap_width = if one_line {
         None
     } else {
-        known.width.or(match available.width {
-            AvailableSpace::Definite(w) => Some(w),
-            AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
-        })
+        known
+            .width
+            .or(match available.width {
+                AvailableSpace::Definite(w) => Some(w),
+                AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
+            })
+            .map(|w| (w - gutter).max(1.0))
     };
 
     // Skip the (expensive) re-shape when nothing that affects it changed. Taffy
@@ -3277,6 +3464,7 @@ mod tests {
     use crate::theme::Theme;
     use crate::widget::{Decoration, DecorationStyle, TextSpan};
     use crate::widget::{Mask, Orientation, WidgetKind};
+    use crate::{text, theme};
     use glam::Vec2;
 
     /// Move the pointer to `p`, then press and release: a click at `p`.
@@ -4412,6 +4600,183 @@ mod tests {
                     if *color == ghost && rect.pos != src_pos)),
             "a faded, offset ghost of the source should be drawn"
         );
+    }
+
+    /// A gutter text area holding `text`, laid out and ready to draw.
+    fn gutter_area(text: &str) -> (Ui, crate::WidgetId) {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 200.0));
+        let field = ui.text_input(
+            root,
+            text.to_string(),
+            Style::new()
+                .size(360.0, 160.0)
+                .multiline()
+                .monospace()
+                .gutter(),
+        );
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        (ui, field)
+    }
+
+    /// Every text command's leftmost glyph x, in draw order.
+    fn text_command_lefts(ui: &Ui) -> Vec<f32> {
+        ui.draw_list()
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Text { glyphs, .. } => {
+                    Some(glyphs.iter().map(|g| g.x).fold(f32::MAX, f32::min))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_gutter_reserves_a_strip_and_the_text_starts_after_it() {
+        let (with, _) = gutter_area("aaa\nbbb");
+        let mut without = Ui::new();
+        let root = without.root_panel(Style::new().size(400.0, 200.0));
+        without.text_input(
+            root,
+            "aaa\nbbb".to_string(),
+            Style::new().size(360.0, 160.0).multiline().monospace(),
+        );
+        without.layout(Vec2::new(400.0, 200.0)).unwrap();
+
+        // Without a gutter: one command for the text. With one: the numbers too.
+        let plain = text_command_lefts(&without);
+        let gutter = text_command_lefts(&with);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(gutter.len(), 3, "two line numbers and the text: {gutter:?}");
+
+        // The text moved right by the strip, and the numbers sit in it.
+        let text_left = gutter.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            text_left > plain[0] + 10.0,
+            "the text should start after the strip: {text_left} vs {}",
+            plain[0]
+        );
+        for number_left in gutter.iter().filter(|&&x| x < text_left) {
+            assert!(*number_left < text_left, "numbers live left of the text");
+        }
+    }
+
+    #[test]
+    fn every_line_gets_a_number_including_the_last_empty_one() {
+        // The off-by-one this guards: `lines()` drops the empty line after a
+        // trailing newline, but cosmic-text keeps it - so the last line of a
+        // file that ends in a newline would have no number.
+        let (ui, _) = gutter_area("aaa\nbbb\n");
+        let count = ui
+            .draw_list()
+            .commands
+            .iter()
+            .filter(|c| matches!(c, DrawCommand::Text { .. }))
+            .count();
+        assert_eq!(count, 4, "three numbers and the text");
+    }
+
+    #[test]
+    fn the_gutter_widens_for_more_digits() {
+        let (few, few_id) = gutter_area("a\nb\nc");
+        let many = {
+            let text: String = (0..120).map(|_| "x\n").collect();
+            gutter_area(&text)
+        };
+        let narrow = few.content_origin[few_id].x;
+        let wide = many.0.content_origin[many.1].x;
+        assert!(
+            wide > narrow,
+            "three digits need more room than one: {wide} vs {narrow}"
+        );
+    }
+
+    #[test]
+    fn a_click_in_the_gutter_reports_its_line_and_leaves_the_caret_alone() {
+        let (mut ui, field) = gutter_area("aaa\nbbb\nccc");
+        // Focus the field and put the caret somewhere specific first.
+        ui.focus_caret(field, 5);
+        ui.drain_events();
+
+        // Press in the strip, on the third line's row.
+        let origin = ui.content_origin[field];
+        let line_h = text::metrics_for(ui.widgets[field].font_size).line_height;
+        let at = Vec2::new(origin.x - 4.0, origin.y + line_h * 2.5);
+        ui.handle_input(InputEvent::PointerMoved(at));
+        ui.handle_input(InputEvent::PointerPressed);
+
+        let events = ui.drain_events();
+        assert!(
+            events.contains(&Event::GutterClicked { id: field, line: 2 }),
+            "expected line 2, got {events:?}"
+        );
+        assert_eq!(
+            ui.caret_offset(),
+            Some(5),
+            "a gutter click must not move the caret out from under the user"
+        );
+    }
+
+    #[test]
+    fn a_click_past_the_gutter_still_places_the_caret() {
+        let (mut ui, field) = gutter_area("aaa\nbbb\nccc");
+        let origin = ui.content_origin[field];
+        let line_h = text::metrics_for(ui.widgets[field].font_size).line_height;
+        let at = Vec2::new(origin.x + 4.0, origin.y + line_h * 1.5);
+        ui.handle_input(InputEvent::PointerMoved(at));
+        ui.handle_input(InputEvent::PointerPressed);
+
+        let events = ui.drain_events();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::GutterClicked { .. })),
+            "the strip must not swallow clicks on the text: {events:?}"
+        );
+        assert_eq!(ui.focused, Some(field));
+        // Second line, at its start.
+        assert_eq!(ui.caret_offset(), Some(4));
+    }
+
+    #[test]
+    fn a_field_without_a_gutter_has_no_strip_and_no_gutter_clicks() {
+        let (mut ui, field) = text_area("aaa\nbbb");
+        let origin = ui.content_origin[field];
+        ui.handle_input(InputEvent::PointerMoved(origin + Vec2::new(1.0, 4.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        let events = ui.drain_events();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::GutterClicked { .. }))
+        );
+        assert_eq!(ui.focused, Some(field), "and the click still focuses it");
+    }
+
+    #[test]
+    fn the_current_line_band_follows_the_caret() {
+        let (mut ui, field) = gutter_area("aaa\nbbb\nccc");
+        let band = |ui: &Ui| {
+            let want = ui.theme.selection.fade(theme::GUTTER_CURRENT_FADE);
+            fills_of(ui, want).first().map(|r| r.pos.y)
+        };
+        ui.focus_caret(field, 0);
+        let first = band(&ui).expect("a band on the caret's line");
+        ui.focus_caret(field, 9);
+        let third = band(&ui).expect("still a band");
+        assert!(
+            third > first + 20.0,
+            "the band should have moved down two lines: {first} -> {third}"
+        );
+    }
+
+    #[test]
+    fn an_unfocused_gutter_field_shows_no_current_line() {
+        let (ui, _) = gutter_area("aaa\nbbb");
+        let want = ui.theme.selection.fade(theme::GUTTER_CURRENT_FADE);
+        assert!(fills_of(&ui, want).is_empty());
     }
 
     /// A multiline field holding `text`, laid out and ready to draw.

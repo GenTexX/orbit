@@ -239,6 +239,8 @@ pub(crate) struct Widget {
     pub font_weight: FontWeight,
     /// Font family for this widget's text (the proportional UI face by default).
     pub font_family: FontFamily,
+    /// Whether a multi-line text input draws a line-number gutter.
+    pub gutter: bool,
     /// Whether this text input is multi-line (a text area): Enter inserts a
     /// newline instead of submitting, and the caret moves by line. Other kinds
     /// ignore it.
