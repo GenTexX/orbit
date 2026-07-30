@@ -18,7 +18,7 @@ mod serialize;
 mod transform;
 
 pub use command::{Edit, History};
-pub use component::{Component, SpriteComponent};
+pub use component::{Component, ScriptComponent, SpriteComponent};
 pub use error::HeliosError;
 pub use project::{Manifest, Project};
 pub use reflect::{Reflect, Value};

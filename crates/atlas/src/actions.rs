@@ -3,7 +3,9 @@
 //! unit-tested; main.rs only decides when to call them.
 
 use glam::Vec2;
-use helios::{Component, History, Node, NodeId, Scene, SpriteComponent, Transform};
+use helios::{
+    Component, History, Node, NodeId, Scene, ScriptComponent, SpriteComponent, Transform,
+};
 
 /// Create a new sprite node under the scene root, centered at `world` (the
 /// node origin is the sprite's center, ADR 0019), showing `texture` at `size`
@@ -33,6 +35,25 @@ pub fn spawn_sprite(
         size,
     }));
     history.add_node(scene, root, node)
+}
+
+/// Attach an empty [`ScriptComponent`] to `node`, returning its index. Undoable:
+/// one history step. Returns `None` if the node already has a script - a node
+/// runs one script, so a second one would just be an inspector row nothing ever
+/// reads.
+///
+/// The source path starts empty. Picking the `.cmt` file is the inspector's job,
+/// through the same asset field a sprite's texture uses.
+pub fn attach_script(scene: &mut Scene, history: &mut History, node: NodeId) -> Option<usize> {
+    if scene
+        .node(node)
+        .components
+        .iter()
+        .any(|c| matches!(c, Component::Script(_)))
+    {
+        return None;
+    }
+    Some(history.add_component(scene, node, Component::Script(ScriptComponent::default())))
 }
 
 /// Deep-clone the subtree rooted at `src` as a new sibling right after it,
@@ -206,13 +227,46 @@ mod tests {
             scene.node(node).transform.translation,
             Vec2::new(120.0, 80.0)
         );
-        let Component::Sprite(s) = &scene.node(node).components[0];
+        let Component::Sprite(s) = &scene.node(node).components[0] else {
+            panic!("spawn_sprite attaches a sprite");
+        };
         assert_eq!(s.texture, "assets/sprite.png");
         assert_eq!(s.size, Vec2::new(64.0, 64.0));
 
         // One undo removes it again.
         assert!(history.undo(&mut scene));
         assert!(scene.children(scene.root()).is_empty());
+    }
+
+    #[test]
+    fn attach_script_adds_one_script_and_only_one() {
+        let mut scene = Scene::new("Root");
+        let mut history = History::new();
+        let node = spawn_sprite(
+            &mut scene,
+            &mut history,
+            Vec2::ZERO,
+            "assets/sprite.png",
+            Vec2::splat(64.0),
+        );
+
+        assert_eq!(
+            attach_script(&mut scene, &mut history, node),
+            Some(1),
+            "the script lands after the sprite already there"
+        );
+        assert!(matches!(
+            scene.node(node).components[1],
+            Component::Script(_)
+        ));
+
+        // A node runs one script, so asking again changes nothing.
+        assert_eq!(attach_script(&mut scene, &mut history, node), None);
+        assert_eq!(scene.node(node).components.len(), 2);
+
+        // One undo takes it back off.
+        assert!(history.undo(&mut scene));
+        assert_eq!(scene.node(node).components.len(), 1);
     }
 
     #[test]

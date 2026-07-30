@@ -65,6 +65,9 @@ impl Scene {
                     texture: sprite.texture.clone(),
                     sprite: build_sprite(world, sprite),
                 }),
+                // A script draws nothing. What it does is move the node, which
+                // this walk reads back through the transform like any other.
+                Component::Script(_) => {}
             }
         }
         for &child in self.children(id) {

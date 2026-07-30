@@ -12,11 +12,11 @@ use helios::{NodeId, Scene, Value};
 
 use crate::console::LogLine;
 use crate::dock::{DockNode, Fixed, Pane, SplitDir};
-use crate::explorer::{
-    AssetRef, Entry, FileExplorer, FileKind, FileView, TreeRow, can_thumbnail, classify,
-};
+use crate::explorer::{Entry, FileExplorer, FileKind, FileView, TreeRow, can_thumbnail, classify};
 use crate::icons::{Icon, Icons};
-use crate::modal::{Modal, ModalAction, ModalBody, SettingField, SettingsDraft};
+use crate::modal::{
+    AssetChooser, AssetKind, Modal, ModalAction, ModalBody, SettingField, SettingsDraft,
+};
 use crate::thumbnails::Thumbnails;
 use crate::viewport::GizmoMode;
 
@@ -367,6 +367,7 @@ pub struct EditorRows {
     pub file_pane: Option<WidgetId>,
     /// The toolbar actions.
     pub add_sprite: Option<WidgetId>,
+    pub add_script: Option<WidgetId>,
     pub save: Option<WidgetId>,
     pub load: Option<WidgetId>,
     /// The toolbar's view toggles (grid, world axes, snapping): highlighted when
@@ -899,6 +900,14 @@ fn build_toolbar(
         false,
         theme,
     ));
+    rows.add_script = Some(toolbar_button(
+        ui,
+        bar,
+        "Add Script",
+        icon(Icon::Add),
+        false,
+        theme,
+    ));
     rows.save = Some(toolbar_button(
         ui,
         bar,
@@ -1152,7 +1161,7 @@ pub fn build_modal(
         }
         ModalBody::Settings(draft) => build_settings_body(ui, card, draft, theme, rows),
         ModalBody::AssetChooser(chooser) => {
-            build_asset_chooser_body(ui, card, &chooser.images, thumbnails, icons, theme, rows);
+            build_asset_chooser_body(ui, card, chooser, thumbnails, icons, theme, rows);
         }
     }
 
@@ -1250,22 +1259,27 @@ const CHOOSER_THUMB: f32 = 72.0;
 fn build_asset_chooser_body(
     ui: &mut Ui,
     card: WidgetId,
-    images: &[AssetRef],
+    chooser: &AssetChooser,
     thumbnails: &Thumbnails,
     icons: Option<&Icons>,
     theme: &EditorTheme,
     rows: &mut EditorRows,
 ) {
+    let images = &chooser.assets;
     if images.is_empty() {
         ui.label(
             card,
-            "No images in this project.".to_string(),
+            chooser.kind.empty_message().to_string(),
             Style::new()
                 .width(MODAL_W - 32.0)
                 .foreground(theme.aurora.subhead),
         );
         return;
     }
+    let fallback_icon = match chooser.kind {
+        AssetKind::Image => Icon::FileImage,
+        AssetKind::Script => Icon::FileScript,
+    };
     let grid_w = MODAL_W - 32.0;
     let grid = ui.panel(
         card,
@@ -1303,7 +1317,7 @@ fn build_asset_chooser_body(
             } else if let Some(icons) = icons {
                 ui.image(
                     cell,
-                    icons.get(Icon::FileImage),
+                    icons.get(fallback_icon),
                     Style::new().size(CHOOSER_THUMB, CHOOSER_THUMB),
                 );
             } else {
@@ -2485,6 +2499,7 @@ fn entry_icon(entry: &Entry) -> Icon {
     match classify(&entry.path) {
         FileKind::Image => Icon::FileImage,
         FileKind::Scene => Icon::FileScene,
+        FileKind::Script => Icon::FileScript,
         FileKind::Other => Icon::FileGeneric,
     }
 }
@@ -2602,18 +2617,18 @@ mod tests {
             field: "texture",
         };
         let images = vec![
-            AssetRef {
+            crate::explorer::AssetRef {
                 abs: "/p/a.png".into(),
                 rel: "a.png".into(),
                 name: "a.png".into(),
             },
-            AssetRef {
+            crate::explorer::AssetRef {
                 abs: "/p/b.png".into(),
                 rel: "b.png".into(),
                 name: "b.png".into(),
             },
         ];
-        let rows = laid_out_modal(&Modal::asset_chooser(target, images));
+        let rows = laid_out_modal(&Modal::asset_chooser(target, images, AssetKind::Image));
         assert_eq!(rows.asset_choices.len(), 2, "one cell per image");
         assert_eq!(
             rows.asset_choices[0].1, "a.png",

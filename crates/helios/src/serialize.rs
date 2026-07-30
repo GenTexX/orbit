@@ -145,7 +145,7 @@ fn doc_to_transform(d: &TransformDoc) -> Transform {
 
 #[cfg(test)]
 mod tests {
-    use crate::component::{Component, SpriteComponent};
+    use crate::component::{Component, ScriptComponent, SpriteComponent};
     use crate::scene::{Node, Scene};
     use crate::transform::Transform;
     use glam::Vec2;
@@ -162,6 +162,9 @@ mod tests {
             size: Vec2::new(32.0, 48.0),
         };
         player.components.push(Component::Sprite(sprite));
+        player.components.push(Component::Script(ScriptComponent {
+            source: "scripts/player.cmt".into(),
+        }));
         let player = scene.add_child(root, player);
 
         scene.add_child(player, Node::new("weapon"));
@@ -192,10 +195,18 @@ mod tests {
         );
         assert_eq!(reloaded.children(player).len(), 1); // the weapon child
 
-        let Component::Sprite(sprite) = &reloaded.node(player).components[0];
+        let Component::Sprite(sprite) = &reloaded.node(player).components[0] else {
+            panic!("the test saved a sprite");
+        };
         assert_eq!(sprite.texture, "player.png");
         assert_eq!(sprite.tint, [1.0, 0.5, 0.25, 1.0]);
         assert_eq!(sprite.size, Vec2::new(32.0, 48.0));
+
+        // A second component kind on the same node: both survive, in order.
+        let Component::Script(script) = &reloaded.node(player).components[1] else {
+            panic!("the test saved a script after the sprite");
+        };
+        assert_eq!(script.source, "scripts/player.cmt");
     }
 
     #[test]

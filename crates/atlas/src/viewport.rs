@@ -215,14 +215,12 @@ pub enum GizmoHit {
 /// Build the gizmo for `node`, or `None` if it has no Sprite component to
 /// frame (e.g. the root selected in the tree).
 pub fn gizmo(scene: &Scene, node: NodeId, zoom: f32) -> Option<Gizmo> {
-    let sprite_size = scene
-        .node(node)
-        .components
-        .iter()
-        .map(|c| match c {
-            Component::Sprite(s) => s.size,
-        })
-        .next()?;
+    // find_map, not map().next(): a node can carry a script alongside its
+    // sprite, and the gizmo belongs to the sprite wherever in the list it sits.
+    let sprite_size = scene.node(node).components.iter().find_map(|c| match c {
+        Component::Sprite(s) => Some(s.size),
+        Component::Script(_) => None,
+    })?;
     let affine = scene.world_transform(node);
     let (scale, angle, translation) = affine.to_scale_angle_translation();
     let size = scale * sprite_size;

@@ -44,11 +44,39 @@ pub struct AssetTarget {
     pub field: &'static str,
 }
 
-/// The state behind the asset chooser: the field being set and the images to
+/// The state behind the asset chooser: the field being set and the assets to
 /// choose among.
 pub struct AssetChooser {
     pub target: AssetTarget,
-    pub images: Vec<AssetRef>,
+    pub assets: Vec<AssetRef>,
+    pub kind: AssetKind,
+}
+
+/// Which kind of asset a chooser is offering. An asset field is not generic in
+/// practice - a sprite wants an image and a script wants a `.cmt` - so the
+/// chooser lists only what the field can actually hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetKind {
+    Image,
+    Script,
+}
+
+impl AssetKind {
+    /// The chooser's title.
+    pub fn title(self) -> &'static str {
+        match self {
+            AssetKind::Image => "Choose an image",
+            AssetKind::Script => "Choose a script",
+        }
+    }
+
+    /// What to say when the project has none of them.
+    pub fn empty_message(self) -> &'static str {
+        match self {
+            AssetKind::Image => "No images in this project.",
+            AssetKind::Script => "No scripts in this project.",
+        }
+    }
 }
 
 /// What a modal footer button does when clicked.
@@ -105,11 +133,15 @@ impl Modal {
     }
 
     /// The asset chooser for an image field.
-    pub fn asset_chooser(target: AssetTarget, images: Vec<AssetRef>) -> Self {
+    pub fn asset_chooser(target: AssetTarget, assets: Vec<AssetRef>, kind: AssetKind) -> Self {
         Self {
-            title: "Choose an image".to_string(),
+            title: kind.title().to_string(),
             closable: true,
-            body: ModalBody::AssetChooser(AssetChooser { target, images }),
+            body: ModalBody::AssetChooser(AssetChooser {
+                target,
+                assets,
+                kind,
+            }),
         }
     }
 
@@ -141,7 +173,7 @@ impl Modal {
     /// thumbnails before rendering the grid).
     pub fn asset_images(&self) -> Option<&[AssetRef]> {
         match &self.body {
-            ModalBody::AssetChooser(c) => Some(&c.images),
+            ModalBody::AssetChooser(c) => Some(&c.assets),
             _ => None,
         }
     }

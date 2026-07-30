@@ -11,6 +11,8 @@ use crate::reflect::{Reflect, Value};
 pub enum Component {
     /// Draws a texture at the owning node's transform.
     Sprite(SpriteComponent),
+    /// Runs a Comet script for the owning node.
+    Script(ScriptComponent),
 }
 
 impl Component {
@@ -19,6 +21,7 @@ impl Component {
     pub fn as_reflect(&self) -> &dyn Reflect {
         match self {
             Component::Sprite(s) => s,
+            Component::Script(s) => s,
         }
     }
 
@@ -26,6 +29,7 @@ impl Component {
     pub fn as_reflect_mut(&mut self) -> &mut dyn Reflect {
         match self {
             Component::Sprite(s) => s,
+            Component::Script(s) => s,
         }
     }
 
@@ -35,6 +39,7 @@ impl Component {
     pub fn from_type_name(kind: &str) -> Option<Component> {
         match kind {
             "Sprite" => Some(Component::Sprite(SpriteComponent::default())),
+            "Script" => Some(Component::Script(ScriptComponent::default())),
             _ => None,
         }
     }
@@ -99,9 +104,81 @@ impl Reflect for SpriteComponent {
     }
 }
 
+/// A Comet script attached to a node: which `.cmt` source file runs for it.
+///
+/// Only the path lives here. Compiling it, instantiating it, and binding it to
+/// this node's [`Transform`](crate::Transform) is the script host's job - a
+/// component is data the inspector edits and the serializer walks, and nothing
+/// more (ADR 0016).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ScriptComponent {
+    /// The `.cmt` source file to run (a project-relative path). Empty means the
+    /// component exists but has no script yet, which is what "Add Script" leaves
+    /// behind until a file is picked.
+    pub source: String,
+}
+
+impl Reflect for ScriptComponent {
+    fn type_name(&self) -> &'static str {
+        "Script"
+    }
+
+    fn field_names(&self) -> &'static [&'static str] {
+        &["source"]
+    }
+
+    fn get(&self, field: &str) -> Option<Value> {
+        match field {
+            // An Asset, not a Str: a script is a file in the project like a
+            // texture is, so the inspector gives it the same path field and the
+            // same drop target for free.
+            "source" => Some(Value::Asset(self.source.clone())),
+            _ => None,
+        }
+    }
+
+    fn set(&mut self, field: &str, value: Value) -> bool {
+        match (field, value) {
+            ("source", Value::Asset(s)) => {
+                self.source = s;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_reflects_its_source_path() {
+        let mut script = ScriptComponent::default();
+        assert_eq!(script.type_name(), "Script");
+        assert_eq!(script.field_names(), &["source"]);
+        assert_eq!(script.get("source"), Some(Value::Asset(String::new())));
+
+        assert!(script.set("source", Value::Asset("scripts/bounce.cmt".into())));
+        assert_eq!(
+            script.get("source"),
+            Some(Value::Asset("scripts/bounce.cmt".into()))
+        );
+
+        assert!(!script.set("source", Value::Str("not an asset".into())));
+        assert!(!script.set("nope", Value::Bool(true)));
+    }
+
+    #[test]
+    fn both_component_kinds_round_trip_through_their_type_name() {
+        // What deserialization relies on: a saved kind tag reconstructs the
+        // right variant, and an unknown one is rejected rather than guessed.
+        for kind in ["Sprite", "Script"] {
+            let component = Component::from_type_name(kind).expect("a known kind");
+            assert_eq!(component.as_reflect().type_name(), kind);
+        }
+        assert!(Component::from_type_name("Camera").is_none());
+    }
 
     #[test]
     fn sprite_reflects_its_fields() {

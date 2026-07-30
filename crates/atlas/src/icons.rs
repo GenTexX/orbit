@@ -72,6 +72,8 @@ pub enum Icon {
     FileImage,
     /// A page with a little node graph (a scene file).
     FileScene,
+    /// A page with a code chevron pair (a Comet script).
+    FileScript,
     /// A plain document with text lines (any other file).
     FileGeneric,
     /// A circular arrow (re-scan the project's files).
@@ -110,6 +112,7 @@ const SPECS: &[(Icon, Predicate)] = &[
     (Icon::FolderOpen, icon_folder_open),
     (Icon::FileImage, icon_file_image),
     (Icon::FileScene, icon_file_scene),
+    (Icon::FileScript, icon_file_script),
     (Icon::FileGeneric, icon_file_generic),
     (Icon::Refresh, icon_refresh),
     (Icon::ViewList, icon_view_list),
@@ -496,6 +499,16 @@ fn icon_file_scene(x: f32, y: f32) -> bool {
         || disc(x, y, (0.64, 0.62), 0.055)
         || line(x, y, (0.5, 0.32), (0.36, 0.62), 0.035)
         || line(x, y, (0.5, 0.32), (0.64, 0.62), 0.035)
+}
+
+/// A script file: a page marked with a code chevron pair, so a `.cmt` reads as
+/// something you write rather than as any other document.
+fn icon_file_script(x: f32, y: f32) -> bool {
+    page(x, y)
+        || line(x, y, (0.45, 0.39), (0.34, 0.53), 0.045)
+        || line(x, y, (0.34, 0.53), (0.45, 0.67), 0.045)
+        || line(x, y, (0.55, 0.39), (0.66, 0.53), 0.045)
+        || line(x, y, (0.66, 0.53), (0.55, 0.67), 0.045)
 }
 
 /// A generic file: a page with three text lines.

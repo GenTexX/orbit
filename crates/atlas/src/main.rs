@@ -1477,15 +1477,32 @@ impl State {
         self.dirty = true;
     }
 
-    /// Open the image chooser for an asset field (all project images in a grid).
+    /// Open the chooser for an asset field: every asset of the kind this field
+    /// can actually hold, in a grid. Which kind comes from the component that
+    /// owns the field, not from the field's name - a Script's source takes a
+    /// `.cmt`, and offering it the project's textures would be a dead end.
     fn open_asset_chooser(&mut self, node: NodeId, component: usize, field: &'static str) {
-        let images = self.explorer.all_images();
+        let kind = match self
+            .project
+            .scene
+            .node(node)
+            .components
+            .get(component)
+            .map(|c| c.as_reflect().type_name())
+        {
+            Some("Script") => modal::AssetKind::Script,
+            _ => modal::AssetKind::Image,
+        };
+        let assets = match kind {
+            modal::AssetKind::Image => self.explorer.all_images(),
+            modal::AssetKind::Script => self.explorer.all_scripts(),
+        };
         let target = modal::AssetTarget {
             node,
             component,
             field,
         };
-        self.open_modal(modal::Modal::asset_chooser(target, images));
+        self.open_modal(modal::Modal::asset_chooser(target, assets, kind));
     }
 
     /// The selection in scene order (root first), skipping the scene root (which
@@ -2577,6 +2594,18 @@ impl State {
         self.select_new_node(node);
     }
 
+    /// The toolbar's Add Script: give the selected node a Script component. The
+    /// `.cmt` file is chosen afterwards in the inspector, the same way a
+    /// sprite's texture is - so this needs a selection, not a viewport point.
+    fn add_script_action(&mut self) {
+        let Some(node) = self.selection.primary() else {
+            return;
+        };
+        if actions::attach_script(&mut self.project.scene, &mut self.history, node).is_some() {
+            self.dirty = true;
+        }
+    }
+
     /// Whether the project has edits since the last save or load.
     fn is_modified(&self) -> bool {
         self.history.revision() != self.saved_revision
@@ -3481,6 +3510,9 @@ impl State {
             match event {
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.add_sprite => {
                     self.add_sprite_action();
+                }
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.add_script => {
+                    self.add_script_action();
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.save => self.save_project(),
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.load => self.load_project(),

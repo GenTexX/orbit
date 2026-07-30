@@ -8,6 +8,7 @@
 //! [`History`]'s methods capture the prior state so callers never build a
 //! malformed edit.
 
+use crate::component::Component;
 use crate::reflect::Value;
 use crate::scene::{Node, NodeId, Scene};
 use crate::transform::Transform;
@@ -50,6 +51,19 @@ pub enum Edit {
         old: String,
         new: String,
     },
+    /// Attach a component to a node at an index.
+    AddComponent {
+        node: NodeId,
+        index: usize,
+        component: Component,
+    },
+    /// Detach the component at an index. The component travels with the edit so
+    /// undo puts back what was there, not a fresh default.
+    RemoveComponent {
+        node: NodeId,
+        index: usize,
+        component: Component,
+    },
     /// Replace one reflected field of one component on a node.
     SetField {
         node: NodeId,
@@ -85,6 +99,12 @@ impl Edit {
             Edit::SetTransform { node, new, .. } => scene.node_mut(*node).transform = *new,
             Edit::SetVisible { node, new, .. } => scene.node_mut(*node).visible = *new,
             Edit::SetName { node, new, .. } => scene.node_mut(*node).name = new.clone(),
+            Edit::AddComponent {
+                node,
+                index,
+                component,
+            } => insert_component(scene, *node, *index, component.clone()),
+            Edit::RemoveComponent { node, index, .. } => remove_component(scene, *node, *index),
             Edit::SetField {
                 node,
                 component,
@@ -120,6 +140,12 @@ impl Edit {
             Edit::SetTransform { node, old, .. } => scene.node_mut(*node).transform = *old,
             Edit::SetVisible { node, old, .. } => scene.node_mut(*node).visible = *old,
             Edit::SetName { node, old, .. } => scene.node_mut(*node).name = old.clone(),
+            Edit::AddComponent { node, index, .. } => remove_component(scene, *node, *index),
+            Edit::RemoveComponent {
+                node,
+                index,
+                component,
+            } => insert_component(scene, *node, *index, component.clone()),
             Edit::SetField {
                 node,
                 component,
@@ -139,6 +165,19 @@ impl Edit {
 fn set_field(scene: &mut Scene, node: NodeId, component: usize, field: &str, value: Value) {
     if let Some(c) = scene.node_mut(node).components.get_mut(component) {
         c.as_reflect_mut().set(field, value);
+    }
+}
+
+fn insert_component(scene: &mut Scene, node: NodeId, index: usize, component: Component) {
+    let components = &mut scene.node_mut(node).components;
+    let index = index.min(components.len());
+    components.insert(index, component);
+}
+
+fn remove_component(scene: &mut Scene, node: NodeId, index: usize) {
+    let components = &mut scene.node_mut(node).components;
+    if index < components.len() {
+        components.remove(index);
     }
 }
 
@@ -412,6 +451,43 @@ impl History {
         );
     }
 
+    /// Attach `component` to `node` as its last component, returning its index.
+    /// Undoable.
+    pub fn add_component(
+        &mut self,
+        scene: &mut Scene,
+        node: NodeId,
+        component: Component,
+    ) -> usize {
+        let index = scene.node(node).components.len();
+        self.push(
+            scene,
+            Edit::AddComponent {
+                node,
+                index,
+                component,
+            },
+        );
+        index
+    }
+
+    /// Detach the component at `index` from `node`. Returns `false` (and records
+    /// nothing) if there is no component there.
+    pub fn remove_component(&mut self, scene: &mut Scene, node: NodeId, index: usize) -> bool {
+        let Some(component) = scene.node(node).components.get(index).cloned() else {
+            return false;
+        };
+        self.push(
+            scene,
+            Edit::RemoveComponent {
+                node,
+                index,
+                component,
+            },
+        );
+        true
+    }
+
     /// Set one reflected field of one component on `node`. Returns `false` (and
     /// records nothing) if the component index or field name is invalid.
     pub fn set_field(
@@ -534,11 +610,15 @@ mod tests {
         ));
 
         assert_eq!(scene.node(node).transform.translation, Vec2::new(9.0, 9.0));
-        let Component::Sprite(s) = &scene.node(node).components[0];
+        let Component::Sprite(s) = &scene.node(node).components[0] else {
+            panic!("the test attached a sprite");
+        };
         assert_eq!(s.texture, "hero.png");
 
         history.undo(&mut scene); // undo set_field
-        let Component::Sprite(s) = &scene.node(node).components[0];
+        let Component::Sprite(s) = &scene.node(node).components[0] else {
+            panic!("the test attached a sprite");
+        };
         assert_eq!(s.texture, ""); // back to the default
 
         history.undo(&mut scene); // undo set_transform
@@ -579,8 +659,74 @@ mod tests {
         assert!(history.set_field(&mut scene, node, 0, "texture", Value::Asset("a.png".into())));
         assert_eq!(history.revision(), rev, "no phantom edit recorded");
         history.undo(&mut scene);
-        let Component::Sprite(s) = &scene.node(node).components[0];
+        let Component::Sprite(s) = &scene.node(node).components[0] else {
+            panic!("the test attached a sprite");
+        };
         assert_eq!(s.texture, "", "the one real edit undoes to the default");
+    }
+
+    #[test]
+    fn add_component_attaches_and_undoes() {
+        use crate::component::ScriptComponent;
+        let (mut scene, root) = scene_with_root();
+        let mut history = History::new();
+        let mut node = Node::new("sprite");
+        node.components
+            .push(Component::Sprite(SpriteComponent::default()));
+        let node = history.add_node(&mut scene, root, node);
+
+        let index = history.add_component(
+            &mut scene,
+            node,
+            Component::Script(ScriptComponent {
+                source: "scripts/bounce.cmt".into(),
+            }),
+        );
+        assert_eq!(index, 1, "attached after the sprite that was already there");
+        assert_eq!(scene.node(node).components.len(), 2);
+
+        history.undo(&mut scene);
+        assert_eq!(scene.node(node).components.len(), 1, "and gone again");
+        history.redo(&mut scene);
+        assert_eq!(
+            scene.node(node).components[1].as_reflect().get("source"),
+            Some(Value::Asset("scripts/bounce.cmt".into())),
+            "redo restores the component's fields, not a fresh default"
+        );
+    }
+
+    #[test]
+    fn remove_component_puts_back_exactly_what_it_took() {
+        let (mut scene, root) = scene_with_root();
+        let mut history = History::new();
+        let mut node = Node::new("sprite");
+        node.components.push(Component::Sprite(SpriteComponent {
+            texture: "hero.png".into(),
+            ..SpriteComponent::default()
+        }));
+        let node = history.add_node(&mut scene, root, node);
+
+        assert!(history.remove_component(&mut scene, node, 0));
+        assert!(scene.node(node).components.is_empty());
+
+        history.undo(&mut scene);
+        let Component::Sprite(sprite) = &scene.node(node).components[0] else {
+            panic!("the sprite came back");
+        };
+        assert_eq!(
+            sprite.texture, "hero.png",
+            "the edit carried the component, so undo is not a default"
+        );
+    }
+
+    #[test]
+    fn removing_a_component_that_is_not_there_records_nothing() {
+        let (mut scene, root) = scene_with_root();
+        let mut history = History::new();
+        let node = history.add_node(&mut scene, root, Node::new("bare"));
+        let rev = history.revision();
+        assert!(!history.remove_component(&mut scene, node, 0));
+        assert_eq!(history.revision(), rev, "no phantom edit recorded");
     }
 
     #[test]

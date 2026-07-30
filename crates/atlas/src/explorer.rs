@@ -122,6 +122,8 @@ pub enum FileKind {
     Image,
     /// A scene file (`.ron`).
     Scene,
+    /// A Comet script (`.cmt`).
+    Script,
     /// Anything else.
     Other,
 }
@@ -131,6 +133,7 @@ pub fn classify(path: &Path) -> FileKind {
     match extension(path).as_deref() {
         Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp") => FileKind::Image,
         Some("ron") => FileKind::Scene,
+        Some("cmt") => FileKind::Script,
         _ => FileKind::Other,
     }
 }
@@ -413,17 +416,28 @@ impl FileExplorer {
     /// asset chooser. Only the decodable kind (PNG) is listed - those are the
     /// images that both preview and actually load as a texture.
     pub fn all_images(&self) -> Vec<AssetRef> {
+        self.all_assets(can_thumbnail)
+    }
+
+    /// Every Comet script in the project, sorted by relative path, for the
+    /// asset chooser behind a Script component's source field.
+    pub fn all_scripts(&self) -> Vec<AssetRef> {
+        self.all_assets(|path| classify(path) == FileKind::Script)
+    }
+
+    /// Every file in the project matching `accept`, sorted by relative path.
+    fn all_assets(&self, accept: fn(&Path) -> bool) -> Vec<AssetRef> {
         let mut out = Vec::new();
-        self.collect_images(&self.root, &mut out);
+        self.collect_assets(&self.root, accept, &mut out);
         out.sort_by(|a, b| a.rel.cmp(&b.rel));
         out
     }
 
-    fn collect_images(&self, dir: &Entry, out: &mut Vec<AssetRef>) {
+    fn collect_assets(&self, dir: &Entry, accept: fn(&Path) -> bool, out: &mut Vec<AssetRef>) {
         for child in &dir.children {
             if child.is_dir() {
-                self.collect_images(child, out);
-            } else if can_thumbnail(&child.path)
+                self.collect_assets(child, accept, out);
+            } else if accept(&child.path)
                 && let Some(rel) = self.project_relative(&child.path)
             {
                 out.push(AssetRef {
@@ -835,6 +849,25 @@ mod tests {
         // PNGs anywhere in the tree, sorted, project-relative; the .jpg is
         // excluded (only PNG previews/loads) and .ron is not an image.
         assert_eq!(rels, ["assets/a.png", "assets/b.png", "sub/nested.png"]);
+    }
+
+    #[test]
+    fn all_scripts_lists_cmt_files_and_nothing_else() {
+        let dir = sample_project();
+        std::fs::write(dir.path().join("sub/player.cmt"), []).unwrap();
+        std::fs::write(dir.path().join("assets/bounce.cmt"), []).unwrap();
+        let ex = FileExplorer::new(dir.path());
+        let rels: Vec<String> = ex.all_scripts().into_iter().map(|a| a.rel).collect();
+        assert_eq!(rels, ["assets/bounce.cmt", "sub/player.cmt"]);
+        // The two lists are disjoint: a chooser offers only what its field holds.
+        assert!(ex.all_images().iter().all(|a| !a.rel.ends_with(".cmt")));
+    }
+
+    #[test]
+    fn a_cmt_file_classifies_as_a_script() {
+        assert_eq!(classify(Path::new("a/b/player.cmt")), FileKind::Script);
+        assert_eq!(classify(Path::new("PLAYER.CMT")), FileKind::Script);
+        assert_eq!(classify(Path::new("notes.txt")), FileKind::Other);
     }
 
     #[test]
