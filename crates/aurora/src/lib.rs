@@ -25,7 +25,7 @@ pub use style::Style;
 pub use tabs::{Reorder, TabBar, TabBarRows, TabDrag};
 pub use theme::Theme;
 pub use ui::Ui;
-pub use widget::{FontWeight, Mask, Orientation, WidgetId, WidgetKind};
+pub use widget::{FontFamily, FontWeight, Mask, Orientation, WidgetId, WidgetKind};
 
 /// The layout engine. Re-exported so callers can reach taffy types without a
 /// direct dependency, e.g. `aurora::taffy::AlignItems`.

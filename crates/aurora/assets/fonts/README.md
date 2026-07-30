@@ -14,3 +14,13 @@ bundled so a widget can select a font weight (`Style::weight` / `Style::bold`).
   https://dejavu-fonts.github.io/License.html
 
 The font is unmodified from its upstream release.
+
+## DejaVu Sans Mono (`DejaVuSansMono.ttf`, `-Bold.ttf`)
+
+Bundled for the same reason, one milestone later: the code editor needs a fixed
+pitch so code lines up in columns, and depending on the host having a monospace
+font installed would lay the same file out differently on different machines.
+Regular and Bold, so `Style::monospace()` composes with `Style::bold()` - which
+is what syntax highlighting will want for keywords.
+
+Same project, same license, also unmodified.

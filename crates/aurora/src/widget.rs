@@ -110,6 +110,26 @@ pub enum FontWeight {
     Bold,
 }
 
+/// Which bundled family a widget's text shapes with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FontFamily {
+    /// The proportional UI face (DejaVu Sans).
+    #[default]
+    Sans,
+    /// A fixed-pitch face (DejaVu Sans Mono), for code and anything whose
+    /// columns have to line up.
+    Mono,
+}
+
+/// The exact face a widget's text shapes with. Family and weight travel
+/// together because both pick the font, so every shape cache keys on one value
+/// and none of them can be taught about a new axis and miss it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Face {
+    pub family: FontFamily,
+    pub weight: FontWeight,
+}
+
 /// Which axis a [`WidgetKind::Splitter`] drags along, and so which dimension of
 /// its target it resizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +183,8 @@ pub(crate) struct Widget {
     pub font_size: f32,
     /// Font weight for this widget's text (normal by default).
     pub font_weight: FontWeight,
+    /// Font family for this widget's text (the proportional UI face by default).
+    pub font_family: FontFamily,
     /// Whether this text input is multi-line (a text area): Enter inserts a
     /// newline instead of submitting, and the caret moves by line. Other kinds
     /// ignore it.
@@ -205,4 +227,14 @@ pub(crate) struct Widget {
     pub hit_transparent: bool,
     /// Whether this widget is disabled: drawn dimmed and inert to all input.
     pub disabled: bool,
+}
+
+impl Widget {
+    /// The exact face this widget's text shapes with.
+    pub fn face(&self) -> Face {
+        Face {
+            family: self.font_family,
+            weight: self.font_weight,
+        }
+    }
 }

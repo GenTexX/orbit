@@ -6,7 +6,7 @@ use taffy::{AlignItems, Display, FlexDirection, Overflow, Rect as TaffyRect, Siz
 use glam::Vec2;
 
 use crate::color::Color;
-use crate::widget::{FontWeight, Mask};
+use crate::widget::{FontFamily, FontWeight, Mask};
 
 /// How a widget lays out and looks. Layout is a taffy `Style` (size, padding,
 /// flex, gap); the visual properties (background, clipping) are Aurora's own.
@@ -45,6 +45,8 @@ pub struct Style {
     pub font_size: Option<f32>,
     /// Font weight for this widget's text.
     pub font_weight: FontWeight,
+    /// Font family for this widget's text.
+    pub font_family: FontFamily,
     /// Whether a text input is multi-line (a text area). Ignored by other kinds.
     pub multiline: bool,
     /// Center this widget's text horizontally within its content box (labels and
@@ -104,6 +106,7 @@ impl Default for Style {
             mask: Mask::None,
             font_size: None,
             font_weight: FontWeight::Normal,
+            font_family: FontFamily::Sans,
             multiline: false,
             text_center: false,
             icon_button: false,
@@ -359,6 +362,13 @@ impl Style {
     /// Set this widget's text weight (light / normal / bold).
     pub fn weight(mut self, weight: FontWeight) -> Self {
         self.font_weight = weight;
+        self
+    }
+
+    /// Shape this widget's text with the bundled fixed-pitch face, for code and
+    /// anything whose columns have to line up.
+    pub fn monospace(mut self) -> Self {
+        self.font_family = FontFamily::Mono;
         self
     }
 

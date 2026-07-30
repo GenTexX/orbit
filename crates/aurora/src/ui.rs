@@ -14,7 +14,7 @@ use crate::input::{CursorHint, InputEvent, Key};
 use crate::rect::Rect;
 use crate::style::Style;
 use crate::theme::Theme;
-use crate::widget::{FontWeight, Mask, Orientation, Widget, WidgetId, WidgetKind};
+use crate::widget::{Face, Mask, Orientation, Widget, WidgetId, WidgetKind};
 use crate::{text, theme};
 
 /// The visual state of an interactive widget, derived from the pointer each
@@ -50,7 +50,7 @@ const DRAG_GHOST_ALPHA: f32 = 0.6;
 struct ShapeCacheEntry {
     content: String,
     font_bits: u32,
-    weight: FontWeight,
+    face: Face,
     /// One-line widgets (single-line inputs, ellipsis) are width-independent, so
     /// a hit needs only the text/font to match.
     one_line: bool,
@@ -77,11 +77,11 @@ impl ShapeCacheEntry {
         one_line: bool,
         wrap_width: Option<f32>,
         font_bits: u32,
-        weight: FontWeight,
+        face: Face,
     ) -> bool {
         if self.content != content
             || self.font_bits != font_bits
-            || self.weight != weight
+            || self.face != face
             || self.one_line != one_line
         {
             return false;
@@ -110,7 +110,7 @@ impl ShapeCacheEntry {
 struct EllipsisFit {
     full: String,
     font_bits: u32,
-    weight: FontWeight,
+    face: Face,
     /// Content widths in `lo..hi` all yield the truncation now in the buffer.
     lo: f32,
     hi: f32,
@@ -118,10 +118,10 @@ struct EllipsisFit {
 
 impl EllipsisFit {
     /// Whether the buffer's current contents are still right for these inputs.
-    fn hits(&self, full: &str, content_w: f32, font_bits: u32, weight: FontWeight) -> bool {
+    fn hits(&self, full: &str, content_w: f32, font_bits: u32, face: Face) -> bool {
         self.full == full
             && self.font_bits == font_bits
-            && self.weight == weight
+            && self.face == face
             && content_w >= self.lo
             && content_w < self.hi
     }
@@ -575,8 +575,8 @@ impl Ui {
     /// path of `measure_widget`.
     fn reshape_field(&mut self, id: WidgetId) {
         let metrics = text::metrics_for(self.widgets[id].font_size);
-        let weight = self.widgets[id].font_weight;
-        let attrs = text::attrs_for(weight);
+        let face = self.widgets[id].face();
+        let attrs = text::attrs_for(face);
         let WidgetKind::TextInput(text) = &self.widgets[id].kind else {
             return;
         };
@@ -601,7 +601,7 @@ impl Ui {
             ShapeCacheEntry {
                 content: text,
                 font_bits: self.widgets[id].font_size.to_bits(),
-                weight,
+                face,
                 one_line: true,
                 single_line_w: None,
                 natural_w,
@@ -835,6 +835,7 @@ impl Ui {
             placeholder: style.placeholder.unwrap_or_default(),
             font_size: style.font_size.unwrap_or(text::FONT_SIZE),
             font_weight: style.font_weight,
+            font_family: style.font_family,
             multiline: style.multiline,
             text_center: style.text_center,
             icon_button: style.icon_button,
@@ -957,7 +958,7 @@ impl Ui {
     fn shape_placeholders(&mut self) {
         // Collect the work first (text + field width), then split the buffer and
         // font-system borrows to shape - the same borrow dance as layout().
-        let jobs: Vec<(WidgetId, String, f32, f32, FontWeight)> = self
+        let jobs: Vec<(WidgetId, String, f32, f32, Face)> = self
             .widgets
             .iter()
             .filter(|(_, w)| {
@@ -969,13 +970,13 @@ impl Ui {
                     w.placeholder.clone(),
                     self.rect(id).map_or(0.0, |r| r.size.x),
                     w.font_size,
-                    w.font_weight,
+                    w.face(),
                 )
             })
             .collect();
         let buffers = &mut self.placeholder_buffers;
         let font_system = &mut self.font_system;
-        for (id, text, width, font_size, weight) in jobs {
+        for (id, text, width, font_size, face) in jobs {
             let metrics = text::metrics_for(font_size);
             if !buffers.contains_key(id) {
                 buffers.insert(id, Buffer::new(font_system, metrics));
@@ -983,7 +984,7 @@ impl Ui {
             let mut borrowed = buffers[id].borrow_with(font_system);
             borrowed.set_metrics(metrics);
             borrowed.set_size(Some(width.max(1.0)), None);
-            borrowed.set_text(&text, &text::attrs_for(weight), Shaping::Advanced, None);
+            borrowed.set_text(&text, &text::attrs_for(face), Shaping::Advanced, None);
             borrowed.shape_until_scroll(false);
         }
     }
@@ -993,7 +994,7 @@ impl Ui {
     /// Runs after layout, when each widget's width is known; re-shapes only the
     /// widgets that actually overflow.
     fn ellipsize(&mut self) {
-        let jobs: Vec<(WidgetId, String, f32, f32, FontWeight)> = self
+        let jobs: Vec<(WidgetId, String, f32, f32, Face)> = self
             .widgets
             .iter()
             .filter(|(_, w)| w.ellipsis)
@@ -1008,7 +1009,7 @@ impl Ui {
                 let origin = self.content_origin.get(id).copied()?;
                 let left_pad = origin.x - rect.pos.x;
                 let content_w = (rect.size.x - 2.0 * left_pad).max(0.0);
-                Some((id, content, content_w, w.font_size, w.font_weight))
+                Some((id, content, content_w, w.font_size, w.face()))
             })
             .collect();
         let buffers = &mut self.buffers;
@@ -1016,7 +1017,7 @@ impl Ui {
         let cache = &mut self.ellipsized;
         let shape_cache = &self.shape_cache;
         let mut shapes = 0u32;
-        for (id, full, content_w, font_size, weight) in jobs {
+        for (id, full, content_w, font_size, face) in jobs {
             let font_bits = font_size.to_bits();
             // Skip while the box width stays inside the range that produced the
             // truncation already in the buffer (and the text and font are
@@ -1024,7 +1025,7 @@ impl Ui {
             // holds for all but the frames that cross a character boundary.
             if cache
                 .get(id)
-                .is_some_and(|f| f.hits(&full, content_w, font_bits, weight))
+                .is_some_and(|f| f.hits(&full, content_w, font_bits, face))
             {
                 continue;
             }
@@ -1033,14 +1034,14 @@ impl Ui {
             // a cached fit means the value still describes this text.
             let natural_w = shape_cache
                 .get(id)
-                .filter(|e| e.content == full && e.font_bits == font_bits && e.weight == weight)
+                .filter(|e| e.content == full && e.font_bits == font_bits && e.face == face)
                 .map(|e| e.natural_w);
 
             let Some(buffer) = buffers.get_mut(id) else {
                 continue;
             };
             let metrics = text::metrics_for(font_size);
-            let attrs = text::attrs_for(weight);
+            let attrs = text::attrs_for(face);
             let mut shaped_w = |buffer: &mut Buffer, fs: &mut FontSystem, s: &str| -> f32 {
                 let mut b = buffer.borrow_with(fs);
                 b.set_metrics(metrics);
@@ -1068,7 +1069,7 @@ impl Ui {
                     EllipsisFit {
                         full,
                         font_bits,
-                        weight,
+                        face,
                         lo: full_w,
                         hi: f32::INFINITY,
                     },
@@ -1107,7 +1108,7 @@ impl Ui {
                 EllipsisFit {
                     full,
                     font_bits,
-                    weight,
+                    face,
                     lo: fit_w,
                     hi: next_w.max(fit_w),
                 },
@@ -2908,12 +2909,12 @@ fn measure_widget(
             }
             let metrics = text::metrics_for(widgets[id].font_size);
             let line_h = theme::CHECKBOX_SIZE.max(metrics.line_height);
-            let weight = widgets[id].font_weight;
+            let face = widgets[id].face();
             let font_bits = widgets[id].font_size.to_bits();
             // Cache the caption shape + resulting box size on the label text (the
             // caption never wraps, so it is width-independent - one_line=true).
             if let Some(e) = shape_cache.get(id)
-                && e.hits(label, true, None, font_bits, weight)
+                && e.hits(label, true, None, font_bits, face)
                 && (label.is_empty() || buffers.contains_key(id))
             {
                 return e.size;
@@ -2926,7 +2927,7 @@ fn measure_widget(
                 let mut borrowed = buffers[id].borrow_with(font_system);
                 borrowed.set_metrics(metrics);
                 borrowed.set_size(None, None);
-                borrowed.set_text(label, &text::attrs_for(weight), Shaping::Advanced, None);
+                borrowed.set_text(label, &text::attrs_for(face), Shaping::Advanced, None);
                 borrowed.shape_until_scroll(false);
                 *reshapes += 1;
                 label_w = borrowed.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
@@ -2946,7 +2947,7 @@ fn measure_widget(
                 ShapeCacheEntry {
                     content: label.clone(),
                     font_bits,
-                    weight,
+                    face,
                     one_line: true,
                     single_line_w: None,
                     natural_w: label_w,
@@ -2989,9 +2990,9 @@ fn measure_widget(
     // probes each leaf several times per layout - and re-measures whole subtrees
     // on any resize - so this turns almost all of those into a field compare.
     let font_bits = widgets[id].font_size.to_bits();
-    let weight = widgets[id].font_weight;
+    let face = widgets[id].face();
     if let Some(e) = shape_cache.get(id)
-        && e.hits(content, one_line, wrap_width, font_bits, weight)
+        && e.hits(content, one_line, wrap_width, font_bits, face)
         && buffers.contains_key(id)
     {
         return e.size;
@@ -3000,7 +3001,7 @@ fn measure_widget(
     // Shape at this widget's font size and weight, so headings and captions
     // measure (and later draw) at their size and weight.
     let metrics = text::metrics_for(widgets[id].font_size);
-    let attrs = text::attrs_for(weight);
+    let attrs = text::attrs_for(face);
     if !buffers.contains_key(id) {
         buffers.insert(id, Buffer::new(font_system, metrics));
     }
@@ -3047,7 +3048,7 @@ fn measure_widget(
         ShapeCacheEntry {
             content: content.to_string(),
             font_bits,
-            weight,
+            face,
             one_line,
             single_line_w,
             natural_w: width,
@@ -4204,6 +4205,59 @@ mod tests {
                     if *color == ghost && rect.pos != src_pos)),
             "a faded, offset ghost of the source should be drawn"
         );
+    }
+
+    /// The laid-out width of `text` in a label styled by `style`.
+    fn label_width(text: &str, style: Style) -> f32 {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(800.0, 100.0).row());
+        let label = ui.label(root, text.to_string(), style);
+        ui.layout(Vec2::new(800.0, 100.0)).unwrap();
+        ui.rect(label).unwrap().size.x
+    }
+
+    #[test]
+    fn the_monospace_face_is_actually_fixed_pitch() {
+        // The whole point of bundling it: in a proportional face an `i` is much
+        // narrower than an `m`, and code stops lining up in columns.
+        let mono = Style::new().monospace();
+        let narrow = label_width("iiiiiiiiii", mono.clone());
+        let wide = label_width("mmmmmmmmmm", mono);
+        assert!(
+            (narrow - wide).abs() < 0.5,
+            "ten of any character must be the same width: {narrow} vs {wide}"
+        );
+
+        let sans = Style::new();
+        let narrow = label_width("iiiiiiiiii", sans.clone());
+        let wide = label_width("mmmmmmmmmm", sans);
+        assert!(
+            wide > narrow * 1.5,
+            "and the default face must still be proportional: {narrow} vs {wide}"
+        );
+    }
+
+    #[test]
+    fn the_two_families_do_not_share_a_shape_cache_entry() {
+        // Both caches key on the whole face rather than the weight, so the same
+        // string at the same size in a different family re-shapes instead of
+        // serving the other family's glyphs.
+        let text = "mmmmmmmmmm";
+        let sans = label_width(text, Style::new());
+        let mono = label_width(text, Style::new().monospace());
+        assert!(
+            (sans - mono).abs() > 1.0,
+            "the same string should measure differently in each family: {sans} vs {mono}"
+        );
+    }
+
+    #[test]
+    fn monospace_composes_with_weight_and_size() {
+        let base = label_width("fn main", Style::new().monospace());
+        let bold = label_width("fn main", Style::new().monospace().bold());
+        let big = label_width("fn main", Style::new().monospace().font_size(30.0));
+        assert!(bold >= base, "bold is a real face, not a fallback to sans");
+        assert!(big > base * 1.5, "and size still scales it");
     }
 
     #[test]

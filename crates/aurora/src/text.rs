@@ -1,8 +1,8 @@
 //! aurora text: the bundled default font, the font system, and text metrics (ADR 0013).
 
-use cosmic_text::{Attrs, FontSystem, Metrics, Weight, fontdb};
+use cosmic_text::{Attrs, Family, FontSystem, Metrics, Weight, fontdb};
 
-use crate::widget::FontWeight;
+use crate::widget::{Face, FontFamily, FontWeight};
 
 /// Default UI font size, in pixels.
 pub(crate) const FONT_SIZE: f32 = 15.0;
@@ -15,6 +15,16 @@ pub(crate) const LINE_HEIGHT: f32 = 20.0;
 const DEJAVU_SANS: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
 const DEJAVU_SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf");
 const DEJAVU_SANS_LIGHT: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-ExtraLight.ttf");
+
+/// DejaVu Sans Mono (Regular, Bold), bundled for the same reason: a code editor
+/// needs a fixed pitch, and one that depends on the host having a monospace font
+/// installed would lay out differently on different machines.
+const DEJAVU_MONO: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono.ttf");
+const DEJAVU_MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono-Bold.ttf");
+
+/// The bundled families, by their names in the font database.
+const SANS_FAMILY: &str = "DejaVu Sans";
+const MONO_FAMILY: &str = "DejaVu Sans Mono";
 
 /// Metrics for an arbitrary font size, keeping the default's line-height ratio
 /// so larger text stays proportionally spaced.
@@ -39,24 +49,31 @@ pub(crate) fn default_attrs() -> Attrs<'static> {
     Attrs::new()
 }
 
-/// Text attributes at `weight`, so shaping selects the matching bundled face.
-pub(crate) fn attrs_for(weight: FontWeight) -> Attrs<'static> {
-    let w = match weight {
+/// Text attributes for `face`, so shaping selects the matching bundled font.
+pub(crate) fn attrs_for(face: Face) -> Attrs<'static> {
+    let weight = match face.weight {
         FontWeight::Light => Weight(250),
         FontWeight::Normal => Weight::NORMAL,
         FontWeight::Bold => Weight::BOLD,
     };
-    Attrs::new().weight(w)
+    let family = match face.family {
+        FontFamily::Sans => Family::Name(SANS_FAMILY),
+        FontFamily::Mono => Family::Name(MONO_FAMILY),
+    };
+    Attrs::new().weight(weight).family(family)
 }
 
 /// A font system pre-loaded with only the bundled faces - no slow system-font
-/// scan, and fully deterministic. All faces share the "DejaVu Sans" family, so a
-/// requested weight resolves to the nearest bundled face.
+/// scan, and fully deterministic. Within a family the requested weight resolves
+/// to the nearest bundled face.
 pub(crate) fn make_font_system() -> FontSystem {
     let mut db = fontdb::Database::new();
     db.load_font_data(DEJAVU_SANS.to_vec());
     db.load_font_data(DEJAVU_SANS_BOLD.to_vec());
     db.load_font_data(DEJAVU_SANS_LIGHT.to_vec());
-    db.set_sans_serif_family("DejaVu Sans");
+    db.load_font_data(DEJAVU_MONO.to_vec());
+    db.load_font_data(DEJAVU_MONO_BOLD.to_vec());
+    db.set_sans_serif_family(SANS_FAMILY);
+    db.set_monospace_family(MONO_FAMILY);
     FontSystem::new_with_locale_and_db("en-US".to_string(), db)
 }
