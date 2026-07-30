@@ -2652,6 +2652,21 @@ impl State {
             self.toggle_find();
             return true;
         }
+        // ctrl+m jumps to the matching bracket - the other half of highlighting
+        // it, and how you get from the top of a long block to its end.
+        if c.eq_ignore_ascii_case("m")
+            && let Some(editor) = self.rows.code_editor
+            && self.ui.focused() == Some(editor)
+        {
+            if let Some(at) = self.ui.caret_offset()
+                && let Some(partner) =
+                    comet::service::bracket_at(&self.script_text, at).and_then(|b| b.partner)
+            {
+                self.ui.focus_caret(editor, partner.end as usize);
+                self.dirty = true;
+            }
+            return true;
+        }
         // With the code editor focused, ctrl+z/y walk the script's own text
         // history rather than the scene's - undoing a typo should not also undo
         // moving a sprite.
@@ -4009,6 +4024,29 @@ impl State {
             },
             style: aurora::DecorationStyle::Squiggle,
         }));
+        // The bracket the caret is touching, and its partner - or the bracket
+        // itself marked in the error color when it has none. comet is entirely
+        // braces and the pane has no folding or indent guides, so this is the
+        // only way to pair a `}` with its `{`.
+        if self.ui.focused() == Some(editor)
+            && let Some(at) = self.ui.caret_offset()
+            && let Some(bracket) = comet::service::bracket_at(&self.script_text, at)
+        {
+            let (color, style) = match bracket.partner {
+                Some(_) => (theme.code_function, aurora::DecorationStyle::Highlight),
+                None => (theme.code_error, aurora::DecorationStyle::Underline),
+            };
+            for span in [Some(bracket.span), bracket.partner].into_iter().flatten() {
+                decorations.push(aurora::Decoration {
+                    range: span.start as usize..span.end as usize,
+                    color: match style {
+                        aurora::DecorationStyle::Highlight => color.fade(0.45),
+                        _ => color,
+                    },
+                    style,
+                });
+            }
+        }
         self.ui.set_decorations(editor, decorations);
     }
 

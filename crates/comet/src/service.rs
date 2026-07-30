@@ -123,6 +123,95 @@ pub fn highlight(source: &str) -> Vec<TokenSpan> {
     out
 }
 
+// --- brackets ---
+
+/// One bracket in the source, and what it pairs with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bracket {
+    pub span: Span,
+    /// The partner's span, or `None` for one that never matched.
+    pub partner: Option<Span>,
+    /// How deeply nested this pair is, outermost 0.
+    pub depth: usize,
+    pub open: bool,
+}
+
+/// Every bracket in `source`, paired where it can be.
+///
+/// Built off the same lexer everything else uses, so a brace inside a string or
+/// a comment is not a brace - which is exactly the case a hand-rolled scan over
+/// the characters gets wrong, and the reason this lives in comet rather than in
+/// the editor.
+pub fn brackets(source: &str) -> Vec<Bracket> {
+    let (tokens, _) = crate::lexer::lex(source);
+    let mut out: Vec<Bracket> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    for token in &tokens {
+        let (open, closes) = match token.kind {
+            TokenKind::LBrace => (true, None),
+            TokenKind::LParen => (true, None),
+            TokenKind::RBrace => (false, Some(TokenKind::LBrace)),
+            TokenKind::RParen => (false, Some(TokenKind::LParen)),
+            _ => continue,
+        };
+        if open {
+            stack.push(out.len());
+            out.push(Bracket {
+                span: token.span,
+                partner: None,
+                depth: stack.len() - 1,
+                open: true,
+            });
+            continue;
+        }
+        // Only pair with a matching opener. A `)` closing a `{` is a mistake in
+        // both places, so neither gets a partner and both can be marked.
+        let matched = stack
+            .last()
+            .copied()
+            .filter(|&i| kind_of(&tokens, out[i].span) == closes);
+        match matched {
+            Some(i) => {
+                stack.pop();
+                let span = token.span;
+                out[i].partner = Some(span);
+                out.push(Bracket {
+                    span,
+                    partner: Some(out[i].span),
+                    depth: out[i].depth,
+                    open: false,
+                });
+            }
+            None => out.push(Bracket {
+                span: token.span,
+                partner: None,
+                depth: stack.len(),
+                open: false,
+            }),
+        }
+    }
+    out
+}
+
+fn kind_of(tokens: &[crate::lexer::Token], span: Span) -> Option<TokenKind> {
+    tokens
+        .iter()
+        .find(|t| t.span == span)
+        .map(|t| t.kind.clone())
+}
+
+/// The bracket the caret at `offset` is touching - on either side of it - and
+/// its partner.
+///
+/// Touching either side is what makes this usable: a caret sitting just after a
+/// `}` is what it feels like to have "just typed" one.
+pub fn bracket_at(source: &str, offset: usize) -> Option<Bracket> {
+    brackets(source).into_iter().find(|b| {
+        let (lo, hi) = (b.span.start as usize, b.span.end as usize);
+        offset == lo || offset == hi
+    })
+}
+
 // --- completions ---
 
 /// What kind of thing a completion offers, so an editor can icon or sort them.
@@ -482,6 +571,62 @@ func third(c: f32) { let x = nope; }
         let spans = highlight(source);
         assert!(spans.windows(2).all(|w| w[0].span.end <= w[1].span.start));
         assert!(spans.iter().all(|s| s.span.end <= source.len() as u32));
+    }
+
+    // --- brackets ---
+
+    #[test]
+    fn brackets_pair_up_and_nest() {
+        let source = "func f() { if a { } }";
+        let all = brackets(source);
+        assert_eq!(all.len(), 6, "two parens, four braces");
+        let open_body = all.iter().find(|b| b.span.start == 9).expect("the body");
+        assert_eq!(open_body.partner.map(|p| p.start), Some(20));
+        assert_eq!(open_body.depth, 0);
+        let inner = all
+            .iter()
+            .find(|b| b.span.start == 16)
+            .expect("the if body");
+        assert_eq!(inner.depth, 1, "nested one deeper");
+        assert!(all.iter().all(|b| b.partner.is_some()));
+    }
+
+    #[test]
+    fn a_brace_in_a_string_or_a_comment_is_not_a_brace() {
+        // The reason this lives in comet: a scan over the raw characters counts
+        // these, and then every brace after them pairs with the wrong partner.
+        let source = "func f() { let s = \"{{{\"; // }}}\n }";
+        let all = brackets(source);
+        assert_eq!(all.len(), 4, "two parens and two real braces: {all:?}");
+        assert!(all.iter().all(|b| b.partner.is_some()));
+    }
+
+    #[test]
+    fn an_unmatched_bracket_has_no_partner() {
+        let all = brackets("func f() {");
+        let brace = all.iter().find(|b| b.open && b.span.start == 9).unwrap();
+        assert_eq!(brace.partner, None, "never closed");
+
+        let all = brackets("} func f() { }");
+        let stray = all.first().expect("the stray closer");
+        assert!(!stray.open);
+        assert_eq!(stray.partner, None);
+    }
+
+    #[test]
+    fn a_pair_closed_by_the_wrong_bracket_matches_neither() {
+        // Both ends are wrong, and marking both is what tells you which two.
+        let all = brackets("func f( }");
+        assert!(all.iter().all(|b| b.partner.is_none()), "{all:?}");
+    }
+
+    #[test]
+    fn the_caret_finds_a_bracket_on_either_side_of_it() {
+        // Just after a `}` is what "just typed one" feels like.
+        let source = "func f() { }";
+        assert!(bracket_at(source, 9).is_some(), "before the brace");
+        assert!(bracket_at(source, 10).is_some(), "just after it");
+        assert!(bracket_at(source, 5).is_none(), "in the middle of a name");
     }
 
     // --- completions ---
