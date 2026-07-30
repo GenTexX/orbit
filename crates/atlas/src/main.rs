@@ -332,6 +332,16 @@ struct State {
     script_diagnostics: Vec<comet::Diagnostic>,
     /// The open script's syntax colors from the last service run.
     script_spans: Vec<aurora::TextSpan>,
+    /// How the open script was encoded on disk, so a save writes it back the
+    /// same way.
+    script_encoding: TextEncoding,
+    /// Set when the window should close - after the unsaved-changes question, if
+    /// there was one. The event loop reads it once per frame.
+    quit_requested: bool,
+    /// The open script's file was deleted or moved out from under the buffer.
+    /// The text stays; the header says so, and Save is unavailable until it is
+    /// opened somewhere real again.
+    script_orphaned: bool,
     /// Text undo for the Code pane: snapshots of the buffer and where the caret
     /// was, newest last.
     ///
@@ -478,6 +488,74 @@ fn coalesces(before: &str, after: &str) -> bool {
         .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
+/// How the open script's bytes were encoded on disk, so a save writes it back
+/// the way it came rather than quietly rewriting the whole file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct TextEncoding {
+    /// The file began with a UTF-8 byte-order mark.
+    bom: bool,
+    /// Its dominant line ending was CRLF.
+    crlf: bool,
+}
+
+impl TextEncoding {
+    /// Decode `raw`, returning the text with LF endings and no BOM, plus what
+    /// was stripped. `None` when the bytes are not UTF-8.
+    ///
+    /// The buffer always holds LF: a CRLF file otherwise puts a carriage return
+    /// inside every line, which shifts every column by one and makes comet
+    /// report diagnostics one character off.
+    fn decode(raw: &[u8]) -> Option<(String, Self)> {
+        let bom = raw.starts_with(&[0xEF, 0xBB, 0xBF]);
+        let body = if bom { &raw[3..] } else { raw };
+        let text = std::str::from_utf8(body).ok()?;
+        let crlf = text.matches("\r\n").count() * 2 > text.matches('\n').count();
+        Some((
+            text.replace("\r\n", "\n").replace('\r', "\n"),
+            Self { bom, crlf },
+        ))
+    }
+
+    /// Put back what decoding took off.
+    fn encode(self, text: &str) -> String {
+        let body = if self.crlf {
+            text.replace('\n', "\r\n")
+        } else {
+            text.to_string()
+        };
+        if self.bom {
+            format!("\u{feff}{body}")
+        } else {
+            body
+        }
+    }
+}
+
+/// Write `bytes` to `path` without ever leaving it half-written: a temp sibling
+/// is written and flushed first, then renamed over the target.
+///
+/// `std::fs::write` truncates the file before it writes, so a crash or a full
+/// disk mid-save leaves an empty or partial script and the original is gone. The
+/// temp name starts with a dot so the file explorer, which hides dotfiles, does
+/// not flicker it into the list.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp = path.with_file_name(format!(".{name}.tmp"));
+    {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(err)
+        }
+    }
+}
+
 /// What a find-bar button does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FindAction {
@@ -521,7 +599,16 @@ impl ApplicationHandler for App {
             return;
         };
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Ask before dropping unsaved script edits. Scene edits are
+                // tracked separately (history.revision vs saved_revision) and
+                // get the same guard.
+                if state.close_would_lose_work() {
+                    state.ask_before_quitting();
+                } else {
+                    event_loop.exit();
+                }
+            }
             WindowEvent::Resized(size) => state.resize((size.width, size.height)),
             WindowEvent::CursorMoved { position, .. } => {
                 // Record only; draw() applies the newest position once per frame
@@ -651,6 +738,9 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 if let Err(err) = state.draw() {
                     tracing::error!("render error: {err:#}");
+                }
+                if state.quit_requested {
+                    event_loop.exit();
                 }
             }
             _ => {}
@@ -787,6 +877,7 @@ impl State {
             None,
             "",
             false,
+            false,
             &[],
             &theme,
         );
@@ -839,6 +930,9 @@ impl State {
             script_modified: false,
             script_diagnostics: Vec::new(),
             script_spans: Vec::new(),
+            script_encoding: TextEncoding::default(),
+            quit_requested: false,
+            script_orphaned: false,
             script_undo: Vec::new(),
             script_redo: Vec::new(),
             script_caret: 0,
@@ -1518,7 +1612,90 @@ impl State {
         match action {
             ModalAction::Close => self.close_modal(),
             ModalAction::SaveSettings => self.save_settings_from_modal(),
+            ModalAction::SaveThenProceed => {
+                let quitting = matches!(
+                    self.modal.as_ref().map(|m| &m.body),
+                    Some(modal::ModalBody::Confirm(c)) if c.pending == modal::Pending::Quit
+                );
+                if quitting && self.is_modified() {
+                    self.save_project();
+                }
+                if self.script_dirty() {
+                    self.save_script();
+                }
+                // A failed save opens its own modal saying why; going ahead
+                // then would throw away the work the save was meant to keep.
+                if !self.script_dirty() {
+                    self.proceed_with_pending();
+                }
+            }
+            ModalAction::DiscardAndProceed => {
+                self.script_modified = false;
+                self.proceed_with_pending();
+            }
         }
+    }
+
+    /// Do the thing the unsaved-changes question was guarding.
+    fn proceed_with_pending(&mut self) {
+        let pending = match self.modal.as_ref().map(|m| &m.body) {
+            Some(modal::ModalBody::Confirm(c)) => c.pending.clone(),
+            _ => return,
+        };
+        self.close_modal();
+        match pending {
+            modal::Pending::Quit => self.quit_requested = true,
+            modal::Pending::OpenScript(path) => self.open_script_file(&path),
+        }
+    }
+
+    /// Keep the open script's path pointing at the file it is actually in.
+    ///
+    /// `to` is where the file went, or `None` if it is gone. A deleted file
+    /// leaves the buffer open and orphaned rather than closing it: the text is
+    /// still the user's, and losing it because a file was deleted in another
+    /// pane would be worse than a header that says the file is missing.
+    fn follow_open_script(&mut self, from: &std::path::Path, to: Option<&std::path::Path>) {
+        let Some(open) = self.open_script.clone() else {
+            return;
+        };
+        let current = self.project_dir.join(&open);
+        if current != from {
+            return;
+        }
+        match to.and_then(|p| self.explorer.project_relative(p)) {
+            Some(relative) => self.open_script = Some(relative),
+            None => {
+                self.open_script = None;
+                self.script_orphaned = true;
+                // The text is still unsaved work; keep it and say so.
+                self.script_modified = true;
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Whether dropping the open buffer now would lose work.
+    fn script_dirty(&self) -> bool {
+        self.open_script.is_some() && self.script_modified
+    }
+
+    /// Whether quitting right now would throw away unsaved work of any kind.
+    fn close_would_lose_work(&self) -> bool {
+        self.script_dirty() || self.is_modified()
+    }
+
+    /// Ask before closing the window over unsaved work.
+    fn ask_before_quitting(&mut self) {
+        let what = match (self.script_dirty(), self.is_modified()) {
+            (true, true) => "The scene and the open script have unsaved changes.",
+            (true, false) => "The open script has unsaved changes.",
+            _ => "The scene has unsaved changes.",
+        };
+        self.open_modal(modal::Modal::confirm(
+            format!("{what} Save before closing?"),
+            modal::Pending::Quit,
+        ));
     }
 
     /// Apply and persist the settings draft, folding in each numeric input's live
@@ -3078,18 +3255,41 @@ impl State {
     /// Open `path` in the Code pane, reading it from disk. A read failure is
     /// reported rather than leaving a stale buffer claiming to be the new file.
     fn open_script_file(&mut self, path: &std::path::Path) {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
+        // Replacing a buffer with unsaved edits would drop them silently.
+        if self.script_dirty() {
+            let name = self.open_script.clone().unwrap_or_default();
+            self.open_modal(modal::Modal::confirm(
+                format!("{name} has unsaved changes. Save them before opening another script?"),
+                modal::Pending::OpenScript(path.to_path_buf()),
+            ));
+            return;
+        }
+        let raw = match std::fs::read(path) {
+            Ok(raw) => raw,
             Err(err) => {
                 self.open_modal(modal::Modal::error("Cannot open script", &err));
                 return;
             }
         };
+        // A file that is not UTF-8 is refused by name rather than opened as
+        // replacement characters and then saved back over the original.
+        let (text, encoding) = match TextEncoding::decode(&raw) {
+            Some(decoded) => decoded,
+            None => {
+                self.open_modal(modal::Modal::report(
+                    "Cannot open script",
+                    format!("{} is not valid UTF-8 text", path.display()),
+                ));
+                return;
+            }
+        };
+        self.script_encoding = encoding;
         let relative = self
             .explorer
             .project_relative(path)
             .unwrap_or_else(|| path.display().to_string());
         self.open_script = Some(relative);
+        self.script_orphaned = false;
         self.script_text = text;
         self.script_modified = false;
         self.analyze_script();
@@ -3097,13 +3297,15 @@ impl State {
         self.dirty = true;
     }
 
-    /// Write the Code pane's buffer back to its file.
+    /// Write the Code pane's buffer back to its file, in the encoding it came
+    /// in: the line endings it had, and its byte-order mark if it had one.
     fn save_script(&mut self) {
         let Some(relative) = self.open_script.clone() else {
             return;
         };
         let path = self.project_dir.join(&relative);
-        match std::fs::write(&path, &self.script_text) {
+        let body = self.script_encoding.encode(&self.script_text);
+        match write_atomic(&path, body.as_bytes()) {
             Ok(()) => {
                 self.script_modified = false;
                 self.dirty = true;
@@ -3194,6 +3396,9 @@ impl State {
         }
         if moved > 0 {
             tracing::info!("moved {moved} item(s) to {}/.orbit/trash", root.display());
+            for path in &sel {
+                self.follow_open_script(path, None);
+            }
         }
         self.after_file_change(&[]);
         if let Some(err) = first_err {
@@ -3261,6 +3466,10 @@ impl State {
         self.explorer.set_renaming(None);
         match file_ops::rename(old, name.trim()) {
             Ok(new_path) => {
+                // If that was the open script, follow it - otherwise the next
+                // save writes to a path that no longer exists and quietly
+                // recreates the old file.
+                self.follow_open_script(old, Some(&new_path));
                 self.explorer.rescan();
                 self.thumbnails.invalidate(&mut self.gui);
                 self.explorer.select_one(&new_path);
@@ -3853,6 +4062,7 @@ impl State {
                 self.open_script.as_deref(),
                 &self.script_text,
                 self.script_modified,
+                self.script_orphaned,
                 &self.tab_bars,
                 &self.theme,
             );
@@ -4651,7 +4861,7 @@ fn translate_key(event: &winit::event::KeyEvent, ctrl: bool) -> Vec<InputEvent> 
 
 #[cfg(test)]
 mod tests {
-    use super::{coalesces, word_before};
+    use super::{TextEncoding, coalesces, word_before, write_atomic};
 
     #[test]
     fn typing_a_word_joins_one_undo_step_and_anything_else_starts_a_new_one() {
@@ -4665,6 +4875,63 @@ mod tests {
         assert!(!coalesces("let xy", "let x"));
         assert!(!coalesces("let x", "let xyz"));
         assert!(!coalesces("let x", "Xlet x"));
+    }
+
+    #[test]
+    fn a_files_line_endings_and_bom_survive_a_round_trip() {
+        // The buffer always holds LF - a carriage return inside every line
+        // shifts every column by one and makes comet report diagnostics one
+        // character off - but the file gets back what it came with.
+        let crlf = b"let a = 1;\r\nlet b = 2;\r\n";
+        let (text, enc) = TextEncoding::decode(crlf).expect("valid utf-8");
+        assert_eq!(text, "let a = 1;\nlet b = 2;\n", "LF in the buffer");
+        assert!(enc.crlf);
+        assert_eq!(enc.encode(&text).as_bytes(), crlf);
+
+        // A BOM is stripped so it is not a stray character the lexer squiggles,
+        // and written back so the file is not silently rewritten.
+        let bom = "\u{feff}let a = 1;\n".as_bytes();
+        let (text, enc) = TextEncoding::decode(bom).unwrap();
+        assert_eq!(text, "let a = 1;\n", "no invisible character in the buffer");
+        assert!(enc.bom);
+        assert_eq!(enc.encode(&text).as_bytes(), bom);
+
+        // A plain LF file stays exactly as it was.
+        let plain = b"let a = 1;\n";
+        let (text, enc) = TextEncoding::decode(plain).unwrap();
+        assert_eq!(enc, TextEncoding::default());
+        assert_eq!(enc.encode(&text).as_bytes(), plain);
+
+        // Mixed endings normalise to whichever dominates.
+        let (_, enc) = TextEncoding::decode(b"a\r\nb\r\nc\n").unwrap();
+        assert!(enc.crlf, "two of three lines are CRLF");
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_are_refused_rather_than_mangled() {
+        // Opening them as replacement characters would then save that back over
+        // the original, which is how a file gets destroyed by being looked at.
+        assert!(TextEncoding::decode(&[0xff, 0xfe, 0x00]).is_none());
+    }
+
+    #[test]
+    fn a_save_never_leaves_the_file_half_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script.cmt");
+        write_atomic(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        write_atomic(&path, b"second, longer").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second, longer");
+
+        // And the temp sibling is gone, and was a dotfile so the explorer -
+        // which hides those - never flickered it into the list.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "script.cmt")
+            .collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
     }
 
     #[test]

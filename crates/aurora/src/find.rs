@@ -20,6 +20,7 @@ use std::ops::Range;
 
 use glam::Vec2;
 
+use crate::input::Key;
 use crate::style::Style;
 use crate::theme::Theme;
 use crate::ui::Ui;
@@ -37,6 +38,15 @@ pub struct FindRows {
     pub replace_all: Option<WidgetId>,
     pub match_case: Option<WidgetId>,
     pub close: Option<WidgetId>,
+}
+
+/// What a key did to an open find bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindKey {
+    /// The current match moved; reveal it.
+    Stepped,
+    /// The bar has no use for this key - the field underneath should get it.
+    Ignored,
 }
 
 /// A find-and-replace bar over one text area.
@@ -144,6 +154,27 @@ impl FindBar {
         }
         self.current = (self.current + self.matches.len() - 1) % self.matches.len();
         self.current()
+    }
+
+    /// Offer a key to the bar while one of its fields has focus.
+    ///
+    /// Enter steps to the next match and shift+Enter to the previous, without
+    /// letting focus leave the bar. The query field is single-line, so aurora's
+    /// own Enter would step focus into the replacement field and the app's
+    /// submit handler would then select a match - putting the caret in the
+    /// source file, where the next keystroke would be typed into the code.
+    pub fn key(&mut self, key: Key, shift: bool) -> FindKey {
+        match key {
+            Key::Enter if shift => {
+                self.find_previous();
+                FindKey::Stepped
+            }
+            Key::Enter => {
+                self.find_next();
+                FindKey::Stepped
+            }
+            _ => FindKey::Ignored,
+        }
     }
 
     /// The readout beside the query field: which match you are on, or that the
@@ -377,6 +408,23 @@ mod tests {
         bar.set_query("POS", text);
         let range = bar.current().expect("found");
         assert_eq!(&text[range], "pos", "the range still slices the real text");
+    }
+
+    #[test]
+    fn enter_steps_matches_and_keeps_focus_in_the_bar() {
+        // The defect: the query field is single-line, so Enter stepped focus
+        // into the replacement field and the app's submit handler then selected
+        // a match - putting the caret in the source, where the next keystroke
+        // was typed into the code.
+        let mut bar = bar("pos");
+        assert_eq!(bar.key(Key::Enter, false), FindKey::Stepped);
+        assert_eq!(bar.position(), Some(2));
+        assert_eq!(bar.key(Key::Enter, true), FindKey::Stepped);
+        assert_eq!(bar.position(), Some(1), "shift steps back");
+
+        // Anything else is the field's, so typing still works.
+        assert_eq!(bar.key(Key::Left, false), FindKey::Ignored);
+        assert_eq!(bar.key(Key::Backspace, false), FindKey::Ignored);
     }
 
     #[test]

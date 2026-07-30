@@ -199,7 +199,12 @@ pub fn completions_at(source: &str, offset: usize) -> Vec<CompletionItem> {
     for name in KEYWORDS {
         items.push(item(name, CompletionKind::Keyword));
     }
-    items.dedup_by(|a, b| a.label == b.label && a.kind == b.kind);
+    // dedup_by only removes ADJACENT duplicates, and the same name reaching the
+    // list from two scopes - a parameter shadowed by a local, a function whose
+    // name is also a variable - is not adjacent. Keep the first, which is the
+    // most specific: locals come before globals, which come before keywords.
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|item| seen.insert(item.label.clone()));
     items
 }
 
@@ -492,6 +497,27 @@ func third(c: f32) { let x = nope; }
     fn at_caret(source: &str) -> Vec<String> {
         let offset = source.find('|').expect("mark the caret with |");
         labels(&source.replace('|', ""), offset)
+    }
+
+    #[test]
+    fn a_name_in_two_scopes_is_offered_once() {
+        // dedup_by only removes adjacent duplicates, so a shadowed name came
+        // back twice with the two entries nowhere near each other in the list.
+        let offered = at_caret(
+            "let speed = 1.0;
+             func update(speed: f32) {
+                 let speed = speed;
+                 |
+             }",
+        );
+        assert_eq!(
+            offered.iter().filter(|l| *l == "speed").count(),
+            1,
+            "{offered:?}"
+        );
+        // And a function whose name is also a type name is still offered once.
+        let offered = at_caret("func f32() { }\nfunc update(dt: f32) { | }");
+        assert_eq!(offered.iter().filter(|l| *l == "f32").count(), 1);
     }
 
     #[test]

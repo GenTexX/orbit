@@ -540,6 +540,7 @@ pub fn build_editor_ui(
     open_script: Option<&str>,
     script_text: &str,
     script_modified: bool,
+    script_orphaned: bool,
     tab_bars: &[TabBar],
     theme: &EditorTheme,
 ) -> (Ui, EditorRows) {
@@ -581,6 +582,7 @@ pub fn build_editor_ui(
         open_script,
         script_text,
         script_modified,
+        script_orphaned,
         tab_bars,
         theme,
     };
@@ -628,6 +630,8 @@ struct PaneCtx<'a> {
     script_text: &'a str,
     /// Whether the open script has unsaved edits.
     script_modified: bool,
+    /// The buffer's file was deleted or moved away underneath it.
+    script_orphaned: bool,
     /// One tab bar per dock group, in the order the dock is walked. aurora owns
     /// their interaction and animation state; the shell just hands them over.
     tab_bars: &'a [TabBar],
@@ -841,6 +845,9 @@ fn build_code_pane(ui: &mut Ui, parent: WidgetId, ctx: &PaneCtx, rows: &mut Edit
     let caption = match ctx.open_script {
         Some(path) if ctx.script_modified => format!("{path} *"),
         Some(path) => path.to_string(),
+        None if ctx.script_orphaned => {
+            "The file this script was in is gone - Save As to keep it".to_string()
+        }
         None => "No script open - double-click a .cmt file".to_string(),
     };
     ui.label(
@@ -869,8 +876,9 @@ fn build_code_pane(ui: &mut Ui, parent: WidgetId, ctx: &PaneCtx, rows: &mut Edit
     }
 
     // Without a script open there is nothing to edit - an empty editor would
-    // invite typing into a buffer with nowhere to go.
-    if ctx.open_script.is_none() {
+    // invite typing into a buffer with nowhere to go. An orphaned buffer is the
+    // exception: its text is still the user's, and hiding it would lose it.
+    if ctx.open_script.is_none() && !ctx.script_orphaned {
         return;
     }
     let editor = ui.text_input(
@@ -1283,6 +1291,15 @@ pub fn build_modal(
                     .foreground(theme.aurora.subhead),
             );
         }
+        ModalBody::Confirm(confirm) => {
+            ui.label(
+                card,
+                confirm.message.clone(),
+                Style::new()
+                    .width(MODAL_W - 32.0)
+                    .foreground(theme.aurora.subhead),
+            );
+        }
         ModalBody::Settings(draft) => build_settings_body(ui, card, draft, theme, rows),
         ModalBody::AssetChooser(chooser) => {
             build_asset_chooser_body(ui, card, chooser, thumbnails, icons, theme, rows);
@@ -1295,6 +1312,13 @@ pub fn build_modal(
     ui.panel(footer, Style::new().grow(1.0));
     let buttons: &[(&str, ModalAction)] = match &modal.body {
         ModalBody::Message(_) => &[("OK", ModalAction::Close)],
+        // Save last, so the accented default is the answer that cannot lose
+        // work; Cancel first, so the destructive one is not next to it.
+        ModalBody::Confirm(_) => &[
+            ("Cancel", ModalAction::Close),
+            ("Discard", ModalAction::DiscardAndProceed),
+            ("Save", ModalAction::SaveThenProceed),
+        ],
         ModalBody::Settings(_) => &[
             ("Cancel", ModalAction::Close),
             ("Save", ModalAction::SaveSettings),
@@ -2911,6 +2935,7 @@ mod tests {
             None,
             "",
             false,
+            false,
             &[],
             theme,
         )
@@ -2969,6 +2994,7 @@ mod tests {
             true,
             None,
             "",
+            false,
             false,
             &[],
             &EditorTheme::default(),
@@ -3371,6 +3397,7 @@ mod tests {
             None,
             "",
             false,
+            false,
             &[],
             &EditorTheme::default(),
         )
@@ -3421,6 +3448,7 @@ mod tests {
             true,
             None,
             "",
+            false,
             false,
             &[],
             &EditorTheme::default(),
@@ -3473,6 +3501,7 @@ mod tests {
             true,
             None,
             "",
+            false,
             false,
             &[],
             &EditorTheme::default(),

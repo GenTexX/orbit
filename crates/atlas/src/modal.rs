@@ -29,11 +29,30 @@ pub struct Modal {
 pub enum ModalBody {
     /// A block of message text (an error or an informational notice).
     Message(String),
+    /// A question with three answers, asked before something would drop unsaved
+    /// work: save it, throw it away, or do not do the thing at all.
+    Confirm(Confirm),
     /// The settings form, editing a live draft applied on Save.
     Settings(SettingsDraft),
     /// An image picker: a grid of the project's images; clicking one sets the
     /// target field.
     AssetChooser(AssetChooser),
+}
+
+/// A "you have unsaved changes" question, and what to do once it is answered.
+pub struct Confirm {
+    pub message: String,
+    /// What the caller wanted to do, held until the answer comes back.
+    pub pending: Pending,
+}
+
+/// The action a [`Confirm`] is guarding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pending {
+    /// Close the window.
+    Quit,
+    /// Open a different script into the Code pane.
+    OpenScript(std::path::PathBuf),
 }
 
 /// Which reflected component field an asset chooser writes to.
@@ -86,6 +105,10 @@ pub enum ModalAction {
     Close,
     /// Apply and persist the settings draft, then dismiss.
     SaveSettings,
+    /// Save the open script, then do what the confirm was guarding.
+    SaveThenProceed,
+    /// Throw the unsaved edits away and do it anyway.
+    DiscardAndProceed,
 }
 
 /// A field of the settings form, so a clicked checkbox / submitted input maps
@@ -120,6 +143,20 @@ impl Modal {
             title: title.into(),
             closable: true,
             body: ModalBody::Message(humanize(&err.to_string())),
+        }
+    }
+
+    /// Ask before dropping unsaved work. Not closable by Escape alone: the
+    /// three answers are the only ways out, because dismissing it would have to
+    /// mean one of them and there is no safe guess.
+    pub fn confirm(message: impl Into<String>, pending: Pending) -> Self {
+        Self {
+            title: "Unsaved changes".to_string(),
+            closable: true,
+            body: ModalBody::Confirm(Confirm {
+                message: message.into(),
+                pending,
+            }),
         }
     }
 
@@ -182,6 +219,10 @@ impl Modal {
     pub fn default_action(&self) -> ModalAction {
         match self.body {
             ModalBody::Settings(_) => ModalAction::SaveSettings,
+            // Enter on an unsaved-changes question saves. Of the three answers
+            // it is the only one that cannot lose work, which is what a default
+            // has to be.
+            ModalBody::Confirm(_) => ModalAction::SaveThenProceed,
             ModalBody::Message(_) | ModalBody::AssetChooser(_) => ModalAction::Close,
         }
     }
