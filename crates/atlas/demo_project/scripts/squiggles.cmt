@@ -1,0 +1,16 @@
+// This file is wrong on purpose. Open it in the Code pane to see what the
+// compiler says while you type - every mistake below has a squiggle waiting,
+// and they all appear at once rather than stopping at the first.
+
+let ready = true;
+
+func update(dt: f32) {
+    // A bool is not a number.
+    pos.x += ready;
+
+    // Nothing here is called `speed`.
+    pos.y = speed;
+
+    // print takes a String.
+    print(dt);
+}

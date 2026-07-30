@@ -10,12 +10,10 @@ and repeat for as long as we want. Iteration work is not part of the
 milestone itself. When an idea ships, delete its entry (git history
 remembers); when one dies, delete it too.
 
-Seeded after M3 (2026-07-23), swept on 2026-07-28, and swept again on
-2026-07-30 after the six iteration-phase reports (3.1-3.6) were written - the
-writing itself was an audit, and it retired a further round of entries. What remains is
-grouped below, with three new sections the first pass did not have: the work
-that unblocks Comet (M4), the teaching surface the project is named for, and
-the tooling that keeps quality from silently regressing.
+Seeded after M3 (2026-07-23), swept on 2026-07-28, swept again on 2026-07-30
+after the six iteration-phase reports (3.1-3.6) were written - the writing
+itself was an audit - and swept on 2026-07-31 when M4 shipped, which retired
+the whole "Toward Comet" section by building all six of its entries.
 
 ## Where the project actually stands
 
@@ -26,19 +24,23 @@ The editor and the GUI framework are the mature part of Orbit: atlas is
 roughly six times as much authoring tool as engine. `comet` and `voyager` are
 still one-line stubs. Concretely, that means:
 
-- **helios has exactly one component: `Sprite`.** The Node/Component model,
-  reflection, serialization, and undo all work - but there is only one kind of
-  capability to attach. This is why "Add Component UI" keeps not happening:
-  there is nothing to add.
+- **helios has two components: `Sprite` and `Script`.** M4 added the second,
+  which is what finally makes an Add/Remove Component UI worth building - and
+  it arrived with the history edits (`add_component`/`remove_component`) that
+  such a UI needs. A third kind is still the thing that would prove the model.
 - **photon draws exactly one thing: textured quads.** The editor's grid, axes,
   and gizmos are all faked with sprites (`grid_sprites`, `gizmo_sprites`).
   There are no line, circle, or arc primitives, and no world-space text.
 - **There is no input abstraction in the engine**, so nothing can be played
-  even in principle.
+  even in principle. M4 got as far as a script moving a node from a test;
+  nothing calls it per frame, which is M5's job.
 
 So the next few bundles have a choice to make: keep polishing the authoring
 experience, or start giving the engine something worth authoring. The scene
-you can edit so nicely is still, today, a pile of static sprites.
+you can edit so nicely is still, today, a pile of static sprites - but as of
+M4 one of them can be handed a script that provably moves it, and the only
+missing piece between here and watching that happen is something calling
+`update` once a frame.
 
 ## Engine (helios / photon)
 
@@ -73,29 +75,6 @@ The thinnest part of the project, and the one that gates the most.
 - **Persistent instance buffer**: the standing optimization from the renderer
   notes - write instances in place rather than rebuilding and re-uploading
   every frame. The `instance_pack` benchmark already measures the cost.
-
-## Toward Comet (M4)
-
-M4 wants a code editor with live error squiggles. Some of that is compiler
-work, but these pieces are aurora/atlas work that can land beforehand - and
-two of them are framework changes worth knowing about early.
-
-- **Styled text runs.** `DrawCommand::Text` carries one color for the whole
-  run, and a widget has a single `foreground`. Syntax highlighting needs
-  per-span colors. This is a real widget-model change (a text widget whose
-  content is a list of styled spans), not a tweak - the earlier we decide its
-  shape, the better.
-- **Text decorations**: squiggly/straight underlines in a given color, for
-  error and warning markers. Same draw-list question as styled runs.
-- **A monospace font.** Only DejaVu Sans (Regular/Bold/ExtraLight) is bundled;
-  a code editor needs a fixed-pitch face, and the font stack currently forces
-  one family.
-- **Gutter support**: line numbers, current-line highlight, and a click target
-  per line (breakpoints later). Probably a text-area capability rather than a
-  separate widget.
-- **Find/replace** in a text area, with match highlighting.
-- **Autocomplete popup**: a list positioned at the caret with keyboard
-  selection - the dropdown widget below, plus caret-relative anchoring.
 
 ## Teaching surface
 
@@ -197,15 +176,20 @@ with a mature IDE.
 
 ## Aurora: missing capabilities (framework-level)
 
-Two sweeps have retired most of the original list: scrollbar drag and
+Three sweeps have retired most of the original list: scrollbar drag and
 track-click, Enter-to-next-row, font weights, text-area scrolling, SDF
-anti-aliasing, theming-as-data, ellipsis, the drag ghost and drop highlight, and
-- in the extraction phase - a tab bar, a colour picker, and a draw-time offset
-that layout ignores (`Style::translate`), which is the seed of an animation
-system. What is genuinely still missing:
+anti-aliasing, theming-as-data, ellipsis, the drag ghost and drop highlight;
+in the extraction phase a tab bar, a colour picker, and a draw-time offset that
+layout ignores (`Style::translate`), the seed of an animation system; and in M4
+a monospace face, per-span text colors, decorations, a gutter, find/replace, and
+the list popup that was the standing biggest hole. What is genuinely still
+missing:
 
-- **Dropdown/select widget.** Still the biggest hole: it gates the Add
-  Component UI, asset-kind pickers, and Comet's autocomplete.
+- **A dropdown/select built on the list popup.** `aurora::list` shipped with M4
+  and covers the hard half (filtering, keyboard navigation, windowing, caret
+  anchoring). A closed-set `select` control - a button that opens it, a chosen
+  value, no free text - is a small wrapper nobody has written, and it is what
+  the Add Component UI and asset-kind pickers actually want.
 - **Tooltips as a framework feature** (popup + hover timer). atlas has a
   hand-rolled file tooltip; that pattern should move into aurora so anything
   can have one.
@@ -215,7 +199,9 @@ system. What is genuinely still missing:
   drag-scrub shipped; discrete nudging did not.
 - **Toggle switch** as a friendlier boolean than the checkbox.
 - **Keyboard scrolling** for scroll containers (PgUp/PgDn/Home/End) - there are
-  no key variants for page movement yet.
+  no key variants for page movement yet. M4 made this sting: a code editor
+  without PageUp/PageDown is noticeably worse than one with it, and aurora's
+  `Key` enum is where the gap lives.
 - **DPI awareness.** Font sizes and metrics are physical-pixel constants and
   nothing reads winit's scale factor; on a hidpi display the whole editor will
   be tiny. This will bite the first time Orbit runs on someone else's laptop.

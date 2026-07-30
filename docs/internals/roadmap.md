@@ -31,11 +31,16 @@ This is the milestone spine for Orbit. A **milestone** is a big, demonstrable ca
 
 Two structural lessons came out of it and are worth carrying into M4. **A rebuild destroys retained interaction state**: atlas rebuilds its whole `Ui` on any change, which silently kills a live drag - found three times (a tooltip, a splitter, a tab) before the general answer landed, which is that a gesture must preview with draw-time offsets and commit only on release. And **aurora grew almost entirely by composition**: across 103 commits exactly one `WidgetKind` variant was added, while `Style` went from 4 fields to 25.
 
-### Milestone 4 - Comet (language runs)
+### Milestone 4 - Comet (language runs) (done)
 **Done when:** you write a `.cmt` script, it compiles in milliseconds, runs on wasmtime, and moves a node - and the code editor shows live error squiggles as you type.
 **Proves:** the fast-compile pipeline (lex -> parse -> check -> emit WASM, no optimizer), the wasmtime host, refcounted linear-memory objects, and the in-process language service.
 **Brings online:** `comet` (frontend, WASM emission, language service), the script host in `helios`, the code editor in `atlas`.
 **Plan:** [Milestone 4 - Comet](plans/milestone-4-comet.md) (ADRs 0006, 0007, 0010, 0016).
+**Shipped:** `comet` end to end - an error-tolerant lexer and recursive-descent parser, a type checker emitting a typed IR, single-pass WASM emission via `wasm-encoder` with a refcounted free-list allocator in linear memory, and the in-process language service (diagnostics, syntax classification, completions). `helios::script` - the `Script` component and a wasmtime host binding a module's imports to a live `Node`'s `Transform`. Six aurora capabilities the code editor needed: a bundled monospace face, per-token colored text runs, decorations (squiggles and match highlights) built out of the mechanism selection already used, a line-number gutter that owns its own alignment, a keyboard-driven list popup, and find/replace. In atlas: `Pane::Code` with live squiggles, syntax color, autocomplete, find/replace, word-granular text undo, and drag-a-script-onto-a-node.
+
+**Two things worth remembering.** The compiler was proven by *execution*, not by structure: the type checker proves a script is consistent and wasmparser proves the bytes are a well-formed module, but neither can tell whether `a < b` emitted `f32.lt` or `f32.gt`, whether `&&` really skips its right operand, or whether a release ever reaches the free list. Nineteen tests on a real wasmtime engine against a fake host answer those, and several of them were written to fail if an operand were swapped. And the editor's live feedback costs no rebuild at all: syntax spans and decorations are read when the draw list is built rather than when text is shaped, so re-highlighting on every keystroke regroups glyphs that are already laid out - which is what keeps the caret where it was.
+
+A survey the day after the pane first worked found 229 things it still cannot do, and twenty of them are defects rather than gaps. That list is [code-editor-backlog.md](code-editor-backlog.md); three of its entries were reproduced with a test, and one - Tab replacing a multi-line selection with four spaces - was a same-day regression fixed on the spot.
 
 ### Milestone 5 - Play & Hot Reload
 **Done when:** you attach a Comet script to a node, press Play, the game runs *in the viewport*, and editing the script hot-reloads it live while preserving reflected field values.

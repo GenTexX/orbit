@@ -1,0 +1,28 @@
+// A bouncing node, and a tour of what Comet can do today.
+//
+// A top-level `let` is script state: it runs once, when the script starts, and
+// keeps its value between frames. `pos` is this node's position - read it, or
+// assign to it, to move the node.
+
+let home = pos;
+let speed = 120.0;
+let direction = 1.0;
+
+// Functions declare their types. The last expression in a body, written with
+// no semicolon, is what the function gives back.
+func past_edge(x: f32, edge: f32) -> bool {
+    x > edge || x < -edge
+}
+
+func update(dt: f32) {
+    pos.x += speed * direction * dt;
+
+    if past_edge(pos.x, 200.0) {
+        direction = -direction;
+        print("turned around");
+    }
+
+    // Vec2 is a value, not a reference: `home` still holds where the node
+    // started, however far the line above has moved it since.
+    pos.y = home.y;
+}
