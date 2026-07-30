@@ -133,6 +133,13 @@ impl ListPopup {
         self.matches.get(self.highlighted).copied()
     }
 
+    /// An item's text by its index - what [`ListKey::Accepted`] and
+    /// [`press`](Self::press) name. Without this, being told which item was
+    /// chosen would not be enough to insert it.
+    pub fn item(&self, index: usize) -> Option<&str> {
+        self.items.get(index).map(String::as_str)
+    }
+
     /// The highlighted item's text.
     pub fn highlighted_text(&self) -> Option<&str> {
         Some(self.items[self.highlighted()?].as_str())
@@ -286,6 +293,17 @@ mod tests {
             .iter()
             .map(|&i| list.items[i].as_str())
             .collect()
+    }
+
+    #[test]
+    fn an_accepted_index_can_be_read_back_as_text() {
+        let mut list = list();
+        list.key(Key::Down);
+        let ListKey::Accepted(index) = list.key(Key::Enter) else {
+            panic!("enter accepts");
+        };
+        assert_eq!(list.item(index), Some("print"));
+        assert_eq!(list.item(999), None);
     }
 
     #[test]

@@ -1695,6 +1695,62 @@ impl Ui {
         self.insert_str(ch.encode_utf8(&mut buf));
     }
 
+    /// Indent (or outdent) every line touched by `lo..hi`, and re-select the
+    /// whole of those lines so the same key can be pressed again.
+    fn shift_lines(&mut self, id: WidgetId, lo: usize, hi: usize, outdent: bool) {
+        let Some(text) = self.text_of(id) else {
+            return;
+        };
+        // Grow the range to whole lines: indenting half a line is not a thing,
+        // and re-selecting the whole lines is what makes Tab repeatable.
+        let start = text[..lo].rfind('\n').map_or(0, |at| at + 1);
+        let end = text[hi..].find('\n').map_or(text.len(), |at| hi + at);
+        let block = &text[start..end];
+        let shifted: Vec<String> = block
+            .split('\n')
+            .map(|line| {
+                if outdent {
+                    // Take up to one indent's worth of leading spaces, and a
+                    // lone leading tab, so a mixed file still outdents.
+                    let strip = line
+                        .strip_prefix(INDENT)
+                        .or_else(|| line.strip_prefix('\t'))
+                        .or_else(|| {
+                            let spaces = line.len() - line.trim_start_matches(' ').len();
+                            (spaces > 0).then(|| &line[spaces..])
+                        });
+                    strip.unwrap_or(line).to_string()
+                } else if line.is_empty() {
+                    // An empty line gains nothing: trailing whitespace on a
+                    // blank line is noise, and the next Tab still finds it.
+                    String::new()
+                } else {
+                    format!("{INDENT}{line}")
+                }
+            })
+            .collect();
+        let replacement = shifted.join("\n");
+        let new_end = start + replacement.len();
+        if let WidgetKind::TextInput(s) = &mut self.widgets[id].kind {
+            s.replace_range(start..end, &replacement);
+        }
+        self.selection_anchor = Some(start);
+        self.caret = new_end;
+        self.invalidate_text(id);
+    }
+
+    /// Remove one indent from the caret's own line, leaving the caret in place
+    /// relative to the text around it.
+    fn outdent_line(&mut self, id: WidgetId) {
+        let caret = self.caret;
+        self.shift_lines(id, caret, caret, true);
+        // shift_lines selects the line; an outdent with no selection should not
+        // leave one behind.
+        let text_len = self.text_len(id);
+        self.selection_anchor = None;
+        self.caret = caret.saturating_sub(INDENT.len()).min(text_len);
+    }
+
     /// Apply a named editing key to the focused input.
     fn edit_key(&mut self, key: Key) {
         let Some(id) = self.focused else {
@@ -1721,6 +1777,23 @@ impl Ui {
                 if self.focused == before {
                     self.events.push(Event::Submitted(id));
                 }
+            }
+            return;
+        }
+        // Tab indents in a text area and steps focus everywhere else. In a form
+        // Tab means "next field"; in a code editor it means indentation, and a
+        // Tab that jumped the cursor out of the file would make one unusable.
+        if key == Key::Tab && multiline {
+            let (lo, hi) = self.selection_bounds(id);
+            if lo != hi {
+                // A selection means indent or outdent every line it touches.
+                // Falling through to insert_str here REPLACED the selection with
+                // four spaces: select a function body, reach for Tab, lose it.
+                self.shift_lines(id, lo, hi, self.shift);
+            } else if self.shift {
+                self.outdent_line(id);
+            } else {
+                self.insert_str(INDENT);
             }
             return;
         }
@@ -3190,11 +3263,22 @@ fn inflate_splitter(rect: Rect, orientation: Orientation) -> Rect {
     }
 }
 
+/// What Tab inserts in a text area. Spaces rather than a tab character: a tab's
+/// width depends on who renders it, and code that lines up here should line up
+/// everywhere.
+const INDENT: &str = "    ";
+
 /// A whole-string byte offset as a cosmic-text [`Cursor`] (buffer line index +
 /// byte within that line). Text areas store the caret as a flat byte offset;
 /// cosmic-text positions and hit-tests in (line, index) - these two convert.
 fn byte_to_cursor(text: &str, byte: usize) -> Cursor {
-    let byte = byte.min(text.len());
+    // Snapped to a character boundary, not just clamped: decoration ranges come
+    // from the app, and one that lands mid-character - a compiler's span for a
+    // stray byte, say - would otherwise panic the whole UI on a slice.
+    let mut byte = byte.min(text.len());
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
     let line = text[..byte].bytes().filter(|&b| b == b'\n').count();
     let line_start = text[..byte].rfind('\n').map_or(0, |i| i + 1);
     Cursor::new(line, byte - line_start)
@@ -4640,6 +4724,76 @@ mod tests {
     }
 
     #[test]
+    fn tab_indents_a_text_area_and_still_steps_focus_elsewhere() {
+        let (mut ui, field) = text_area("ab");
+        ui.focus_caret(field, 1);
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        assert_eq!(ui.text_of(field), Some("a    b"), "indented, not escaped");
+        assert_eq!(ui.caret_offset(), Some(5));
+
+        // A single-line field is unchanged: Tab is still "next field".
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 100.0).row());
+        let first = ui.text_input(root, "x".to_string(), Style::new().width(80.0));
+        let second = ui.text_input(root, "y".to_string(), Style::new().width(80.0));
+        ui.layout(Vec2::new(400.0, 100.0)).unwrap();
+        ui.focus(first);
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        assert_eq!(ui.focused(), Some(second));
+        assert_eq!(ui.text_of(first), Some("x"));
+    }
+
+    #[test]
+    fn tab_over_a_selection_indents_it_instead_of_replacing_it() {
+        // The regression this exists for: Tab went through insert_str, which
+        // replaces the selection. Selecting a whole file and reaching for Tab
+        // left behind four spaces.
+        let (mut ui, field) = text_area("aaa\nbbb\nccc");
+        ui.select_range(field, 0, 11);
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        assert_eq!(ui.text_of(field), Some("    aaa\n    bbb\n    ccc"));
+
+        // Still selected, so Tab is repeatable.
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        assert_eq!(
+            ui.text_of(field),
+            Some("        aaa\n        bbb\n        ccc")
+        );
+
+        // And shift+Tab takes it back.
+        ui.set_shift(true);
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        assert_eq!(ui.text_of(field), Some("aaa\nbbb\nccc"));
+    }
+
+    #[test]
+    fn indenting_reaches_whole_lines_and_leaves_blank_ones_alone() {
+        // A selection of half a line still indents that whole line, and a blank
+        // line inside the block gains no trailing whitespace.
+        let (mut ui, field) = text_area("aaa\n\nccc");
+        ui.select_range(field, 1, 6);
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        assert_eq!(ui.text_of(field), Some("    aaa\n\n    ccc"));
+    }
+
+    #[test]
+    fn shift_tab_outdents_the_caret_line_rather_than_leaving_the_field() {
+        let (mut ui, field) = text_area("        deep");
+        ui.focus_caret(field, 12);
+        ui.set_shift(true);
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        assert_eq!(ui.text_of(field), Some("    deep"));
+        assert_eq!(ui.focused(), Some(field), "and does not eject you");
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        assert_eq!(ui.text_of(field), Some("deep"));
+        // Nothing left to remove: a no-op, not a focus jump.
+        ui.handle_input(InputEvent::Key(Key::Tab));
+        assert_eq!(ui.text_of(field), Some("deep"));
+        assert_eq!(ui.focused(), Some(field));
+    }
+
+    #[test]
     fn the_caret_rect_is_where_a_caret_relative_popup_anchors() {
         // An autocomplete list hangs off this. It has to be the same point the
         // caret is drawn at, or the popup drifts from the text it belongs to.
@@ -4866,6 +5020,22 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_decoration_range_that_splits_a_character_does_not_panic() {
+        // Ranges come from apps, and an app that hands over a bad one should get
+        // a wrong-looking mark, not a dead editor.
+        let (mut ui, field) = text_area("a \u{fc} b");
+        ui.set_decorations(
+            field,
+            vec![Decoration {
+                range: 2..3, // inside the two-byte character at 2..4
+                color: RED,
+                style: DecorationStyle::Underline,
+            }],
+        );
+        ui.draw_list();
     }
 
     #[test]

@@ -184,6 +184,17 @@ not pay off, plus the instruments it wished existed.
 - **Cross-texture batching** still breaks on painter's order (see Engine), and
   photon's instance buffer is still rebuilt per frame rather than written in place.
 
+## Code editor
+
+The Code pane's own backlog lives in
+[code-editor-backlog.md](code-editor-backlog.md) - 229 entries from a survey on
+2026-07-31, kept separate so one pane's wishlist does not drown this inbox.
+It opens with a defects section: three reproduced with a test, one of them a
+same-day regression already fixed. Read the caution about ordering at the top
+before picking from it - the sections on running, debugging, and teaching a
+script matter more to Orbit than the ones that would make the pane competitive
+with a mature IDE.
+
 ## Aurora: missing capabilities (framework-level)
 
 Two sweeps have retired most of the original list: scrollbar drag and

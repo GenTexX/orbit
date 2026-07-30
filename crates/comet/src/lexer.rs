@@ -254,12 +254,20 @@ impl<'src> Lexer<'src> {
             (Some(b'<'), _) => (TokenKind::Lt, 1),
             (Some(b'>'), _) => (TokenKind::Gt, 1),
             (Some(b'!'), _) => (TokenKind::Bang, 1),
-            (Some(c), _) => {
+            (Some(_), _) => {
+                // Advance by the whole character, not one byte. A multi-byte
+                // character consumed a byte at a time yields one nonsense
+                // diagnostic per byte, each spanning a cut through the middle of
+                // it - and a span that is not a char boundary panics anything
+                // downstream that slices the source with it, which an editor
+                // drawing a squiggle does.
+                let rest = &self.source[start..];
+                let ch = rest.chars().next().expect("peek confirmed a byte exists");
+                self.pos += ch.len_utf8();
                 self.diagnostics.push(Diagnostic::error(
-                    Span::new(start as u32, (start + 1) as u32),
-                    format!("unexpected character {:?}", c as char),
+                    Span::new(start as u32, self.pos as u32),
+                    format!("unexpected character {ch:?}"),
                 ));
-                self.pos += 1;
                 return;
             }
             (None, _) => unreachable!("run() only calls lex_punct when peek() is Some"),
@@ -382,6 +390,31 @@ mod tests {
         assert!(diagnostics[0].message.contains('@'));
         // Lexing continued past the bad character instead of stopping.
         assert!(tokens.iter().any(|t| t.kind == TokenKind::Number(2.0)));
+    }
+
+    #[test]
+    fn a_stray_multibyte_character_is_one_error_spanning_the_whole_character() {
+        // A byte-at-a-time skip reported one error per byte, each spanning a cut
+        // through the middle of the character - and a span that is not a char
+        // boundary panics anything that slices the source with it, which an
+        // editor drawing a squiggle does.
+        let source = "let x = \u{fc};";
+        let (_, diagnostics) = lex(source);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "one character, one error: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].span.text(source), "\u{fc}");
+        assert!(diagnostics[0].message.contains('\u{fc}'), "and names it");
+        assert!(source.is_char_boundary(diagnostics[0].span.start as usize));
+        assert!(source.is_char_boundary(diagnostics[0].span.end as usize));
+    }
+
+    #[test]
+    fn lexing_continues_past_a_multibyte_character() {
+        let (tokens, _) = lex("\u{1f600} 42");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Number(42.0)));
     }
 
     #[test]
