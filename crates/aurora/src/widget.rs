@@ -241,6 +241,8 @@ pub(crate) struct Widget {
     pub font_family: FontFamily,
     /// Whether a multi-line text input draws a line-number gutter.
     pub gutter: bool,
+    /// Whether typing an opener auto-closes it (see [`crate::Style::auto_pairs`]).
+    pub auto_pairs: bool,
     /// Whether this text input is multi-line (a text area): Enter inserts a
     /// newline instead of submitting, and the caret moves by line. Other kinds
     /// ignore it.

@@ -79,6 +79,8 @@ pub struct Style {
     /// Whether a multi-line text input draws a line-number gutter down its left
     /// edge. Ignored by other kinds.
     pub gutter: bool,
+    /// Whether typing an opening bracket or quote inserts its partner.
+    pub auto_pairs: bool,
     /// Whether this widget is a drag source: pressing and moving past a small
     /// threshold starts a drag carrying this widget (see `Event::DragStarted`).
     pub draggable: bool,
@@ -122,6 +124,7 @@ impl Default for Style {
             border_bottom_width: 0.0,
             border_bottom_color: Color::TRANSPARENT,
             gutter: false,
+            auto_pairs: false,
             draggable: false,
             drop_target: false,
             drag_kind: u32::MAX,
@@ -377,6 +380,19 @@ impl Style {
     /// reproduce the text area's line layout beside it.
     pub fn gutter(mut self) -> Self {
         self.gutter = true;
+        self
+    }
+
+    /// Auto-close brackets and quotes in a text area.
+    ///
+    /// Typing an opener inserts its partner and leaves the caret between them;
+    /// typing the closer that is already there steps over it; backspace between
+    /// an empty pair removes both; and typing an opener with a selection wraps
+    /// the selection rather than replacing it. It stays out of the way where it
+    /// would be wrong: not inside a string or a comment, and not when the next
+    /// character is a word - typing `(` before a name means wrapping it.
+    pub fn auto_pairs(mut self) -> Self {
+        self.auto_pairs = true;
         self
     }
 

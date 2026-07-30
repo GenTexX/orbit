@@ -892,6 +892,7 @@ fn build_code_pane(ui: &mut Ui, parent: WidgetId, ctx: &PaneCtx, rows: &mut Edit
             .multiline()
             .monospace()
             .gutter()
+            .auto_pairs()
             .padding(6.0)
             .background(theme.aurora.panel_bg)
             .foreground(theme.aurora.heading),

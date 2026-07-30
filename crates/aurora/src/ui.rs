@@ -1071,6 +1071,7 @@ impl Ui {
             font_weight: style.font_weight,
             font_family: style.font_family,
             gutter: style.gutter,
+            auto_pairs: style.auto_pairs,
             multiline: style.multiline,
             text_center: style.text_center,
             icon_button: style.icon_button,
@@ -1855,9 +1856,76 @@ impl Ui {
         if ch.is_control() {
             return;
         }
+        if self.auto_pair(ch) {
+            return;
+        }
         // Typing over a selection replaces it; insert_str handles both cases.
         let mut buf = [0u8; 4];
         self.insert_str(ch.encode_utf8(&mut buf));
+    }
+
+    /// The auto-pairing rules, applied before an ordinary insert. Returns
+    /// whether the character was handled here.
+    ///
+    /// Only in a text area with pairing switched on: a one-line field is a form
+    /// input, and a bracket typed into one is just a bracket.
+    fn auto_pair(&mut self, ch: char) -> bool {
+        let Some(id) = self.focused else {
+            return false;
+        };
+        if !self.widgets[id].auto_pairs || !self.widgets[id].multiline {
+            return false;
+        }
+        let (lo, hi) = self.selection_bounds(id);
+        let text = self.text_of(id).unwrap_or_default();
+
+        // Typing a quote or bracket with a selection wraps it instead of
+        // replacing it - the thing people reach for and lose a paragraph to.
+        if lo != hi
+            && let Some(close) = closer_for(ch)
+        {
+            let selected = text[lo..hi].to_string();
+            self.replace_range(id, lo..hi, &format!("{ch}{selected}{close}"));
+            self.selection_anchor = Some(lo + ch.len_utf8());
+            self.caret = lo + ch.len_utf8() + selected.len();
+            return true;
+        }
+        if lo != hi {
+            return false;
+        }
+
+        // Typing the closer that is already sitting there steps over it, so
+        // finishing a call by typing `)` does not leave `))`.
+        if is_closer(ch) && text[lo..].starts_with(ch) {
+            self.caret = lo + ch.len_utf8();
+            return true;
+        }
+
+        let Some(close) = closer_for(ch) else {
+            return false;
+        };
+        // Not inside a string or a comment: a lone apostrophe in a comment
+        // should stay a lone apostrophe.
+        if in_string_or_comment(text, lo) {
+            return false;
+        }
+        // Only when what follows is a boundary. Typing `(` before a word means
+        // wrapping it, not opening an empty pair in front of it.
+        let next_is_boundary = text[lo..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || is_closer(c) || c == ',' || c == ';');
+        if !next_is_boundary {
+            return false;
+        }
+        // A quote is its own closer, so an odd count on the line means this one
+        // is finishing a string rather than starting one.
+        if ch == close && text[line_start_of(text, lo)..lo].matches(ch).count() % 2 == 1 {
+            return false;
+        }
+        self.replace_range(id, lo..lo, &format!("{ch}{close}"));
+        self.caret = lo + ch.len_utf8();
+        true
     }
 
     /// Indent (or outdent) every line touched by `lo..hi`, and re-select the
@@ -2027,6 +2095,7 @@ impl Ui {
             }
             _ => {}
         }
+        let pairs = self.widgets[id].auto_pairs && multiline;
         let WidgetKind::TextInput(s) = &mut self.widgets[id].kind else {
             return;
         };
@@ -2039,6 +2108,16 @@ impl Ui {
             Key::WordRight => self.caret = next_word_boundary(s, caret),
             Key::Home => self.caret = 0,
             Key::End => self.caret = s.len(),
+            // Backspace between an empty auto-pair deletes both halves.
+            Key::Backspace if caret > 0 && pairs && is_empty_pair(s, caret) => {
+                let prev = prev_boundary(s, caret);
+                let next = next_boundary(s, caret);
+                self.caret = prev;
+                self.selection_anchor = None;
+                let range = prev..next;
+                self.replace_range(id, range, "");
+                return;
+            }
             Key::Backspace if caret > 0 => {
                 let prev = prev_boundary(s, caret);
                 s.replace_range(prev..caret, "");
@@ -2070,12 +2149,37 @@ impl Ui {
             return;
         };
         let (lo, hi) = self.selection_bounds(id);
-        if let WidgetKind::TextInput(s) = &mut self.widgets[id].kind {
-            s.replace_range(lo..hi, "\n");
-        } else {
+        if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
             return;
         }
-        self.caret = lo + 1;
+        // Carry the current line's indentation onto the new one, and add a level
+        // when the line being left ends with an opener. Without this every line
+        // of every function body is hand-indented four spaces at a time.
+        let text = self.text_of(id).unwrap_or_default();
+        let line_start = text[..lo].rfind('\n').map_or(0, |at| at + 1);
+        let indent: String = text[line_start..lo]
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        let opens = text[..lo].trim_end().ends_with(['{', '(', '[']);
+        let closes_next = text[hi..].trim_start().starts_with(['}', ')', ']']);
+        let inner = if opens {
+            format!("{indent}{INDENT}")
+        } else {
+            indent.clone()
+        };
+
+        // Enter between a pair opens a block: the closer moves to its own line,
+        // indented back out, and the caret lands on the blank line between.
+        let insertion = if opens && closes_next {
+            format!("\n{inner}\n{indent}")
+        } else {
+            format!("\n{inner}")
+        };
+        if let WidgetKind::TextInput(s) = &mut self.widgets[id].kind {
+            s.replace_range(lo..hi, &insertion);
+        }
+        self.caret = lo + 1 + inner.len();
         self.selection_anchor = None;
         self.invalidate_text(id);
     }
@@ -3480,6 +3584,52 @@ fn inflate_splitter(rect: Rect, orientation: Orientation) -> Rect {
             rect.size + Vec2::new(0.0, extra * 2.0),
         ),
     }
+}
+
+/// The closing character `ch` opens, if it opens one.
+fn closer_for(ch: char) -> Option<char> {
+    match ch {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '"' => Some('"'),
+        _ => None,
+    }
+}
+
+fn is_closer(ch: char) -> bool {
+    matches!(ch, ')' | ']' | '}' | '"')
+}
+
+/// Whether the caret sits between a pair with nothing in it.
+fn is_empty_pair(text: &str, caret: usize) -> bool {
+    let before = text[..caret].chars().next_back();
+    let after = text[caret..].chars().next();
+    matches!((before, after), (Some(b), Some(a)) if closer_for(b) == Some(a))
+}
+
+fn line_start_of(text: &str, at: usize) -> usize {
+    text[..at].rfind('\n').map_or(0, |i| i + 1)
+}
+
+/// Whether `at` is inside a string literal or a line comment, scanning only the
+/// line it is on - which is all comet needs, since it has neither multi-line
+/// strings nor block comments.
+fn in_string_or_comment(text: &str, at: usize) -> bool {
+    let line = &text[line_start_of(text, at)..at];
+    let mut in_string = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if in_string => {
+                chars.next();
+            }
+            '"' => in_string = !in_string,
+            '/' if !in_string && chars.peek() == Some(&'/') => return true,
+            _ => {}
+        }
+    }
+    in_string
 }
 
 /// What Tab inserts in a text area. Spaces rather than a tab character: a tab's
@@ -5284,6 +5434,137 @@ mod tests {
             })
             .expect("a caret is drawn");
         assert_eq!(drawn, second);
+    }
+
+    /// A code-shaped text area: monospace, auto-pairing, laid out.
+    fn code_area(text: &str) -> (Ui, crate::WidgetId) {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(500.0, 300.0));
+        let field = ui.text_input(
+            root,
+            text.to_string(),
+            Style::new()
+                .size(460.0, 260.0)
+                .multiline()
+                .monospace()
+                .auto_pairs(),
+        );
+        ui.layout(Vec2::new(500.0, 300.0)).unwrap();
+        (ui, field)
+    }
+
+    fn type_str(ui: &mut Ui, text: &str) {
+        for c in text.chars() {
+            ui.handle_input(InputEvent::Text(c));
+        }
+    }
+
+    #[test]
+    fn enter_carries_the_current_lines_indentation() {
+        let (mut ui, field) = code_area("    let a = 1;");
+        ui.focus_caret(field, 14);
+        ui.handle_input(InputEvent::Key(Key::Enter));
+        assert_eq!(ui.text_of(field), Some("    let a = 1;\n    "));
+        assert_eq!(ui.caret_offset(), Some(19), "and lands after the indent");
+    }
+
+    #[test]
+    fn enter_after_an_opener_adds_a_level() {
+        let (mut ui, field) = code_area("    func f() {");
+        ui.focus_caret(field, 14);
+        ui.handle_input(InputEvent::Key(Key::Enter));
+        assert_eq!(ui.text_of(field), Some("    func f() {\n        "));
+    }
+
+    #[test]
+    fn enter_between_a_pair_opens_a_block() {
+        // The shape everyone expects: the closer moves down and out, and the
+        // caret lands on the blank line between.
+        let (mut ui, field) = code_area("func f() {}");
+        ui.focus_caret(field, 10);
+        ui.handle_input(InputEvent::Key(Key::Enter));
+        assert_eq!(ui.text_of(field), Some("func f() {\n    \n}"));
+        assert_eq!(ui.caret_offset(), Some(15));
+    }
+
+    #[test]
+    fn typing_an_opener_closes_it_and_typing_the_closer_steps_over() {
+        let (mut ui, field) = code_area("");
+        ui.focus_caret(field, 0);
+        type_str(&mut ui, "f(");
+        assert_eq!(ui.text_of(field), Some("f()"));
+        assert_eq!(ui.caret_offset(), Some(2), "between them");
+        // Finishing the call by typing `)` must not leave `))`.
+        type_str(&mut ui, "1)");
+        assert_eq!(ui.text_of(field), Some("f(1)"));
+        assert_eq!(ui.caret_offset(), Some(4));
+    }
+
+    #[test]
+    fn backspace_between_an_empty_pair_removes_both() {
+        let (mut ui, field) = code_area("");
+        ui.focus_caret(field, 0);
+        type_str(&mut ui, "(");
+        ui.handle_input(InputEvent::Key(Key::Backspace));
+        assert_eq!(ui.text_of(field), Some(""));
+
+        // But a pair with something in it loses one character, as always.
+        type_str(&mut ui, "(x");
+        ui.handle_input(InputEvent::Key(Key::Backspace));
+        assert_eq!(ui.text_of(field), Some("()"));
+    }
+
+    #[test]
+    fn typing_a_quote_with_a_selection_wraps_it() {
+        // The reflex that loses a paragraph in an editor without this.
+        let (mut ui, field) = code_area("hello world");
+        ui.focus_selection(field, 0, 5);
+        type_str(&mut ui, "\"");
+        assert_eq!(ui.text_of(field), Some("\"hello\" world"));
+        assert_eq!(
+            ui.selected_text().as_deref(),
+            Some("hello"),
+            "and the selection survives, so it can be wrapped again"
+        );
+    }
+
+    #[test]
+    fn auto_close_stays_out_of_the_way_where_it_would_be_wrong() {
+        // Before a word, `(` means wrapping it, not opening an empty pair.
+        let (mut ui, field) = code_area("name");
+        ui.focus_caret(field, 0);
+        type_str(&mut ui, "(");
+        assert_eq!(ui.text_of(field), Some("(name"));
+
+        // Inside a comment, a bracket is just a bracket.
+        let (mut ui, field) = code_area("// a note ");
+        ui.focus_caret(field, 10);
+        type_str(&mut ui, "(");
+        assert_eq!(ui.text_of(field), Some("// a note ("));
+
+        // Inside a string too.
+        let (mut ui, field) = code_area("let s = \"hi ");
+        ui.focus_caret(field, 12);
+        type_str(&mut ui, "(");
+        assert_eq!(ui.text_of(field), Some("let s = \"hi ("));
+
+        // And a closing quote finishes the string rather than opening one.
+        let (mut ui, field) = code_area("let s = \"hi");
+        ui.focus_caret(field, 11);
+        type_str(&mut ui, "\"");
+        assert_eq!(ui.text_of(field), Some("let s = \"hi\""));
+    }
+
+    #[test]
+    fn a_single_line_field_does_not_auto_pair() {
+        // A form input is not code; a bracket typed into one is a bracket.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(300.0, 60.0));
+        let field = ui.text_input(root, String::new(), Style::new().width(200.0).auto_pairs());
+        ui.layout(Vec2::new(300.0, 60.0)).unwrap();
+        ui.focus(field);
+        type_str(&mut ui, "(");
+        assert_eq!(ui.text_of(field), Some("("));
     }
 
     /// A gutter text area holding `text`, laid out and ready to draw.
