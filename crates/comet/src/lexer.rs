@@ -51,6 +51,11 @@ pub enum TokenKind {
     StarEq,
     SlashEq,
 
+    /// A `//` line comment, including the slashes. Only [`lex_with_comments`]
+    /// reports these - [`lex`] drops them, because nothing downstream of the
+    /// parser has any use for one.
+    Comment,
+
     /// The sentinel that always ends a token stream, so the parser never has to
     /// special-case running off the end - it just sees `Eof` forever.
     Eof,
@@ -68,6 +73,18 @@ pub struct Token {
 /// and reported, not a hard error, so the parser downstream still sees
 /// everything else (ADR 0010).
 pub fn lex(source: &str) -> (Vec<Token>, Vec<Diagnostic>) {
+    let (mut tokens, diagnostics) = lex_with_comments(source);
+    tokens.retain(|token| token.kind != TokenKind::Comment);
+    (tokens, diagnostics)
+}
+
+/// The same, keeping comments in the stream.
+///
+/// Syntax highlighting is the one consumer that wants them: everything else
+/// downstream reads code, and a comment is by definition not code. Keeping one
+/// lexer rather than a second scanner in the highlighter is what stops `//`
+/// inside a string literal from being colored as a comment.
+pub fn lex_with_comments(source: &str) -> (Vec<Token>, Vec<Diagnostic>) {
     Lexer::new(source).run()
 }
 
@@ -95,7 +112,7 @@ impl<'src> Lexer<'src> {
             let start = self.pos;
             match c {
                 b' ' | b'\t' | b'\r' | b'\n' => self.pos += 1,
-                b'/' if self.peek_at(1) == Some(b'/') => self.skip_line_comment(),
+                b'/' if self.peek_at(1) == Some(b'/') => self.lex_line_comment(start),
                 b'"' => self.lex_string(start),
                 b'0'..=b'9' => self.lex_number(start),
                 b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_ident_or_keyword(start),
@@ -121,13 +138,14 @@ impl<'src> Lexer<'src> {
         });
     }
 
-    fn skip_line_comment(&mut self) {
+    fn lex_line_comment(&mut self, start: usize) {
         while let Some(c) = self.peek() {
             if c == b'\n' {
                 break;
             }
             self.pos += 1;
         }
+        self.push(TokenKind::Comment, start, self.pos);
     }
 
     fn lex_string(&mut self, start: usize) {

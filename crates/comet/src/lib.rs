@@ -17,6 +17,7 @@ mod codegen;
 mod diagnostic;
 mod lexer;
 mod parser;
+pub mod service;
 mod span;
 mod tir;
 
@@ -46,7 +47,7 @@ pub use ast::{
 pub use check::check;
 pub use codegen::{HOST_MODULE, emit};
 pub use diagnostic::{Diagnostic, Severity};
-pub use lexer::{Token, TokenKind, lex};
+pub use lexer::{Token, TokenKind, lex, lex_with_comments};
 pub use parser::parse;
 pub use span::Span;
 pub use tir::{
