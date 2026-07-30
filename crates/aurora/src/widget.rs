@@ -130,6 +130,40 @@ pub struct TextSpan {
     pub color: Color,
 }
 
+/// A mark drawn over a range of a widget's text: an error squiggle, a search
+/// match, a highlighted line.
+///
+/// Decorations share the machinery selection is drawn with - a byte range
+/// resolved to per-visual-line pixel spans - so they wrap and scroll exactly the
+/// way a selection over the same range would. An app may attach as many as it
+/// likes, and they may overlap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Decoration {
+    /// Byte range into the widget's text.
+    pub range: Range<usize>,
+    pub color: Color,
+    pub style: DecorationStyle,
+}
+
+/// How a [`Decoration`] draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecorationStyle {
+    /// A fill behind the text, the way a selection draws. Use a translucent
+    /// color: the text is drawn over it.
+    Highlight,
+    /// A straight line under the text.
+    Underline,
+    /// A wavy line under the text - the error and warning mark.
+    Squiggle,
+}
+
+impl DecorationStyle {
+    /// Whether this draws behind the text (rather than over it).
+    pub(crate) fn is_behind(self) -> bool {
+        matches!(self, DecorationStyle::Highlight)
+    }
+}
+
 /// Which bundled family a widget's text shapes with.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FontFamily {

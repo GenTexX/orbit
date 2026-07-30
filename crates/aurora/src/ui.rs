@@ -14,7 +14,9 @@ use crate::input::{CursorHint, InputEvent, Key};
 use crate::rect::Rect;
 use crate::style::Style;
 use crate::theme::Theme;
-use crate::widget::{Face, Mask, Orientation, TextSpan, Widget, WidgetId, WidgetKind};
+use crate::widget::{
+    Decoration, DecorationStyle, Face, Mask, Orientation, TextSpan, Widget, WidgetId, WidgetKind,
+};
 use crate::{text, theme};
 
 /// The visual state of an interactive widget, derived from the pointer each
@@ -168,6 +170,9 @@ pub struct Ui {
     /// Per-widget color spans, kept sorted by start. Consulted only when the
     /// draw list is built, so setting them never invalidates a shape.
     text_spans: SecondaryMap<WidgetId, Vec<TextSpan>>,
+    /// Per-widget decorations (squiggles, match highlights). Draw-time only,
+    /// for the same reason.
+    decorations: SecondaryMap<WidgetId, Vec<Decoration>>,
     /// A shaped check-glyph buffer per checkbox (its main buffer holds the label
     /// caption instead), produced during measure and drawn when checked.
     check_buffers: SecondaryMap<WidgetId, Buffer>,
@@ -242,6 +247,7 @@ impl Ui {
             ellipsized: SecondaryMap::new(),
             placeholder_buffers: SecondaryMap::new(),
             text_spans: SecondaryMap::new(),
+            decorations: SecondaryMap::new(),
             check_buffers: SecondaryMap::new(),
             text_vscroll: SecondaryMap::new(),
             scroll_offsets: SecondaryMap::new(),
@@ -522,6 +528,23 @@ impl Ui {
     /// Drop a widget's color spans, so all its text draws in one color again.
     pub fn clear_text_spans(&mut self, id: WidgetId) {
         self.text_spans.remove(id);
+    }
+
+    /// Mark ranges of a widget's text: error squiggles, search matches, a
+    /// highlighted line.
+    ///
+    /// Each is resolved through the same byte-range-to-pixel-spans path a
+    /// selection uses, so a decoration wraps and scrolls exactly the way
+    /// selecting the same range would. Like color spans they are read only when
+    /// the draw list is built, so changing them never re-shapes; unlike them,
+    /// they may overlap.
+    pub fn set_decorations(&mut self, id: WidgetId, decorations: Vec<Decoration>) {
+        self.decorations.insert(id, decorations);
+    }
+
+    /// Drop a widget's decorations.
+    pub fn clear_decorations(&mut self, id: WidgetId) {
+        self.decorations.remove(id);
     }
 
     /// Offset a widget and its subtree by `delta` px when drawing, leaving
@@ -2622,6 +2645,9 @@ impl Ui {
         if empty && let Some(buffer) = self.placeholder_buffers.get(id) {
             self.emit_buffer(buffer, base, self.theme.placeholder, None, list);
         }
+        // Decorations that sit behind the text go under the selection: the
+        // selection is what the user is doing right now, and should win.
+        self.emit_decorations(id, origin, true, list);
         // The selection highlight, behind the text.
         if focused {
             let (lo, hi) = self.selection_bounds(id);
@@ -2651,6 +2677,7 @@ impl Ui {
                 list,
             );
         }
+        self.emit_decorations(id, origin, false, list);
         if focused && self.caret_on {
             let caret = if widget.multiline {
                 self.multiline_caret(id).map(|(cx, top)| {
@@ -2685,13 +2712,29 @@ impl Ui {
         origin: Vec2,
         list: &mut DrawList,
     ) {
-        let WidgetKind::TextInput(s) = &self.widgets[id].kind else {
-            return;
+        for rect in self.range_rects(id, lo, hi, origin) {
+            list.commands.push(DrawCommand::FillRect {
+                rect,
+                color: self.theme.selection,
+            });
+        }
+    }
+
+    /// The rectangles a byte range covers, one per visual line it crosses, in
+    /// draw coordinates.
+    ///
+    /// This is the whole mechanism behind selection, wrapping and scrolling
+    /// included, factored out so a decoration gets exactly the same behaviour
+    /// rather than a second implementation that drifts from it.
+    fn range_rects(&self, id: WidgetId, lo: usize, hi: usize, origin: Vec2) -> Vec<Rect> {
+        let Some(text) = self.text_of(id) else {
+            return Vec::new();
         };
         let Some(buffer) = self.buffers.get(id) else {
-            return;
+            return Vec::new();
         };
-        let (start, end) = (byte_to_cursor(s, lo), byte_to_cursor(s, hi));
+        let (start, end) = (byte_to_cursor(text, lo), byte_to_cursor(text, hi));
+        let mut rects = Vec::new();
         for run in buffer.layout_runs() {
             // highlight() only tests "between the cursors"; for a run OUTSIDE the
             // selected line range that wrongly reports the whole line selected,
@@ -2701,13 +2744,33 @@ impl Ui {
                 continue;
             }
             for (x, w) in run.highlight(start, end) {
-                list.commands.push(DrawCommand::FillRect {
-                    rect: Rect::new(
-                        origin + Vec2::new(x, run.line_top),
-                        Vec2::new(w.max(0.0), run.line_height),
-                    ),
-                    color: self.theme.selection,
-                });
+                rects.push(Rect::new(
+                    origin + Vec2::new(x, run.line_top),
+                    Vec2::new(w.max(0.0), run.line_height),
+                ));
+            }
+        }
+        rects
+    }
+
+    /// A widget's own text, whatever kind it is.
+    fn text_of(&self, id: WidgetId) -> Option<&str> {
+        match &self.widgets[id].kind {
+            WidgetKind::Label(s) | WidgetKind::Button(s) | WidgetKind::TextInput(s) => Some(s),
+            WidgetKind::Checkbox { label, .. } => Some(label),
+            _ => None,
+        }
+    }
+
+    /// Draw a widget's decorations, either the ones that sit behind the text or
+    /// the ones that sit over it.
+    fn emit_decorations(&self, id: WidgetId, origin: Vec2, behind: bool, list: &mut DrawList) {
+        let Some(decorations) = self.decorations.get(id) else {
+            return;
+        };
+        for decoration in decorations.iter().filter(|d| d.style.is_behind() == behind) {
+            for rect in self.range_rects(id, decoration.range.start, decoration.range.end, origin) {
+                emit_decoration(rect, decoration, list);
             }
         }
     }
@@ -2748,12 +2811,7 @@ impl Ui {
     /// deliberately does not get them: it is not the widget's text.
     fn spans_of(&self, id: WidgetId) -> Option<(&str, &[TextSpan])> {
         let spans = self.text_spans.get(id)?;
-        let text = match &self.widgets[id].kind {
-            WidgetKind::Label(s) | WidgetKind::Button(s) | WidgetKind::TextInput(s) => s,
-            WidgetKind::Checkbox { label, .. } => label,
-            _ => return None,
-        };
-        Some((text, spans.as_slice()))
+        Some((self.text_of(id)?, spans.as_slice()))
     }
 
     /// Emit a `Text` command for a shaped `buffer` drawn from `origin` (its
@@ -2832,6 +2890,52 @@ impl Ui {
 impl Default for Ui {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// How thick an underline is, and how far below the line's bottom it sits.
+const DECORATION_THICKNESS: f32 = 1.5;
+const DECORATION_INSET: f32 = 2.0;
+/// A squiggle's horizontal period and peak-to-trough height, in px.
+const SQUIGGLE_PERIOD: f32 = 6.0;
+const SQUIGGLE_AMPLITUDE: f32 = 2.0;
+
+/// Draw one decoration over one visual line's rectangle.
+fn emit_decoration(rect: Rect, decoration: &Decoration, list: &mut DrawList) {
+    if rect.size.x <= 0.0 {
+        return;
+    }
+    match decoration.style {
+        DecorationStyle::Highlight => list.commands.push(DrawCommand::FillRect {
+            rect,
+            color: decoration.color,
+        }),
+        DecorationStyle::Underline => list.commands.push(DrawCommand::FillRect {
+            rect: Rect::new(
+                Vec2::new(rect.pos.x, rect.pos.y + rect.size.y - DECORATION_INSET),
+                Vec2::new(rect.size.x, DECORATION_THICKNESS),
+            ),
+            color: decoration.color,
+        }),
+        // A zigzag of short segments: aurora's command set has no path, so the
+        // wave is stepped. At a step of half the period it reads as a wave and
+        // costs one rect per 3px rather than one per pixel.
+        DecorationStyle::Squiggle => {
+            let step = SQUIGGLE_PERIOD * 0.5;
+            let top = rect.pos.y + rect.size.y - DECORATION_INSET - SQUIGGLE_AMPLITUDE;
+            let mut x = rect.pos.x;
+            let mut high = true;
+            while x < rect.pos.x + rect.size.x {
+                let w = step.min(rect.pos.x + rect.size.x - x);
+                let y = if high { top } else { top + SQUIGGLE_AMPLITUDE };
+                list.commands.push(DrawCommand::FillRect {
+                    rect: Rect::new(Vec2::new(x, y), Vec2::new(w, DECORATION_THICKNESS)),
+                    color: decoration.color,
+                });
+                x += step;
+                high = !high;
+            }
+        }
     }
 }
 
@@ -3171,7 +3275,7 @@ mod tests {
     use crate::rect::Rect;
     use crate::style::Style;
     use crate::theme::Theme;
-    use crate::widget::TextSpan;
+    use crate::widget::{Decoration, DecorationStyle, TextSpan};
     use crate::widget::{Mask, Orientation, WidgetKind};
     use glam::Vec2;
 
@@ -4308,6 +4412,255 @@ mod tests {
                     if *color == ghost && rect.pos != src_pos)),
             "a faded, offset ghost of the source should be drawn"
         );
+    }
+
+    /// A multiline field holding `text`, laid out and ready to draw.
+    fn text_area(text: &str) -> (Ui, crate::WidgetId) {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 200.0));
+        let field = ui.text_input(
+            root,
+            text.to_string(),
+            Style::new().size(360.0, 160.0).multiline().monospace(),
+        );
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        (ui, field)
+    }
+
+    /// Every fill of `color` in a Ui's draw list.
+    fn fills_of(ui: &Ui, color: Color) -> Vec<Rect> {
+        ui.draw_list()
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::FillRect { rect, color: c } if *c == color => Some(*rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_underline_sits_under_the_range_it_marks_and_nothing_else() {
+        let (mut ui, field) = text_area("func main");
+        ui.set_decorations(
+            field,
+            vec![Decoration {
+                range: 0..4,
+                color: RED,
+                style: DecorationStyle::Underline,
+            }],
+        );
+        let marks = fills_of(&ui, RED);
+        assert_eq!(marks.len(), 1, "one visual line, one line of underline");
+        // Four monospace characters of nine: the mark covers well under half the
+        // text, and starts at its left edge.
+        let all = fills_of(
+            &{
+                let (mut ui, field) = text_area("func main");
+                ui.set_decorations(
+                    field,
+                    vec![Decoration {
+                        range: 0..9,
+                        color: RED,
+                        style: DecorationStyle::Underline,
+                    }],
+                );
+                ui
+            },
+            RED,
+        );
+        assert!(marks[0].size.x > 0.0);
+        assert!(
+            marks[0].size.x < all[0].size.x * 0.6,
+            "marking 4 of 9 characters must not underline the whole line"
+        );
+        assert_eq!(
+            marks[0].pos.x, all[0].pos.x,
+            "both start at the text's left"
+        );
+    }
+
+    #[test]
+    fn a_decoration_on_a_later_line_lands_on_that_line() {
+        let (mut ui, field) = text_area("aaa\nbbb\nccc");
+        // "ccc" is bytes 8..11, on the third line.
+        ui.set_decorations(
+            field,
+            vec![Decoration {
+                range: 8..11,
+                color: RED,
+                style: DecorationStyle::Underline,
+            }],
+        );
+        let marks = fills_of(&ui, RED);
+        assert_eq!(marks.len(), 1);
+        let third_line_top = marks[0].pos.y;
+
+        let (mut ui, field) = text_area("aaa\nbbb\nccc");
+        ui.set_decorations(
+            field,
+            vec![Decoration {
+                range: 0..3,
+                color: RED,
+                style: DecorationStyle::Underline,
+            }],
+        );
+        let first = fills_of(&ui, RED);
+        assert!(
+            third_line_top > first[0].pos.y + 20.0,
+            "the third line's mark must sit two line heights below the first's"
+        );
+    }
+
+    #[test]
+    fn a_decoration_spanning_lines_gets_one_mark_per_line() {
+        // The behaviour inherited from selection: a range crossing lines becomes
+        // one rectangle per visual line, not one box around the lot.
+        let (mut ui, field) = text_area("aaa\nbbb\nccc");
+        ui.set_decorations(
+            field,
+            vec![Decoration {
+                range: 0..11,
+                color: RED,
+                style: DecorationStyle::Underline,
+            }],
+        );
+        assert_eq!(fills_of(&ui, RED).len(), 3);
+    }
+
+    #[test]
+    fn a_squiggle_waves_within_the_range_it_marks() {
+        let (mut ui, field) = text_area("func main");
+        ui.set_decorations(
+            field,
+            vec![Decoration {
+                range: 0..4,
+                color: RED,
+                style: DecorationStyle::Squiggle,
+            }],
+        );
+        let segments = fills_of(&ui, RED);
+        assert!(segments.len() > 3, "a squiggle is many segments, not one");
+
+        // It alternates between two heights - that is what makes it a wave and
+        // not an underline - and stays inside the range's horizontal extent.
+        let tops: Vec<f32> = segments.iter().map(|r| r.pos.y).collect();
+        let hi = tops.iter().cloned().fold(f32::MAX, f32::min);
+        let lo = tops.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(lo > hi, "the segments must not all sit at one height");
+        assert!(tops.contains(&hi) && tops.contains(&lo));
+
+        let left = segments.iter().map(|r| r.pos.x).fold(f32::MAX, f32::min);
+        let right = segments
+            .iter()
+            .map(|r| r.pos.x + r.size.x)
+            .fold(f32::MIN, f32::max);
+        let (mut ui, field) = text_area("func main");
+        ui.set_decorations(
+            field,
+            vec![Decoration {
+                range: 0..4,
+                color: BLUE,
+                style: DecorationStyle::Underline,
+            }],
+        );
+        let under = fills_of(&ui, BLUE)[0];
+        assert!((left - under.pos.x).abs() < 0.01);
+        assert!(
+            (right - (under.pos.x + under.size.x)).abs() < 0.01,
+            "the wave must not run past the range it marks"
+        );
+    }
+
+    #[test]
+    fn a_highlight_draws_behind_the_text_and_a_squiggle_over_it() {
+        // Order matters and is not cosmetic: a highlight the text cannot be read
+        // through is a bug, and a squiggle hidden behind glyphs is invisible.
+        let (mut ui, field) = text_area("func main");
+        ui.set_decorations(
+            field,
+            vec![
+                Decoration {
+                    range: 0..4,
+                    color: RED,
+                    style: DecorationStyle::Highlight,
+                },
+                Decoration {
+                    range: 5..9,
+                    color: BLUE,
+                    style: DecorationStyle::Squiggle,
+                },
+            ],
+        );
+        let commands = ui.draw_list().commands;
+        let index = |pred: &dyn Fn(&DrawCommand) -> bool| {
+            commands.iter().position(pred).expect("command present")
+        };
+        let highlight =
+            index(&|c| matches!(c, DrawCommand::FillRect { color, .. } if *color == RED));
+        let text = index(&|c| matches!(c, DrawCommand::Text { .. }));
+        let squiggle =
+            index(&|c| matches!(c, DrawCommand::FillRect { color, .. } if *color == BLUE));
+        assert!(highlight < text, "a highlight is behind the text");
+        assert!(squiggle > text, "a squiggle is over it");
+    }
+
+    #[test]
+    fn decorations_may_overlap_and_each_still_draws() {
+        // Unlike color spans, two diagnostics on the same token are ordinary.
+        let (mut ui, field) = text_area("func main");
+        ui.set_decorations(
+            field,
+            vec![
+                Decoration {
+                    range: 0..9,
+                    color: RED,
+                    style: DecorationStyle::Underline,
+                },
+                Decoration {
+                    range: 2..6,
+                    color: BLUE,
+                    style: DecorationStyle::Underline,
+                },
+            ],
+        );
+        assert_eq!(fills_of(&ui, RED).len(), 1);
+        assert_eq!(fills_of(&ui, BLUE).len(), 1);
+    }
+
+    #[test]
+    fn clearing_decorations_removes_them() {
+        let (mut ui, field) = text_area("func main");
+        ui.set_decorations(
+            field,
+            vec![Decoration {
+                range: 0..4,
+                color: RED,
+                style: DecorationStyle::Underline,
+            }],
+        );
+        assert_eq!(fills_of(&ui, RED).len(), 1);
+        ui.clear_decorations(field);
+        assert!(fills_of(&ui, RED).is_empty());
+    }
+
+    #[test]
+    fn changing_decorations_does_not_reshape_the_text() {
+        let (mut ui, field) = text_area("func main");
+        ui.draw_list();
+        let before = ui.last_measure_count();
+        for i in 0..20 {
+            ui.set_decorations(
+                field,
+                vec![Decoration {
+                    range: 0..(i % 8) + 1,
+                    color: RED,
+                    style: DecorationStyle::Squiggle,
+                }],
+            );
+            ui.draw_list();
+        }
+        assert_eq!(ui.last_measure_count(), before);
     }
 
     /// The `(color, glyph count)` of every text command a one-label Ui emits.
