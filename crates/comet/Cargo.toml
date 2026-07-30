@@ -11,3 +11,7 @@ wasm-encoder = "0.244"
 # Every emitted module goes through the real validator in tests. "it encoded"
 # is not evidence that wasmtime will accept it.
 wasmparser = "0.244"
+# Tests only, deliberately. comet proves its output runs correctly against a
+# fake host before helios ever sees it, but the compiler itself must not link an
+# execution engine into its public surface - helios owns the real Engine.
+wasmtime = "39"
