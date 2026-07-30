@@ -768,6 +768,23 @@ impl Ui {
         true
     }
 
+    /// Focus `id` and select `lo..hi` (clamped to its text), leaving the caret
+    /// at the end of the selection.
+    ///
+    /// Layout scrolls the caret into view, so this also reveals the range - what
+    /// a find bar needs to show a match, and what jumping to a diagnostic needs
+    /// to show the offending token.
+    pub fn select_range(&mut self, id: WidgetId, lo: usize, hi: usize) {
+        let len = self.text_len(id);
+        if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
+            return;
+        }
+        let (lo, hi) = (lo.min(len), hi.min(len));
+        self.focused = Some(id);
+        self.selection_anchor = Some(lo);
+        self.caret = hi;
+    }
+
     /// Insert `text` into the focused input at the caret, replacing any
     /// selection (control characters are dropped). The app uses this for paste.
     pub fn insert_str(&mut self, text: &str) {
@@ -2851,8 +2868,9 @@ impl Ui {
         rects
     }
 
-    /// A widget's own text, whatever kind it is.
-    fn text_of(&self, id: WidgetId) -> Option<&str> {
+    /// A widget's own text, whatever kind it is: a label's, a button's caption,
+    /// a field's contents, a checkbox's label.
+    pub fn text_of(&self, id: WidgetId) -> Option<&str> {
         match &self.widgets[id].kind {
             WidgetKind::Label(s) | WidgetKind::Button(s) | WidgetKind::TextInput(s) => Some(s),
             WidgetKind::Checkbox { label, .. } => Some(label),

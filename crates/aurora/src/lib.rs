@@ -4,6 +4,7 @@ mod color;
 mod draw;
 mod error;
 mod event;
+pub mod find;
 mod input;
 pub mod list;
 pub mod picker;
