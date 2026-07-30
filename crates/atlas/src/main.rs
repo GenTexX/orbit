@@ -345,6 +345,9 @@ struct State {
     /// Focus the find bar's query field after the next rebuild, and select what
     /// is in it. Consumed there, like `refocus_filter`.
     focus_find: bool,
+    /// The diagnostic message currently shown as a tooltip, so the shell only
+    /// rebuilds when what is under the pointer changes.
+    diagnostic_tooltip: Option<String>,
     /// Text undo for the Code pane: snapshots of the buffer and where the caret
     /// was, newest last.
     ///
@@ -489,6 +492,21 @@ fn coalesces(before: &str, after: &str) -> bool {
         .as_bytes()
         .last()
         .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// The diagnostic covering `offset`, narrowest first.
+///
+/// Narrowest wins because a wide diagnostic - "this function must return f32",
+/// spanning a whole body - would otherwise hide the precise one inside it, and
+/// the precise one is the one that says what to change. A zero-width span (an
+/// unclosed brace, reported at the end of the file) is found at its own offset.
+fn narrowest_at(all: &[comet::Diagnostic], offset: usize) -> Option<&comet::Diagnostic> {
+    all.iter()
+        .filter(|d| {
+            let (lo, hi) = (d.span.start as usize, d.span.end as usize);
+            offset >= lo && (offset < hi || (lo == hi && offset == lo))
+        })
+        .min_by_key(|d| d.span.end - d.span.start)
 }
 
 /// How the open script's bytes were encoded on disk, so a save writes it back
@@ -937,6 +955,7 @@ impl State {
             quit_requested: false,
             script_orphaned: false,
             focus_find: false,
+            diagnostic_tooltip: None,
             script_undo: Vec::new(),
             script_redo: Vec::new(),
             script_caret: 0,
@@ -3582,6 +3601,71 @@ impl State {
         }
     }
 
+    /// The diagnostic whose span covers `offset`, if any. The narrowest one
+    /// wins, so a wide "this function must return" does not hide a precise
+    /// type error inside it.
+    fn diagnostic_at(&self, offset: usize) -> Option<&comet::Diagnostic> {
+        narrowest_at(&self.script_diagnostics, offset)
+    }
+
+    /// The diagnostic message the pointer is over in the Code pane.
+    fn diagnostic_under_pointer(&self) -> Option<String> {
+        let editor = self.rows.code_editor?;
+        let offset = self.ui.offset_at_point(editor, self.cursor)?;
+        self.diagnostic_at(offset).map(|d| d.message.clone())
+    }
+
+    /// Move the caret to the next problem after it, or the previous one before
+    /// it, wrapping. A no-op when the file is clean.
+    fn step_diagnostic(&mut self, forward: bool) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        if self.script_diagnostics.is_empty() {
+            return;
+        }
+        let caret = self.ui.caret_offset().unwrap_or(0);
+        let mut spans: Vec<(usize, usize)> = self
+            .script_diagnostics
+            .iter()
+            .map(|d| (d.span.start as usize, d.span.end as usize))
+            .collect();
+        spans.sort_unstable();
+        let next = if forward {
+            spans
+                .iter()
+                .find(|(start, _)| *start > caret)
+                .or_else(|| spans.first())
+        } else {
+            spans
+                .iter()
+                .rev()
+                .find(|(start, _)| *start < caret)
+                .or_else(|| spans.last())
+        };
+        if let Some(&(start, end)) = next {
+            // Select the span, so the problem is visible as well as reached.
+            self.ui.select_range(editor, start, end.max(start));
+            self.dirty = true;
+        }
+    }
+
+    /// Keep the hovered-diagnostic tooltip in step with the pointer.
+    ///
+    /// Gated on the pointer being up for the reason every poller here is: a
+    /// rebuild swaps the whole Ui and drops aurora's drag state, so anything
+    /// that sets `dirty` mid-gesture kills the gesture.
+    fn poll_diagnostic_tooltip(&mut self) {
+        if self.pointer_down {
+            return;
+        }
+        let message = self.diagnostic_under_pointer();
+        if message != self.diagnostic_tooltip {
+            self.diagnostic_tooltip = message;
+            self.dirty = true;
+        }
+    }
+
     /// Which find-bar button `id` is, if any.
     fn find_button(&self, id: aurora::WidgetId) -> Option<FindAction> {
         let rows = &self.rows.find;
@@ -3746,6 +3830,12 @@ impl State {
                 self.focus_find = true;
                 self.dirty = true;
             }
+            return true;
+        }
+        // F8 steps to the next problem, shift+F8 to the previous. With the
+        // message in the status bar this is how a broken file gets walked.
+        if *named == NamedKey::F8 && self.rows.code_editor.is_some() {
+            self.step_diagnostic(!self.modifiers.shift_key());
             return true;
         }
         // Escape closes what is open, innermost first.
@@ -4040,6 +4130,30 @@ impl State {
                 format!("{} +{} more", self.project.scene.node(node).name, n - 1)
             }
         };
+        // The Code pane's readouts, blank when it is not what you are using.
+        let (caret, diagnostic) = match self.rows.code_editor {
+            Some(editor) if self.ui.focused() == Some(editor) => {
+                let position = self
+                    .ui
+                    .caret_line_column()
+                    .map(|(line, column)| format!("Ln {line}, Col {column}"))
+                    .unwrap_or_default();
+                let message = self
+                    .ui
+                    .caret_offset()
+                    .and_then(|at| self.diagnostic_at(at))
+                    .map(|d| d.message.clone())
+                    .unwrap_or_else(|| match self.script_diagnostics.len() {
+                        0 => String::new(),
+                        // Not on one, but the file has some: say how many, so a
+                        // broken file never looks clean.
+                        1 => "1 problem".to_string(),
+                        n => format!("{n} problems"),
+                    });
+                (position, message)
+            }
+            _ => (String::new(), String::new()),
+        };
         let zoom = format!("zoom {:.0}%", self.camera.zoom * 100.0);
         let fps = format!("{:.0} fps", self.last_fps);
         let modified = if self.is_modified() {
@@ -4048,6 +4162,8 @@ impl State {
             ""
         };
         for (id, text) in [
+            (self.rows.status_caret, caret),
+            (self.rows.status_diagnostic, diagnostic),
             (self.rows.status_cursor, cursor),
             (self.rows.status_zoom, zoom),
             (self.rows.status_selected, selected),
@@ -4071,6 +4187,7 @@ impl State {
         let fstart = std::time::Instant::now();
         self.flush_pointer();
         self.poll_settings();
+        self.poll_diagnostic_tooltip();
         self.react();
         self.sync_tree_filter();
         // Incidental background maintenance that can flip `dirty` and so force a
@@ -4260,6 +4377,14 @@ impl State {
         // one from the last rebuild (adding again would stack duplicates).
         if rebuilt && let Some(spot) = self.reparent.and_then(|r| r.target) {
             ui::add_reparent_line(&mut self.ui, &self.rows, spot, self.theme.row_drop);
+            self.ui.layout(window)?;
+        }
+
+        // A squiggle's message, near the pointer. The whole reason diagnostics
+        // are worth drawing: a red line with no text anywhere tells you that
+        // something is wrong and nothing about what.
+        if rebuilt && let Some(message) = self.diagnostic_tooltip.clone() {
+            ui::add_diagnostic_tooltip(&mut self.ui, self.cursor, window, &message, &self.theme);
             self.ui.layout(window)?;
         }
 
@@ -4967,7 +5092,8 @@ fn translate_key(event: &winit::event::KeyEvent, ctrl: bool) -> Vec<InputEvent> 
 
 #[cfg(test)]
 mod tests {
-    use super::{TextEncoding, coalesces, word_before, write_atomic};
+    use super::{TextEncoding, coalesces, narrowest_at, word_before, write_atomic};
+    use comet::{Diagnostic, Span};
 
     #[test]
     fn typing_a_word_joins_one_undo_step_and_anything_else_starts_a_new_one() {
@@ -4981,6 +5107,35 @@ mod tests {
         assert!(!coalesces("let xy", "let x"));
         assert!(!coalesces("let x", "let xyz"));
         assert!(!coalesces("let x", "Xlet x"));
+    }
+
+    #[test]
+    fn the_narrowest_diagnostic_wins_where_they_overlap() {
+        // A wide "this function must return f32" spanning a whole body must not
+        // hide the precise type error inside it - the narrow one is the one that
+        // says what to change.
+        let wide = Diagnostic::error(Span::new(0, 100), "must return `f32`");
+        let narrow = Diagnostic::error(Span::new(40, 45), "expected `f32`, found `bool`");
+        let all = vec![wide, narrow];
+        assert_eq!(
+            narrowest_at(&all, 42).map(|d| d.message.as_str()),
+            Some("expected `f32`, found `bool`")
+        );
+        assert_eq!(
+            narrowest_at(&all, 10).map(|d| d.message.as_str()),
+            Some("must return `f32`"),
+            "outside the narrow one, the wide one still applies"
+        );
+        assert!(narrowest_at(&all, 200).is_none());
+    }
+
+    #[test]
+    fn a_zero_width_diagnostic_is_still_found_at_its_offset() {
+        // An unclosed brace is reported at the end of the file with an empty
+        // span; hovering it has to still find it.
+        let all = vec![Diagnostic::error(Span::new(10, 10), "expected `}`")];
+        assert!(narrowest_at(&all, 10).is_some());
+        assert!(narrowest_at(&all, 11).is_none());
     }
 
     #[test]

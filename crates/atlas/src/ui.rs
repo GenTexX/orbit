@@ -417,6 +417,9 @@ pub struct EditorRows {
     pub scrub_labels: Vec<(WidgetId, FieldRef, Axis)>,
     /// Status bar readouts, updated in place every frame via `set_label`.
     pub status_cursor: Option<WidgetId>,
+    /// The Code pane's caret position, and the diagnostic under it.
+    pub status_caret: Option<WidgetId>,
+    pub status_diagnostic: Option<WidgetId>,
     pub status_zoom: Option<WidgetId>,
     pub status_selected: Option<WidgetId>,
     pub status_fps: Option<WidgetId>,
@@ -990,6 +993,15 @@ fn build_status_bar(ui: &mut Ui, parent: WidgetId, theme: &EditorTheme, rows: &m
         ui.label(bar, text, Style::new().foreground(theme.aurora.subhead))
     };
     rows.status_cursor = Some(readout(ui, "x -, y -"));
+    // The Code pane's two readouts: where the caret is, and what the compiler
+    // says about the line it is on. The message is the whole point - a squiggle
+    // with no text anywhere is a red line and no information.
+    rows.status_caret = Some(readout(ui, ""));
+    rows.status_diagnostic = Some(ui.label(
+        bar,
+        "",
+        Style::new().ellipsis().grow(1.0).foreground(theme.axis_x),
+    ));
     rows.status_zoom = Some(readout(ui, "zoom 100%"));
     rows.status_selected = Some(readout(ui, "nothing selected"));
     rows.status_fps = Some(readout(ui, "- fps"));
@@ -2006,6 +2018,29 @@ fn asset_field_icon(path: &str, kind: AssetKind) -> Icon {
             AssetKind::Script => Icon::FileScript,
         },
     }
+}
+
+/// Overlay a diagnostic's message near the pointer, the same way the file
+/// details tooltip works: built after layout, positioned by hand, nudged back on
+/// screen at the edges.
+pub fn add_diagnostic_tooltip(
+    ui: &mut Ui,
+    cursor: Vec2,
+    window: Vec2,
+    message: &str,
+    theme: &EditorTheme,
+) {
+    let card = ui.popup(
+        cursor + Vec2::new(14.0, 20.0),
+        Style::new()
+            .column()
+            .padding(8.0)
+            .width((window.x * 0.45).clamp(220.0, 520.0))
+            .background(theme.aurora.menu_bg)
+            .corner_radius(theme.aurora.card_radius)
+            .border(theme.aurora.border_width, theme.aurora.card_border),
+    );
+    ui.label(card, message, Style::new().foreground(theme.aurora.heading));
 }
 
 /// The thumbnail/icon size in an inspector asset field.
