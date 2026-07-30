@@ -135,6 +135,11 @@ impl Checker {
                         f.name
                     ),
                 );
+            } else if is_reserved_name(&f.name) {
+                self.error(
+                    f.name_span,
+                    format!("`{}` is reserved for the runtime", f.name),
+                );
             }
         }
 
@@ -727,6 +732,15 @@ fn is_host_name(name: &str) -> bool {
     host_fn(name).is_some()
 }
 
+/// Names the compiled module already uses for something. Every script function
+/// is exported under its own name, and wasm export names have to be unique, so
+/// a script calling a function `memory` would emit an invalid module. Reserving
+/// the `comet_` prefix and `memory` up front turns that into a diagnostic with a
+/// span, which is the only form of it a person can act on.
+fn is_reserved_name(name: &str) -> bool {
+    name.starts_with("comet_") || name == "memory"
+}
+
 fn host_signature(host: Host) -> (&'static [Type], Type) {
     match host {
         Host::Print => (&[Type::Str], Type::Unit),
@@ -1177,6 +1191,18 @@ mod tests {
         let messages = messages("func f() { }\nfunc f() { }");
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("already defined"), "got: {messages:?}");
+    }
+
+    #[test]
+    fn the_names_the_emitted_module_uses_are_reserved() {
+        // Not pedantry: these become wasm export names, which must be unique, so
+        // without this the module would simply be invalid.
+        for source in ["func memory() { }", "func comet_alloc() { }"] {
+            let messages = messages(source);
+            assert_eq!(messages.len(), 1, "{source}: {messages:?}");
+            assert!(messages[0].contains("reserved"), "{source}: {messages:?}");
+        }
+        check_clean("func comet() { }\nfunc memory_used() { }");
     }
 
     #[test]

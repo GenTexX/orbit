@@ -13,17 +13,38 @@
 
 mod ast;
 mod check;
+mod codegen;
 mod diagnostic;
 mod lexer;
 mod parser;
 mod span;
 mod tir;
 
+/// Compile a script to a WebAssembly module.
+///
+/// The whole pipeline: lex, parse, check, emit. A script with any error
+/// diagnostic produces no module - it is the one place in comet that refuses to
+/// carry on, because emitting code for a program known to be wrong is the only
+/// outcome worse than reporting it. Everything upstream stays error-tolerant, so
+/// the returned diagnostics cover the whole file rather than stopping at the
+/// first mistake.
+pub fn compile(source: &str) -> Result<Vec<u8>, Vec<Diagnostic>> {
+    let (script, mut diagnostics) = parse(source);
+    let (typed, check_diagnostics) = check(&script);
+    diagnostics.extend(check_diagnostics);
+    if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+        diagnostics.sort_by_key(|d| (d.span.start, d.span.end));
+        return Err(diagnostics);
+    }
+    Ok(codegen::emit(&typed))
+}
+
 pub use ast::{
     AssignOp, BinaryOp, Block, Else, Expr, Function, IfStmt, Param, Script, StateDecl, Stmt,
     TypeName, UnaryOp,
 };
 pub use check::check;
+pub use codegen::{HOST_MODULE, emit};
 pub use diagnostic::{Diagnostic, Severity};
 pub use lexer::{Token, TokenKind, lex};
 pub use parser::parse;

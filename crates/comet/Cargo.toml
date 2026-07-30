@@ -4,3 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# Emission only - comet writes WebAssembly, it never reads or runs it.
+wasm-encoder = "0.244"
+
+[dev-dependencies]
+# Every emitted module goes through the real validator in tests. "it encoded"
+# is not evidence that wasmtime will accept it.
+wasmparser = "0.244"
