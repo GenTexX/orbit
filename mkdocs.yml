@@ -15,6 +15,7 @@ nav:
           - internals/plans/milestone-1-walking-skeleton.md
           - internals/plans/milestone-2-aurora.md
           - internals/plans/milestone-3-scenes-editor.md
+          - internals/plans/milestone-4-comet.md
       - Subsystems:
           - internals/renderer.md
       - internals/benchmarks.md

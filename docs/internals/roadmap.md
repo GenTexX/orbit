@@ -35,6 +35,7 @@ Two structural lessons came out of it and are worth carrying into M4. **A rebuil
 **Done when:** you write a `.cmt` script, it compiles in milliseconds, runs on wasmtime, and moves a node - and the code editor shows live error squiggles as you type.
 **Proves:** the fast-compile pipeline (lex -> parse -> check -> emit WASM, no optimizer), the wasmtime host, refcounted linear-memory objects, and the in-process language service.
 **Brings online:** `comet` (frontend, WASM emission, language service), the script host in `helios`, the code editor in `atlas`.
+**Plan:** [Milestone 4 - Comet](plans/milestone-4-comet.md) (ADRs 0006, 0007, 0010, 0016).
 
 ### Milestone 5 - Play & Hot Reload
 **Done when:** you attach a Comet script to a node, press Play, the game runs *in the viewport*, and editing the script hot-reloads it live while preserving reflected field values.

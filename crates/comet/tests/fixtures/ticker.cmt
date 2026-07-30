@@ -1,0 +1,9 @@
+let ticks = 0.0;
+
+func update(dt: f32) {
+    ticks += dt;
+    if ticks > 1.0 {
+        print("one second passed");
+        ticks = 0.0;
+    }
+}
