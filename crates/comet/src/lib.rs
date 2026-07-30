@@ -12,16 +12,23 @@
 //! file parsed and checkable, which is what makes live squiggles possible.
 
 mod ast;
+mod check;
 mod diagnostic;
 mod lexer;
 mod parser;
 mod span;
+mod tir;
 
 pub use ast::{
     AssignOp, BinaryOp, Block, Else, Expr, Function, IfStmt, Param, Script, StateDecl, Stmt,
     TypeName, UnaryOp,
 };
+pub use check::check;
 pub use diagnostic::{Diagnostic, Severity};
 pub use lexer::{Token, TokenKind, lex};
 pub use parser::parse;
 pub use span::Span;
+pub use tir::{
+    Axis, Host, Place, Type, TypedBlock, TypedExpr, TypedExprKind, TypedFn, TypedScript,
+    TypedState, TypedStmt,
+};
