@@ -173,6 +173,10 @@ pub struct Ui {
     /// Per-widget decorations (squiggles, match highlights). Draw-time only,
     /// for the same reason.
     decorations: SecondaryMap<WidgetId, Vec<Decoration>>,
+    /// The caret offset each text area's scroll was last reconciled against, so
+    /// the view follows the caret when it moves and leaves the scroll alone when
+    /// it does not.
+    reconciled_caret: SecondaryMap<WidgetId, usize>,
     /// A gutter field's line numbers, shaped as one buffer whose run `i` is the
     /// number for logical line `i`.
     gutter_numbers: SecondaryMap<WidgetId, Buffer>,
@@ -255,6 +259,7 @@ impl Ui {
             placeholder_buffers: SecondaryMap::new(),
             text_spans: SecondaryMap::new(),
             decorations: SecondaryMap::new(),
+            reconciled_caret: SecondaryMap::new(),
             gutter_numbers: SecondaryMap::new(),
             gutter_widths: SecondaryMap::new(),
             check_buffers: SecondaryMap::new(),
@@ -706,11 +711,64 @@ impl Ui {
         }
     }
 
+    /// The focused field's selection, or `None` when there is no selection.
+    ///
+    /// Public because a shell that rebuilds its whole `Ui` has to put the
+    /// selection back, and because a status bar wants to say how much is
+    /// selected. [`caret_offset`](Self::caret_offset) gives the moving end;
+    /// this gives both.
+    pub fn selection_range(&self) -> Option<std::ops::Range<usize>> {
+        let id = self.focused?;
+        let (lo, hi) = self.selection_bounds(id);
+        (lo != hi).then_some(lo..hi)
+    }
+
+    /// The fixed end of the focused field's selection - where the drag started.
+    pub fn selection_anchor(&self) -> Option<usize> {
+        self.selection_anchor
+    }
+
+    /// Focus `id` with the caret at `caret` and the selection anchored at
+    /// `anchor`, restoring a selection exactly rather than only its caret.
+    ///
+    /// [`focus_caret`](Self::focus_caret) deliberately clears the selection, so
+    /// a shell using it to restore focus after a rebuild silently drops one.
+    pub fn focus_selection(&mut self, id: WidgetId, anchor: usize, caret: usize) {
+        let len = self.text_len(id);
+        if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
+            return;
+        }
+        let text = self.text_of(id).unwrap_or_default();
+        let (anchor, caret) = (
+            snap_boundary(text, anchor.min(len)),
+            snap_boundary(text, caret.min(len)),
+        );
+        self.focused = Some(id);
+        self.selection_anchor = (anchor != caret).then_some(anchor);
+        self.caret = caret;
+    }
+
+    /// The (line, column) the focused field's caret sits at, both 1-based - what
+    /// a status bar shows. Columns count characters, not bytes, so a line with
+    /// an accent in it does not read as longer than it looks.
+    pub fn caret_line_column(&self) -> Option<(usize, usize)> {
+        let id = self.focused?;
+        let text = self.text_of(id)?;
+        let caret = snap_boundary(text, self.caret.min(text.len()));
+        let line = text[..caret].matches('\n').count() + 1;
+        let start = text[..caret].rfind('\n').map_or(0, |at| at + 1);
+        Some((line, text[start..caret].chars().count() + 1))
+    }
+
     /// Select the whole focused input (ctrl+a, driven by the app).
     pub fn select_all(&mut self) {
         if let Some(id) = self.focused {
             self.selection_anchor = Some(0);
             self.caret = self.text_len(id);
+            // Selecting everything is not navigating anywhere: leaving this
+            // unreconciled would have the next layout chase the caret to the end
+            // of the file, so ctrl+a then ctrl+c loses your reading position.
+            self.reconciled_caret.insert(id, self.caret);
         }
     }
 
@@ -768,6 +826,74 @@ impl Ui {
         true
     }
 
+    /// Strip what `id` cannot hold: control characters, except that a text area
+    /// keeps newlines. CRLF and a lone CR normalise to LF, so a file pasted from
+    /// a Windows editor does not arrive with invisible carriage returns in it.
+    fn clean_for(&self, id: WidgetId, text: &str) -> String {
+        let multiline = self.widgets[id].multiline;
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' if multiline => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    out.push('\n');
+                }
+                '\n' if multiline => out.push('\n'),
+                c if !c.is_control() => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Replace `range` in `id` with `text`, leaving the caret at the end of what
+    /// was inserted and no selection.
+    ///
+    /// The one mutation every editing command goes through: a line move, a
+    /// comment toggle, a sort, a replace. Having one of these rather than each
+    /// command reaching into the widget means the mask check, the caret
+    /// placement and the re-shape happen once and identically.
+    ///
+    /// Returns the range the new text occupies. A range that runs backwards is
+    /// treated as empty at its start: a caller with its ends the wrong way round
+    /// should not have a span deleted on its behalf.
+    pub fn replace_range(
+        &mut self,
+        id: WidgetId,
+        range: std::ops::Range<usize>,
+        text: &str,
+    ) -> std::ops::Range<usize> {
+        let len = self.text_len(id);
+        let lo = snap_boundary(self.text_of(id).unwrap_or_default(), range.start.min(len));
+        let hi = snap_boundary(self.text_of(id).unwrap_or_default(), range.end.min(len)).max(lo);
+        if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
+            return lo..lo;
+        }
+        let cleaned = self.clean_for(id, text);
+        if self.widgets[id].mask != Mask::None
+            && let WidgetKind::TextInput(s) = &self.widgets[id].kind
+        {
+            let mut candidate = s.clone();
+            candidate.replace_range(lo..hi, &cleaned);
+            if !self.widgets[id].mask.accepts(&candidate) {
+                return lo..hi;
+            }
+        }
+        if let WidgetKind::TextInput(s) = &mut self.widgets[id].kind {
+            s.replace_range(lo..hi, &cleaned);
+        }
+        let end = lo + cleaned.len();
+        if self.focused == Some(id) {
+            self.caret = end;
+            self.selection_anchor = None;
+        }
+        self.invalidate_text(id);
+        lo..end
+    }
+
     /// Focus `id` and select `lo..hi` (clamped to its text), leaving the caret
     /// at the end of the selection.
     ///
@@ -786,7 +912,11 @@ impl Ui {
     }
 
     /// Insert `text` into the focused input at the caret, replacing any
-    /// selection (control characters are dropped). The app uses this for paste.
+    /// selection. The app uses this for paste.
+    ///
+    /// A text area keeps newlines; a single-line field still drops them, along
+    /// with every other control character, because a newline in a one-line box
+    /// has nowhere to go.
     pub fn insert_str(&mut self, text: &str) {
         let Some(id) = self.focused else {
             return;
@@ -794,7 +924,7 @@ impl Ui {
         if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
             return;
         }
-        let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+        let cleaned = self.clean_for(id, text);
         let (lo, hi) = self.selection_bounds(id);
         // A masked field rejects an edit that would make its whole text stop
         // matching the mask.
@@ -826,6 +956,36 @@ impl Ui {
             }
             None => (caret, caret),
         }
+    }
+
+    /// A text area's vertical scroll in pixels, and how far it can go.
+    ///
+    /// Exposed so a shell can put the scroll back after rebuilding its `Ui` - a
+    /// text area is not a registered scroll container, so nothing else captures
+    /// it - and so a scrollbar has something to read.
+    pub fn text_scroll(&self, id: WidgetId) -> Option<(f32, f32)> {
+        let (view_h, content_h) = self.text_area_extent(id)?;
+        Some((self.vscroll_of(id), (content_h - view_h).max(0.0)))
+    }
+
+    /// Scroll a text area to `offset` pixels, clamped to its content.
+    ///
+    /// This counts as reconciled: the view stays where it is put until the caret
+    /// itself moves, rather than snapping back on the next frame.
+    pub fn set_text_scroll(&mut self, id: WidgetId, offset: f32) {
+        let Some((view_h, content_h)) = self.text_area_extent(id) else {
+            return;
+        };
+        let max = (content_h - view_h).max(0.0);
+        self.text_vscroll.insert(id, offset.clamp(0.0, max));
+        self.reconciled_caret.insert(id, self.caret);
+    }
+
+    /// The byte offset nearest a screen point in `id`'s text - what a hover over
+    /// a squiggle needs to know which diagnostic it is on.
+    pub fn offset_at_point(&self, id: WidgetId, point: Vec2) -> Option<usize> {
+        self.rect(id)?.contains(point).then_some(())?;
+        Some(self.caret_at_x(id, Some(point)))
     }
 
     /// A scroll container's current vertical offset (0 = scrolled to the top).
@@ -2067,6 +2227,19 @@ impl Ui {
         let Some((view_h, content_h)) = self.text_area_extent(id) else {
             return;
         };
+        // Only chase the caret when the caret moved. Running every layout - and
+        // layout runs every frame - meant wheel-scrolling away to read something
+        // was undone before it was drawn, and ctrl+a yanked the view to the
+        // bottom of the file just because select-all leaves the caret there.
+        let moved = self.reconciled_caret.get(id).copied() != Some(self.caret);
+        self.reconciled_caret.insert(id, self.caret);
+        let max = (content_h - view_h).max(0.0);
+        if !moved {
+            if let Some(v) = self.text_vscroll.get(id).copied() {
+                self.text_vscroll.insert(id, v.clamp(0.0, max));
+            }
+            return;
+        }
         let caret_top = self.multiline_caret(id).map_or(0.0, |(_, top)| top);
         let line_h = text::metrics_for(self.widgets[id].font_size).line_height;
         let mut v = self.text_vscroll.get(id).copied().unwrap_or(0.0);
@@ -2075,7 +2248,6 @@ impl Ui {
         } else if caret_top + line_h > v + view_h {
             v = caret_top + line_h - view_h;
         }
-        let max = (content_h - view_h).max(0.0);
         self.text_vscroll.insert(id, v.clamp(0.0, max));
     }
 
@@ -3267,6 +3439,17 @@ fn inflate_splitter(rect: Rect, orientation: Orientation) -> Rect {
 /// width depends on who renders it, and code that lines up here should line up
 /// everywhere.
 const INDENT: &str = "    ";
+
+/// The nearest character boundary at or before `byte`. Offsets reaching aurora
+/// from an app - a compiler span, a saved caret - are not guaranteed to land on
+/// one, and slicing on a bad one panics.
+fn snap_boundary(text: &str, byte: usize) -> usize {
+    let mut byte = byte.min(text.len());
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    byte
+}
 
 /// A whole-string byte offset as a cosmic-text [`Cursor`] (buffer line index +
 /// byte within that line). Text areas store the caret as a flat byte offset;
@@ -4720,6 +4903,175 @@ mod tests {
                 DrawCommand::FillRect { rect, color }
                     if *color == ghost && rect.pos != src_pos)),
             "a faded, offset ghost of the source should be drawn"
+        );
+    }
+
+    /// A text area whose content is taller than its box, laid out.
+    fn scrollable_area() -> (Ui, crate::WidgetId) {
+        let text: String = (0..60).map(|i| format!("line {i}\n")).collect();
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 200.0));
+        let field = ui.text_input(
+            root,
+            text,
+            Style::new().size(360.0, 120.0).multiline().monospace(),
+        );
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        (ui, field)
+    }
+
+    #[test]
+    fn scrolling_away_from_the_caret_survives_the_next_layout() {
+        // The defect: update_vscroll ran every layout, and layout runs every
+        // frame, so glancing at another part of the file was undone before it
+        // was drawn.
+        let (mut ui, field) = scrollable_area();
+        ui.focus_caret(field, 0);
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+
+        ui.set_text_scroll(field, 300.0);
+        let (before, max) = ui.text_scroll(field).unwrap();
+        assert!(before > 0.0 && max > 0.0);
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        assert_eq!(ui.text_scroll(field).unwrap().0, before, "stayed put");
+
+        // But the view still follows the caret when the caret actually moves.
+        // (Putting it back where it already was is not a move, and correctly
+        // does not re-reveal.)
+        ui.focus_caret(field, 5);
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        assert_eq!(ui.text_scroll(field).unwrap().0, 0.0, "revealed the caret");
+    }
+
+    #[test]
+    fn select_all_does_not_yank_the_view_to_the_end_of_the_file() {
+        // ctrl+a leaves the caret at text_len, and the view used to chase it -
+        // so selecting in order to copy lost your reading position.
+        let (mut ui, field) = scrollable_area();
+        ui.focus_caret(field, 0);
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        ui.select_all();
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        assert_eq!(ui.text_scroll(field).unwrap().0, 0.0);
+        assert!(ui.selection_range().is_some(), "and it did select");
+    }
+
+    #[test]
+    fn a_point_in_the_text_maps_back_to_a_byte_offset() {
+        let (mut ui, field) = text_area("aaa\nbbb");
+        ui.focus_caret(field, 0);
+        let origin = ui.content_origin[field];
+        let line_h = text::metrics_for(ui.widgets[field].font_size).line_height;
+        let on_second = origin + Vec2::new(1.0, line_h * 1.5);
+        assert_eq!(ui.offset_at_point(field, on_second), Some(4));
+        // Outside the widget entirely: nothing, rather than a clamped guess.
+        assert_eq!(ui.offset_at_point(field, Vec2::new(-50.0, -50.0)), None);
+    }
+
+    #[test]
+    fn a_selection_can_be_read_back_and_restored_exactly() {
+        // The defect this exists for: a shell rebuild restored only the caret,
+        // and focus_caret clears the anchor - so a console line arriving
+        // mid-selection silently emptied it and ctrl+c copied nothing.
+        let (mut ui, field) = text_area("aaa\nbbb\nccc");
+        ui.select_range(field, 2, 9);
+        assert_eq!(ui.selection_range(), Some(2..9));
+        assert_eq!(ui.selection_anchor(), Some(2));
+
+        let (anchor, caret) = (ui.selection_anchor().unwrap(), ui.caret_offset().unwrap());
+        ui.focus_caret(field, 0); // stands in for a rebuild losing it
+        assert_eq!(ui.selection_range(), None);
+        ui.focus_selection(field, anchor, caret);
+        assert_eq!(ui.selection_range(), Some(2..9));
+        assert_eq!(ui.selected_text().as_deref(), Some("a\nbbb\nc"));
+    }
+
+    #[test]
+    fn a_backwards_selection_reads_the_same_range_and_keeps_its_moving_end() {
+        let (mut ui, field) = text_area("abcdef");
+        ui.focus_selection(field, 5, 1);
+        assert_eq!(ui.selection_range(), Some(1..5));
+        assert_eq!(
+            ui.caret_offset(),
+            Some(1),
+            "the caret is still the end that moved"
+        );
+    }
+
+    #[test]
+    fn the_caret_reports_a_line_and_column_a_status_bar_can_show() {
+        let (mut ui, field) = text_area("aaa\nbb\u{fc}cc");
+        ui.focus_caret(field, 0);
+        assert_eq!(ui.caret_line_column(), Some((1, 1)));
+        ui.focus_caret(field, 4);
+        assert_eq!(
+            ui.caret_line_column(),
+            Some((2, 1)),
+            "start of the second line"
+        );
+        // Just past the two-byte character: three characters in, so column 4 -
+        // where counting bytes would have said 5.
+        ui.focus_caret(field, 8);
+        assert_eq!(ui.caret_line_column(), Some((2, 4)));
+    }
+
+    #[test]
+    fn a_text_area_keeps_pasted_newlines_and_a_field_still_drops_them() {
+        // The defect: insert_str filtered every control character, so pasting
+        // three lines of code welded them into one.
+        let (mut ui, field) = text_area("");
+        ui.focus(field);
+        ui.insert_str("one\ntwo\nthree");
+        assert_eq!(ui.text_of(field), Some("one\ntwo\nthree"));
+
+        // CRLF and a lone CR normalise, so a file from a Windows editor does
+        // not arrive with invisible carriage returns in it.
+        let (mut ui, field) = text_area("");
+        ui.focus(field);
+        ui.insert_str("a\r\nb\rc");
+        assert_eq!(ui.text_of(field), Some("a\nb\nc"));
+
+        // A single-line field still has nowhere to put a newline.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 100.0));
+        let line = ui.text_input(root, String::new(), Style::new().width(200.0));
+        ui.layout(Vec2::new(400.0, 100.0)).unwrap();
+        ui.focus(line);
+        ui.insert_str("one\ntwo");
+        assert_eq!(ui.text_of(line), Some("onetwo"));
+    }
+
+    #[test]
+    fn replace_range_edits_anywhere_and_reports_where_the_text_landed() {
+        let (mut ui, field) = text_area("aaa\nbbb\nccc");
+        let at = ui.replace_range(field, 4..7, "XX\nYY");
+        assert_eq!(ui.text_of(field), Some("aaa\nXX\nYY\nccc"));
+        assert_eq!(at, 4..9, "the range the new text occupies");
+
+        // Out-of-range clamps to the end rather than panicking.
+        let (mut ui, field) = text_area("abc");
+        ui.replace_range(field, 99..99, "!");
+        assert_eq!(ui.text_of(field), Some("abc!"));
+
+        // A reversed range is a caller with its ends backwards, and deleting a
+        // span on its behalf would be worse than doing nothing.
+        // Built rather than written literally, so the lint that catches a
+        // reversed range by accident still fires everywhere it should.
+        let (start, end) = (3, 1);
+        ui.replace_range(field, start..end, "");
+        assert_eq!(ui.text_of(field), Some("abc!"));
+    }
+
+    #[test]
+    fn replace_range_never_splits_a_character() {
+        // Offsets reach aurora from apps - a compiler span, a restored caret -
+        // and slicing on a bad one panics.
+        let (mut ui, field) = text_area("a\u{fc}b");
+        ui.replace_range(field, 1..2, "X");
+        assert_eq!(
+            ui.text_of(field),
+            Some("aX\u{fc}b"),
+            "snapped left, not split"
         );
     }
 
