@@ -1671,8 +1671,13 @@ impl Ui {
                     }
                 }
                 // Arm the widget under the pointer; a release over the same one
-                // is a click.
-                self.pressed = self.hovered;
+                // is a click. Except in a gutter: focus_from_press reports the
+                // line and deliberately leaves the caret alone, so arming here
+                // would let the next pointer move sweep a selection out of
+                // whatever anchor an earlier click left behind.
+                self.pressed = self
+                    .hovered
+                    .filter(|&id| self.gutter_line_at_cursor(id).is_none());
                 // Arm a drag if the press landed on (or within) a draggable.
                 self.drag = self
                     .cursor
@@ -1983,7 +1988,21 @@ impl Ui {
             if self.shift {
                 self.selection_anchor.get_or_insert(caret);
             } else {
+                // A plain Left or Right with a selection collapses to that edge
+                // and stops there. Clearing the anchor and then stepping landed
+                // one character past whichever end happened to be moving, which
+                // depends on which way the selection was dragged - so the same
+                // keystroke did different things and quietly lost your place.
+                let (lo, hi) = self.selection_bounds(id);
                 self.selection_anchor = None;
+                // Only a plain arrow means "put the caret back". Word, line and
+                // vertical motion all move on from wherever the caret already
+                // is, which is what makes ctrl+Right after a shift-selection
+                // continue from the end you were dragging.
+                if lo != hi && matches!(key, Key::Left | Key::Right) {
+                    self.caret = if key == Key::Left { lo } else { hi };
+                    return;
+                }
             }
         }
         // Vertical and line-scoped moves are 2D (text areas only); Up/Down are a
@@ -3093,6 +3112,20 @@ impl Ui {
         let Some(buffer) = self.buffers.get(id) else {
             return Vec::new();
         };
+        // An empty range covers no glyphs, so highlight() yields nothing for it -
+        // and the commonest diagnostic while typing (an unclosed brace, reported
+        // at the end of the file) is exactly that. Widen it to one character, the
+        // one before it where there is one, so the mark lands on the text the
+        // error is about rather than after it.
+        let (lo, hi) = if lo == hi {
+            match text[..lo.min(text.len())].chars().next_back() {
+                Some(c) if c != '\n' => (lo - c.len_utf8(), lo),
+                _ => (lo, next_boundary(text, lo)),
+            }
+        } else {
+            (lo, hi)
+        };
+
         let (start, end) = (byte_to_cursor(text, lo), byte_to_cursor(text, hi));
         let mut rects = Vec::new();
         for run in buffer.layout_runs() {
@@ -3103,10 +3136,20 @@ impl Ui {
             if run.line_i < start.line || run.line_i > end.line {
                 continue;
             }
+            let mut any = false;
             for (x, w) in run.highlight(start, end) {
+                any = true;
                 rects.push(Rect::new(
                     origin + Vec2::new(x, run.line_top),
                     Vec2::new(w.max(0.0), run.line_height),
+                ));
+            }
+            // A blank line has no glyphs to highlight, so a selection crossing
+            // one broke in half. A stub keeps it reading as one continuous block.
+            if !any && run.line_i > start.line && run.line_i < end.line {
+                rects.push(Rect::new(
+                    origin + Vec2::new(0.0, run.line_top),
+                    Vec2::new(BLANK_LINE_STUB, run.line_height),
                 ));
             }
         }
@@ -3354,6 +3397,10 @@ impl Default for Ui {
         Self::new()
     }
 }
+
+/// How wide a mark on an otherwise empty line is drawn, in px - enough to read
+/// as "this line is included" without pretending there is text there.
+const BLANK_LINE_STUB: f32 = 5.0;
 
 /// How thick an underline is, and how far below the line's bottom it sits.
 const DECORATION_THICKNESS: f32 = 1.5;
@@ -4921,6 +4968,73 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_arrow_with_a_selection_collapses_to_that_edge_and_stops() {
+        // The defect: the anchor was cleared and then the caret stepped, so a
+        // plain arrow landed one character past whichever end happened to be
+        // moving - which depends on which way the selection was dragged.
+        let (mut ui, field) = text_area("abcdef");
+
+        // Dragged forwards: caret at the high end.
+        ui.focus_selection(field, 1, 4);
+        ui.handle_input(InputEvent::Key(Key::Left));
+        assert_eq!(ui.caret_offset(), Some(1));
+        assert_eq!(ui.selection_range(), None);
+
+        // Dragged backwards: caret at the low end. Same keystroke, same result.
+        ui.focus_selection(field, 4, 1);
+        ui.handle_input(InputEvent::Key(Key::Left));
+        assert_eq!(ui.caret_offset(), Some(1));
+
+        ui.focus_selection(field, 1, 4);
+        ui.handle_input(InputEvent::Key(Key::Right));
+        assert_eq!(ui.caret_offset(), Some(4));
+        ui.focus_selection(field, 4, 1);
+        ui.handle_input(InputEvent::Key(Key::Right));
+        assert_eq!(ui.caret_offset(), Some(4));
+
+        // With no selection an arrow still steps, as always.
+        ui.focus_caret(field, 2);
+        ui.handle_input(InputEvent::Key(Key::Right));
+        assert_eq!(ui.caret_offset(), Some(3));
+    }
+
+    #[test]
+    fn a_zero_width_diagnostic_still_gets_a_mark() {
+        // The commonest error while typing - an unclosed brace, which comet
+        // reports at the end of the file - is a zero-length span, and
+        // highlight() yields nothing for one. It drew nothing at all.
+        let (mut ui, field) = text_area("func f() {");
+        let at = "func f() {".len();
+        ui.set_decorations(
+            field,
+            vec![Decoration {
+                range: at..at,
+                color: RED,
+                style: DecorationStyle::Squiggle,
+            }],
+        );
+        let marks = fills_of(&ui, RED);
+        assert!(!marks.is_empty(), "an empty span must still be visible");
+        assert!(marks.iter().all(|r| r.size.x > 0.0));
+    }
+
+    #[test]
+    fn a_selection_across_a_blank_line_stays_continuous() {
+        // A blank line has no glyphs, so highlight() returned nothing for it and
+        // a multi-line selection broke in half.
+        let (mut ui, field) = text_area("aaa\n\nccc");
+        ui.set_decorations(
+            field,
+            vec![Decoration {
+                range: 0..9,
+                color: RED,
+                style: DecorationStyle::Highlight,
+            }],
+        );
+        assert_eq!(fills_of(&ui, RED).len(), 3, "one per line, blank included");
+    }
+
+    #[test]
     fn scrolling_away_from_the_caret_survives_the_next_layout() {
         // The defect: update_vscroll ran every layout, and layout runs every
         // frame, so glancing at another part of the file was undone before it
@@ -5261,6 +5375,31 @@ mod tests {
             wide > narrow,
             "three digits need more room than one: {wide} vs {narrow}"
         );
+    }
+
+    #[test]
+    fn a_gutter_press_does_not_arm_a_text_sweep() {
+        // The defect: pressed was armed from the hovered widget before
+        // focus_from_press ran, and the gutter branch returns early - so the
+        // next pointer move dragged a selection out of whatever anchor an
+        // earlier click had left behind.
+        let (mut ui, field) = gutter_area("aaa\nbbb\nccc");
+        ui.focus_caret(field, 5);
+        let origin = ui.content_origin[field];
+        let line_h = text::metrics_for(ui.widgets[field].font_size).line_height;
+
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(
+            origin.x - 4.0,
+            origin.y + line_h * 0.5,
+        )));
+        ui.handle_input(InputEvent::PointerPressed);
+        // Twitch the mouse the way a hand on a trackpad does.
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(
+            origin.x - 4.0,
+            origin.y + line_h * 2.5,
+        )));
+        assert_eq!(ui.selection_range(), None, "nothing was swept");
+        assert_eq!(ui.caret_offset(), Some(5), "and the caret did not move");
     }
 
     #[test]
