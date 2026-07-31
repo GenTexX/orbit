@@ -16,6 +16,8 @@ pub enum TokenKind {
     If,
     Else,
     While,
+    For,
+    In,
     Return,
     True,
     False,
@@ -26,6 +28,8 @@ pub enum TokenKind {
     RParen,
     Comma,
     Dot,
+    /// `..`, which only ever appears in a `for` range.
+    DotDot,
     Semicolon,
     Colon,
     Arrow,
@@ -243,6 +247,8 @@ impl<'src> Lexer<'src> {
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "while" => TokenKind::While,
+            "for" => TokenKind::For,
+            "in" => TokenKind::In,
             "return" => TokenKind::Return,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
@@ -254,6 +260,7 @@ impl<'src> Lexer<'src> {
     fn lex_punct(&mut self, start: usize) {
         let two = self.peek_at(1);
         let (kind, len) = match (self.peek(), two) {
+            (Some(b'.'), Some(b'.')) => (TokenKind::DotDot, 2),
             (Some(b'='), Some(b'=')) => (TokenKind::EqEq, 2),
             (Some(b'!'), Some(b'=')) => (TokenKind::NotEq, 2),
             (Some(b'<'), Some(b'=')) => (TokenKind::Le, 2),
@@ -390,13 +397,15 @@ mod tests {
     #[test]
     fn keywords_are_not_identifiers() {
         assert_eq!(
-            kinds("func let if else while return true false"),
+            kinds("func let if else while for in return true false"),
             vec![
                 TokenKind::Func,
                 TokenKind::Let,
                 TokenKind::If,
                 TokenKind::Else,
                 TokenKind::While,
+                TokenKind::For,
+                TokenKind::In,
                 TokenKind::Return,
                 TokenKind::True,
                 TokenKind::False,

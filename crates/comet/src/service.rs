@@ -133,6 +133,8 @@ fn classify(tokens: &[crate::lexer::Token]) -> Vec<TokenSpan> {
             | TokenKind::If
             | TokenKind::Else
             | TokenKind::While
+            | TokenKind::For
+            | TokenKind::In
             | TokenKind::Return
             | TokenKind::True
             | TokenKind::False => TokenClass::Keyword,
@@ -288,7 +290,7 @@ pub struct CompletionItem {
 
 /// The keywords a script can start a statement with.
 const KEYWORDS: &[&str] = &[
-    "func", "let", "if", "else", "while", "return", "true", "false",
+    "func", "let", "if", "else", "while", "for", "in", "return", "true", "false",
 ];
 /// The type names a script can write.
 const TYPES: &[&str] = &["f32", "bool", "Vec2", "String"];
@@ -401,6 +403,8 @@ fn keyword_detail(word: &str) -> &'static str {
         "if" => "run a block when a condition holds",
         "else" => "run a block when the `if` did not",
         "while" => "repeat a block while a condition holds",
+        "for" => "repeat a block once per number in a range: `for i in 0.0..4.0`",
+        "in" => "separates a `for` loop's variable from its range",
         "return" => "leave a function with a value",
         "true" | "false" => "a bool literal",
         _ => "",
@@ -642,6 +646,20 @@ fn visit_lets(block: &Block, offset: usize, out: &mut impl FnMut(&str, Option<&s
                 }
             }
             Stmt::While { body, .. } => visit_lets(body, offset, out),
+            Stmt::For {
+                name,
+                name_span,
+                body,
+                ..
+            } => {
+                // The loop variable is always an f32, and it is in scope from
+                // the moment it is written - which is what makes `for i in`
+                // followed by `i` inside the body complete.
+                if (name_span.end as usize) <= offset {
+                    out(name, Some("f32"), *name_span);
+                }
+                visit_lets(body, offset, out);
+            }
             Stmt::Assign { .. } | Stmt::Return { .. } | Stmt::Expr { .. } => {}
         }
     }

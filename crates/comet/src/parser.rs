@@ -263,6 +263,26 @@ impl Parser {
                     body,
                 })
             }
+            TokenKind::For => {
+                self.advance();
+                let (name, name_span) = self.ident("a loop variable");
+                self.expect(&TokenKind::In, "`in`");
+                // The bounds are parsed without the range operator in the
+                // expression grammar, so `..` cannot appear anywhere else and
+                // does not need a precedence level of its own.
+                let start_bound = self.expr();
+                self.expect(&TokenKind::DotDot, "`..`");
+                let end_bound = self.expr();
+                let body = self.block();
+                StmtOrTail::Stmt(Stmt::For {
+                    name,
+                    name_span,
+                    start: start_bound,
+                    end: end_bound,
+                    span: start.to(body.span),
+                    body,
+                })
+            }
             TokenKind::Return => {
                 self.advance();
                 let value = if matches!(self.peek(), TokenKind::Semicolon) {
@@ -669,6 +689,29 @@ mod tests {
             script.functions[0].body.stmts[0],
             Stmt::While { .. }
         ));
+    }
+
+    #[test]
+    fn for_loops_parse_their_range() {
+        let script = parse_ok("func update(dt: f32) { for i in 0.0..count { } }");
+        let Stmt::For {
+            name, start, end, ..
+        } = &script.functions[0].body.stmts[0]
+        else {
+            panic!("expected a for");
+        };
+        assert_eq!(name, "i");
+        assert!(matches!(start, Expr::Number { .. }));
+        assert!(matches!(end, Expr::Ident { .. }));
+    }
+
+    #[test]
+    fn a_for_loop_missing_its_range_is_reported_not_panicked() {
+        let (_, diagnostics) = parse("func update(dt: f32) { for i in 0.0 { } }");
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("`..`")),
+            "the missing range operator is what to report: {diagnostics:?}"
+        );
     }
 
     #[test]

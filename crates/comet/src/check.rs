@@ -228,11 +228,98 @@ impl Checker {
 
     fn block(&mut self, block: &ast::Block) -> TypedBlock {
         self.scopes.push(HashMap::new());
-        let stmts = block.stmts.iter().map(|s| self.stmt(s)).collect();
+        let mut stmts = Vec::with_capacity(block.stmts.len());
+        for stmt in &block.stmts {
+            // One source statement can become several typed ones: `for` is
+            // checked by lowering it to the `while` a reader would have written
+            // by hand.
+            match stmt {
+                ast::Stmt::For { .. } => self.for_stmt(stmt, &mut stmts),
+                other => stmts.push(self.stmt(other)),
+            }
+        }
         let tail = block.tail.as_ref().map(|e| self.expr(e));
         self.scopes.pop();
         let ty = tail.as_ref().map_or(Type::Unit, |t| t.ty);
         TypedBlock { stmts, tail, ty }
+    }
+
+    /// Lower `for i in a..b { body }` into the three statements that mean the
+    /// same thing:
+    ///
+    /// ```text
+    /// let i = a;
+    /// let <end> = b;
+    /// while i < <end> { body; i = i + 1.0; }
+    /// ```
+    ///
+    /// Doing it here rather than in codegen means `for` cannot drift from the
+    /// `while` it claims to be, and codegen never learns that `for` exists. The
+    /// upper bound is hoisted into a local of its own so it is evaluated once,
+    /// which is what makes `for i in 0..count()` call `count` a single time.
+    fn for_stmt(&mut self, stmt: &ast::Stmt, out: &mut Vec<TypedStmt>) {
+        let ast::Stmt::For {
+            name,
+            name_span,
+            start,
+            end,
+            body,
+            ..
+        } = stmt
+        else {
+            unreachable!("only called for a `for`");
+        };
+
+        let start = self.expr(start);
+        let end = self.expr(end);
+        self.expect_type(Type::F32, start.ty, start.span);
+        self.expect_type(Type::F32, end.ty, end.span);
+
+        // The loop variable and the bound live in a scope of their own, so
+        // neither is in scope after the loop and neither shadows anything for
+        // longer than the loop lasts.
+        self.scopes.push(HashMap::new());
+        let slot = self.declare_local(name, Type::F32);
+        // A name with a space in it: no source text can lex to this, so the
+        // bound cannot be read or written by the script that produced it.
+        let end_slot = self.declare_local("for end", Type::F32);
+        out.push(TypedStmt::Let { slot, init: start });
+        out.push(TypedStmt::Let {
+            slot: end_slot,
+            init: end,
+        });
+
+        let counter = |kind| TypedExpr {
+            kind,
+            ty: Type::F32,
+            span: *name_span,
+        };
+        let cond = TypedExpr {
+            kind: TypedExprKind::Binary {
+                op: BinaryOp::LtF32,
+                lhs: Box::new(counter(TypedExprKind::Local(slot))),
+                rhs: Box::new(counter(TypedExprKind::Local(end_slot))),
+            },
+            ty: Type::Bool,
+            span: *name_span,
+        };
+
+        let mut body = self.block(body);
+        body.stmts.push(TypedStmt::Assign {
+            place: Place::Local(slot),
+            value: TypedExpr {
+                kind: TypedExprKind::Binary {
+                    op: BinaryOp::AddF32,
+                    lhs: Box::new(counter(TypedExprKind::Local(slot))),
+                    rhs: Box::new(counter(TypedExprKind::Number(1.0))),
+                },
+                ty: Type::F32,
+                span: *name_span,
+            },
+        });
+        self.scopes.pop();
+
+        out.push(TypedStmt::While { cond, body });
     }
 
     fn declare_local(&mut self, name: &str, ty: Type) -> u32 {
@@ -317,6 +404,10 @@ impl Checker {
             }
 
             ast::Stmt::If(if_stmt) => self.if_stmt(if_stmt),
+
+            ast::Stmt::For { .. } => {
+                unreachable!("`for` is lowered by for_stmt, which block calls directly")
+            }
 
             ast::Stmt::While { cond, body, .. } => {
                 let cond = self.expr(cond);
@@ -1429,6 +1520,56 @@ mod tests {
         check_clean(r#"func f(x: f32) -> String { "x: " + str(x) }"#);
         assert_eq!(
             messages(r#"func f() { let s: String = str("already"); }"#),
+            ["expected `f32`, found `String`"]
+        );
+    }
+
+    #[test]
+    fn a_for_loop_is_the_while_loop_a_reader_would_have_written() {
+        let typed = check_clean("func f() { for i in 0.0..3.0 { print(str(i)); } }");
+        let body = &typed.functions[0].body.stmts;
+
+        // let i = 0; let <end> = 3; while i < <end> { ...; i = i + 1 }
+        assert_eq!(body.len(), 3, "three statements, not one loop node");
+        assert!(matches!(body[0], TypedStmt::Let { slot: 0, .. }));
+        assert!(matches!(body[1], TypedStmt::Let { slot: 1, .. }));
+        let TypedStmt::While { cond, body } = &body[2] else {
+            panic!("expected a while");
+        };
+        assert!(matches!(
+            cond.kind,
+            TypedExprKind::Binary {
+                op: BinaryOp::LtF32,
+                ..
+            }
+        ));
+        assert!(
+            matches!(
+                body.stmts.last(),
+                Some(TypedStmt::Assign {
+                    place: Place::Local(0),
+                    ..
+                })
+            ),
+            "the increment is the last thing in the body"
+        );
+    }
+
+    #[test]
+    fn the_loop_variable_leaves_scope_with_the_loop() {
+        assert_eq!(
+            messages("func f() { for i in 0.0..3.0 { } print(str(i)); }"),
+            ["cannot find `i` in this scope"]
+        );
+        // And the hidden bound is not a name any script can reach, because no
+        // source text lexes to it.
+        check_clean("func f() { for i in 0.0..3.0 { } for i in 0.0..3.0 { } }");
+    }
+
+    #[test]
+    fn for_bounds_must_be_numbers() {
+        assert_eq!(
+            messages(r#"func f() { for i in "a"..3.0 { } }"#),
             ["expected `f32`, found `String`"]
         );
     }

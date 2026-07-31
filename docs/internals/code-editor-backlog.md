@@ -2684,7 +2684,7 @@ backlog.
   type case is proven on String, and that sequencing looks right. Flagged
   because until it lands, completions and hover have little to be deep about.
 
-- **A for loop** (M, comet)
+- ~~**A for loop** (M, comet)~~ DONE
   `for i in 0.0..10.0 { }` (or over a collection, once one exists) parses,
   checks and lowers to the same wasm loop while already emits.
   Why: while is the only loop, so every iteration is a hand-written counter
@@ -2695,8 +2695,15 @@ backlog.
   step, so codegen needs nothing. The cost is a design call: no integer type
   means an f32 loop counter, which is a real semantics decision about
   fencepost behaviour, not a syntax one.
+  Done: desugars in the checker, as the note guessed - codegen never learns
+  that `for` exists, and the loop provably behaves as the `while` a reader
+  would have written. Half-open, f32 counter, upper bound hoisted into a local
+  so it is evaluated once. The counter and the bound live in a scope of their
+  own, so the variable is gone after the loop.
 
-- **Block comments in the lexer** (S, comet)
+- **Block comments in the lexer** was done with the maths builtins.
+
+- ~~**Block comments in the lexer** (S, comet)~~ DONE
   /* */ lexes as a comment, is classified as one by highlight, and is skipped
   by the parser and the checker. Nesting either works or is explicitly
   refused.

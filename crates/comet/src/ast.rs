@@ -87,6 +87,15 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    /// `for i in a..b { ... }` - the counted loop, half-open like Rust's.
+    For {
+        name: String,
+        name_span: Span,
+        start: Expr,
+        end: Expr,
+        body: Block,
+        span: Span,
+    },
     Return {
         value: Option<Expr>,
         span: Span,

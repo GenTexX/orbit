@@ -829,3 +829,71 @@ fn a_concatenated_string_can_be_joined_again_without_leaking() {
         "intermediates are reused from the free list rather than growing memory"
     );
 }
+
+#[test]
+fn a_for_loop_runs_from_the_lower_bound_up_to_but_not_including_the_upper() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            for i in 0.0..4.0 {
+                print(str(i));
+            }
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["0", "1", "2", "3"]);
+}
+
+#[test]
+fn a_for_loop_whose_bounds_cross_runs_no_iterations() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            for i in 3.0..3.0 { print("never"); }
+            for i in 5.0..1.0 { print("never"); }
+            print("done");
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["done"]);
+}
+
+#[test]
+fn a_for_loop_evaluates_its_upper_bound_once() {
+    // The bound is hoisted into a local, so a bound with a side effect - or
+    // simply an expensive one - happens once rather than per iteration.
+    let mut script = Script::new(
+        r#"
+        let calls: f32 = 0.0;
+        func bound() -> f32 {
+            calls = calls + 1.0;
+            3.0
+        }
+        func update(dt: f32) {
+            for i in 0.0..bound() { }
+        }
+        func call_count() -> f32 { calls }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.call::<(), f32>("call_count", ()), 1.0);
+}
+
+#[test]
+fn nested_for_loops_each_get_their_own_counter() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            for y in 0.0..2.0 {
+                for x in 0.0..2.0 {
+                    print(str(x) + "," + str(y));
+                }
+            }
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["0,0", "1,0", "0,1", "1,1"]);
+}
