@@ -10,10 +10,15 @@ one pane, and putting 229 entries about it in the general idea inbox would
 drown everything else. Same rules apply - an entry is a captured thought, not a
 promise; when one ships, delete it.
 
+**Status, 2026-08-01.** All twenty defects are fixed, and the twenty entries
+picked as most important are implemented and tested. They are struck through
+below rather than deleted, because the reasoning in each is what a later reader
+needs to know why the editor behaves the way it does; the next sweep should
+delete them. Everything not marked DONE is still open - about 190 entries.
+
 **How to read it.** The first section is defects, not features: behaviours that
 lose text, discard state, or draw nothing where something should be. Three of
-them were reproduced with a test before this document was written, and one of
-those was fixed immediately rather than filed (see the section). Everything
+them were reproduced with a test before this document was written. Everything
 after that is missing capability, grouped by what a person would recognize.
 
 **Sizes** are rough: S is under about a hundred lines in one place, M a few
@@ -47,7 +52,7 @@ rather than taken on trust:
 - `insert_str("one\ntwo\nthree")` produced `"onetwothree"`.
 - A zero-width diagnostic span produced zero draw commands.
 
-- **Tab over a multi-line selection deletes it** (S, aurora) - FIXED 2026-07-31
+- **~~Tab over a multi-line selection deletes it~~** DONE (S, aurora) - FIXED 2026-07-31
   Tab with a selection spanning lines indents each touched line instead of
   replacing the selection with four spaces.
   Why: edit_key's Tab branch calls insert_str(INDENT), which does
@@ -57,7 +62,7 @@ rather than taken on trust:
   fixed the moment Tab-with-a-multiline-selection stops going through
   insert_str.
 
-- **Paste drops every newline** (S, aurora) - REPRODUCED
+- **~~Paste drops every newline~~** DONE (S, aurora) - REPRODUCED
   ctrl+v of multi-line text into a multiline field inserts the newlines; CRLF
   normalises to LF. A single-line field still strips them.
   Why: Ui::insert_str filters with !c.is_control() and '\n'.is_control() is
@@ -66,7 +71,7 @@ rather than taken on trust:
   Note: Gate on widget.multiline; the filter is load-bearing for single-line
   fields and has a test.
 
-- **A gutter press arms a text sweep from a stale anchor** (S, aurora)
+- **~~A gutter press arms a text sweep from a stale anchor~~** DONE (S, aurora)
   A press in the gutter neither moves the caret nor extends any selection,
   before or after the pointer moves.
   Why: handle_input sets self.pressed = self.hovered before focus_from_press,
@@ -75,7 +80,7 @@ rather than taken on trust:
   from whatever anchor an earlier click left. Press a line number, twitch the
   mouse, and a chunk of the file is selected.
 
-- **shift+Tab throws focus out of the file** (S, aurora)
+- **~~shift+Tab throws focus out of the file~~** DONE (S, aurora)
   shift+Tab with a text area focused outdents; it never moves focus. In a
   single-line field it still steps focus backwards.
   Why: edit_key guards indent with `multiline && !self.shift`, so shift+Tab
@@ -85,7 +90,7 @@ rather than taken on trust:
   today's behaviour as intended, so this is a decision to revisit
   deliberately. Escape or ctrl+Tab can carry the focus-escape duty.
 
-- **ctrl+f leaves focus in the source file** (S, atlas)
+- **~~ctrl+f leaves focus in the source file~~** DONE (S, atlas)
   ctrl+f opens the bar and focuses the query field with its text selected.
   ctrl+f while it is open re-focuses and re-selects rather than closing.
   Why: toggle_find never calls ui.focus, and the post-rebuild block restores
@@ -95,7 +100,7 @@ rather than taken on trust:
   Note: Needs a focus_find flag consumed after the bar is built, and the
   code_caret restore must not fire when it is set.
 
-- **Enter in the find query moves focus into the buffer** (M, aurora+atlas)
+- **~~Enter in the find query moves focus into the buffer~~** DONE (M, aurora+atlas)
   Enter steps to the next match and keeps focus in the query field;
   shift+Enter steps back; Enter in the replacement field replaces and
   advances. Neither leaves the bar.
@@ -106,7 +111,7 @@ rather than taken on trust:
   Note: Wants a FindBar::key(Key, shift) -> outcome mirroring ListPopup::key,
   routed from handle_code_key before ui.handle_input.
 
-- **A plain arrow with a selection steps past the wrong edge** (S, aurora)
+- **~~A plain arrow with a selection steps past the wrong edge~~** DONE (S, aurora)
   With a selection, Left/Up collapse to the low edge without moving further
   and Right/Down collapse to the high edge; Home/End collapse then apply the
   line move.
@@ -115,7 +120,7 @@ rather than taken on trust:
   to be moving - which depends on drag direction. It silently loses your
   place.
 
-- **ctrl+a scrolls the view to the bottom of the file** (S, aurora)
+- **~~ctrl+a scrolls the view to the bottom of the file~~** DONE (S, aurora)
   Select-all sets anchor 0 and caret text_len without scrolling; the visible
   rows stay put.
   Why: select_all moves the caret to text_len and the next layout's
@@ -124,7 +129,7 @@ rather than taken on trust:
   Note: A do-not-reveal flag consumed by the next update_vscroll, or reveal
   only when a movement key moved the caret.
 
-- **Wheel-scrolling away from the caret is undone next frame** (S, aurora)
+- **~~Wheel-scrolling away from the caret is undone next frame~~** DONE (S, aurora)
   Wheel-scrolling the focused editor to read elsewhere stays where you put it;
   the view only chases the caret when the caret actually moved.
   Why: update_vscroll runs at the end of every layout for the focused field
@@ -135,7 +140,7 @@ rather than taken on trust:
   only re-follow when it changes. The existing test never calls layout after
   the wheel, which is why it passes.
 
-- **The selection is destroyed by any shell rebuild** (S, aurora+atlas)
+- **~~The selection is destroyed by any shell rebuild~~** DONE (S, aurora+atlas)
   Anchor and caret are both captured before the Ui is swapped and restored
   after, so a rebuild triggered by anything else leaves the selection exactly
   as it was.
@@ -147,7 +152,7 @@ rather than taken on trust:
   Note: Needs a selection_range() reader and a focus_selection(id, anchor,
   caret) setter; Ui has caret_offset but no anchor reader.
 
-- **The editor's scroll position is destroyed by any shell rebuild** (S, aurora+atlas)
+- **~~The editor's scroll position is destroyed by any shell rebuild~~** DONE (S, aurora+atlas)
   After a rebuild the editor shows the same lines it showed before, whether or
   not the caret is on screen.
   Why: text_vscroll is a SecondaryMap on the Ui and a rebuild makes a new one;
@@ -159,7 +164,7 @@ rather than taken on trust:
   argues for a restore-scroll-without-chasing-the-caret flag rather than a
   plain setter.
 
-- **A zero-width diagnostic draws no squiggle** (S, aurora) - REPRODUCED
+- **~~A zero-width diagnostic draws no squiggle~~** DONE (S, aurora) - REPRODUCED
   A diagnostic whose span is empty still gets a visible mark: at least one
   character cell wide, at that offset or under the last character before it.
   Why: comet's lexer pushes Eof with span (pos, pos) and parser::expect
@@ -168,7 +173,7 @@ rather than taken on trust:
   range_rects returns empty and emit_decoration returns early on size.x <= 0.
   The commonest error state while typing renders nothing at all.
 
-- **A blank line inside a selection or a decoration draws nothing** (S, aurora)
+- **~~A blank line inside a selection or a decoration draws nothing~~** DONE (S, aurora)
   A selection or decoration crossing an empty line fills it with a stub about
   one space wide, so a multi-line selection reads as continuous.
   Why: range_rects gets its rects from LayoutRun::highlight, which iterates
@@ -176,7 +181,7 @@ rather than taken on trust:
   looks like two separate selections, and a find match or squiggle can never
   land on an empty line.
 
-- **Closing the window discards every unsaved edit** (M, atlas)
+- **~~Closing the window discards every unsaved edit~~** DONE (M, atlas)
   A Save / Discard / Cancel modal appears before any action that would drop a
   dirty buffer: closing the window, closing a tab, opening another file into
   the same slot, reloading the project. Cancel aborts entirely; several dirty
@@ -189,14 +194,14 @@ rather than taken on trust:
   button confirm body yet, and nothing there is async, so the pending action
   rides on State.
 
-- **Opening another script discards the current buffer** (S, atlas)
+- **~~Opening another script discards the current buffer~~** DONE (S, atlas)
   Double-clicking a second .cmt with unsaved edits prompts before replacing
   the buffer.
   Why: open_script_file never consults script_modified; it reads the new file
   and overwrites script_text, script_undo and script_redo. The scene-tree and
   explorer paths have the same hole for a dirty scene.
 
-- **Renaming, moving or deleting the open file leaves the save path stale** (S, atlas)
+- **~~Renaming, moving or deleting the open file leaves the save path stale~~** DONE (S, atlas)
   Renaming or moving the open file updates the document's path in place;
   deleting it marks the document orphaned, the header says the file is gone,
   and ctrl+s becomes Save As.
@@ -209,7 +214,7 @@ rather than taken on trust:
   folder rename above the file has to re-prefix it, which is why the check
   belongs in one place.
 
-- **Save truncates the file before writing it** (S, atlas)
+- **~~Save truncates the file before writing it~~** DONE (S, atlas)
   A save writes a sibling temp file in the same directory, flushes, then
   renames over the target. A failure anywhere leaves the original untouched
   and reports it.
@@ -220,7 +225,7 @@ rather than taken on trust:
   Note: The temp file must be in the target's own directory; file_ops.rs
   already owns atlas's filesystem vocabulary including unique_path.
 
-- **A CRLF file mis-places the caret and grows mixed endings** (M, atlas)
+- **~~A CRLF file mis-places the caret and grows mixed endings~~** DONE (M, atlas)
   The dominant ending is detected on open, the buffer always holds LF, and
   save writes the original ending back. Mixed endings normalise to whichever
   dominates, and the header says so.
@@ -232,7 +237,7 @@ rather than taken on trust:
   Note: Normalising at the open/save boundary keeps aurora LF-only by
   contract; worth stating that in a doc comment on byte_to_cursor.
 
-- **A UTF-8 BOM produces a diagnostic on an invisible character** (S, atlas)
+- **~~A UTF-8 BOM produces a diagnostic on an invisible character~~** DONE (S, atlas)
   A BOM is stripped on open, remembered, and written back on save. A file that
   is not valid UTF-8 is refused with a sentence naming the problem rather than
   a raw io::Error.
@@ -242,7 +247,7 @@ rather than taken on trust:
   Note: byte_to_cursor's boundary snapping is why this is quiet rather than a
   panic. modal::friendly_error already exists for the wording half.
 
-- **Completion items are de-duplicated adjacently only** (S, comet)
+- **~~Completion items are de-duplicated adjacently only~~** DONE (S, comet)
   A name appearing in two scopes is offered once.
   Why: names_in_scope does names.dedup() and completions_at does
   items.dedup_by(...), both adjacent-only, so a parameter sharing a name with
@@ -255,7 +260,7 @@ What the caret does when you move it, and what a selection is worth. Most of
 these are single-function changes inside aurora that the user feels on every
 keystroke.
 
-- **The caret remembers a goal column across vertical moves** (S, aurora)
+- **~~The caret remembers a goal column across vertical moves~~** DONE (S, aurora)
   The first Up/Down records a goal x in pixels within the content box; every
   subsequent Up/Down hit-tests that x, so passing through a short line and
   continuing lands back on the original column. Any horizontal move, click,
@@ -270,7 +275,7 @@ keystroke.
   SoftHome, PageUp/PageDown and BufferStart/End; adopting it needs a &mut
   FontSystem in edit_key.
 
-- **Smart Home: first non-whitespace, then column 0** (S, aurora)
+- **~~Smart Home: first non-whitespace, then column 0~~** DONE (S, aurora)
   Home moves to the line's first non-whitespace character; again from there
   goes to column 0; from column 0 back to the first non-whitespace. shift+Home
   extends over the same two stops.
@@ -291,7 +296,7 @@ keystroke.
   byte span contain the caret) - the same helper wrap affinity and
   PageUp/PageDown want.
 
-- **ctrl+Home / ctrl+End jump to the ends of the document** (S, aurora+atlas)
+- **~~ctrl+Home / ctrl+End jump to the ends of the document~~** DONE (S, aurora+atlas)
   ctrl+Home puts the caret at 0 and scrolls to the top, ctrl+End at text_len
   and scrolls to the bottom; shift+ctrl+ them selects to that end. Up on the
   first visual line also moves to offset 0.
@@ -301,7 +306,7 @@ keystroke.
   silent no-op because caret_vertical clamps target_y with .max(0.0) and re-
   hits the same row.
 
-- **PageUp / PageDown** (M, aurora+atlas)
+- **~~PageUp / PageDown~~** DONE (M, aurora+atlas)
   Move the caret by the number of visual rows that fit in the field's height
   minus one row of overlap, and scroll by the same amount so the caret keeps
   its on-screen row. They respect the goal column; shift+ extends; ctrl+ stays
@@ -327,7 +332,7 @@ keystroke.
   ctrl+Backspace so all four agree. atlas::word_before has a third definition
   for completion prefixes - worth reconciling.
 
-- **Double-click selects the word under the pointer** (M, aurora)
+- **~~Double-click selects the word under the pointer~~** DONE (M, aurora)
   Two presses on the same field within the double-click window and within a
   few pixels select the word containing (or immediately before) the hit
   offset: anchor at word start, caret at word end. Inside a whitespace run it
@@ -340,7 +345,7 @@ keystroke.
   own Instant-based counter. atlas has the pattern to copy in click_tree_row
   and click_file_entry.
 
-- **Triple-click selects the whole line** (S, aurora)
+- **~~Triple-click selects the whole line~~** DONE (S, aurora)
   A third press in the window selects the logical line from its start through
   and including the trailing newline, so a follow-up cut removes the line
   whole. On the last line it selects to the end of the text.
@@ -407,7 +412,7 @@ keystroke.
   under a selection would NOT be cheap - DrawCommand::Text is one colour per
   run, so it would mean splicing the colour spans.
 
-- **The caret blinks, and holds solid while typing** (S, atlas (timer and reset points) + aurora (a caret-moved hook or a last-movement instant))
+- **~~The caret blinks, and holds solid while typing~~** DONE (S, atlas (timer and reset points) + aurora (a caret-moved hook or a last-movement instant))
   Solid for about 500ms after any caret move or edit, then on/off at roughly
   530ms. Solid while a drag-selection is live, hidden when the window loses
   focus, phase reset on every keystroke.
@@ -432,7 +437,7 @@ keystroke.
   rather than twice. LayoutRun::cursor_glyph does not consult affinity, so the
   disambiguation is in choosing which run to ask.
 
-- **The app can read the selection, and the status bar shows Ln/Col** (S, aurora (accessors) + atlas (the readout))
+- **~~The app can read the selection, and the status bar shows Ln/Col~~** DONE (S, aurora (accessors) + atlas (the readout))
   Ui exposes the focused field's selection as byte offsets and the caret as
   (line, column) counted in characters with tabs expanded to the indent width.
   The status bar reads `Ln 12, Col 5` while the editor is focused and `Ln 12,
@@ -727,7 +732,7 @@ Comet is a brace language whose every statement lives at least one level deep,
 and the editor currently contributes exactly four spaces on Tab. This group is
 what makes typing a block feel finished rather than half-done.
 
-- **Enter keeps the current line's leading whitespace** (S, aurora)
+- **~~Enter keeps the current line's leading whitespace~~** DONE (S, aurora)
   Enter inserts a newline followed by a copy of the leading whitespace of the
   line the caret was on, leaving the caret after it. Enter inside the leading
   whitespace copies only what is left of the caret; on a whitespace-only line
@@ -741,7 +746,7 @@ what makes typing a block feel finished rather than half-done.
   behaviour for every text area, so it likely wants a per-widget Style flag
   (Style::auto_indent()).
 
-- **An opening brace at end of line adds a level** (S, aurora)
+- **~~An opening brace at end of line adds a level~~** DONE (S, aurora)
   When the line being left ends - ignoring trailing whitespace and a trailing
   line comment - with '{', the newline is followed by that line's leading
   whitespace plus one indent unit. Only the last non-whitespace character is
@@ -753,7 +758,7 @@ what makes typing a block feel finished rather than half-done.
   needs the veto hook from the brackets group; a purely textual last-char test
   is wrong.
 
-- **Enter between a brace pair opens a block** (S, aurora)
+- **~~Enter between a brace pair opens a block~~** DONE (S, aurora)
   With the caret directly between '{' and '}', Enter produces three lines: the
   '{' line unchanged, a blank line one level deeper with the caret on it, and
   a line holding '}' at the opener's own indentation.
@@ -777,7 +782,7 @@ what makes typing a block feel finished rather than half-done.
   exactly one unit is the honest cheap version; matching the opener's real
   column needs the bracket index.
 
-- **Tab and shift+Tab indent or outdent a whole multi-line selection** (M, aurora (the Tab branch) + atlas (restore the selection across the rebuild the first edit triggers))
+- **~~Tab and shift+Tab indent or outdent a whole multi-line selection~~** DONE (M, aurora (the Tab branch) + atlas (restore the selection across the rebuild the first edit triggers))
   With a selection spanning more than one line, Tab adds one indent unit to
   every touched line and shift+Tab removes up to one from each (fewer where
   there is less). Blank lines are skipped by indent and untouched by outdent.
@@ -945,7 +950,7 @@ features; auto-close is a separate mechanism that needs a language veto to be
 trustworthy. Comet is entirely braces and parenthesised conditions, so this
 group carries more weight here than in a typical editor.
 
-- **Comet answers what pairs with this bracket** (S, comet)
+- **~~Comet answers what pairs with this bracket~~** DONE (S, comet)
   A comet::service call over lex_with_comments walks
   LBrace/RBrace/LParen/RParen with a stack and returns per bracket token: its
   byte span, its partner's span or none, its nesting depth, and whether it is
@@ -959,7 +964,7 @@ group carries more weight here than in a typical editor.
   not in apply_script_marks, which runs every frame. There are no [ ] in comet
   at all, so the table is two pairs.
 
-- **The matching bracket lights up when the caret touches one** (S, comet+atlas)
+- **~~The matching bracket lights up when the caret touches one~~** DONE (S, comet+atlas)
   Look at the byte before the caret first, then the byte at it, so both `}|`
   and `|{` match. On a hit, add a Highlight on both single-byte ranges in a
   colour distinct from the selection. Recomputed when the caret moves, not
@@ -983,7 +988,7 @@ group carries more weight here than in a typical editor.
   Note: A fade of the match colour rather than a new theme entry; Color::fade
   is already used for the gutter band.
 
-- **An unmatched bracket is squiggled where it is** (M, comet+atlas)
+- **~~An unmatched bracket is squiggled where it is~~** DONE (M, comet+atlas)
   An opener with no closer gets an error on the opener ("this { is never
   closed"); a closer with no opener gets one on the closer. When the caret
   sits on an unmatched bracket, the match highlight uses the error colour so
@@ -996,7 +1001,7 @@ group carries more weight here than in a typical editor.
   lexer-level one when the parser already named the same block - the parser's
   is the one that drives recovery.
 
-- **A pair closed by the wrong bracket marks both ends** (S, comet)
+- **~~A pair closed by the wrong bracket marks both ends~~** DONE (S, comet)
   A closer that does not match the kind on top of the stack is reported on
   both the closer and the opener it collided with ("( closed by }"), and both
   draw in the error colour when the caret touches either.
@@ -1004,7 +1009,7 @@ group carries more weight here than in a typical editor.
   a naive matcher actively lies - it will draw a match between a ( and a } and
   send a jump to the wrong place.
 
-- **Jump to the matching bracket, and select to it** (S, atlas)
+- **~~Jump to the matching bracket, and select to it~~** DONE (S, atlas)
   ctrl+m with the caret on or just after a bracket moves the caret past its
   partner, so twice returns you home. Inside a block and on no bracket, it
   jumps to the enclosing opener, and again to that block's closer. With shift
@@ -1032,7 +1037,7 @@ group carries more weight here than in a typical editor.
   parse, fall back to the bracket index. atlas must hold the stack - aurora
   keeps one anchor and no history.
 
-- **Typing an opener or a quote auto-closes it** (M, aurora (pair table, per-widget flag, pending state) + atlas (the language veto))
+- **~~Typing an opener or a quote auto-closes it~~** DONE (M, aurora (pair table, per-widget flag, pending state) + atlas (the language veto))
   Typing (, { or " in the code editor inserts the pair and leaves the caret
   between the halves. Only a typed character does this: paste, find-and-
   replace, completion accept and insert_str in general insert exactly what
@@ -1044,7 +1049,7 @@ group carries more weight here than in a typical editor.
   what makes "only typing pairs" fall out for free. Needs a
   Style::auto_pairs() alongside multiline()/monospace()/gutter().
 
-- **No auto-closing inside a string or a comment** (S, comet (a context_at(source, offset) on the same lex_with_comments pass) + atlas hands aurora a predicate so aurora stays language-free)
+- **~~No auto-closing inside a string or a comment~~** DONE (S, comet (a context_at(source, offset) on the same lex_with_comments pass) + atlas hands aurora a predicate so aurora stays language-free)
   Typing ( inside `// note (see below` inserts one (. Typing " inside an open
   string closes that string rather than pairing. Typing { inside "a {b}"
   inserts one {. The editor asks comet whether the offset is code, string or
@@ -1056,7 +1061,7 @@ group carries more weight here than in a typical editor.
   lexer closes an unterminated string at EOF, so the answer is well-defined
   mid-typing, which is the only time it is asked.
 
-- **Auto-close only when the next character is a boundary** (S, aurora)
+- **~~Auto-close only when the next character is a boundary~~** DONE (S, aurora)
   The pair is inserted only at end of line, or when the next character is
   whitespace, ), }, comma, semicolon or dot. Typing ( immediately before
   `speed` gives `(speed`. For a quote the rule is tighter: no pair when the
@@ -1076,7 +1081,7 @@ group carries more weight here than in a typical editor.
   Note: Uses the same veto channel as the string/comment rule, so no new
   plumbing.
 
-- **Typing the closer steps over one that was auto-inserted** (S, aurora)
+- **~~Typing the closer steps over one that was auto-inserted~~** DONE (S, aurora)
   After `print(` auto-closed to `print(|)`, typing ) moves past the existing )
   and inserts nothing. A small stack of pending closers records each auto-
   inserted offset; offsets shift with edits before them, and an entry drops
@@ -1090,7 +1095,7 @@ group carries more weight here than in a typical editor.
   typed closer - is wrong in the case that matters: typing ) at `foo(|)bar()`
   when you genuinely meant to add one.
 
-- **Backspace between an empty auto-pair deletes both halves** (S, aurora)
+- **~~Backspace between an empty auto-pair deletes both halves~~** DONE (S, aurora)
   With the caret at `(|)` where the ) is a tracked auto-insertion, one
   Backspace leaves nothing. If anything was typed between them, or the closer
   was not auto-inserted, Backspace removes only the opener - a { deleted from
@@ -1099,7 +1104,7 @@ group carries more weight here than in a typical editor.
   negative half matters more: a Backspace that silently removes a brace 40
   lines away is a data-loss bug.
 
-- **Typing a quote or bracket with a selection surrounds it** (S, aurora)
+- **~~Typing a quote or bracket with a selection surrounds it~~** DONE (S, aurora)
   With `pos.x + 1.0` selected, typing ( yields `(pos.x + 1.0)` with the
   selection preserved over the original text so a second ( nests another pair.
   " does the same. A closing ) or } with a selection still replaces it like
@@ -1182,7 +1187,7 @@ of string work once two primitives exist, and together they are the difference
 between a text box and an editor. They also want one table instead of a fourth
 if-ladder.
 
-- **A newline-safe text mutation API on Ui** (S, aurora)
+- **~~A newline-safe text mutation API on Ui~~** DONE (S, aurora)
   Ui::replace_range(id, range, text) replaces an arbitrary byte range with
   arbitrary text, newlines included, then places the caret and optionally a
   selection at a caller-given offset. Control characters other than '\n' are
@@ -1196,7 +1201,7 @@ if-ladder.
   becomes multiline-aware rather than disappearing. Keep the Mask::accepts
   check on the candidate.
 
-- **Duplicate line or selection (ctrl+shift+d)** (S, atlas)
+- **~~Duplicate line or selection (ctrl+shift+d)~~** DONE (S, atlas)
   With no selection, copy the caret's whole line and insert it directly below
   with the caret at the same column on the copy. With a selection, insert an
   exact copy immediately after it and select the copy so repeats stack. Works
@@ -1206,7 +1211,7 @@ if-ladder.
   Enter, ctrl+v, and the paste eats the newline.
   Note: One Ui mutation so sync_script_buffer records one undo step.
 
-- **Move line or selection up and down (alt+up / alt+down)** (S, atlas)
+- **~~Move line or selection up and down (alt+up / alt+down)~~** DONE (S, atlas)
   alt+up swaps the caret's line with the one above and keeps the caret on the
   moved text at the same column; alt+down swaps downward. With a selection the
   whole block of touched lines moves as a unit and stays selected. At the
@@ -1219,7 +1224,7 @@ if-ladder.
   and just moves the caret. Intercept before translate_key; self.modifiers
   already carries alt_key().
 
-- **Delete line (ctrl+shift+k)** (S, atlas)
+- **~~Delete line (ctrl+shift+k)~~** DONE (S, atlas)
   Delete the caret's whole line including its newline; with a selection, every
   line it touches. The caret lands at the same clamped column on the line that
   moved up. Deleting the last line removes the preceding newline instead,
@@ -1239,7 +1244,7 @@ if-ladder.
   Note: Strip trailing whitespace on the first line before inserting the
   space, or joining an indented block leaves double spaces.
 
-- **Toggle line comment (ctrl+slash)** (M, atlas)
+- **~~Toggle line comment (ctrl+slash)~~** DONE (M, atlas)
   With no selection, prefix the caret's line with `// ` at its first non-
   whitespace column, or strip an existing one there. With a selection, if
   every non-blank touched line is already commented, uncomment all; otherwise
@@ -1407,7 +1412,7 @@ it - focus, keyboard stepping, scope, and the ability to search more than one
 file. Several entries here are also outright focus bugs, listed in the defects
 group.
 
-- **Find as you type** (S, atlas (a sync_find_query each frame, like sync_tree_filter))
+- **~~Find as you type~~** DONE (S, atlas (a sync_find_query each frame, like sync_tree_filter))
   Every keystroke in the query field re-searches: the count updates, all
   matches re-highlight, and the view previews the first match at or after the
   caret. No Enter needed. Deleting back to empty clears the highlights and
@@ -1421,7 +1426,7 @@ group.
   caret. find_all is an O(n*m) byte scan re-run over the whole buffer per
   keystroke - fine at script size, worth remembering before a 5k-line file.
 
-- **F3 and ctrl+g step matches with the bar closed** (M, atlas)
+- **~~F3 and ctrl+g step matches with the bar closed~~** DONE (M, atlas)
   F3 / ctrl+g goes to the next match of the last query, shift+F3 /
   ctrl+shift+g the previous, whether or not the bar is open. Escape keeps the
   query alive for these; they wrap and announce the wrap.
@@ -1629,7 +1634,7 @@ group.
   is one buffer's history, so this needs either a multi-file undo record or an
   explicit confirmation modal before it runs.
 
-- **Go to line, and line:column** (S, atlas)
+- **~~Go to line, and line:column~~** DONE (S, atlas)
   A shortcut opens a small field over the editor; `120` puts the caret at the
   first non-space character of line 120 and reveals it with context, `120:8`
   puts it at column 8, a number past the end clamps to the last line, Escape
@@ -1866,7 +1871,7 @@ a Diagnostic's message string is produced, cached, and rendered nowhere.
 Beyond that: hover, signature help, rename, references, warnings, and quick
 fixes - most of which read a TypedScript that already exists.
 
-- **One analysis per edit instead of three whole-file pipeline runs** (S, comet (the Analysis type) + atlas (hold one, invalidate on edit))
+- **~~One analysis per edit instead of three whole-file pipeline runs~~** DONE (S, comet (the Analysis type) + atlas (hold one, invalidate on edit))
   A single Analysis value computed once per buffer revision carries the token
   stream, the AST, the TypedScript, the diagnostics and the highlight spans;
   diagnostics, highlight, completions, hover and signature help all read it.
@@ -1880,7 +1885,7 @@ fixes - most of which read a TypedScript that already exists.
   would have to beat by roughly 3x before that question is worth asking, and
   ORBIT_FRAME_LOG exists to do the measuring.
 
-- **Show a diagnostic's message, not just its squiggle** (M, atlas (dwell timer and popup) + aurora (a public byte-offset-at-point))
+- **~~Show a diagnostic's message, not just its squiggle~~** DONE (M, atlas (dwell timer and popup) + aurora (a public byte-offset-at-point))
   Resting the pointer over a squiggle for about 500ms pops a small card near
   the cursor with the message, tinted by severity; moving off, typing or
   clicking dismisses it; overlapping diagnostics stack in one card in source
@@ -1898,7 +1903,7 @@ fixes - most of which read a TypedScript that already exists.
   the point-to-offset mapping but is private and returns text_len as its off-
   the-field answer, which a hover must not treat as real.
 
-- **Error and warning counts, and stepping between diagnostics** (S, atlas)
+- **~~Error and warning counts, and stepping between diagnostics~~** DONE (S, atlas)
   The Code pane header shows `2 errors, 1 warning` in the error/warning
   colours, or `no problems`. F8 / shift+F8 (and clicking the count) move the
   caret to the next / previous diagnostic span and reveal it, wrapping at the
@@ -1927,7 +1932,7 @@ fixes - most of which read a TypedScript that already exists.
   in the stage that decides whether the script can actually run has no path to
   the screen.
 
-- **Hover shows a symbol's type** (M, comet (service::hover(source, offset)) + atlas (the card))
+- **~~Hover shows a symbol's type~~** DONE (M, comet (service::hover(source, offset)) + atlas (the card))
   Hovering an identifier shows `dt: f32`, `pos: Vec2` (and says it is script
   state), or for a function `func clamp(value: f32, lo: f32, hi: f32) -> f32`.
   Punctuation, whitespace and literals show nothing; a name that did not
@@ -1957,7 +1962,7 @@ fixes - most of which read a TypedScript that already exists.
   builds up front. There are no overloads (by_name maps one name to one
   index), which removes the fiddliest part.
 
-- **Completion detail, kind and documentation** (M, aurora (ListPopup rows take a colour/tag) + comet (a detail string) + atlas (map kinds onto the code_* palette))
+- **~~Completion detail, kind and documentation~~** DONE (M, aurora (ListPopup rows take a colour/tag) + comet (a detail string) + atlas (map kinds onto the code_* palette))
   Each row shows the label, a small kind-coloured marker on the left, and a
   dimmed right-aligned detail: `f32` for a local, `(f32, f32, f32) -> f32` for
   a function, `keyword`, `type`, `field`. The typed prefix is emphasised in
@@ -2207,7 +2212,7 @@ What the pane looks like and how you move around it. Wrap-versus-scroll is the
 load-bearing decision here - several other entries in this backlog reason
 differently depending on which way it goes.
 
-- **Turn word wrap off and scroll code horizontally** (L, aurora (the flag, the set_wrap call, generalizing hscroll to multiline) + atlas (the toggle in build_code_pane))
+- **~~Turn word wrap off and scroll code horizontally~~** DONE (L, aurora (the flag, the set_wrap call, generalizing hscroll to multiline) + atlas (the toggle in build_code_pane))
   Style::no_wrap() on a text area sets cosmic-text's Wrap::None so a long line
   stays one visual row and runs past the right edge; the field scrolls
   horizontally to keep the primary caret in view, shift+wheel pans, and the
@@ -2246,7 +2251,7 @@ differently depending on which way it goes.
   detects a continuation (last_line == run.line_i), so the marker half is
   cheap and can ship alone.
 
-- **A scrollbar on the code editor** (M, aurora)
+- **~~A scrollbar on the code editor~~** DONE (M, aurora)
   A thumb on the right edge sized to the visible fraction and positioned by
   the scrolled fraction; dragging scrolls, clicking the track pages toward the
   click, and it appears only while the content overflows - the same behaviour
@@ -2260,7 +2265,7 @@ differently depending on which way it goes.
   text_area_extent and text_vscroll instead of scroll_content. Nothing new is
   needed from the draw vocabulary.
 
-- **Diagnostic and search marks on the scrollbar track** (M, aurora (an overview-marks API drawn in the track) + atlas (feeds it from apply_script_marks))
+- **~~Diagnostic and search marks on the scrollbar track~~** DONE (M, aurora (an overview-marks API drawn in the track) + atlas (feeds it from apply_script_marks))
   A 2px mark per diagnostic at its line's fraction of the document in the
   error or warning colour, and a fainter mark per find match. Clicking a mark
   scrolls to it.
@@ -2316,7 +2321,7 @@ differently depending on which way it goes.
   free. ShapeCacheEntry keys on font_bits only, so the factor must join that
   key or a size change silently reuses a stale shape.
 
-- **Expose the code viewport and the mono cell metrics** (S, aurora)
+- **~~Expose the code viewport and the mono cell metrics~~** DONE (S, aurora)
   A small public surface on Ui for a text area: get and set its vertical
   scroll, its content height and visible height, the range of visual rows on
   screen, first_visible_line, the byte offset under an arbitrary point, and
@@ -2727,7 +2732,7 @@ backlog.
   script on one node for one frame is already built and merely unwired, and it
   is the gate on every debugging entry below.
 
-- **print output reaches the Console, tagged with its script** (S, atlas)
+- **~~print output reaches the Console, tagged with its script~~** DONE (S, atlas)
   Everything a running instance printed since the last frame is drained into
   the Console prefixed with the node and file it came from, filterable to
   script output only, and rate-limited so a script printing every frame does
@@ -2740,7 +2745,7 @@ backlog.
   watch, no formatter), so an educational engine whose print goes nowhere has
   no debugging story at all.
 
-- **A runtime error names a line, not a wasm trap** (M, comet (a function name section plus a statement->line table) + helios (carry it on the error) + atlas (draw and route it))
+- **~~A runtime error names a line, not a wasm trap~~** DONE (M, comet (a function name section plus a statement->line table) + helios (carry it on the error) + atlas (draw and route it))
   A trap or host error while a script runs reports the comet function and line
   it happened in, squiggles that line in the Code pane in the error colour
   until the next edit, and its Console entry jumps there when clicked. An
