@@ -7,10 +7,10 @@ without context, and the result of a real trade-off. Several of them will be
 promoted to numbered ADRs once the set is complete - which one, and how many,
 is itself still open (see "Still to decide").
 
-**Status: incomplete.** Eight decisions are settled. Four questions have been
-asked and not yet answered, and a further set has not been put yet. Nothing
-here is implemented, and nothing should be built from it until at least the
-contradiction in "The unresolved conflict" is closed.
+**Status: incomplete.** Nine decisions are settled. Four questions are open, and
+a further set has not been put yet. Nothing here is implemented. The generics
+question under "Open" gates decisions 7 and 9, so those two should not be built
+before it is answered.
 
 ## Where the language actually stands
 
@@ -128,16 +128,29 @@ hazard in a language meant to be learned from.
 Note: this is the smallest and most-felt item on the list. It is pure checker
 plus codegen, introduces no new type, and needs nothing from the host.
 
-### 7. User-defined enums are payload-free, with exhaustive `match`
+### 7. User-defined enums carry payloads, with exhaustive `match`
 
-`enum State { Idle, Walking, Falling }`. A payload-free enum is just a tag, so
-codegen is nearly free, and `match` over one gets real exhaustiveness checking.
+`enum State { Idle, Walking, Falling }`, and also
+`enum Hit { Miss, Wall(f32), Node(Node) }`. Real sum types.
 
-Why: state machines are the canonical game-script pattern, and a compiler that
-tells a learner they forgot a case is a teaching win rather than only an
-ergonomic one. Enums with payloads were rejected for now as much the biggest
-language change available - a tagged representation plus per-variant refcount
-rules against ADR 0007's allocator.
+This revises an earlier answer of payload-free enums, taken back once it turned
+out not to compose with decision 8. `Option` carries a payload by definition, so
+a payload-free rule would have meant special-casing `Option` in the compiler
+while forbidding users the same shape - an asymmetry a learner notices and
+cannot act on.
+
+Why: state machines can carry the data their states are about, `Option` needs no
+special casing, and `match` still gets the exhaustiveness checking that was the
+point of the original answer. A compiler that tells a learner they forgot a case
+is a teaching win rather than only an ergonomic one.
+
+Note: this is the largest single language change on the list. The cost is a
+tagged representation plus per-variant refcount rules against ADR 0007's
+allocator - a variant holding a `String` means release has to consult the tag to
+know what to drop. It is the first construct in the language whose layout depends
+on which variant is live, and the first place where the "known limitation" in
+ADR 0007 (cycles leak until weak refs exist) becomes reachable from ordinary
+user code rather than only from a future reference struct.
 
 ### 8. `Option` and exhaustive matching land now, not later
 
@@ -149,29 +162,34 @@ Why not the alternative: a null value plus a runtime trap is cheap and familiar,
 but it puts a whole class of error back into runtime after ADR 0006 chose static
 types specifically to catch things early in our own editor.
 
-## The unresolved conflict
+### 9. `Option` is an ordinary enum, not a compiler builtin
 
-**Decisions 7 and 8 do not compose as written.** `Option<T>` carries a payload
-by definition; user-defined enums were just decided to be payload-free. One of
-three things has to give, and this is the first open question:
+Follows from decision 7. With payloads available to users there is nothing left
+for a builtin to provide, so `Option` is declared the way any other sum type is
+and gets no special treatment in the checker or codegen.
 
-- **`Option` is a compiler builtin.** The checker knows `Option<T>`, `Some(x)`
-  and `None` and matches them exhaustively, while user enums stay payload-free.
-  No user-facing generics and no general tagged-union machinery: one special
-  case in the checker plus a known two-slot representation in codegen. Keeps
-  both decisions intact for the least machinery.
-- **A nullable type suffix instead.** `Node?`, `int?`, unwrapped by `match` or
-  `if let`, with no generics and no payload-carrying enums at all. Every absence
-  case that actually exists is "a T or nothing", so this covers them and reads
-  casually. Less general if a second payload-carrying shape ever appears.
-- **Give user enums payloads after all.** Revises decision 7. `Option` becomes
-  an ordinary enum needing no special casing, and the language gets real sum
-  types - at the cost of the tagged representation and refcount rules that
-  decision 7 deferred.
+Rejected on the way: a compiler-known `Option<T>` alongside payload-free user
+enums (the asymmetry described in decision 7), and a nullable type suffix -
+`Node?`, `int?` - which would have avoided both payloads and generics, but only
+covers "a T or nothing" and would have to be replaced the first time a second
+payload-carrying shape appeared.
+
+Note: this raises a question decision 7 does not settle by itself, recorded
+under "Open" below - `Option<T>` is generic, and nothing else in the language is.
 
 ## Open - asked, not yet answered
 
-- **The `Option` shape**, as above. Blocks decisions 7 and 8 both.
+- **Does the language get generics?** Created by decisions 7 and 9 together.
+  `Option<T>` is parameterized over its payload type, and no other Comet
+  construct is parameterized over anything. Three ways out, none obviously
+  right: user-facing generics on enums and functions (the general answer, and
+  the most checker work in a pipeline whose headline property is compile speed);
+  `Option` alone is parameterized, as the one blessed generic, which is a
+  smaller version of exactly the asymmetry decision 7 rejected; or monomorphize
+  per concrete use at check time, which keeps codegen simple but needs a rule
+  for what happens when the payload type is itself an error type. This should be
+  settled before any of decision 7 is built, because it decides whether the
+  checker grows a type-parameter concept at all.
 - **Export syntax.** `@export let speed = 120.0;` (one new lexer token, and the
   `@` prefix generalizes to `@range(0, 100)` and `@tooltip("...")`, matching the
   Godot spelling this audience likely arrives with), a plain `export` keyword
@@ -242,3 +260,14 @@ Collected so they are not rediscovered during implementation:
 - `Place::Pos` and `Place::PosField` disappear into a general path (decision 1),
   which is the one change here that gets more expensive the longer other work
   piles onto `pos`.
+- Release stops being decidable from a value's static type alone (decision 7):
+  with payload-carrying variants, dropping a value means reading its tag first
+  to know which payload, if any, to release. This is the first thing in comet
+  whose layout is not fixed by its type.
+- ADR 0007's known limitation - reference cycles leak until weak refs or a cycle
+  collector exist - becomes reachable from ordinary user code once an enum
+  variant can hold a reference (decision 7), rather than staying theoretical
+  until reference structs arrive.
+- The checker may grow a type-parameter concept (the open generics question),
+  which would be the first thing in the pipeline that is not resolvable in a
+  single pass over the tree.
