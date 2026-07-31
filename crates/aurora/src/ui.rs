@@ -3555,9 +3555,14 @@ impl Ui {
                 continue;
             };
             let x0 = right - number.line_w;
+            // Anchored to the row's top plus the NUMBERS buffer's own baseline,
+            // not to the text run's baseline. A line's baseline moves within its
+            // row when what is on it changes - emptying a line is enough - and
+            // riding it made the numbers jump about by a pixel as you typed.
+            let baseline = origin.y + run.line_top + (number.line_y - number.line_top);
             let mut glyphs = Vec::new();
             for glyph in number.glyphs {
-                let physical = glyph.physical((x0, origin.y + run.line_y), 1.0);
+                let physical = glyph.physical((x0, baseline), 1.0);
                 glyphs.push(Glyph {
                     cache_key: physical.cache_key,
                     x: physical.x as f32,
@@ -6198,6 +6203,31 @@ mod tests {
         for number_left in gutter.iter().filter(|&&x| x < text_left) {
             assert!(*number_left < text_left, "numbers live left of the text");
         }
+    }
+
+    #[test]
+    fn a_line_number_sits_at_the_same_height_whatever_is_on_its_line() {
+        // The numbers used to ride the text run's baseline, which moves within
+        // its row when the line's content changes - emptying a line was enough -
+        // so they jumped about by a pixel as you typed.
+        let tops = |text: &str| -> Vec<f32> {
+            let (ui, _) = gutter_area(text);
+            ui.draw_list()
+                .commands
+                .iter()
+                .filter_map(|c| match c {
+                    DrawCommand::Text { glyphs, .. } => {
+                        Some(glyphs.iter().map(|g| g.y).fold(f32::MAX, f32::min))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        // Three lines of text, then the same with the middle one emptied. The
+        // numbers are the first three commands either way.
+        let full = tops("aaa\nbbb\nccc");
+        let empty = tops("aaa\n\nccc");
+        assert_eq!(&full[..3], &empty[..3], "the numbers did not move");
     }
 
     #[test]

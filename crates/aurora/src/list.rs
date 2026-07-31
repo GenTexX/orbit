@@ -36,10 +36,7 @@ const MAX_VISIBLE: usize = 8;
 
 /// The popup's width. Fixed rather than fitted, so the list does not jump about
 /// as the filter narrows it and the longest detail changes.
-const CARD_WIDTH: f32 = 340.0;
-/// How much of a row the detail column takes. The name gets the rest, because
-/// the name is what you are choosing between.
-const DETAIL_WIDTH: f32 = 150.0;
+const CARD_WIDTH: f32 = 380.0;
 
 /// The widgets one [`build`](ListPopup::build) produced, for routing clicks.
 #[derive(Debug, Clone, Default)]
@@ -265,10 +262,7 @@ impl ListPopup {
                 ui.label(
                     row,
                     &item.detail,
-                    Style::new()
-                        .width(DETAIL_WIDTH)
-                        .ellipsis()
-                        .foreground(theme.subhead),
+                    Style::new().grow(1.0).ellipsis().foreground(theme.subhead),
                 );
             }
             rows.push((row, index));
