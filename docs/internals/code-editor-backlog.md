@@ -770,7 +770,7 @@ what makes typing a block feel finished rather than half-done.
   characters, so this wants a shared private replace_range(lo, hi, text,
   caret_at).
 
-- **Typing a closing brace dedents its own line** (S, aurora)
+- ~~**Typing a closing brace dedents its own line**~~ DONE (S, aurora)
   Typing '}' when everything left of the caret on that line is whitespace
   removes one indent unit before inserting, so the brace lines up with the
   line that opened the block. With no indentation, or with non-whitespace to
@@ -806,7 +806,7 @@ what makes typing a block feel finished rather than half-done.
   Note: Column measured from the line start, not the byte offset, so a UTF-8
   identifier earlier on the line does not skew it.
 
-- **Backspace deletes a whole indent level** (S, aurora)
+- ~~**Backspace deletes a whole indent level**~~ DONE (S, aurora)
   Backspace when everything between line start and caret is whitespace deletes
   back to the previous tab stop (up to one indent unit) in one press: column 6
   lands on column 4, not column 0. Elsewhere, and with a selection, it keeps
@@ -1300,7 +1300,7 @@ if-ladder.
   Note: The last selected line may lack a trailing newline; normalise before
   sorting and restore after or the final line joins.
 
-- **Insert line below or above without splitting (ctrl+enter / ctrl+shift+enter)** (S, atlas)
+- ~~**Insert line below or above without splitting (ctrl+enter / ctrl+shift+enter)**~~ DONE (S, atlas)
   ctrl+enter opens a new line below the caret's line and moves there
   regardless of where in the line the caret was; ctrl+shift+enter does the
   same above. Both copy the current line's leading whitespace.
@@ -1308,7 +1308,7 @@ if-ladder.
   after it, so today it is End then Enter, and Enter drops to column 0 so you
   retype the indent.
 
-- **Delete by word (ctrl+backspace / ctrl+delete)** (S, aurora (two Key variants plus edit_key arms) + atlas (translate_key))
+- ~~**Delete by word (ctrl+backspace / ctrl+delete)**~~ DONE (S, aurora (two Key variants plus edit_key arms) + atlas (translate_key))
   ctrl+backspace deletes back to the previous word boundary, skipping trailing
   whitespace first then the word; ctrl+delete deletes forward. Over a
   selection they behave like plain Backspace/Delete. A run of whitespace
@@ -1320,7 +1320,7 @@ if-ladder.
   Note: prev_word_boundary/next_word_boundary already exist. Adding the
   variants forces edit_key's unreachable!() arm to be revisited.
 
-- **Delete to end of line, and to start of line** (S, aurora (Key variants, so it works in any text area) or atlas)
+- ~~**Delete to end of line, and to start of line**~~ DONE (S, aurora (Key variants, so it works in any text area) or atlas)
   ctrl+k deletes from the caret to the end of its line leaving the newline;
   again on an empty remainder removes the newline and pulls the next line up.
   ctrl+u deletes back to the first non-whitespace character, and again to
@@ -1330,7 +1330,7 @@ if-ladder.
   from scratch.
   Note: line_start/line_end are exactly the offsets these need.
 
-- **Cut and copy with no selection act on the whole line** (M, atlas)
+- ~~**Cut and copy with no selection act on the whole line**~~ DONE (M, atlas)
   ctrl+c with a collapsed caret copies the caret's entire line including its
   newline; ctrl+x cuts it, closing the gap and leaving the caret at the same
   column on the following line. A clipboard entry captured this way pastes as

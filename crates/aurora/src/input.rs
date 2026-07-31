@@ -65,6 +65,18 @@ pub enum Key {
     DocumentStart,
     /// Move the caret to the very end of the text.
     DocumentEnd,
+    /// Delete the word before the caret (ctrl+backspace).
+    DeleteWordLeft,
+    /// Delete the word after the caret (ctrl+delete).
+    DeleteWordRight,
+    /// Delete from the caret to the start of its line (ctrl+shift+backspace).
+    DeleteToLineStart,
+    /// Delete from the caret to the end of its line (ctrl+shift+delete).
+    DeleteToLineEnd,
+    /// Open a new line below the caret's line and move to it (ctrl+enter).
+    LineBelow,
+    /// Open a new line above the caret's line and move to it (ctrl+shift+enter).
+    LineAbove,
 }
 
 /// What the mouse cursor should look like over the current hover target. The

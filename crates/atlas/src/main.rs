@@ -846,7 +846,11 @@ impl ApplicationHandler for App {
                             return;
                         }
                     }
-                    for ev in translate_key(&event, state.modifiers.control_key()) {
+                    for ev in translate_key(
+                        &event,
+                        state.modifiers.control_key(),
+                        state.modifiers.shift_key(),
+                    ) {
                         state.ui.handle_input(ev);
                     }
                     return;
@@ -861,7 +865,11 @@ impl ApplicationHandler for App {
                     && !state.handle_editor_key(&event)
                     && !state.handle_mode_key(&event)
                 {
-                    for ev in translate_key(&event, state.modifiers.control_key()) {
+                    for ev in translate_key(
+                        &event,
+                        state.modifiers.control_key(),
+                        state.modifiers.shift_key(),
+                    ) {
                         state.ui.handle_input(ev);
                     }
                 }
@@ -2961,15 +2969,27 @@ impl State {
     fn clipboard_shortcut(&mut self, c: &str) -> bool {
         match c {
             "a" | "A" => self.ui.select_all(),
+            // With nothing selected, copy and cut take the whole line. Reaching
+            // for ctrl+X to move a line and getting nothing is the single most
+            // common wasted keystroke in an editor without this.
             "c" | "C" => {
                 if let Some(text) = self.ui.selected_text() {
                     self.set_clipboard(&text);
+                } else if let Some((_, line)) = self.ui.current_line() {
+                    self.set_clipboard(&line);
                 }
             }
             "x" | "X" => {
                 if let Some(text) = self.ui.selected_text() {
                     self.set_clipboard(&text);
                     self.ui.delete_selection();
+                } else if let Some((range, line)) = self.ui.current_line() {
+                    self.set_clipboard(&line);
+                    if let Some(id) = self.ui.focused() {
+                        let start = range.start;
+                        self.ui.replace_range(id, range, "");
+                        self.ui.focus_caret(id, start);
+                    }
                 }
             }
             "v" | "V" => {
@@ -4245,6 +4265,11 @@ impl State {
                 self.dirty = true;
                 return true;
             }
+            return false;
+        }
+        // ctrl+Enter opens a line; the popup must not take it as "accept". A
+        // chord the list has no meaning for belongs to the editor underneath.
+        if self.modifiers.control_key() && *named == NamedKey::Enter {
             return false;
         }
         let Some((list, _)) = &mut self.completions else {
@@ -5624,12 +5649,24 @@ fn build_viewport_target(
 }
 
 /// Map a winit key press to Aurora input: a named editing key, or the typed
-/// text as a run of character events. `ctrl` upgrades the arrow keys to
-/// word-wise motion (ctrl+left/right).
-fn translate_key(event: &winit::event::KeyEvent, ctrl: bool) -> Vec<InputEvent> {
+/// text as a run of character events.
+///
+/// The modifiers widen what a key means rather than changing it: ctrl takes an
+/// arrow from a character to a word and a delete from a character to a word,
+/// and ctrl+shift takes that delete out to the rest of the line. One shape to
+/// learn, three scopes.
+fn translate_key(event: &winit::event::KeyEvent, ctrl: bool, shift: bool) -> Vec<InputEvent> {
     let named = match &event.logical_key {
+        WinitKey::Named(NamedKey::Backspace) if ctrl && shift => Some(Key::DeleteToLineStart),
+        WinitKey::Named(NamedKey::Delete) if ctrl && shift => Some(Key::DeleteToLineEnd),
+        WinitKey::Named(NamedKey::Backspace) if ctrl => Some(Key::DeleteWordLeft),
+        WinitKey::Named(NamedKey::Delete) if ctrl => Some(Key::DeleteWordRight),
         WinitKey::Named(NamedKey::Backspace) => Some(Key::Backspace),
         WinitKey::Named(NamedKey::Delete) => Some(Key::Delete),
+        // ctrl+Enter opens a line below without splitting the one you are on;
+        // ctrl+shift+Enter opens one above.
+        WinitKey::Named(NamedKey::Enter) if ctrl && shift => Some(Key::LineAbove),
+        WinitKey::Named(NamedKey::Enter) if ctrl => Some(Key::LineBelow),
         WinitKey::Named(NamedKey::ArrowLeft) if ctrl => Some(Key::WordLeft),
         WinitKey::Named(NamedKey::ArrowRight) if ctrl => Some(Key::WordRight),
         WinitKey::Named(NamedKey::ArrowLeft) => Some(Key::Left),

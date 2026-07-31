@@ -724,6 +724,33 @@ impl Ui {
         }
     }
 
+    /// The focused text area's current line, newline included, and the range it
+    /// occupies.
+    ///
+    /// What cut and copy fall back to when nothing is selected: taking the line
+    /// with its newline is what makes the cut close the gap and the paste land
+    /// as a whole line rather than joining onto whatever it was dropped into.
+    /// On the last line, which has no newline after it, the preceding one is
+    /// taken instead so the same thing happens.
+    pub fn current_line(&self) -> Option<(std::ops::Range<usize>, String)> {
+        let id = self.focused?;
+        if !self.widgets[id].multiline {
+            return None;
+        }
+        let text = self.text_of(id)?;
+        let caret = self.caret.min(text.len());
+        let start = line_start_of(text, caret);
+        let end = text[caret..].find('\n').map_or(text.len(), |at| caret + at);
+        let range = if end < text.len() {
+            start..end + 1
+        } else if start > 0 {
+            start - 1..end
+        } else {
+            start..end
+        };
+        Some((range.clone(), format!("{}\n", &text[start..end])))
+    }
+
     /// The focused field's selection, or `None` when there is no selection.
     ///
     /// Public because a shell that rebuilds its whole `Ui` has to put the
@@ -1975,9 +2002,43 @@ impl Ui {
         if self.auto_pair(ch) {
             return;
         }
+        self.dedent_for_closer(ch);
         // Typing over a selection replaces it; insert_str handles both cases.
         let mut buf = [0u8; 4];
         self.insert_str(ch.encode_utf8(&mut buf));
+    }
+
+    /// Pull a line back one indent level when the closer that ends its block is
+    /// typed at the head of it.
+    ///
+    /// Enter after `{` indents, so the closing brace starts life one level too
+    /// deep - and typing `}` is the moment the editor learns which block is
+    /// ending. Only fires on a line that is nothing but whitespace so far: a
+    /// `}` typed after any code is part of an expression, not the end of a
+    /// block, and moving that line would be wrong.
+    fn dedent_for_closer(&mut self, ch: char) {
+        let Some(id) = self.focused else {
+            return;
+        };
+        if !self.widgets[id].multiline || !is_closer(ch) || ch == '"' {
+            return;
+        }
+        let (lo, hi) = self.selection_bounds(id);
+        if lo != hi {
+            return;
+        }
+        let text = self.text_of(id).unwrap_or_default();
+        let start = line_start_of(text, lo);
+        let head = &text[start..lo];
+        if head.is_empty() || !head.chars().all(|c| c == ' ' || c == '\t') {
+            return;
+        }
+        let width = outdent_width(head);
+        if width == 0 {
+            return;
+        }
+        self.replace_range(id, lo - width..lo, "");
+        self.caret = lo - width;
     }
 
     /// The auto-pairing rules, applied before an ordinary insert. Returns
@@ -2103,16 +2164,7 @@ impl Ui {
             .split('\n')
             .map(|line| {
                 if outdent {
-                    // Take up to one indent's worth of leading spaces, and a
-                    // lone leading tab, so a mixed file still outdents.
-                    let strip = line
-                        .strip_prefix(INDENT)
-                        .or_else(|| line.strip_prefix('\t'))
-                        .or_else(|| {
-                            let spaces = line.len() - line.trim_start_matches(' ').len();
-                            (spaces > 0).then(|| &line[spaces..])
-                        });
-                    strip.unwrap_or(line).to_string()
+                    line[outdent_width(line)..].to_string()
                 } else if line.is_empty() {
                     // An empty line gains nothing: trailing whitespace on a
                     // blank line is noise, and the next Tab still finds it.
@@ -2142,6 +2194,44 @@ impl Ui {
         let text_len = self.text_len(id);
         self.selection_anchor = None;
         self.caret = caret.saturating_sub(INDENT.len()).min(text_len);
+    }
+
+    /// Open a blank line below the caret's line, or above it, and put the caret
+    /// on it - indented to match, and one level deeper when the line it follows
+    /// opens a block.
+    ///
+    /// This is what you want three times out of four when you press Enter:
+    /// a new line here, without splitting the one the caret is sitting in the
+    /// middle of.
+    fn open_line(&mut self, id: WidgetId, above: bool) {
+        let text = self.text_of(id).unwrap_or_default();
+        let caret = self.caret.min(text.len());
+        let start = line_start_of(text, caret);
+        let line = &text[start..self.line_end(id, caret)];
+        let indent: String = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        // A line below an opener belongs inside the block it opened. A line
+        // above one does not: it is a sibling of the line it displaces.
+        let indent = if !above && line.trim_end().ends_with(['{', '(', '[']) {
+            format!("{indent}{INDENT}")
+        } else {
+            indent
+        };
+        let (at, insertion) = if above {
+            (start, format!("{indent}\n"))
+        } else {
+            (self.line_end(id, caret), format!("\n{indent}"))
+        };
+        let caret_at = if above {
+            at + indent.len()
+        } else {
+            at + 1 + indent.len()
+        };
+        self.replace_range(id, at..at, &insertion);
+        self.caret = caret_at;
+        self.selection_anchor = None;
     }
 
     /// Apply a named editing key to the focused input.
@@ -2195,9 +2285,82 @@ impl Ui {
             self.focus_step(if self.shift { -1 } else { 1 });
             return;
         }
-        // Backspace/Delete over a selection remove it as a unit.
-        if matches!(key, Key::Backspace | Key::Delete) && self.delete_selection() {
+        // Every delete over a selection removes it as a unit - a word-delete
+        // with something selected means "get rid of that", not "get rid of that
+        // and then a word".
+        if matches!(
+            key,
+            Key::Backspace
+                | Key::Delete
+                | Key::DeleteWordLeft
+                | Key::DeleteWordRight
+                | Key::DeleteToLineStart
+                | Key::DeleteToLineEnd
+        ) && self.delete_selection()
+        {
             return;
+        }
+        // The wider deletes, and the two ways to open a line. All of them are
+        // range edits rather than character ones, so they go through
+        // replace_range before the buffer is borrowed below.
+        match key {
+            Key::DeleteWordLeft | Key::DeleteWordRight => {
+                let text = self.text_of(id).unwrap_or_default();
+                let caret = self.caret.min(text.len());
+                let range = if key == Key::DeleteWordLeft {
+                    prev_word_boundary(text, caret)..caret
+                } else {
+                    caret..next_word_boundary(text, caret)
+                };
+                if !range.is_empty() {
+                    let start = range.start;
+                    self.replace_range(id, range, "");
+                    self.caret = start;
+                }
+                return;
+            }
+            Key::DeleteToLineStart | Key::DeleteToLineEnd if multiline => {
+                let text = self.text_of(id).unwrap_or_default();
+                let caret = self.caret.min(text.len());
+                let range = if key == Key::DeleteToLineStart {
+                    line_start_of(text, caret)..caret
+                } else {
+                    let end = self.line_end(id, caret);
+                    // At the end of a line there is nothing left to kill, so
+                    // take the newline and pull the next line up. Without this
+                    // the key does nothing on exactly the lines you use it on.
+                    if end == caret {
+                        caret..next_boundary(text, caret)
+                    } else {
+                        caret..end
+                    }
+                };
+                if !range.is_empty() {
+                    let start = range.start;
+                    self.replace_range(id, range, "");
+                    self.caret = start;
+                }
+                return;
+            }
+            Key::DeleteToLineStart => {
+                let caret = self.caret.min(self.text_len(id));
+                self.replace_range(id, 0..caret, "");
+                self.caret = 0;
+                return;
+            }
+            Key::DeleteToLineEnd => {
+                let caret = self.caret.min(self.text_len(id));
+                let len = self.text_len(id);
+                self.replace_range(id, caret..len, "");
+                self.caret = caret;
+                return;
+            }
+            Key::LineBelow | Key::LineAbove if multiline => {
+                self.open_line(id, key == Key::LineAbove);
+                return;
+            }
+            Key::LineBelow | Key::LineAbove => return,
+            _ => {}
         }
         // A shift+movement extends a selection (anchoring the fixed end here if
         // none yet); a plain movement collapses it.
@@ -2314,6 +2477,18 @@ impl Ui {
                 self.replace_range(id, range, "");
                 return;
             }
+            // Backspace in a line's leading whitespace takes the whole level.
+            // Tab put four spaces in; one backspace should take four out, or a
+            // line indented by hand needs four presses to give one back.
+            Key::Backspace if caret > 0 && multiline && in_leading_indent(s, caret) => {
+                let start = line_start_of(s, caret);
+                let width = trailing_outdent_width(&s[start..caret]);
+                let from = caret - width;
+                self.caret = from;
+                self.selection_anchor = None;
+                self.replace_range(id, from..caret, "");
+                return;
+            }
             Key::Backspace if caret > 0 => {
                 let prev = prev_boundary(s, caret);
                 s.replace_range(prev..caret, "");
@@ -2330,7 +2505,16 @@ impl Ui {
             Key::Backspace | Key::Delete => self.caret = caret,
             // Up/Down/Home/End multiline paths returned above; single-line
             // Up/Down returned; the rest are unreachable here.
-            Key::Up | Key::Down | Key::Enter | Key::Tab => unreachable!("handled above"),
+            Key::Up
+            | Key::Down
+            | Key::Enter
+            | Key::Tab
+            | Key::DeleteWordLeft
+            | Key::DeleteWordRight
+            | Key::DeleteToLineStart
+            | Key::DeleteToLineEnd
+            | Key::LineBelow
+            | Key::LineAbove => unreachable!("handled above"),
         }
         if edited {
             self.invalidate_text(id);
@@ -3845,6 +4029,40 @@ fn is_empty_pair(text: &str, caret: usize) -> bool {
     let before = text[..caret].chars().next_back();
     let after = text[caret..].chars().next();
     matches!((before, after), (Some(b), Some(a)) if closer_for(b) == Some(a))
+}
+
+/// How many bytes of leading whitespace one outdent takes off `line`: an
+/// indent's worth of spaces, a lone tab, or whatever less there is. Shared so
+/// that shift+Tab and a typed closing brace cannot disagree about what a level
+/// of indentation is.
+/// Whether `caret` sits in the run of whitespace that starts its line, with
+/// nothing but whitespace behind it.
+fn in_leading_indent(text: &str, caret: usize) -> bool {
+    let start = line_start_of(text, caret);
+    caret > start && text[start..caret].chars().all(|c| c == ' ' || c == '\t')
+}
+
+/// How many bytes to take off the END of an all-whitespace run to remove one
+/// level: back to the previous multiple of an indent, so a line sitting at six
+/// spaces goes to four rather than to two.
+fn trailing_outdent_width(head: &str) -> usize {
+    if head.ends_with('\t') {
+        return 1;
+    }
+    let width = INDENT.len();
+    let over = head.len() % width;
+    let take = if over == 0 { width } else { over };
+    take.min(head.len())
+}
+
+fn outdent_width(line: &str) -> usize {
+    if line.starts_with(INDENT) {
+        INDENT.len()
+    } else if line.starts_with('\t') {
+        1
+    } else {
+        line.len() - line.trim_start_matches(' ').len()
+    }
 }
 
 fn line_start_of(text: &str, at: usize) -> usize {
@@ -5703,6 +5921,171 @@ mod tests {
         ui.handle_input(InputEvent::Key(Key::Tab));
         assert_eq!(ui.text_of(field), Some("deep"));
         assert_eq!(ui.focused(), Some(field));
+    }
+
+    #[test]
+    fn typing_a_closing_brace_pulls_its_line_back_out() {
+        // Enter after `{` indents, so the closer starts life one level too
+        // deep. Typing it is the moment the editor learns which block is
+        // ending.
+        let (mut ui, field) = text_area("func f() {\n    \n");
+        ui.focus_caret(field, 15);
+        ui.handle_input(InputEvent::Text('}'));
+        assert_eq!(ui.text_of(field), Some("func f() {\n}\n"));
+        assert_eq!(ui.caret_offset(), Some(12));
+    }
+
+    #[test]
+    fn a_closing_brace_after_code_is_left_where_it_was_typed() {
+        // `}` at the end of a line of code closes an expression, not a block.
+        // Moving that line would be wrong, so the rule only fires on a line
+        // that is nothing but whitespace so far.
+        let (mut ui, field) = text_area("    let x = f(a)");
+        ui.focus_caret(field, 16);
+        ui.handle_input(InputEvent::Text(']'));
+        assert_eq!(ui.text_of(field), Some("    let x = f(a)]"));
+    }
+
+    #[test]
+    fn backspace_in_the_leading_indent_takes_a_whole_level() {
+        let (mut ui, field) = text_area("        deep");
+        ui.focus_caret(field, 8);
+        ui.handle_input(InputEvent::Key(Key::Backspace));
+        assert_eq!(ui.text_of(field), Some("    deep"));
+        ui.handle_input(InputEvent::Key(Key::Backspace));
+        assert_eq!(ui.text_of(field), Some("deep"));
+
+        // Off the indent, it is one character again.
+        ui.focus_caret(field, 4);
+        ui.handle_input(InputEvent::Key(Key::Backspace));
+        assert_eq!(ui.text_of(field), Some("dee"));
+    }
+
+    #[test]
+    fn backspace_in_a_ragged_indent_lands_on_the_next_level_down() {
+        // Six spaces goes to four, not to two: the point is to reach a level,
+        // not to remove a fixed count.
+        let (mut ui, field) = text_area("      odd");
+        ui.focus_caret(field, 6);
+        ui.handle_input(InputEvent::Key(Key::Backspace));
+        assert_eq!(ui.text_of(field), Some("    odd"));
+    }
+
+    #[test]
+    fn ctrl_backspace_and_ctrl_delete_take_a_word() {
+        let (mut ui, field) = text_area("alpha beta gamma");
+        ui.focus_caret(field, 10);
+        ui.handle_input(InputEvent::Key(Key::DeleteWordLeft));
+        assert_eq!(ui.text_of(field), Some("alpha  gamma"));
+        assert_eq!(ui.caret_offset(), Some(6));
+
+        // Forward, from the start of a word: the word goes, and the space
+        // after it with it. Each delete reaches exactly the boundary the
+        // matching arrow key moves to, so the two cannot disagree about where a
+        // word ends.
+        let (mut ui, field) = text_area("alpha beta gamma");
+        ui.focus_caret(field, 6);
+        ui.handle_input(InputEvent::Key(Key::DeleteWordRight));
+        assert_eq!(ui.text_of(field), Some("alpha gamma"));
+        assert_eq!(ui.caret_offset(), Some(6));
+    }
+
+    #[test]
+    fn a_word_delete_with_a_selection_removes_the_selection_and_stops() {
+        let (mut ui, field) = text_area("alpha beta gamma");
+        ui.select_range(field, 6, 10);
+        ui.handle_input(InputEvent::Key(Key::DeleteWordLeft));
+        assert_eq!(
+            ui.text_of(field),
+            Some("alpha  gamma"),
+            "the selection, and not a word beyond it"
+        );
+    }
+
+    #[test]
+    fn the_line_deletes_reach_to_each_end_and_then_join() {
+        let (mut ui, field) = text_area(
+            "one two
+three",
+        );
+        ui.focus_caret(field, 4);
+        ui.handle_input(InputEvent::Key(Key::DeleteToLineEnd));
+        assert_eq!(
+            ui.text_of(field),
+            Some(
+                "one 
+three"
+            )
+        );
+
+        // Now at the end of the line: the next one comes up.
+        ui.handle_input(InputEvent::Key(Key::DeleteToLineEnd));
+        assert_eq!(ui.text_of(field), Some("one three"));
+
+        ui.focus_caret(field, 8);
+        ui.handle_input(InputEvent::Key(Key::DeleteToLineStart));
+        assert_eq!(ui.text_of(field), Some("e"));
+    }
+
+    #[test]
+    fn ctrl_enter_opens_a_line_below_without_splitting_this_one() {
+        let (mut ui, field) = text_area("    let x = 1.0;");
+        ui.focus_caret(field, 8);
+        ui.handle_input(InputEvent::Key(Key::LineBelow));
+        assert_eq!(ui.text_of(field), Some("    let x = 1.0;\n    "));
+        assert_eq!(
+            ui.caret_offset(),
+            Some(21),
+            "on the new line, past its indent"
+        );
+    }
+
+    #[test]
+    fn a_line_opened_below_an_opener_goes_inside_the_block() {
+        let (mut ui, field) = text_area("    if x {");
+        ui.focus_caret(field, 6);
+        ui.handle_input(InputEvent::Key(Key::LineBelow));
+        assert_eq!(ui.text_of(field), Some("    if x {\n        "));
+    }
+
+    #[test]
+    fn ctrl_shift_enter_opens_a_line_above() {
+        let (mut ui, field) = text_area(
+            "one
+    two
+three",
+        );
+        ui.focus_caret(field, 8);
+        ui.handle_input(InputEvent::Key(Key::LineAbove));
+        assert_eq!(ui.text_of(field), Some("one\n    \n    two\nthree"));
+        assert_eq!(ui.caret_offset(), Some(8));
+
+        // A line above an opener is a sibling of it, not a child - so it does
+        // not gain a level the way a line below one does.
+        let (mut ui, field) = text_area("    if x {");
+        ui.focus_caret(field, 6);
+        ui.handle_input(InputEvent::Key(Key::LineAbove));
+        assert_eq!(ui.text_of(field), Some("    \n    if x {"));
+    }
+
+    #[test]
+    fn the_current_line_comes_with_its_newline_so_a_cut_closes_the_gap() {
+        let (mut ui, field) = text_area(
+            "one
+two
+three",
+        );
+        ui.focus_caret(field, 5);
+        let (range, text) = ui.current_line().expect("a focused text area has one");
+        assert_eq!(text, "two\n");
+        assert_eq!(range, 4..8, "including the newline, so the lines close up");
+
+        // The last line has no newline after it, so the one before it goes
+        // instead - a cut there still leaves no blank line behind.
+        ui.focus_caret(field, 9);
+        let (range, text) = ui.current_line().expect("still");
+        assert_eq!(text, "three\n");
+        assert_eq!(range, 7..13);
     }
 
     #[test]
