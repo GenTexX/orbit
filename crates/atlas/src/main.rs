@@ -3760,9 +3760,10 @@ impl State {
             .and_then(|id| self.ui.text_of(id))
             .map(str::to_string);
         let text = self.script_text.clone();
+        let caret = self.editor_caret();
         if let Some(find) = &mut self.find {
             if let Some(query) = query {
-                find.set_query(query, &text);
+                find.set_query(query, &text, caret);
             }
             if let Some(replacement) = replacement {
                 find.set_replacement(replacement);
@@ -4129,6 +4130,20 @@ impl State {
         true
     }
 
+    /// Where the caret is in the script, or 0 when the editor is not focused.
+    ///
+    /// What a search starts from. Once the find bar has focus the editor no
+    /// longer reports a caret, so this is read before opening the bar and while
+    /// the query is being typed, and it keeps returning the last place the
+    /// editor's own caret was.
+    fn editor_caret(&self) -> usize {
+        self.rows
+            .code_editor
+            .filter(|&editor| self.ui.focused() == Some(editor))
+            .and_then(|_| self.ui.caret_offset())
+            .unwrap_or(self.script_caret)
+    }
+
     /// Whether focus is in the code editor or in the find bar over it - the
     /// only places a code-pane shortcut should fire from.
     fn code_context_focused(&self) -> bool {
@@ -4158,9 +4173,11 @@ impl State {
             .map(|r| Vec2::new(r.pos.x + r.size.x - 320.0, r.pos.y + 6.0))
             .unwrap_or_default();
         let mut find = aurora::find::FindBar::new(anchor);
-        // Pre-fill from the selection, the way every editor does.
+        // Pre-fill from the selection, the way every editor does, and stand on
+        // the match nearest the caret rather than the one at the top of the file.
+        let caret = self.editor_caret();
         if let Some(selected) = self.ui.selected_text() {
-            find.set_query(selected, &self.script_text);
+            find.set_query(selected, &self.script_text, caret);
         }
         self.find = Some(find);
         // The point of ctrl+f is to type a query. Without this the caret stays
@@ -4506,6 +4523,22 @@ impl State {
             },
             style: aurora::DecorationStyle::Squiggle,
         }));
+        // Every occurrence of the word the caret is in, faintly. Reading code
+        // is mostly "where else does this name appear", and this answers it
+        // without a search, a shortcut, or moving the caret.
+        if self.ui.focused() == Some(editor)
+            && let Some(at) = self.ui.caret_offset()
+        {
+            decorations.extend(
+                comet::service::occurrences_at(&self.script_text, at)
+                    .iter()
+                    .map(|span| aurora::Decoration {
+                        range: span.start as usize..span.end as usize,
+                        color: theme.code_occurrence,
+                        style: aurora::DecorationStyle::Highlight,
+                    }),
+            );
+        }
         // The bracket the caret is touching, and its partner - or the bracket
         // itself marked in the error color when it has none. comet is entirely
         // braces and the pane has no folding or indent guides, so this is the
@@ -4629,13 +4662,14 @@ impl State {
             return;
         };
         let script = self.script_text.clone();
+        let caret = self.editor_caret();
         let Some(find) = &mut self.find else {
             return;
         };
         if find.query() == text {
             return;
         }
-        find.set_query(text, &script);
+        find.set_query(text, &script, caret);
         // Show where the matches are while typing, but do not drag the caret
         // into the file on every keystroke - that would steal focus from the
         // query box being typed into.
@@ -5203,8 +5237,9 @@ impl State {
                 }
                 AuroraEvent::Submitted(id) if Some(id) == self.rows.find.query => {
                     let text = self.ui.text_of(id).unwrap_or_default().to_string();
+                    let caret = self.editor_caret();
                     if let Some(find) = &mut self.find {
-                        find.set_query(text, &self.script_text);
+                        find.set_query(text, &self.script_text, caret);
                         self.reveal_find_match();
                     }
                 }
@@ -5217,6 +5252,12 @@ impl State {
                 AuroraEvent::Toggled { id, checked } if Some(id) == self.rows.find.match_case => {
                     if let Some(find) = &mut self.find {
                         find.set_match_case(checked, &self.script_text);
+                        self.reveal_find_match();
+                    }
+                }
+                AuroraEvent::Toggled { id, checked } if Some(id) == self.rows.find.whole_word => {
+                    if let Some(find) = &mut self.find {
+                        find.set_whole_word(checked, &self.script_text);
                         self.reveal_find_match();
                     }
                 }

@@ -97,6 +97,7 @@ theme_tokens! {
     "icon_hover": Color => aurora.icon_hover,
     "icon_active": Color => aurora.icon_active,
     "selection": Color => aurora.selection,
+    "find_match": Color => aurora.find_match,
     "slider_track": Color => aurora.slider_track,
     "slider_fill": Color => aurora.slider_fill,
     "splitter": Color => aurora.splitter,
@@ -129,6 +130,7 @@ theme_tokens! {
     "code_type": Color => code_type,
     "code_error": Color => code_error,
     "code_warning": Color => code_warning,
+    "code_occurrence": Color => code_occurrence,
     "scrim": Color => aurora.scrim,
     // shape scalars.
     "card_radius": Scalar => aurora.card_radius,

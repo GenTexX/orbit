@@ -37,6 +37,7 @@ pub struct FindRows {
     pub replace: Option<WidgetId>,
     pub replace_all: Option<WidgetId>,
     pub match_case: Option<WidgetId>,
+    pub whole_word: Option<WidgetId>,
     pub close: Option<WidgetId>,
 }
 
@@ -55,10 +56,15 @@ pub struct FindBar {
     query: String,
     replacement: String,
     match_case: bool,
+    whole_word: bool,
     /// Byte ranges of every match, in order.
     matches: Vec<Range<usize>>,
     /// Which match is current.
     current: usize,
+    /// Whether the last step ran off an end and came back round. Cleared by
+    /// anything that recomputes the matches, because a fresh search has not
+    /// wrapped yet.
+    wrapped: bool,
     anchor: Vec2,
 }
 
@@ -95,11 +101,31 @@ impl FindBar {
         self.match_case
     }
 
-    /// Search `text` for `query`, keeping the current match on the same place in
-    /// the text where one still matches there.
-    pub fn set_query(&mut self, query: impl Into<String>, text: &str) {
-        self.query = query.into();
+    pub fn whole_word(&self) -> bool {
+        self.whole_word
+    }
+
+    pub fn set_whole_word(&mut self, whole_word: bool, text: &str) {
+        self.whole_word = whole_word;
         self.refresh(text);
+    }
+
+    /// Search `text` for `query`, and stand on the first match at or after
+    /// `from` - the caret.
+    ///
+    /// Searching from the top instead sends you to the start of the file for a
+    /// word that occurs six lines below where you are looking, and every search
+    /// begins with pressing Enter until you get back. `from` makes the first
+    /// result the one nearest to hand.
+    pub fn set_query(&mut self, query: impl Into<String>, text: &str, from: usize) {
+        self.query = query.into();
+        self.matches = find_all(text, &self.query, self.match_case, self.whole_word);
+        self.current = self
+            .matches
+            .iter()
+            .position(|m| m.start >= from)
+            .unwrap_or(0);
+        self.wrapped = false;
     }
 
     pub fn set_match_case(&mut self, match_case: bool, text: &str) {
@@ -115,8 +141,9 @@ impl FindBar {
     /// edit was above the match, at which point every offset shifts and the
     /// nearest one is a different match.
     pub fn refresh(&mut self, text: &str) {
-        self.matches = find_all(text, &self.query, self.match_case);
+        self.matches = find_all(text, &self.query, self.match_case, self.whole_word);
         self.current = self.current.min(self.matches.len().saturating_sub(1));
+        self.wrapped = false;
     }
 
     /// How many matches there are.
@@ -138,12 +165,15 @@ impl FindBar {
         self.matches.get(self.current).cloned()
     }
 
-    /// Step to the next match, wrapping.
+    /// Step to the next match, wrapping - and remember that it wrapped, so the
+    /// readout can say so.
     pub fn find_next(&mut self) -> Option<Range<usize>> {
         if self.matches.is_empty() {
             return None;
         }
-        self.current = (self.current + 1) % self.matches.len();
+        let next = self.current + 1;
+        self.wrapped = next >= self.matches.len();
+        self.current = next % self.matches.len();
         self.current()
     }
 
@@ -152,6 +182,7 @@ impl FindBar {
         if self.matches.is_empty() {
             return None;
         }
+        self.wrapped = self.current == 0;
         self.current = (self.current + self.matches.len() - 1) % self.matches.len();
         self.current()
     }
@@ -182,6 +213,10 @@ impl FindBar {
     /// search that matched nothing.
     pub fn status(&self) -> String {
         match self.position() {
+            // Coming back round to the top looks identical to not having moved
+            // when there is one match, and to having lost your place when there
+            // are many. Saying so costs a word.
+            Some(at) if self.wrapped => format!("{at} of {} (wrapped)", self.matches.len()),
             Some(at) => format!("{at} of {}", self.matches.len()),
             None if self.query.is_empty() => String::new(),
             None => "no matches".to_string(),
@@ -197,9 +232,9 @@ impl FindBar {
             .map(|(index, range)| Decoration {
                 range: range.clone(),
                 color: if index == self.current {
-                    theme.focus.fade(0.45)
+                    theme.find_match
                 } else {
-                    theme.focus.fade(0.18)
+                    theme.find_match.fade(0.35)
                 },
                 style: DecorationStyle::Highlight,
             })
@@ -270,6 +305,7 @@ impl FindBar {
         let previous = ui.button(top, "<", small(theme));
         let next = ui.button(top, ">", small(theme));
         let match_case = ui.checkbox(top, self.match_case, "Aa", Style::new());
+        let whole_word = ui.checkbox(top, self.whole_word, "W", Style::new());
         let close = ui.button(top, "x", small(theme));
 
         let bottom = ui.panel(card, Style::new().row().gap(4.0).align_center());
@@ -294,6 +330,7 @@ impl FindBar {
             replace: Some(replace),
             replace_all: Some(replace_all),
             match_case: Some(match_case),
+            whole_word: Some(whole_word),
             close: Some(close),
         }
     }
@@ -312,7 +349,7 @@ fn small(theme: &Theme) -> Style {
 /// byte length as the query, so the offsets it reports are exact - lowercasing
 /// the whole text first would be simpler and would silently shift them, because
 /// case mapping is not length-preserving in general.
-fn find_all(haystack: &str, needle: &str, match_case: bool) -> Vec<Range<usize>> {
+fn find_all(haystack: &str, needle: &str, match_case: bool, whole_word: bool) -> Vec<Range<usize>> {
     if needle.is_empty() {
         return Vec::new();
     }
@@ -330,14 +367,26 @@ fn find_all(haystack: &str, needle: &str, match_case: bool) -> Vec<Range<usize>>
         } else {
             window.eq_ignore_ascii_case(needle_bytes)
         };
-        if hit {
-            found.push(at..at + needle_bytes.len());
-            at += needle_bytes.len();
+        let end = at + needle_bytes.len();
+        // Whole-word means neither neighbour continues the word: searching for
+        // `pos` should not stop on every `position`.
+        let bounded = !whole_word
+            || (!haystack[..at].chars().next_back().is_some_and(is_word)
+                && !haystack[end..].chars().next().is_some_and(is_word));
+        if hit && bounded {
+            found.push(at..end);
+            at = end;
         } else {
             at += 1;
         }
     }
     found
+}
+
+/// What counts as part of a word for whole-word matching: the characters an
+/// identifier is made of.
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 #[cfg(test)]
@@ -349,7 +398,7 @@ mod tests {
 
     fn bar(query: &str) -> FindBar {
         let mut bar = FindBar::new(Vec2::ZERO);
-        bar.set_query(query, TEXT);
+        bar.set_query(query, TEXT, 0);
         bar
     }
 
@@ -384,18 +433,18 @@ mod tests {
     #[test]
     fn matching_is_case_insensitive_until_it_is_not() {
         let mut bar = FindBar::new(Vec2::ZERO);
-        bar.set_query("LET", TEXT);
+        bar.set_query("LET", TEXT, 0);
         assert_eq!(bar.len(), 2);
         bar.set_match_case(true, TEXT);
         assert_eq!(bar.len(), 0, "no `LET` in the text");
-        bar.set_query("let", TEXT);
+        bar.set_query("let", TEXT, 0);
         assert_eq!(bar.len(), 2);
     }
 
     #[test]
     fn matches_do_not_overlap() {
         let mut bar = FindBar::new(Vec2::ZERO);
-        bar.set_query("aa", "aaaa");
+        bar.set_query("aa", "aaaa", 0);
         assert_eq!(bar.len(), 2, "aaaa holds two `aa`, not three");
     }
 
@@ -405,7 +454,7 @@ mod tests {
         // move every offset after a character whose case mapping changes length.
         let text = "AAA \u{130} pos";
         let mut bar = FindBar::new(Vec2::ZERO);
-        bar.set_query("POS", text);
+        bar.set_query("POS", text, 0);
         let range = bar.current().expect("found");
         assert_eq!(&text[range], "pos", "the range still slices the real text");
     }
@@ -527,7 +576,7 @@ mod tests {
     fn replacing_with_something_longer_also_lands_in_the_right_places() {
         let (mut ui, field) = area("a a a");
         let mut bar = FindBar::new(Vec2::ZERO);
-        bar.set_query("a", "a a a");
+        bar.set_query("a", "a a a", 0);
         bar.set_replacement("long");
         bar.replace_all(&mut ui, field);
         assert_eq!(ui.text_of(field).unwrap(), "long long long");
@@ -557,7 +606,7 @@ mod tests {
         // inserted text, with no selection left over.
         let (mut ui, field) = area("aaa");
         let mut bar = FindBar::new(Vec2::ZERO);
-        bar.set_query("aaa", "aaa");
+        bar.set_query("aaa", "aaa", 0);
         bar.set_replacement("bb");
         bar.replace_current(&mut ui, field);
         assert_eq!(ui.caret_offset(), Some(2));
@@ -611,5 +660,75 @@ mod tests {
             ui.handle_input(InputEvent::Text(c));
         }
         assert_eq!(ui.text_of(query), Some("pos"));
+    }
+
+    #[test]
+    fn whole_word_skips_the_matches_inside_longer_words() {
+        let text = "pos position reposition pos_x pos";
+        let mut bar = FindBar::default();
+        bar.set_query("pos", text, 0);
+        assert_eq!(bar.len(), 5, "plainly, every substring");
+
+        bar.set_whole_word(true, text);
+        let ranges: Vec<Range<usize>> = (0..bar.len())
+            .map(|i| {
+                bar.current = i;
+                bar.current().unwrap()
+            })
+            .collect();
+        assert_eq!(ranges, vec![0..3, 30..33], "the two standing alone");
+    }
+
+    #[test]
+    fn a_search_starts_from_the_caret_rather_than_the_top_of_the_file() {
+        let text = "a\na\na\na";
+        let mut bar = FindBar::default();
+        bar.set_query("a", text, 4);
+        assert_eq!(bar.current(), Some(4..5), "the first one at or after");
+        assert_eq!(
+            bar.position(),
+            Some(3),
+            "and the readout counts it as third"
+        );
+
+        // Past the last match, it comes back to the first rather than to none.
+        bar.set_query("a", text, 100);
+        assert_eq!(bar.current(), Some(0..1));
+    }
+
+    #[test]
+    fn stepping_past_the_end_says_that_it_wrapped() {
+        let text = "a a";
+        let mut bar = FindBar::default();
+        bar.set_query("a", text, 0);
+        assert_eq!(bar.status(), "1 of 2");
+        bar.find_next();
+        assert_eq!(bar.status(), "2 of 2");
+        bar.find_next();
+        assert_eq!(bar.status(), "1 of 2 (wrapped)");
+
+        // Backwards off the top says so too, and a fresh query forgets it.
+        bar.find_previous();
+        assert_eq!(bar.status(), "2 of 2 (wrapped)");
+        bar.set_query("a", text, 0);
+        assert_eq!(bar.status(), "1 of 2");
+    }
+
+    #[test]
+    fn matches_do_not_borrow_the_selection_colour() {
+        // The current match is also selected, so if the two agreed there would
+        // be no way to tell it from the others.
+        let text = "a a";
+        let mut bar = FindBar::default();
+        bar.set_query("a", text, 0);
+        let theme = Theme::dark();
+        let colors: Vec<_> = bar
+            .decorations(&theme)
+            .into_iter()
+            .map(|d| d.color)
+            .collect();
+        assert_eq!(colors.len(), 2);
+        assert_ne!(colors[0], theme.selection);
+        assert_ne!(colors[0], colors[1], "current versus the rest");
     }
 }

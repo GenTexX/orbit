@@ -130,6 +130,12 @@ pub const TOKENS: &[Token] = &[
     t("code_type", C, "Code", "Script type names"),
     t("code_error", C, "Code", "The squiggle under an error"),
     t("code_warning", C, "Code", "The squiggle under a warning"),
+    t(
+        "code_occurrence",
+        C,
+        "Code",
+        "Backing behind every occurrence of the word under the caret",
+    ),
     // Accents.
     t(
         "accent",
@@ -192,6 +198,12 @@ pub const TOKENS: &[Token] = &[
         "Placeholder text in an empty field",
     ),
     t("selection", C, "Inputs", "Text-selection highlight"),
+    t(
+        "find_match",
+        C,
+        "Inputs",
+        "Find-bar match highlight (distinct from the selection)",
+    ),
     // Widgets.
     t("widget_bg", C, "Widgets", "Default button fill"),
     t("row_hover", C, "Widgets", "Hover overlay on list/tree rows"),

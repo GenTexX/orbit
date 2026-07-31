@@ -61,6 +61,8 @@ pub struct EditorTheme {
     /// The squiggle under an error and under a warning.
     pub code_error: Color,
     pub code_warning: Color,
+    /// The faint backing behind every occurrence of the word under the caret.
+    pub code_occurrence: Color,
     /// Viewport (scene-view) colors. Stored as [`Color`] like the rest of the
     /// theme, converted to photon colors where the scene is drawn.
     /// The clear color behind the scene.
@@ -96,6 +98,7 @@ impl EditorTheme {
             code_type: Color::rgb(0.40, 0.80, 0.78),
             code_error: Color::rgb(0.92, 0.36, 0.36),
             code_warning: Color::rgb(0.90, 0.72, 0.32),
+            code_occurrence: Color::rgba(0.55, 0.60, 0.70, 0.28),
             viewport_bg: Color::rgb(0.052, 0.052, 0.055),
             grid_line: Color::rgba(0.0, 0.0, 0.0, 0.10),
             grid_line_strong: Color::rgba(0.0, 0.0, 0.0, 0.22),
@@ -124,6 +127,7 @@ impl EditorTheme {
             code_type: Color::rgb(0.05, 0.48, 0.46),
             code_error: Color::rgb(0.78, 0.16, 0.16),
             code_warning: Color::rgb(0.70, 0.50, 0.10),
+            code_occurrence: Color::rgba(0.45, 0.50, 0.60, 0.22),
             viewport_bg: Color::rgb(0.86, 0.87, 0.89),
             grid_line: Color::rgba(0.0, 0.0, 0.0, 0.08),
             grid_line_strong: Color::rgba(0.0, 0.0, 0.0, 0.16),

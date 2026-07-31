@@ -288,6 +288,54 @@ pub struct CompletionItem {
     pub detail: String,
 }
 
+/// Every occurrence of the identifier `offset` sits in, including that one.
+///
+/// Token-based rather than textual: `pos` does not light up inside `position`,
+/// inside a comment, or inside a string. It is also deliberately not
+/// scope-aware - two locals called `i` in different functions both highlight -
+/// because the point is "show me this word", answered instantly on every caret
+/// move, and a wrong answer here costs a faint background rather than a jump to
+/// the wrong place.
+pub fn occurrences_at(source: &str, offset: usize) -> Vec<Span> {
+    let (tokens, _) = lex_with_comments(source);
+    let Some(word) = tokens.iter().find_map(|token| match &token.kind {
+        TokenKind::Ident(name)
+            if offset >= token.span.start as usize && offset <= token.span.end as usize =>
+        {
+            Some(name.clone())
+        }
+        _ => None,
+    }) else {
+        return Vec::new();
+    };
+    tokens
+        .iter()
+        .filter(|token| matches!(&token.kind, TokenKind::Ident(name) if *name == word))
+        .map(|token| token.span)
+        .collect()
+}
+
+/// Whether `offset` falls inside a comment or a string literal.
+///
+/// A token's span covers the text it was made from, so a caret strictly inside
+/// one is inside that token. The far edge counts as inside too: after the
+/// closing quote of `"ab"` the caret is back in code, but at `"ab|"` it is
+/// still in the string. An unterminated string runs to the end of the line,
+/// which is what makes a half-typed `"` suppress the list rather than offering
+/// completions inside the string being written.
+fn in_comment_or_string(source: &str, offset: usize) -> bool {
+    let (tokens, _) = lex_with_comments(source);
+    tokens.iter().any(|token| {
+        let (start, end) = (token.span.start as usize, token.span.end as usize);
+        let inside = offset > start && offset < end;
+        match token.kind {
+            TokenKind::Comment => offset > start && offset <= end,
+            TokenKind::Str(_) => inside,
+            _ => false,
+        }
+    })
+}
+
 /// The keywords a script can start a statement with.
 const KEYWORDS: &[&str] = &[
     "func", "let", "if", "else", "while", "for", "in", "return", "true", "false",
@@ -325,6 +373,12 @@ const VEC2_FIELDS: &[&str] = &["x", "y"];
 /// Resolution is single-file, because a v1 script is (there is no `import`).
 pub fn completions_at(source: &str, offset: usize) -> Vec<CompletionItem> {
     let offset = offset.min(source.len());
+    // Inside a comment or a string literal there is no code to complete, and a
+    // list popping up over prose is pure noise. The lexer already knows which
+    // is which, so this asks it rather than guessing from quote counts.
+    if in_comment_or_string(source, offset) {
+        return Vec::new();
+    }
     let (script, _) = parse(source);
 
     if let Some(receiver) = field_receiver(source, offset) {
@@ -1122,6 +1176,63 @@ func third(c: f32) { let x = nope; }
         assert!(
             !completions_at("", 0).is_empty(),
             "keywords are still offered"
+        );
+    }
+
+    #[test]
+    fn a_comment_offers_no_completions() {
+        let source = "func f() {\n    // let me think\n}";
+        let in_comment = source.find("think").unwrap() + 2;
+        assert!(completions_at(source, in_comment).is_empty());
+
+        // A block comment counts too, and the line the comment is on still
+        // completes before the `//` starts.
+        let source = "func f() {\n    let x = 1.0; /* le */\n}";
+        assert!(completions_at(source, source.find("le */").unwrap() + 2).is_empty());
+        let before = source.find("let x").unwrap() + 2;
+        assert!(!completions_at(source, before).is_empty());
+    }
+
+    #[test]
+    fn a_string_literal_offers_no_completions() {
+        let source = r#"func f() { print("let me in"); }"#;
+        let inside = source.find("me in").unwrap();
+        assert!(completions_at(source, inside).is_empty());
+
+        // Just past the closing quote is code again.
+        let after = source.find("\");").unwrap() + 1;
+        assert!(!completions_at(source, after).is_empty());
+    }
+
+    #[test]
+    fn a_half_typed_string_suppresses_the_list_to_the_end_of_its_line() {
+        // The lexer runs an unterminated string to the line end, which is
+        // exactly what should happen while one is being typed.
+        let source = "func f() {\n    print(\"le\n}";
+        assert!(completions_at(source, source.find("le").unwrap() + 2).is_empty());
+    }
+
+    #[test]
+    fn occurrences_are_the_same_word_and_not_the_words_containing_it() {
+        let source = "func f() {\n    let pos = 1.0;\n    let position = pos;\n}";
+        let at = source.find("pos =").unwrap();
+        let found: Vec<&str> = occurrences_at(source, at)
+            .iter()
+            .map(|s| &source[s.start as usize..s.end as usize])
+            .collect();
+        assert_eq!(found, ["pos", "pos"], "not the `pos` inside `position`");
+
+        // The caret has to be in an identifier for there to be an answer.
+        assert!(occurrences_at(source, source.find('{').unwrap()).is_empty());
+    }
+
+    #[test]
+    fn occurrences_ignore_comments_and_strings() {
+        let source = "func f() {\n    let x = 1.0; // x\n    print(\"x\");\n}";
+        assert_eq!(
+            occurrences_at(source, source.find("x =").unwrap()).len(),
+            1,
+            "the declaration only"
         );
     }
 }

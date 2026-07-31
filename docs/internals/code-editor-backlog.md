@@ -1460,7 +1460,7 @@ group.
   something has silently moved you, and the next keystroke overwrites the
   selected match.
 
-- **Searching starts at the caret, not at the top of the file** (S, aurora (a FindBar::seek_from(byte)))
+- ~~**Searching starts at the caret, not at the top of the file**~~ DONE (S, aurora (a FindBar::seek_from(byte)))
   Opening the bar, or changing the query, selects the first match at or after
   the caret rather than match #1. Clicking elsewhere in the editor while the
   bar is open re-bases the next find. Wrapping past the end returns to the
@@ -1472,7 +1472,7 @@ group.
   an_edit_leaves_you_on_the_same_match_by_ordinal test is the contract to
   preserve.
 
-- **Say when the search wrapped** (S, aurora (return whether it wrapped) + atlas (show it))
+- ~~**Say when the search wrapped**~~ DONE (S, aurora (return whether it wrapped) + atlas (show it))
   Stepping past the last match to the first (or before the first to the last)
   shows "wrapped to the top" / "wrapped to the bottom" beside the count for a
   couple of seconds, or on the status bar.
@@ -1483,7 +1483,7 @@ group.
   Note: update_status_bar sets labels with no rebuild, which is the cheap
   place for transient search feedback.
 
-- **Whole-word matching** (S, aurora)
+- ~~**Whole-word matching**~~ DONE (S, aurora)
   A third toggle beside Aa restricts matches to ones whose neighbouring
   characters are not alphanumeric or underscore, so `pos` in `let pos = 1.0;
   let post = pos` finds two, not four. Toggling re-searches and keeps you on
@@ -1580,7 +1580,7 @@ group.
   rect atlas has. Alternatively dodge it: move the bar to the bottom-right
   when the current match is in the top band.
 
-- **Give find matches their own colour, distinct from the selection** (S, aurora (two theme tokens read by FindBar::decorations))
+- ~~**Give find matches their own colour, distinct from the selection**~~ DONE (S, aurora (two theme tokens read by FindBar::decorations))
   The selection keeps the blue accent; find matches take a separate hue - a
   faint amber wash for the others, stronger amber or an outline for the
   current one - so a revealed match and a hand-made selection never look
@@ -1592,7 +1592,7 @@ group.
   stacked, while the others are a washed-out version. Nothing separates "I
   selected this" from "the search found this".
 
-- **Highlight every occurrence of the word under the caret** (M, atlas (computed in apply_script_marks) + aurora (a distinct theme colour))
+- ~~**Highlight every occurrence of the word under the caret**~~ DONE (M, atlas (computed in apply_script_marks) + aurora (a distinct theme colour))
   After a short pause with the caret inside an identifier, every other whole-
   word occurrence in the file gets a dim highlight - `pos` must not light up
   inside `post` - with the occurrence under the caret unmarked or marked
@@ -1991,7 +1991,7 @@ fixes - most of which read a TypedScript that already exists.
   Note: refilter re-orders unconditionally today, so a supplied rank would be
   discarded; it must become a stable tie-break rather than the whole ordering.
 
-- **Suppress completions inside comments and string literals** (S, comet (the context test belongs with the lexer) + a one-line guard in atlas)
+- ~~**Suppress completions inside comments and string literals**~~ DONE (S, comet (the context test belongs with the lexer) + a one-line guard in atlas)
   Typing a word inside `// bounces along x` or inside "hello world" opens no
   popup. The same word outside them still completes.
   Why: refresh_completions asks only whether the prefix is non-empty and
