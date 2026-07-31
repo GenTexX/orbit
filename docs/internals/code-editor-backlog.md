@@ -1947,7 +1947,7 @@ fixes - most of which read a TypedScript that already exists.
   no span, and ast::Param has no name_span at all (parser.rs discards it), so
   hovering a parameter's declaration is blocked until that field is added.
 
-- **Signature help while typing a call's arguments** (M, comet (which call, which argument index) + atlas (the popup))
+- ~~**Signature help while typing a call's arguments**~~ DONE (M, comet (which call, which argument index) + atlas (the popup))
   After `clamp(` a hint at the caret reads `func clamp(value: f32, lo: f32,
   hi: f32) -> f32` with the current parameter emphasised; it advances on each
   comma, survives nesting (`clamp(min(a, ` shows min's), and closes on the

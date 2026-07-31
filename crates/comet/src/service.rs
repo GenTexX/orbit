@@ -16,7 +16,7 @@
 
 use crate::ast::{Block, Else, Function, Script, Stmt};
 use crate::diagnostic::Diagnostic;
-use crate::lexer::{TokenKind, lex_with_comments};
+use crate::lexer::{Token, TokenKind, lex_with_comments};
 use crate::parser::parse;
 use crate::span::Span;
 use crate::tir::Type;
@@ -501,6 +501,93 @@ fn type_of_name(script: &Script, offset: usize, name: &str) -> Option<Type> {
 }
 
 /// A function's signature as written, for a completion's detail and for hover.
+/// The call the caret is inside, for the hint shown while typing arguments.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignatureHelp {
+    /// The whole signature, as it would be written.
+    pub signature: String,
+    /// Each parameter as `name: Type`, so the caller can emphasise one.
+    pub params: Vec<String>,
+    /// Which parameter the caret is on. Can be past the end of `params` when
+    /// more arguments have been typed than the function takes - which is worth
+    /// showing rather than clamping away, because it is the mistake.
+    pub active: usize,
+}
+
+/// The signature of the call `offset` is inside, and which argument it is on.
+///
+/// `None` when the caret is not between a call's parentheses, or the callee is
+/// not something with a known signature. Nested calls resolve to the innermost:
+/// in `max(1.0, min(|`, the caret is on `min`'s first argument.
+pub fn signature_at(source: &str, offset: usize) -> Option<SignatureHelp> {
+    let (tokens, _) = lex_with_comments(source);
+    // Only tokens strictly before the caret matter, and comments are not part
+    // of the call - a `(` inside one must not open anything.
+    let before: Vec<&Token> = tokens
+        .iter()
+        .filter(|t| t.span.end as usize <= offset && t.kind != TokenKind::Comment)
+        .collect();
+
+    // Walk back for the innermost paren that is still open, counting commas at
+    // that depth on the way - which is the active argument.
+    let mut depth = 0i32;
+    let mut commas = 0usize;
+    let mut open: Option<usize> = None;
+    for (i, token) in before.iter().enumerate().rev() {
+        match token.kind {
+            TokenKind::RParen => depth += 1,
+            TokenKind::LParen if depth == 0 => {
+                open = Some(i);
+                break;
+            }
+            TokenKind::LParen => depth -= 1,
+            TokenKind::Comma if depth == 0 => commas += 1,
+            _ => {}
+        }
+    }
+    let open = open?;
+    // The name in front of the paren is the callee. Without one this is a
+    // grouping paren, not a call.
+    let TokenKind::Ident(name) = &before.get(open.checked_sub(1)?)?.kind else {
+        return None;
+    };
+
+    let (script, _) = parse(source);
+    if let Some(function) = script.functions.iter().find(|f| f.name == *name) {
+        return Some(SignatureHelp {
+            signature: signature_of(function),
+            params: function
+                .params
+                .iter()
+                .map(|p| format!("{}: {}", p.name, p.ty.name))
+                .collect(),
+            active: commas,
+        });
+    }
+    let (_, signature) = BUILTINS.iter().find(|(builtin, _)| builtin == name)?;
+    Some(SignatureHelp {
+        signature: signature.to_string(),
+        params: params_of(signature),
+        active: commas,
+    })
+}
+
+/// The parameter list out of a written signature like
+/// `func min(a: f32, b: f32) -> f32`.
+fn params_of(signature: &str) -> Vec<String> {
+    let Some(open) = signature.find('(') else {
+        return Vec::new();
+    };
+    let Some(close) = signature[open..].find(')') else {
+        return Vec::new();
+    };
+    let inner = &signature[open + 1..open + close];
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    inner.split(',').map(|p| p.trim().to_string()).collect()
+}
+
 fn signature_of(function: &Function) -> String {
     let params: Vec<String> = function
         .params
@@ -1851,5 +1938,67 @@ func f() {
         assert!(!rename_is_safe(source, at, "two words"));
         assert!(!rename_is_safe(source, at, ""));
         assert!(!rename_is_safe(source, at, "1st"));
+    }
+
+    #[test]
+    fn signature_help_names_the_call_and_the_argument_being_typed() {
+        let source = "func f(a: f32) { min(1.0, 2.0); }";
+        let first = source.find("1.0").expect("in the fixture");
+        let second = source.find("2.0").expect("in the fixture");
+
+        let help = signature_at(source, first).expect("inside a call");
+        assert_eq!(help.signature, "func min(a: f32, b: f32) -> f32");
+        assert_eq!(help.params, ["a: f32", "b: f32"]);
+        assert_eq!(help.active, 0);
+        assert_eq!(
+            signature_at(source, second).expect("still inside").active,
+            1
+        );
+    }
+
+    #[test]
+    fn a_nested_call_resolves_to_the_innermost_one() {
+        let source = "func f() { max(1.0, min(2.0, 3.0)); }";
+        let inner = source.find("2.0").expect("in the fixture");
+        let help = signature_at(source, inner).expect("inside min");
+        assert!(help.signature.starts_with("func min"), "{}", help.signature);
+        assert_eq!(help.active, 0);
+
+        // And back out to the outer call after the inner one closes.
+        let after = source.find("));").expect("in the fixture") + 1;
+        let help = signature_at(source, after).expect("inside max");
+        assert!(help.signature.starts_with("func max"), "{}", help.signature);
+        assert_eq!(help.active, 1);
+    }
+
+    #[test]
+    fn a_script_defined_function_gets_its_own_signature() {
+        let source = "func aim(x: f32, y: f32) -> Vec2 { vec2(x, y) }\nfunc f() { aim(1.0, ); }";
+        let at = source.rfind("1.0").expect("in the fixture");
+        let help = signature_at(source, at).expect("inside aim");
+        assert_eq!(help.signature, "func aim(x: f32, y: f32) -> Vec2");
+        assert_eq!(help.params, ["x: f32", "y: f32"]);
+    }
+
+    #[test]
+    fn there_is_no_signature_where_there_is_no_call() {
+        // A grouping paren is not a call.
+        assert_eq!(signature_at("func f() { let x = (1.0 + 2.0); }", 22), None);
+        // Nor is a closed call you have stepped out of.
+        let source = "func f() { min(1.0, 2.0); }";
+        assert_eq!(signature_at(source, source.find(';').unwrap()), None);
+        // A paren inside a comment opens nothing.
+        let source = "func f() {\n    // min(\n    let x = 1.0;\n}";
+        assert_eq!(signature_at(source, source.find("let x").unwrap()), None);
+    }
+
+    #[test]
+    fn too_many_arguments_shows_as_being_past_the_end() {
+        // Clamping would hide the mistake; the count is the useful part.
+        let source = "func f() { min(1.0, 2.0, 3.0); }";
+        let third = source.find("3.0").expect("in the fixture");
+        let help = signature_at(source, third).expect("inside a call");
+        assert_eq!(help.active, 2);
+        assert_eq!(help.params.len(), 2, "one more argument than it takes");
     }
 }

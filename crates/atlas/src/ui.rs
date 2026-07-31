@@ -2150,6 +2150,72 @@ pub fn add_symbol_query(
     )
 }
 
+/// The signature hint under the caret: the call being typed, with the argument
+/// you are on picked out.
+///
+/// Emphasis by colour rather than by weight - there is one font - and the rest
+/// of the signature stays legible rather than being dimmed to nothing, because
+/// the parameters you have already passed are exactly what you are checking
+/// against.
+pub fn add_signature_hint(
+    ui: &mut Ui,
+    anchor: Vec2,
+    help: &comet::service::SignatureHelp,
+    theme: &EditorTheme,
+) {
+    let card = ui.popup(
+        anchor,
+        Style::new()
+            .row()
+            .gap(0.0)
+            .padding(6.0)
+            .align_center()
+            .background(theme.aurora.menu_bg)
+            .corner_radius(theme.aurora.card_radius)
+            .border(theme.aurora.border_width, theme.aurora.card_border),
+    );
+    // The head is everything up to the parameters - `func min(`.
+    let head = help
+        .signature
+        .find('(')
+        .map_or(help.signature.as_str(), |at| &help.signature[..=at]);
+    ui.label(
+        card,
+        head.to_string(),
+        Style::new().foreground(theme.code_function),
+    );
+    for (i, param) in help.params.iter().enumerate() {
+        if i > 0 {
+            ui.label(card, ", ", Style::new().foreground(theme.aurora.subhead));
+        }
+        let color = if i == help.active {
+            theme.code_type
+        } else {
+            theme.aurora.subhead
+        };
+        ui.label(card, param.clone(), Style::new().foreground(color));
+    }
+    // The tail is the closing paren and any return type.
+    let tail = help
+        .signature
+        .rfind(')')
+        .map_or(")", |at| &help.signature[at..]);
+    ui.label(
+        card,
+        tail.to_string(),
+        Style::new().foreground(theme.code_function),
+    );
+    // Past the end: more arguments than the function takes. Saying so beside
+    // the signature is more use than clamping the highlight and showing nothing.
+    if help.active >= help.params.len() {
+        ui.label(
+            card,
+            format!("  (takes {})", help.params.len()),
+            Style::new().foreground(theme.code_error),
+        );
+    }
+}
+
 /// The rename field over the code editor, with the reason the last attempt was
 /// refused beside it when there was one.
 pub fn add_symbol_rename(

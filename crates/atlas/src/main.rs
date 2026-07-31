@@ -363,6 +363,9 @@ struct State {
     /// Where the caret and the view were, per script, so reopening a file this
     /// session puts you back where you left rather than at the top.
     script_positions: std::collections::HashMap<String, (usize, f32)>,
+    /// The call the caret is inside, and where to draw the hint. Refreshed on
+    /// every edit and caret move, like the completion list.
+    signature: Option<(comet::service::SignatureHelp, Vec2)>,
     /// A transient line for the status bar - what a jump found, or why it did
     /// not go anywhere - and when it was set, so it fades rather than lingering.
     status_note: Option<(String, std::time::Instant)>,
@@ -1304,6 +1307,7 @@ impl State {
             symbol_palette: None,
             script_positions: std::collections::HashMap::new(),
             focus_editor: false,
+            signature: None,
             status_note: None,
             symbol_rename: None,
             force_completions: false,
@@ -4177,6 +4181,10 @@ impl State {
             if self.completions.is_some() {
                 self.refresh_completions();
             }
+            // The signature hint follows the caret whether or not anything was
+            // typed: clicking or arrowing into a call is how you come back to
+            // an argument you left, and that is exactly when you want it.
+            self.update_signature();
             self.caret_was = caret;
             self.caret_phase = std::time::Instant::now();
             self.caret_visible = true;
@@ -5057,6 +5065,7 @@ impl State {
     fn refresh_completions(&mut self) {
         let was_open = self.completions.is_some();
         self.refresh_completions_inner();
+        self.update_signature();
         // Every exit from here has to mark the shell dirty when the popup's
         // presence changed. Five of them used to just clear the state and
         // return, so the popup vanished from `self.completions` but the old Ui
@@ -5145,6 +5154,33 @@ impl State {
             .map_or(previous, |r| r.pos + Vec2::new(0.0, r.size.y + 2.0))
     }
 
+    /// Refresh the signature hint for the call the caret is inside.
+    ///
+    /// Sits below the caret like the completion list, and gives way to it: two
+    /// popups in the same place is worse than either. The completion list is
+    /// what you are acting on; the signature is reference.
+    fn update_signature(&mut self) {
+        let was = self.signature.is_some();
+        let editor = self.rows.code_editor;
+        let focused = editor.is_some() && self.ui.focused() == editor;
+        let help = (focused && self.completions.is_none())
+            .then(|| comet::service::signature_at(&self.script_text, self.editor_caret()))
+            .flatten();
+        self.signature = help.map(|help| {
+            let anchor = editor
+                .and_then(|editor| self.ui.caret_rect(editor))
+                .map(|r| r.pos + Vec2::new(0.0, r.size.y + 2.0))
+                .or_else(|| self.signature.as_ref().map(|(_, at)| *at))
+                .unwrap_or_default();
+            (help, anchor)
+        });
+        // Same rule as the completion popup: a change in whether it is there at
+        // all has to reach the shell, or the old Ui keeps drawing it.
+        if self.signature.is_some() != was {
+            self.dirty = true;
+        }
+    }
+
     /// Move the popup under the caret, after layout has given the caret a
     /// position. Also the backstop that takes it down when the editor is no
     /// longer the focused widget - clicking away should not leave it floating.
@@ -5167,6 +5203,24 @@ impl State {
             && list.anchor() != anchor
         {
             list.set_anchor(anchor);
+            self.dirty = true;
+        }
+    }
+
+    /// Keep the signature hint under the caret, the way the completion popup is
+    /// kept under it.
+    fn update_signature_anchor(&mut self) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let Some(rect) = self.ui.caret_rect(editor) else {
+            return;
+        };
+        let anchor = rect.pos + Vec2::new(0.0, rect.size.y + 2.0);
+        if let Some((_, at)) = &mut self.signature
+            && *at != anchor
+        {
+            *at = anchor;
             self.dirty = true;
         }
     }
@@ -5726,6 +5780,9 @@ impl State {
             if let Some((list, _)) = &self.completions {
                 self.rows.completions = list.build(&mut self.ui, &self.theme.aurora);
             }
+            if let Some((help, anchor)) = &self.signature {
+                ui::add_signature_hint(&mut self.ui, *anchor, help, &self.theme);
+            }
             if let Some(find) = &self.find {
                 self.rows.find = find.build(&mut self.ui, &self.theme.aurora);
             }
@@ -5933,6 +5990,7 @@ impl State {
         // them - the docking equivalent of the old capture_panel_sizes.
         self.apply_script_marks();
         self.update_completion_anchor();
+        self.update_signature_anchor();
         self.check_editor_in_sync("at the end of a frame");
         self.sync_dock_state();
         self.maybe_save_editor_state();
