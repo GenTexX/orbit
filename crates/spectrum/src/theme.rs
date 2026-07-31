@@ -199,6 +199,12 @@ pub const TOKENS: &[Token] = &[
     ),
     t("selection", C, "Inputs", "Text-selection highlight"),
     t(
+        "selection_inactive",
+        C,
+        "Inputs",
+        "Text selection in a field that does not have the keyboard",
+    ),
+    t(
         "find_match",
         C,
         "Inputs",

@@ -236,6 +236,10 @@ pub struct Ui {
     /// The fixed end of a selection (the caret is the moving end), or `None`
     /// for no selection. The selected range is `min..max` of the two.
     selection_anchor: Option<usize>,
+    /// The selection each text input had when focus last left it: its range and
+    /// its caret. Drawn in the inactive colours while something else holds the
+    /// keyboard, so the range you were working on stays visible.
+    parked_selection: SecondaryMap<WidgetId, (usize, usize, usize)>,
     /// Whether shift is currently held (set by the app), so movement keys
     /// extend the selection rather than collapse it.
     shift: bool,
@@ -290,6 +294,7 @@ impl Ui {
             caret: 0,
             focused_hscroll: 0.0,
             selection_anchor: None,
+            parked_selection: SecondaryMap::new(),
             shift: false,
             caret_on: true,
             events: Vec::new(),
@@ -724,6 +729,28 @@ impl Ui {
         }
     }
 
+    /// Move focus, parking the outgoing field's selection so it can still be
+    /// drawn while another widget has the keyboard.
+    ///
+    /// The caret and the selection anchor are properties of the Ui rather than
+    /// of a widget - there is one of each, belonging to whatever is focused - so
+    /// without this, clicking into the find bar loses the range you were about
+    /// to replace, which is exactly when you want to keep seeing it.
+    fn set_focused(&mut self, id: Option<WidgetId>) {
+        if self.focused == id {
+            self.focused = id;
+            return;
+        }
+        if let Some(previous) = self.focused
+            && self.widgets.contains_key(previous)
+            && matches!(self.widgets[previous].kind, WidgetKind::TextInput(_))
+        {
+            let (lo, hi) = self.selection_bounds(previous);
+            self.parked_selection.insert(previous, (lo, hi, self.caret));
+        }
+        self.focused = id;
+    }
+
     /// The focused text area's current line, newline included, and the range it
     /// occupies.
     ///
@@ -749,6 +776,24 @@ impl Ui {
             start..end
         };
         Some((range.clone(), format!("{}\n", &text[start..end])))
+    }
+
+    /// Collapse the focused field's selection onto its moving end.
+    ///
+    /// What Escape does in the editor: a stray selection could otherwise only be
+    /// cleared by clicking, and clicking moves the caret somewhere else.
+    /// Returns whether there was one to collapse, so a caller can fall through
+    /// to whatever Escape means when there is not.
+    pub fn collapse_selection(&mut self) -> bool {
+        let Some(id) = self.focused else {
+            return false;
+        };
+        let (lo, hi) = self.selection_bounds(id);
+        if lo == hi {
+            return false;
+        }
+        self.selection_anchor = None;
+        true
     }
 
     /// The focused field's selection, or `None` when there is no selection.
@@ -783,7 +828,7 @@ impl Ui {
             snap_boundary(text, anchor.min(len)),
             snap_boundary(text, caret.min(len)),
         );
-        self.focused = Some(id);
+        self.set_focused(Some(id));
         self.selection_anchor = (anchor != caret).then_some(anchor);
         self.caret = caret;
     }
@@ -820,7 +865,7 @@ impl Ui {
         if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
             return;
         }
-        self.focused = Some(id);
+        self.set_focused(Some(id));
         self.focused_hscroll = 0.0;
         self.selection_anchor = Some(0);
         self.caret = self.text_len(id);
@@ -834,7 +879,7 @@ impl Ui {
         if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
             return;
         }
-        self.focused = Some(id);
+        self.set_focused(Some(id));
         self.focused_hscroll = 0.0;
         self.selection_anchor = None;
         self.caret = offset.min(self.text_len(id));
@@ -946,7 +991,7 @@ impl Ui {
             return;
         }
         let (lo, hi) = (lo.min(len), hi.min(len));
-        self.focused = Some(id);
+        self.set_focused(Some(id));
         self.selection_anchor = Some(lo);
         self.caret = hi;
     }
@@ -1863,7 +1908,7 @@ impl Ui {
             }
             Some(id) if matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) => {
                 let was_focused = self.focused == Some(id);
-                self.focused = Some(id);
+                self.set_focused(Some(id));
                 // shift+click extends the selection to the click instead of
                 // starting a new one - the standard way to select a long span
                 // without dragging across it.
@@ -1902,7 +1947,7 @@ impl Ui {
                 self.selection_anchor = Some(self.caret);
             }
             _ => {
-                self.focused = None;
+                self.set_focused(None);
                 self.selection_anchor = None;
             }
         }
@@ -2142,7 +2187,7 @@ impl Ui {
         // widget, so a line command editing an unfocused field could not select
         // what it produced - and a promise that silently does not apply is worse
         // than a command that takes focus.
-        self.focused = Some(id);
+        self.set_focused(Some(id));
         let (block, _) = self.line_block(id, range);
         let at = self.replace_range(id, block, text);
         self.selection_anchor = Some(at.start);
@@ -2867,7 +2912,7 @@ impl Ui {
         {
             self.events.push(Event::Submitted(old));
         }
-        self.focused = Some(id);
+        self.set_focused(Some(id));
         self.caret = self.text_len(id);
         self.selection_anchor = Some(0);
         // The new field starts unscrolled; layout re-derives its scroll to keep
@@ -3557,23 +3602,32 @@ impl Ui {
         // Decorations that sit behind the text go under the selection: the
         // selection is what the user is doing right now, and should win.
         self.emit_decorations(id, origin, true, list);
-        // The selection highlight, behind the text.
-        if focused {
+        // The selection highlight, behind the text. An unfocused field still
+        // shows the range it had, in the inactive colour: clicking into the find
+        // bar should not hide the match you were about to replace.
+        let selection = if focused {
             let (lo, hi) = self.selection_bounds(id);
-            if lo != hi {
-                if widget.multiline {
-                    self.emit_multiline_selection(id, lo, hi, origin, list);
-                } else {
-                    let x0 = origin.x + self.x_offset_at(id, lo);
-                    let x1 = origin.x + self.x_offset_at(id, hi);
-                    list.commands.push(DrawCommand::FillRect {
-                        rect: Rect::new(
-                            Vec2::new(x0, rect.pos.y + 3.0),
-                            Vec2::new((x1 - x0).max(0.0), (rect.size.y - 6.0).max(0.0)),
-                        ),
-                        color: self.theme.selection,
-                    });
-                }
+            Some((lo, hi, self.theme.selection))
+        } else {
+            self.parked_selection
+                .get(id)
+                .map(|&(lo, hi, _)| (lo, hi, self.theme.selection_inactive))
+        };
+        if let Some((lo, hi, color)) = selection
+            && lo != hi
+        {
+            if widget.multiline {
+                self.emit_multiline_selection(id, lo, hi, color, origin, list);
+            } else {
+                let x0 = origin.x + self.x_offset_at(id, lo);
+                let x1 = origin.x + self.x_offset_at(id, hi);
+                list.commands.push(DrawCommand::FillRect {
+                    rect: Rect::new(
+                        Vec2::new(x0, rect.pos.y + 3.0),
+                        Vec2::new((x1 - x0).max(0.0), (rect.size.y - 6.0).max(0.0)),
+                    ),
+                    color,
+                });
             }
         }
         if let Some(buffer) = self.buffers.get(id) {
@@ -3607,14 +3661,12 @@ impl Ui {
         id: WidgetId,
         lo: usize,
         hi: usize,
+        color: Color,
         origin: Vec2,
         list: &mut DrawList,
     ) {
         for rect in self.range_rects(id, lo, hi, origin) {
-            list.commands.push(DrawCommand::FillRect {
-                rect,
-                color: self.theme.selection,
-            });
+            list.commands.push(DrawCommand::FillRect { rect, color });
         }
     }
 
@@ -3714,7 +3766,21 @@ impl Ui {
         let Some(text) = self.text_of(id) else {
             return;
         };
-        let caret_line = (self.focused == Some(id)).then(|| byte_to_cursor(text, self.caret).line);
+        // An unfocused field still marks the line it was left on, fainter: the
+        // band is where you were reading, and clicking into the find bar should
+        // not lose it.
+        let focused = self.focused == Some(id);
+        let at = if focused {
+            Some(self.caret)
+        } else {
+            self.parked_selection.get(id).map(|&(_, _, caret)| caret)
+        };
+        let caret_line = at.map(|at| byte_to_cursor(text, at).line);
+        let band = self.theme.selection.fade(if focused {
+            theme::GUTTER_CURRENT_FADE
+        } else {
+            theme::GUTTER_CURRENT_FADE * 0.45
+        });
         let right = origin.x - theme::GUTTER_PAD;
 
         let mut last_line = None;
@@ -3727,7 +3793,7 @@ impl Ui {
                         Vec2::new(rect.pos.x, origin.y + run.line_top),
                         Vec2::new(rect.size.x, run.line_height),
                     ),
-                    color: self.theme.selection.fade(theme::GUTTER_CURRENT_FADE),
+                    color: band,
                 });
             }
             // One number per logical line, on the first visual row it occupies.
@@ -5921,6 +5987,35 @@ mod tests {
         ui.handle_input(InputEvent::Key(Key::Tab));
         assert_eq!(ui.text_of(field), Some("deep"));
         assert_eq!(ui.focused(), Some(field));
+    }
+
+    #[test]
+    fn a_field_that_loses_focus_keeps_showing_its_selection() {
+        // Clicking into the find bar should not hide the range you were about
+        // to replace - which is exactly when you need to see it.
+        let (mut ui, field) = text_area("hello world");
+        ui.select_range(field, 0, 5);
+        let other = ui.text_input(ui.root().expect("a root"), "q".to_string(), Style::new());
+        ui.layout(Vec2::new(400.0, 300.0)).unwrap();
+
+        ui.focus(other);
+        assert_eq!(ui.parked_selection.get(field).copied(), Some((0, 5, 5)));
+
+        // And coming back does not change the range.
+        ui.focus(field);
+        ui.select_range(field, 0, 5);
+        assert_eq!(ui.selection_range(), Some(0..5));
+    }
+
+    #[test]
+    fn escape_collapses_a_selection_and_says_whether_there_was_one() {
+        let (mut ui, field) = text_area("hello world");
+        assert!(!ui.collapse_selection(), "nothing selected, nothing to do");
+
+        ui.select_range(field, 0, 5);
+        assert!(ui.collapse_selection());
+        assert_eq!(ui.selection_range(), None);
+        assert_eq!(ui.caret_offset(), Some(5), "the caret stays where it was");
     }
 
     #[test]

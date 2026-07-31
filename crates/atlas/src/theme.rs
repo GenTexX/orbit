@@ -97,6 +97,7 @@ theme_tokens! {
     "icon_hover": Color => aurora.icon_hover,
     "icon_active": Color => aurora.icon_active,
     "selection": Color => aurora.selection,
+    "selection_inactive": Color => aurora.selection_inactive,
     "find_match": Color => aurora.find_match,
     "slider_track": Color => aurora.slider_track,
     "slider_fill": Color => aurora.slider_fill,

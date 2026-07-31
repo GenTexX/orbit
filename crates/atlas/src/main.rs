@@ -360,6 +360,12 @@ struct State {
     /// The go-to-symbol palette: what has been typed into it, and the list of
     /// matching declarations. Open only over the Code pane.
     symbol_palette: Option<(String, aurora::list::ListPopup)>,
+    /// Where the caret and the view were, per script, so reopening a file this
+    /// session puts you back where you left rather than at the top.
+    script_positions: std::collections::HashMap<String, (usize, f32)>,
+    /// Set when a script is opened: focus the editor after the next rebuild.
+    /// A file that appears with no caret swallows the first keystroke.
+    focus_editor: bool,
     /// Set by ctrl+space: offer the list wherever the caret is, rather than only
     /// where a name is being typed. Cleared as soon as it has been used.
     force_completions: bool,
@@ -1103,6 +1109,8 @@ impl State {
             tooltip_rested: std::time::Instant::now(),
             go_to_line: None,
             symbol_palette: None,
+            script_positions: std::collections::HashMap::new(),
+            focus_editor: false,
             force_completions: false,
             caret_phase: std::time::Instant::now(),
             caret_visible: true,
@@ -3497,6 +3505,9 @@ impl State {
                 return;
             }
         };
+        // Remember where the outgoing file was being read, before anything about
+        // it is replaced.
+        self.remember_script_position();
         // A file that is not UTF-8 is refused by name rather than opened as
         // replacement characters and then saved back over the original.
         let (text, encoding) = match TextEncoding::decode(&raw) {
@@ -3542,7 +3553,14 @@ impl State {
         }
         self.script_undo.clear();
         self.script_redo.clear();
-        self.script_caret = 0;
+        // Back where this file was left, if it has been open this session.
+        let (caret, _) = self
+            .open_script
+            .as_ref()
+            .and_then(|name| self.script_positions.get(name).copied())
+            .unwrap_or((0, 0.0));
+        self.script_caret = caret.min(self.script_text.len());
+        self.focus_editor = true;
         self.script_coalescing = false;
         // A completion list and a find bar are both about the buffer that just
         // went away.
@@ -4279,6 +4297,21 @@ impl State {
         true
     }
 
+    /// Note where the open script is being read, so reopening it this session
+    /// comes back here rather than to the top of the file.
+    ///
+    /// Both the caret and the scroll: a fresh Ui has no scroll for the field, so
+    /// restoring only the caret leaves the view to be re-derived from it, which
+    /// parks the caret's line at the bottom of the pane.
+    fn remember_script_position(&mut self) {
+        let (Some(name), Some(editor)) = (self.open_script.clone(), self.rows.code_editor) else {
+            return;
+        };
+        let caret = self.editor_caret();
+        let scroll = self.ui.text_scroll(editor).map_or(0.0, |(y, _)| y);
+        self.script_positions.insert(name, (caret, scroll));
+    }
+
     /// Where the caret is in the script, or 0 when the editor is not focused.
     ///
     /// What a search starts from. Once the find bar has focus the editor no
@@ -4443,6 +4476,12 @@ impl State {
             }
             if self.completions.take().is_some() || self.find.take().is_some() {
                 self.dirty = true;
+                return true;
+            }
+            // Nothing open: Escape drops a stray selection in the editor. It
+            // could otherwise only be cleared by clicking, and clicking puts the
+            // caret somewhere you did not ask for.
+            if self.ui.focused() == self.rows.code_editor && self.ui.collapse_selection() {
                 return true;
             }
             return false;
@@ -5192,7 +5231,23 @@ impl State {
                 self.ui.focus_caret(field, offset);
                 self.refocus_filter = false;
             }
-            if self.focus_find
+            // A freshly opened script takes the keyboard, at the position it
+            // was left. Ahead of the ordinary caret restore below, which only
+            // fires when the editor already had focus - which, on the frame a
+            // file is opened from the explorer, it did not.
+            if self.focus_editor
+                && let Some(editor) = self.rows.code_editor
+            {
+                let (caret, scroll) = self
+                    .open_script
+                    .as_ref()
+                    .and_then(|name| self.script_positions.get(name).copied())
+                    .unwrap_or((0, 0.0));
+                self.ui
+                    .focus_caret(editor, caret.min(self.script_text.len()));
+                self.ui.set_text_scroll(editor, scroll);
+                self.focus_editor = false;
+            } else if self.focus_find
                 && let Some(query) = self.rows.find.query
             {
                 let len = self.ui.text_of(query).map_or(0, str::len);

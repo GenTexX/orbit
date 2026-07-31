@@ -45,6 +45,9 @@ pub struct Theme {
     pub icon_hover: Color,
     /// Text-selection highlight (drawn behind the selected glyphs).
     pub selection: Color,
+    /// A selection in a field that no longer has the keyboard. Desaturated, so
+    /// it reads as "this is still selected, but not where you are typing".
+    pub selection_inactive: Color,
     /// Find-bar matches. Deliberately not the selection colour: the current
     /// match IS selected, so if the two agree there is no way to tell the other
     /// matches from the one you are standing on.
@@ -127,6 +130,7 @@ impl Theme {
             placeholder: Color::rgb(0.42, 0.44, 0.50),
             icon_hover: Color::rgb(0.45, 0.70, 1.0),
             selection: Color::rgba(0.30, 0.55, 0.90, 0.40),
+            selection_inactive: Color::rgba(0.55, 0.60, 0.68, 0.28),
             find_match: Color::rgba(0.95, 0.70, 0.25, 0.45),
             slider_track: Color::rgb(0.14, 0.15, 0.19),
             slider_fill: Color::rgb(0.30, 0.55, 0.90),
@@ -172,6 +176,7 @@ impl Theme {
             placeholder: Color::rgb(0.55, 0.57, 0.62),
             icon_hover: Color::rgb(0.20, 0.50, 0.90),
             selection: Color::rgba(0.20, 0.50, 0.90, 0.30),
+            selection_inactive: Color::rgba(0.45, 0.50, 0.58, 0.22),
             find_match: Color::rgba(0.90, 0.62, 0.10, 0.40),
             slider_track: Color::rgb(0.80, 0.81, 0.85),
             slider_fill: Color::rgb(0.20, 0.50, 0.90),

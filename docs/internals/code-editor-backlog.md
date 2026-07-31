@@ -364,7 +364,7 @@ keystroke.
   Note: Needs the anchor to become a range (anchor_lo/anchor_hi), which
   shift+click and multi-selection also want.
 
-- **Shift+click extends the selection instead of restarting it** (S, aurora)
+- ~~**Shift+click extends the selection instead of restarting it**~~ DONE (S, aurora)
   A press with shift on the focused field leaves the anchor where it is (or
   drops one at the caret if there is none) and moves only the caret, extending
   or shrinking. shift+drag keeps extending. Without shift the anchor resets,
@@ -389,7 +389,7 @@ keystroke.
   caret_at_x's local.y.max(0.0) makes an upward overshoot jump straight to
   line 0 rather than one line at a time.
 
-- **Escape collapses the selection to the caret** (S, aurora+atlas)
+- ~~**Escape collapses the selection to the caret**~~ DONE (S, aurora+atlas)
   With the editor focused and no popup open, Escape collapses the selection
   (keeping the caret at the moving end) and leaves focus alone. A completion
   list or find bar still gets Escape first; with nothing open and no selection
@@ -399,7 +399,7 @@ keystroke.
   translate_key filters the control character. A stray selection can only be
   cleared by clicking.
 
-- **An unfocused field keeps showing its selection and current line** (S, aurora)
+- ~~**An unfocused field keeps showing its selection and current line**~~ DONE (S, aurora)
   When focus moves to another widget, the editor keeps drawing its selection
   in a desaturated inactive colour and still marks the caret's line (fainter);
   only the caret itself disappears. Clicking back restores the active colours
@@ -464,7 +464,7 @@ keystroke.
   Note: Depends on the gutter-press defect above. Aurora only emits on the
   press, so a drag needs it to keep reporting while the button is held.
 
-- **Opening a script focuses the editor, with the caret where you left it** (S, atlas)
+- ~~**Opening a script focuses the editor, with the caret where you left it**~~ DONE (S, atlas)
   Double-clicking a .cmt opens the pane, focuses the text area and places the
   caret at offset 0, or at the caret and scroll it had if the file was open
   before this session. Switching dock tabs and back restores the same caret;
