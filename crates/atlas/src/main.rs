@@ -656,6 +656,28 @@ enum FindAction {
     Close,
 }
 
+/// What to draw a completion's name and its note in.
+///
+/// The same colors the code itself uses, so the list looks like what it is
+/// about to insert: a keyword arrives in the keyword color, a type in the type
+/// color. The note is colored by what it *is* rather than by the item's kind -
+/// a variable's note is its type, a function's note is its signature, and a
+/// keyword's note is a sentence of English, which is not code and is drawn as
+/// the quiet prose it is.
+fn completion_colors(
+    kind: comet::service::CompletionKind,
+    theme: &ui::EditorTheme,
+) -> (Option<aurora::Color>, Option<aurora::Color>) {
+    use comet::service::CompletionKind as K;
+    match kind {
+        K::Keyword => (Some(theme.code_keyword), None),
+        K::Type => (Some(theme.code_type), None),
+        K::Function => (Some(theme.code_function), Some(theme.code_function)),
+        // An identifier is plain in the editor, and its note is its type.
+        K::Variable | K::Field => (None, Some(theme.code_type)),
+    }
+}
+
 /// Where a completion popup should be anchored for a caret at `caret`, or
 /// `None` if none should be open there.
 ///
@@ -4292,10 +4314,15 @@ impl State {
             }
         };
         let (_, prefix) = word_before(&self.script_text, caret);
+        let theme = &self.theme;
         let items: Vec<aurora::list::ListItem> =
             comet::service::completions_at(&self.script_text, caret)
                 .into_iter()
-                .map(|item| aurora::list::ListItem::with_detail(item.label, item.detail))
+                .map(|item| {
+                    let (label, detail) = completion_colors(item.kind, theme);
+                    aurora::list::ListItem::with_detail(item.label, item.detail)
+                        .colored(label, detail)
+                })
                 .collect();
         // No anchor here on purpose. The buffer has just been edited and not
         // re-shaped, so the caret has no on-screen position yet - asking for one

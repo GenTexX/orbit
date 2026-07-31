@@ -22,6 +22,7 @@
 
 use glam::Vec2;
 
+use crate::color::Color;
 use crate::input::Key;
 use crate::style::Style;
 use crate::theme::Theme;
@@ -60,19 +61,26 @@ pub enum ListKey {
 }
 
 /// One row: what would be inserted, and a dimmer note about what it is.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ListItem {
     pub label: String,
-    /// A short note shown after the label in a quieter color - a type, a
-    /// signature, a sentence. Empty for none.
+    /// A short note shown after the label - a type, a signature, a sentence.
+    /// Empty for none.
     pub detail: String,
+    /// What to draw them in, or `None` for the theme's defaults.
+    ///
+    /// Aurora has no idea what a keyword or a type is; an app that colors its
+    /// code can hand the same colors down here, so what the list offers looks
+    /// like what it is about to insert.
+    pub label_color: Option<Color>,
+    pub detail_color: Option<Color>,
 }
 
 impl ListItem {
     pub fn new(label: impl Into<String>) -> Self {
         Self {
             label: label.into(),
-            detail: String::new(),
+            ..Self::default()
         }
     }
 
@@ -80,7 +88,15 @@ impl ListItem {
         Self {
             label: label.into(),
             detail: detail.into(),
+            ..Self::default()
         }
+    }
+
+    /// Color the label, and the detail after it.
+    pub fn colored(mut self, label: Option<Color>, detail: Option<Color>) -> Self {
+        self.label_color = label;
+        self.detail_color = detail;
+        self
     }
 }
 
@@ -254,7 +270,11 @@ impl ListPopup {
             // caption makes it a container whose children draw the text, the
             // same shape the file explorer's rows use.
             let row = ui.button(card, "", style);
-            ui.label(row, &item.label, Style::new().foreground(theme.heading));
+            ui.label(
+                row,
+                &item.label,
+                Style::new().foreground(item.label_color.unwrap_or(theme.heading)),
+            );
             if !item.detail.is_empty() {
                 // A real column rather than a spacer plus a label. Given the
                 // rest of the width by a grow(1.0) spacer, an ellipsizing label
@@ -262,7 +282,10 @@ impl ListPopup {
                 ui.label(
                     row,
                     &item.detail,
-                    Style::new().grow(1.0).ellipsis().foreground(theme.subhead),
+                    Style::new()
+                        .grow(1.0)
+                        .ellipsis()
+                        .foreground(item.detail_color.unwrap_or(theme.subhead)),
                 );
             }
             rows.push((row, index));
@@ -572,6 +595,38 @@ mod tests {
         let (_, rows) = built(&list);
         assert!(rows.card.is_none(), "no empty box floating over the text");
         assert!(rows.rows.is_empty());
+    }
+
+    #[test]
+    fn an_item_can_carry_its_own_colors() {
+        // Aurora has no idea what a keyword is; an app that colors its code
+        // hands the same colors down, so the list looks like what it inserts.
+        let theme = Theme::dark();
+        let purple = Color::rgb(0.8, 0.5, 0.9);
+        let teal = Color::rgb(0.3, 0.8, 0.8);
+        let mut list = ListPopup::new(
+            vec![
+                ListItem::with_detail("let", "bind a name").colored(Some(purple), None),
+                ListItem::with_detail("dt", "f32").colored(None, Some(teal)),
+            ],
+            Vec2::ZERO,
+        );
+        list.set_filter("");
+        let (ui, _) = built(&list);
+        let colors: Vec<Color> = ui
+            .draw_list()
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Text { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect();
+        assert!(colors.contains(&purple), "the keyword's own color");
+        assert!(colors.contains(&teal), "the type in the type color");
+        // And the ones that said nothing still get the theme's defaults.
+        assert!(colors.contains(&theme.heading), "an uncolored name");
+        assert!(colors.contains(&theme.subhead), "an uncolored note");
     }
 
     #[test]
