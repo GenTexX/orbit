@@ -351,6 +351,10 @@ struct State {
     /// The diagnostic message currently shown as a tooltip, so the shell only
     /// rebuilds when what is under the pointer changes.
     diagnostic_tooltip: Option<String>,
+    /// Where the pointer was when it last moved, and when it stopped - a
+    /// tooltip belongs to a resting pointer, not a passing one.
+    tooltip_cursor: Vec2,
+    tooltip_rested: std::time::Instant,
     /// The go-to-line box's contents while it is open.
     go_to_line: Option<String>,
     /// When the caret's blink phase last flipped, and what the caret was doing
@@ -485,6 +489,9 @@ struct ReparentDrag {
     source: NodeId,
     target: Option<DropSpot>,
 }
+
+/// How long the pointer must rest before a hover tooltip appears.
+const HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// How long each half of the caret's blink lasts.
 const CARET_BLINK: std::time::Duration = std::time::Duration::from_millis(530);
@@ -744,6 +751,7 @@ impl ApplicationHandler for App {
                         }
                         // A press on a tree row arms a reparent drag (non-consuming:
                         // a plain click still selects via the row's Clicked event).
+                        state.dismiss_code_popups();
                         state.begin_reparent();
                         state.viewport_press();
                     }
@@ -1011,6 +1019,8 @@ impl State {
             script_orphaned: false,
             focus_find: false,
             diagnostic_tooltip: None,
+            tooltip_cursor: Vec2::ZERO,
+            tooltip_rested: std::time::Instant::now(),
             go_to_line: None,
             caret_phase: std::time::Instant::now(),
             caret_visible: true,
@@ -3756,6 +3766,12 @@ impl State {
     fn tick_caret(&mut self) {
         let caret = self.ui.caret_offset();
         if caret != self.caret_was {
+            // The caret moving is also what makes an open completion popup
+            // stale: it was offering names for a word the caret has left.
+            // Refreshing closes it when there is no longer a word there.
+            if self.completions.is_some() && self.caret_was.is_some() {
+                self.refresh_completions();
+            }
             self.caret_was = caret;
             self.caret_phase = std::time::Instant::now();
             self.caret_visible = true;
@@ -3775,9 +3791,49 @@ impl State {
         if self.pointer_down {
             return;
         }
+        // A tooltip belongs to a resting pointer. It appears only after the
+        // pointer has stopped, and anything the user does next - a key, a click,
+        // a move - takes it away again. Without that it had no dismissal path at
+        // all except moving off the word, and sat over the code indefinitely.
+        if self.cursor != self.tooltip_cursor {
+            self.tooltip_cursor = self.cursor;
+            self.tooltip_rested = std::time::Instant::now();
+            self.hide_hover();
+            return;
+        }
+        if self.tooltip_rested.elapsed() < HOVER_DELAY {
+            return;
+        }
         let message = self.hover_under_pointer();
         if message != self.diagnostic_tooltip {
             self.diagnostic_tooltip = message;
+            self.dirty = true;
+        }
+    }
+
+    /// A press outside the completion popup dismisses it. Clicking elsewhere
+    /// means you are done with what it was offering, and a list that survives
+    /// the click sits over whatever you clicked on.
+    fn dismiss_code_popups(&mut self) {
+        self.hide_hover();
+        if self.completions.is_none() {
+            return;
+        }
+        let on_popup = self
+            .rows
+            .completions
+            .rows
+            .iter()
+            .any(|(w, _)| self.ui.rect(*w).is_some_and(|r| r.contains(self.cursor)));
+        if !on_popup {
+            self.completions = None;
+            self.dirty = true;
+        }
+    }
+
+    /// Take the hover tooltip down, if one is up.
+    fn hide_hover(&mut self) {
+        if self.diagnostic_tooltip.take().is_some() {
             self.dirty = true;
         }
     }
@@ -4047,6 +4103,9 @@ impl State {
     /// Keys the Code pane's popups claim before anything else sees them.
     /// Returns whether one was consumed.
     fn handle_code_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        // Any key takes a hover tooltip down: it describes what the pointer is
+        // resting on, and once you are typing you are not looking there.
+        self.hide_hover();
         let WinitKey::Named(named) = &event.logical_key else {
             return false;
         };
@@ -4177,19 +4236,11 @@ impl State {
             self.completions = None;
             return;
         }
-        let offered = comet::service::completions_at(&self.script_text, caret);
-        // The detail rides along after two spaces, so the list shows what each
-        // name is; accept_completion takes the label back off the front.
-        let items: Vec<String> = offered
-            .iter()
-            .map(|item| {
-                if item.detail.is_empty() {
-                    item.label.clone()
-                } else {
-                    format!("{}  {}", item.label, item.detail)
-                }
-            })
-            .collect();
+        let items: Vec<aurora::list::ListItem> =
+            comet::service::completions_at(&self.script_text, caret)
+                .into_iter()
+                .map(|item| aurora::list::ListItem::with_detail(item.label, item.detail))
+                .collect();
         // Anchor below the caret so the popup does not cover the word being
         // typed; layout nudges it back on screen near an edge.
         let anchor = self
@@ -4218,12 +4269,7 @@ impl State {
     }
 
     /// Replace the word the popup was completing with `label`.
-    ///
-    /// A row's text is "name  detail", so only the part before the gap is the
-    /// name to insert.
     fn accept_completion(&mut self, label: &str) {
-        let label = label.split("  ").next().unwrap_or(label).to_string();
-        let label = label.as_str();
         let (Some(editor), Some((_, start))) = (self.rows.code_editor, self.completions.as_ref())
         else {
             return;

@@ -1835,7 +1835,17 @@ impl Ui {
                 return;
             }
             Some(id) if matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) => {
+                let was_focused = self.focused == Some(id);
                 self.focused = Some(id);
+                // shift+click extends the selection to the click instead of
+                // starting a new one - the standard way to select a long span
+                // without dragging across it.
+                if self.shift && was_focused {
+                    let anchor = self.selection_anchor.unwrap_or(self.caret);
+                    self.caret = self.caret_at_x(id, self.cursor);
+                    self.selection_anchor = Some(anchor);
+                    return;
+                }
                 // A second or third press in the same spot selects the word or
                 // the line under it, the way every editor and every browser
                 // does. The count is reset by moving away or by time.
@@ -2347,7 +2357,10 @@ impl Ui {
             .chars()
             .take_while(|c| *c == ' ' || *c == '\t')
             .collect();
-        let opens = text[..lo].trim_end().ends_with(['{', '(', '[']);
+        // Only the line being left, not everything before the caret. Trimming
+        // the whole prefix walks back over blank lines and still finds the `{`,
+        // so every Enter on an empty line inside a block added another level.
+        let opens = text[line_start..lo].trim_end().ends_with(['{', '(', '[']);
         let closes_next = text[hi..].trim_start().starts_with(['}', ')', ']']);
         let inner = if opens {
             format!("{indent}{INDENT}")
@@ -3996,12 +4009,18 @@ fn translate_and_fade(cmd: &mut DrawCommand, delta: Vec2, fade: f32) {
 /// The previous word boundary at or before `i`: skip any whitespace to the left,
 /// then the run of word characters, landing at the word's start (ctrl+left).
 fn prev_word_boundary(s: &str, i: usize) -> usize {
-    let is_ws = |j: usize| s[..j].chars().next_back().is_some_and(char::is_whitespace);
+    let before = |j: usize| s[..j].chars().next_back();
+    // A line end is a stop. Treating a newline as ordinary whitespace made
+    // ctrl+Left skate over blank lines and land somewhere on a line you were
+    // not looking at.
+    if before(i) == Some('\n') {
+        return prev_boundary(s, i);
+    }
     let mut j = i;
-    while j > 0 && is_ws(j) {
+    while j > 0 && before(j).is_some_and(|c| c.is_whitespace() && c != '\n') {
         j = prev_boundary(s, j);
     }
-    while j > 0 && !is_ws(j) {
+    while j > 0 && before(j).is_some_and(|c| !c.is_whitespace()) {
         j = prev_boundary(s, j);
     }
     j
@@ -4010,12 +4029,17 @@ fn prev_word_boundary(s: &str, i: usize) -> usize {
 /// The next word boundary at or after `i`: skip the run of word characters, then
 /// the whitespace after it, landing at the next word's start (ctrl+right).
 fn next_word_boundary(s: &str, i: usize) -> usize {
-    let is_ws = |j: usize| s[j..].chars().next().is_some_and(char::is_whitespace);
+    let at = |j: usize| s[j..].chars().next();
+    // Sitting on a line end: step over exactly this one, so repeated presses
+    // still advance a line at a time rather than stopping forever.
+    if at(i) == Some('\n') {
+        return next_boundary(s, i);
+    }
     let mut j = i;
-    while j < s.len() && !is_ws(j) {
+    while j < s.len() && at(j).is_some_and(|c| !c.is_whitespace()) {
         j = next_boundary(s, j);
     }
-    while j < s.len() && is_ws(j) {
+    while j < s.len() && at(j).is_some_and(|c| c.is_whitespace() && c != '\n') {
         j = next_boundary(s, j);
     }
     j
@@ -5947,6 +5971,73 @@ mod tests {
         ui.handle_input(InputEvent::Key(Key::Enter));
         assert_eq!(ui.text_of(field), Some("    let a = 1;\n    "));
         assert_eq!(ui.caret_offset(), Some(19), "and lands after the indent");
+    }
+
+    #[test]
+    fn enter_on_a_blank_line_in_a_block_does_not_keep_indenting() {
+        // The bug: the opener check trimmed the whole prefix, which walks back
+        // over blank lines and still finds the `{` - so every Enter inside a
+        // block added another level, for ever.
+        let (mut ui, field) = code_area("func f() {\n    ");
+        ui.focus_caret(field, 15);
+        ui.handle_input(InputEvent::Key(Key::Enter));
+        assert_eq!(ui.text_of(field), Some("func f() {\n    \n    "));
+        ui.handle_input(InputEvent::Key(Key::Enter));
+        assert_eq!(
+            ui.text_of(field),
+            Some("func f() {\n    \n    \n    "),
+            "still one level, however many times"
+        );
+    }
+
+    #[test]
+    fn word_motion_stops_at_a_line_end() {
+        // Treating a newline as ordinary whitespace made ctrl+arrow skate over
+        // blank lines and land on a line you were not looking at.
+        let (mut ui, field) = code_area("aaa bbb\n\nccc");
+        ui.focus_caret(field, 4); // start of "bbb"
+        ui.handle_input(InputEvent::Key(Key::WordRight));
+        assert_eq!(
+            ui.caret_offset(),
+            Some(7),
+            "the end of the line, not past it"
+        );
+        ui.handle_input(InputEvent::Key(Key::WordRight));
+        assert_eq!(ui.caret_offset(), Some(8), "one line at a time");
+        ui.handle_input(InputEvent::Key(Key::WordRight));
+        assert_eq!(ui.caret_offset(), Some(9), "onto the last line");
+
+        // And the same going back.
+        ui.focus_caret(field, 12);
+        ui.handle_input(InputEvent::Key(Key::WordLeft));
+        assert_eq!(ui.caret_offset(), Some(9), "the start of `ccc`");
+        ui.handle_input(InputEvent::Key(Key::WordLeft));
+        assert_eq!(ui.caret_offset(), Some(8));
+        ui.handle_input(InputEvent::Key(Key::WordLeft));
+        assert_eq!(ui.caret_offset(), Some(7));
+    }
+
+    #[test]
+    fn shift_click_extends_the_selection_to_the_click() {
+        let (mut ui, field) = code_area("let speed = 120;");
+        ui.focus_caret(field, 4);
+        let origin = ui.content_origin[field];
+        // Click well to the right, with shift held.
+        ui.set_shift(true);
+        ui.handle_input(InputEvent::PointerMoved(origin + Vec2::new(80.0, 6.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        let selected = ui.selected_text().expect("a selection");
+        assert!(
+            selected.starts_with("speed"),
+            "extended from where the caret was: {selected:?}"
+        );
+
+        // Without shift the same click starts fresh.
+        ui.set_shift(false);
+        ui.handle_input(InputEvent::PointerReleased);
+        ui.handle_input(InputEvent::PointerMoved(origin + Vec2::new(20.0, 6.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        assert_eq!(ui.selection_range(), None);
     }
 
     #[test]

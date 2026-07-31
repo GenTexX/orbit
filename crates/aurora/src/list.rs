@@ -34,6 +34,10 @@ use crate::widget::WidgetId;
 /// keyboard would then have to drive.
 const MAX_VISIBLE: usize = 8;
 
+/// The popup's width. Fixed rather than fitted, so the list does not jump about
+/// as the filter narrows it and the longest detail changes.
+const CARD_WIDTH: f32 = 340.0;
+
 /// The widgets one [`build`](ListPopup::build) produced, for routing clicks.
 #[derive(Debug, Clone, Default)]
 pub struct ListRows {
@@ -55,10 +59,35 @@ pub enum ListKey {
     Ignored,
 }
 
+/// One row: what would be inserted, and a dimmer note about what it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListItem {
+    pub label: String,
+    /// A short note shown after the label in a quieter color - a type, a
+    /// signature, a sentence. Empty for none.
+    pub detail: String,
+}
+
+impl ListItem {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            detail: String::new(),
+        }
+    }
+
+    pub fn with_detail(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
 /// A floating list of choices.
 #[derive(Debug, Clone, Default)]
 pub struct ListPopup {
-    items: Vec<String>,
+    items: Vec<ListItem>,
     filter: String,
     /// Indices into `items` that match `filter`, best first.
     matches: Vec<usize>,
@@ -70,7 +99,7 @@ pub struct ListPopup {
 impl ListPopup {
     /// A list of `items`, anchored with its top-left at `anchor` (screen
     /// coordinates - see [`Ui::caret_rect`] for the caret-relative case).
-    pub fn new(items: Vec<String>, anchor: Vec2) -> Self {
+    pub fn new(items: Vec<ListItem>, anchor: Vec2) -> Self {
         let mut list = Self {
             items,
             anchor,
@@ -82,8 +111,8 @@ impl ListPopup {
 
     /// Replace the items, keeping the filter. The highlight stays on the same
     /// item if it is still there.
-    pub fn set_items(&mut self, items: Vec<String>) {
-        let held = self.highlighted().map(|i| self.items[i].clone());
+    pub fn set_items(&mut self, items: Vec<ListItem>) {
+        let held = self.highlighted().map(|i| self.items[i].label.clone());
         self.items = items;
         self.refilter();
         self.restore(held.as_deref());
@@ -98,7 +127,7 @@ impl ListPopup {
         if self.filter == filter {
             return;
         }
-        let held = self.highlighted().map(|i| self.items[i].clone());
+        let held = self.highlighted().map(|i| self.items[i].label.clone());
         self.filter = filter.to_string();
         self.refilter();
         self.restore(held.as_deref());
@@ -137,12 +166,12 @@ impl ListPopup {
     /// [`press`](Self::press) name. Without this, being told which item was
     /// chosen would not be enough to insert it.
     pub fn item(&self, index: usize) -> Option<&str> {
-        self.items.get(index).map(String::as_str)
+        self.items.get(index).map(|i| i.label.as_str())
     }
 
     /// The highlighted item's text.
     pub fn highlighted_text(&self) -> Option<&str> {
-        Some(self.items[self.highlighted()?].as_str())
+        Some(self.items[self.highlighted()?].label.as_str())
     }
 
     /// Offer a key to the list. Anything it does not use comes back
@@ -186,12 +215,15 @@ impl ListPopup {
         if self.matches.is_empty() {
             return ListRows::default();
         }
+        // Wide enough that a signature fits without the list jumping in width
+        // as you type, and capped so it never covers the code it is over.
         let card = ui.popup(
             self.anchor,
             Style::new()
                 .column()
                 .padding(4.0)
                 .gap(1.0)
+                .width(CARD_WIDTH)
                 .background(theme.menu_bg)
                 .corner_radius(theme.card_radius)
                 .border(theme.border_width, theme.card_border)
@@ -201,17 +233,32 @@ impl ListPopup {
         for slot in self.window() {
             let index = self.matches[slot];
             let selected = slot == self.highlighted;
+            let item = &self.items[index];
+            // A row is a panel, not a button, so the label and its detail can be
+            // coloured differently - jamming them into one string made the note
+            // about a name as loud as the name.
             let mut style = Style::new()
                 .row()
+                .gap(10.0)
+                .align_center()
                 .padding_x(8.0)
                 .padding_y(3.0)
-                .flat()
-                .corner_radius(theme.control_radius)
-                .foreground(theme.heading);
+                .corner_radius(theme.control_radius);
             if selected {
                 style = style.background(theme.row_selected);
             }
-            let row = ui.button(card, &self.items[index], style);
+            let row = ui.panel(card, style);
+            ui.label(row, &item.label, Style::new().foreground(theme.heading));
+            if !item.detail.is_empty() {
+                // Pushed right and dimmed: it is there to be glanced at, not
+                // read, and it must never be mistaken for part of the name.
+                ui.panel(row, Style::new().grow(1.0));
+                ui.label(
+                    row,
+                    &item.detail,
+                    Style::new().ellipsis().foreground(theme.subhead),
+                );
+            }
             rows.push((row, index));
         }
         ListRows {
@@ -245,7 +292,7 @@ impl ListPopup {
                 prefix.push(index);
                 continue;
             }
-            let lower = item.to_lowercase();
+            let lower = item.label.to_lowercase();
             if lower.starts_with(&filter) {
                 prefix.push(index);
             } else if lower.contains(&filter) {
@@ -266,7 +313,7 @@ impl ListPopup {
         if let Some(slot) = self
             .matches
             .iter()
-            .position(|&index| self.items[index] == held)
+            .position(|&index| self.items[index].label == held)
         {
             self.highlighted = slot;
         }
@@ -276,11 +323,12 @@ impl ListPopup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Color, draw::DrawCommand};
 
-    fn items() -> Vec<String> {
+    fn items() -> Vec<ListItem> {
         ["pos", "print", "compose", "clamp"]
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| ListItem::new(*s))
             .collect()
     }
 
@@ -291,7 +339,7 @@ mod tests {
     fn shown(list: &ListPopup) -> Vec<&str> {
         list.matches
             .iter()
-            .map(|&i| list.items[i].as_str())
+            .map(|&i| list.items[i].label.as_str())
             .collect()
     }
 
@@ -403,7 +451,9 @@ mod tests {
     // --- windowing ---
 
     fn long_list(n: usize) -> ListPopup {
-        let items = (0..n).map(|i| format!("item{i:02}")).collect();
+        let items = (0..n)
+            .map(|i| ListItem::new(format!("item{i:02}")))
+            .collect();
         ListPopup::new(items, Vec2::ZERO)
     }
 
@@ -451,6 +501,30 @@ mod tests {
         let rows = list.build(&mut ui, &Theme::dark());
         ui.layout(Vec2::new(600.0, 400.0)).unwrap();
         (ui, rows)
+    }
+
+    #[test]
+    fn a_detail_is_drawn_beside_its_label_and_more_quietly() {
+        // Jamming the two into one string made the note about a name as loud as
+        // the name, and made the name harder to pick out of the list.
+        let mut list = ListPopup::new(vec![ListItem::with_detail("pos", "Vec2")], Vec2::ZERO);
+        list.set_filter("");
+        let (ui, _) = built(&list);
+        let theme = Theme::dark();
+        let colors: Vec<Color> = ui
+            .draw_list()
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Text { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            colors.contains(&theme.heading),
+            "the name, in full strength"
+        );
+        assert!(colors.contains(&theme.subhead), "the detail, dimmed");
     }
 
     #[test]
@@ -517,7 +591,7 @@ mod tests {
         list.set_items(
             ["clamp", "print", "pos"]
                 .iter()
-                .map(|s| s.to_string())
+                .map(|s| ListItem::new(*s))
                 .collect(),
         );
         assert_eq!(list.highlighted_text(), Some("print"));

@@ -15,4 +15,3 @@ func update(dt: f32) {
         direction = 1.0;
     }
 }
-
