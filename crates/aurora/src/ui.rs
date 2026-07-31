@@ -173,6 +173,13 @@ pub struct Ui {
     /// Per-widget decorations (squiggles, match highlights). Draw-time only,
     /// for the same reason.
     decorations: SecondaryMap<WidgetId, Vec<Decoration>>,
+    /// Where and when the last press landed, and how many have stacked up
+    /// there - for double- and triple-click selection.
+    last_press: Option<(WidgetId, usize, std::time::Instant)>,
+    press_count: u32,
+    /// The x a run of vertical caret moves is aiming for, per field. Set on the
+    /// first Up/Down and cleared by anything horizontal.
+    goal_x: SecondaryMap<WidgetId, f32>,
     /// The caret offset each text area's scroll was last reconciled against, so
     /// the view follows the caret when it moves and leaves the scroll alone when
     /// it does not.
@@ -259,6 +266,9 @@ impl Ui {
             placeholder_buffers: SecondaryMap::new(),
             text_spans: SecondaryMap::new(),
             decorations: SecondaryMap::new(),
+            last_press: None,
+            press_count: 0,
+            goal_x: SecondaryMap::new(),
             reconciled_caret: SecondaryMap::new(),
             gutter_numbers: SecondaryMap::new(),
             gutter_widths: SecondaryMap::new(),
@@ -1747,6 +1757,23 @@ impl Ui {
             }
             Some(id) if matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) => {
                 self.focused = Some(id);
+                // A second or third press in the same spot selects the word or
+                // the line under it, the way every editor and every browser
+                // does. The count is reset by moving away or by time.
+                let at = self.caret_at_x(id, self.cursor);
+                let repeat = self.multi_click(id, at);
+                if repeat > 1 {
+                    let (lo, hi) = if repeat == 2 {
+                        word_around(self.text_of(id).unwrap_or_default(), at)
+                    } else {
+                        let (range, _) = self.line_block(id, at..at);
+                        (range.start, range.end)
+                    };
+                    self.selection_anchor = Some(lo);
+                    self.caret = hi;
+                    self.pressed = None;
+                    return;
+                }
                 // A field starts unscrolled; reset before mapping the click so
                 // caret_at_x reads the right (zero) scroll for a new field.
                 if previous != Some(id) {
@@ -2120,6 +2147,27 @@ impl Ui {
         // Vertical and line-scoped moves are 2D (text areas only); Up/Down are a
         // no-op on a single-line field.
         match key {
+            // A page is the visible rows less one, so the line you were reading
+            // at the edge is still on screen after the jump.
+            Key::PageUp if multiline => {
+                let rows = self.visible_rows(id);
+                self.caret = self.caret_vertical(id, -rows);
+                return;
+            }
+            Key::PageDown if multiline => {
+                let rows = self.visible_rows(id);
+                self.caret = self.caret_vertical(id, rows);
+                return;
+            }
+            Key::PageUp | Key::PageDown => return,
+            Key::DocumentStart => {
+                self.caret = 0;
+                return;
+            }
+            Key::DocumentEnd => {
+                self.caret = self.text_len(id);
+                return;
+            }
             Key::Up if multiline => {
                 self.caret = self.caret_vertical(id, -1);
                 return;
@@ -2129,8 +2177,16 @@ impl Ui {
                 return;
             }
             Key::Up | Key::Down => return,
+            // Smart Home: the first non-whitespace character, and the margin
+            // only when already there. Every line in a script is indented, so a
+            // plain Home lands in the whitespace almost every time.
             Key::Home if multiline => {
-                self.caret = self.line_start(id, self.caret);
+                let line = self.line_start(id, self.caret);
+                let text = self.text_of(id).unwrap_or_default();
+                let rest = &text[line..];
+                let first = line + rest.len() - rest.trim_start_matches([' ', '\t']).len();
+                let first = first.min(line + rest.find('\n').unwrap_or(rest.len()));
+                self.caret = if self.caret == first { line } else { first };
                 return;
             }
             Key::End if multiline => {
@@ -2140,6 +2196,11 @@ impl Ui {
             _ => {}
         }
         let pairs = self.widgets[id].auto_pairs && multiline;
+        // The goal column only survives a run of vertical moves; anything else
+        // ends it. Done before the buffer is borrowed.
+        if !matches!(key, Key::Up | Key::Down | Key::PageUp | Key::PageDown) {
+            self.clear_goal(id);
+        }
         let WidgetKind::TextInput(s) = &mut self.widgets[id].kind else {
             return;
         };
@@ -2152,6 +2213,8 @@ impl Ui {
             Key::WordRight => self.caret = next_word_boundary(s, caret),
             Key::Home => self.caret = 0,
             Key::End => self.caret = s.len(),
+            // Handled above for a text area; a one-line field has nowhere to go.
+            Key::PageUp | Key::PageDown | Key::DocumentStart | Key::DocumentEnd => {}
             // Backspace between an empty auto-pair deletes both halves.
             Key::Backspace if caret > 0 && pairs && is_empty_pair(s, caret) => {
                 let prev = prev_boundary(s, caret);
@@ -2230,7 +2293,7 @@ impl Ui {
 
     /// Move the caret one visual line up (`dir < 0`) or down: find its current
     /// pixel position, then hit-test the same x on the adjacent line's middle.
-    fn caret_vertical(&self, id: WidgetId, dir: i32) -> usize {
+    fn caret_vertical(&mut self, id: WidgetId, lines: i32) -> usize {
         let WidgetKind::TextInput(s) = &self.widgets[id].kind else {
             return self.caret;
         };
@@ -2242,11 +2305,53 @@ impl Ui {
         let Some((x, top)) = buffer.cursor_position(&cursor) else {
             return caret;
         };
+        // The goal column: where a run of vertical moves is trying to be.
+        // Without it, passing through one short line truncates the column for
+        // the rest of the file - move down past a blank line and you are at
+        // column 0 forever, which is the most-felt caret bug there is.
+        let goal = self.goal_x.get(id).copied().unwrap_or(x).max(x);
         let line_h = text::metrics_for(self.widgets[id].font_size).line_height;
-        let target_y = top + dir as f32 * line_h + line_h * 0.5;
-        buffer
-            .hit(x, target_y.max(0.0))
-            .map_or(caret, |c| cursor_to_byte(s, c))
+        let target_y = top + lines as f32 * line_h + line_h * 0.5;
+        let landed = buffer
+            .hit(goal, target_y.max(0.0))
+            .map_or(caret, |c| cursor_to_byte(s, c));
+        self.goal_x.insert(id, goal);
+        landed
+    }
+
+    /// How many presses in a row have landed in the same place: 1 for a fresh
+    /// click, 2 for a double, 3 for a triple, wrapping back to 1 after that.
+    fn multi_click(&mut self, id: WidgetId, at: usize) -> u32 {
+        let now = std::time::Instant::now();
+        let repeat = match self.last_press {
+            Some((last_id, last_at, when))
+                if last_id == id
+                    && last_at.abs_diff(at) <= 1
+                    && now.duration_since(when) < MULTI_CLICK_WINDOW =>
+            {
+                (self.press_count % 3) + 1
+            }
+            _ => 1,
+        };
+        self.press_count = repeat;
+        self.last_press = Some((id, at, now));
+        repeat
+    }
+
+    /// How many whole lines fit in a text area's box, at least one.
+    fn visible_rows(&self, id: WidgetId) -> i32 {
+        let Some((view_h, _)) = self.text_area_extent(id) else {
+            return 1;
+        };
+        let line_h = text::metrics_for(self.widgets[id].font_size).line_height;
+        ((view_h / line_h).floor() as i32 - 1).max(1)
+    }
+
+    /// Forget the goal column, so the next vertical move starts a fresh run.
+    /// Any horizontal move or edit does this - the column you are aiming for is
+    /// only meaningful while you are moving up and down.
+    fn clear_goal(&mut self, id: WidgetId) {
+        self.goal_x.remove(id);
     }
 
     /// The byte offset of the start of the text line (by hard newline)
@@ -3674,6 +3779,50 @@ fn in_string_or_comment(text: &str, at: usize) -> bool {
         }
     }
     in_string
+}
+
+/// How long after a press a second one still counts as a double-click.
+const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// The word around `at`: a run of word characters, or a run of the same kind of
+/// non-word character, so double-clicking whitespace selects the whitespace
+/// rather than nothing.
+fn word_around(text: &str, at: usize) -> (usize, usize) {
+    let at = snap_boundary(text, at.min(text.len()));
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    // Prefer the word to the left when the caret sits between two kinds, which
+    // is where a double-click on the end of a word lands.
+    let here = text[at..].chars().next();
+    let left = text[..at].chars().next_back();
+    let word = match (left, here) {
+        (Some(l), _) if is_word(l) => Some(true),
+        (_, Some(h)) if is_word(h) => Some(true),
+        (_, Some(h)) if !h.is_whitespace() => Some(false),
+        (Some(_), _) => Some(false),
+        _ => None,
+    };
+    let Some(word) = word else {
+        return (at, at);
+    };
+    let matches = |c: char| {
+        if word {
+            is_word(c)
+        } else {
+            !is_word(c) && c != '\n'
+        }
+    };
+    let start = text[..at]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| matches(*c))
+        .last()
+        .map_or(at, |(i, _)| i);
+    let end = text[at..]
+        .char_indices()
+        .take_while(|(_, c)| matches(*c))
+        .last()
+        .map_or(at, |(i, c)| at + i + c.len_utf8());
+    (start, end)
 }
 
 /// What Tab inserts in a text area. Spaces rather than a tab character: a tab's
@@ -5501,6 +5650,93 @@ mod tests {
         for c in text.chars() {
             ui.handle_input(InputEvent::Text(c));
         }
+    }
+
+    #[test]
+    fn the_caret_keeps_its_column_across_a_short_line() {
+        // The most-felt caret bug: passing through a short line truncated the
+        // column for the rest of the file, so moving down past a blank line
+        // left you at column 0 forever.
+        let (mut ui, field) = code_area("aaaaaaaaaa\n\nbbbbbbbbbb");
+        ui.focus_caret(field, 10); // end of the first line
+        ui.handle_input(InputEvent::Key(Key::Down));
+        assert_eq!(ui.caret_offset(), Some(11), "the blank line has one column");
+        ui.handle_input(InputEvent::Key(Key::Down));
+        assert_eq!(
+            ui.caret_offset(),
+            Some(22),
+            "and the third line gets the column back"
+        );
+
+        // A horizontal move ends the run, so the next run aims from where the
+        // caret actually is - column 9, not the 10 it was aiming for before.
+        ui.focus_caret(field, 10);
+        ui.handle_input(InputEvent::Key(Key::Left));
+        ui.handle_input(InputEvent::Key(Key::Down));
+        ui.handle_input(InputEvent::Key(Key::Down));
+        assert_eq!(ui.caret_offset(), Some(21), "column 9 of the third line");
+    }
+
+    #[test]
+    fn smart_home_goes_to_the_text_then_to_the_margin() {
+        let (mut ui, field) = code_area("    let a = 1;");
+        ui.focus_caret(field, 14);
+        ui.handle_input(InputEvent::Key(Key::Home));
+        assert_eq!(ui.caret_offset(), Some(4), "the first real character");
+        ui.handle_input(InputEvent::Key(Key::Home));
+        assert_eq!(ui.caret_offset(), Some(0), "then the margin");
+        ui.handle_input(InputEvent::Key(Key::Home));
+        assert_eq!(ui.caret_offset(), Some(4), "and back");
+    }
+
+    #[test]
+    fn paging_moves_by_a_screenful_and_keeps_a_line_of_overlap() {
+        let (mut ui, field) = scrollable_area();
+        ui.focus_caret(field, 0);
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        ui.handle_input(InputEvent::Key(Key::PageDown));
+        let after = ui.caret_line_column().unwrap().0;
+        assert!(after > 1, "moved down a screenful, landed on line {after}");
+        ui.handle_input(InputEvent::Key(Key::PageUp));
+        assert_eq!(ui.caret_line_column().unwrap().0, 1, "and back");
+    }
+
+    #[test]
+    fn ctrl_home_and_end_reach_the_ends_of_the_document() {
+        let (mut ui, field) = code_area("aaa\nbbb\nccc");
+        ui.focus_caret(field, 5);
+        ui.handle_input(InputEvent::Key(Key::DocumentEnd));
+        assert_eq!(ui.caret_offset(), Some(11));
+        ui.handle_input(InputEvent::Key(Key::DocumentStart));
+        assert_eq!(ui.caret_offset(), Some(0));
+    }
+
+    #[test]
+    fn double_click_selects_a_word_and_triple_click_the_line() {
+        let (mut ui, field) = code_area("let speed = 120;\nlet other = 1;");
+        let origin = ui.content_origin[field];
+        // Land inside "speed" on the first line.
+        let at = Vec2::new(origin.x + 40.0, origin.y + 6.0);
+        ui.handle_input(InputEvent::PointerMoved(at));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerReleased);
+        ui.handle_input(InputEvent::PointerPressed);
+        assert_eq!(ui.selected_text().as_deref(), Some("speed"));
+
+        ui.handle_input(InputEvent::PointerReleased);
+        ui.handle_input(InputEvent::PointerPressed);
+        assert_eq!(ui.selected_text().as_deref(), Some("let speed = 120;"));
+    }
+
+    #[test]
+    fn a_word_is_found_around_any_point_in_it() {
+        use super::word_around;
+        let text = "let speed = 120;";
+        assert_eq!(word_around(text, 4), (4, 9), "at its start");
+        assert_eq!(word_around(text, 6), (4, 9), "in the middle");
+        assert_eq!(word_around(text, 9), (4, 9), "just after it");
+        // Between two non-word characters, the run of them is the word.
+        assert_eq!(word_around(text, 10), (9, 12), "the ` = ` run");
     }
 
     #[test]

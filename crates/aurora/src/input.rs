@@ -57,6 +57,14 @@ pub enum Key {
     Enter,
     /// Move focus to the next input (or the previous one, with shift held).
     Tab,
+    /// Move the caret up one screenful (text areas only).
+    PageUp,
+    /// Move the caret down one screenful (text areas only).
+    PageDown,
+    /// Move the caret to the very start of the text.
+    DocumentStart,
+    /// Move the caret to the very end of the text.
+    DocumentEnd,
 }
 
 /// What the mouse cursor should look like over the current hover target. The

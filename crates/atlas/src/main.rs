@@ -5349,8 +5349,14 @@ fn translate_key(event: &winit::event::KeyEvent, ctrl: bool) -> Vec<InputEvent> 
         WinitKey::Named(NamedKey::ArrowRight) => Some(Key::Right),
         WinitKey::Named(NamedKey::ArrowUp) => Some(Key::Up),
         WinitKey::Named(NamedKey::ArrowDown) => Some(Key::Down),
+        // ctrl+Home / ctrl+End reach the ends of the document; plain Home is
+        // smart-Home inside a text area.
+        WinitKey::Named(NamedKey::Home) if ctrl => Some(Key::DocumentStart),
+        WinitKey::Named(NamedKey::End) if ctrl => Some(Key::DocumentEnd),
         WinitKey::Named(NamedKey::Home) => Some(Key::Home),
         WinitKey::Named(NamedKey::End) => Some(Key::End),
+        WinitKey::Named(NamedKey::PageUp) => Some(Key::PageUp),
+        WinitKey::Named(NamedKey::PageDown) => Some(Key::PageDown),
         WinitKey::Named(NamedKey::Enter) => Some(Key::Enter),
         WinitKey::Named(NamedKey::Tab) => Some(Key::Tab),
         _ => None,
