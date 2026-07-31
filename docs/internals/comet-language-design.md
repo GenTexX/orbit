@@ -7,10 +7,9 @@ without context, and the result of a real trade-off. Several of them will be
 promoted to numbered ADRs once the set is complete - which one, and how many,
 is itself still open (see "Still to decide").
 
-**Status: incomplete.** Nine decisions are settled. Four questions are open, and
-a further set has not been put yet. Nothing here is implemented. The generics
-question under "Open" gates decisions 7 and 9, so those two should not be built
-before it is answered.
+**Status: incomplete.** Thirteen decisions are settled and two questions are
+open, neither of which blocks the others. A further set, listed under "Still to
+decide", has not been put yet. Nothing here is implemented.
 
 ## Where the language actually stands
 
@@ -174,44 +173,92 @@ enums (the asymmetry described in decision 7), and a nullable type suffix -
 covers "a T or nothing" and would have to be replaced the first time a second
 payload-carrying shape appeared.
 
-Note: this raises a question decision 7 does not settle by itself, recorded
-under "Open" below - `Option<T>` is generic, and nothing else in the language is.
+Note: this raised a question decision 7 does not settle by itself - `Option<T>`
+is generic, and nothing else in the language is. Settled as decision 10.
 
-## Open - asked, not yet answered
+### 10. The language gets real generics
 
-- **Does the language get generics?** Created by decisions 7 and 9 together.
-  `Option<T>` is parameterized over its payload type, and no other Comet
-  construct is parameterized over anything. Three ways out, none obviously
-  right: user-facing generics on enums and functions (the general answer, and
-  the most checker work in a pipeline whose headline property is compile speed);
-  `Option` alone is parameterized, as the one blessed generic, which is a
-  smaller version of exactly the asymmetry decision 7 rejected; or monomorphize
-  per concrete use at check time, which keeps codegen simple but needs a rule
-  for what happens when the payload type is itself an error type. This should be
-  settled before any of decision 7 is built, because it decides whether the
-  checker grows a type-parameter concept at all.
-- **Export syntax.** `@export let speed = 120.0;` (one new lexer token, and the
-  `@` prefix generalizes to `@range(0, 100)` and `@tooltip("...")`, matching the
-  Godot spelling this audience likely arrives with), a plain `export` keyword
-  (no new token class, but annotations with arguments then need a second
-  mechanism), or a doc-comment convention (no grammar change, but semantics move
-  into comments the lexer discards and a typo silently does nothing).
-- **Initializer versus stored value.** The script says `let speed = 120.0`, the
-  inspector has stored `200`. Either the stored value wins and the initializer
-  is the default on creation and revert (Godot's model, and what makes
-  per-instance tuning work), or the initializer always wins and inspector edits
-  touch only the live instance, or the stored value is re-seeded whenever the
-  initializer changes.
-- **Lifecycle hooks beyond `update`.** Candidates are `start()` before the first
-  update (nearly free, and it clarifies that a top-level `let` is currently
-  doing double duty as init code), `on_destroy()` (cheap now, awkward to
-  retrofit once instances have lifetimes), and `fixed_update(dt)` (needs an
-  accumulator and an ordering rule, so more M5 runtime design than language
-  design).
+Chosen over blessing `Option` as the one parameterized type, and over
+monomorphizing per concrete use at check time without a surface concept.
 
-Independent of that last one: a script defining `func update()` with the wrong
-signature currently gets silence, because the host looks up exactly one hardcoded
-name at `f32 -> ()`. A diagnostic for that is not in question.
+Why: a one-off exemption for `Option` is the same asymmetry decision 7 rejected,
+one level down. Real generics also make `Array<T>`, and any future container, an
+ordinary declaration rather than another compiler special case.
+
+Note: this is a decision about the **surface**. How generics are compiled stays
+open, and monomorphizing at emit remains available - a generic surface does not
+oblige a generic representation. What it does oblige is a type-parameter concept
+in the checker, which is the first thing in the pipeline not resolvable by a
+single pass over the tree, against a design whose headline property is compile
+speed (ADR 0007). Keeping the checking cheap is the risk to watch.
+
+### 11. `@export` marks a variable as inspector-editable
+
+`@export let speed = 120.0;`. One new lexer token, and the `@` prefix
+generalizes to annotations that take arguments - `@range(0, 100)`,
+`@tooltip("...")` - so the language does not end up with one syntax for flags
+and another for parameterized ones.
+
+Rejected: a plain `export` keyword (burns a reserved word and still needs a
+second mechanism for the parameterized annotations), and a doc-comment
+convention (no grammar change, but a typo would silently do nothing instead of
+producing a diagnostic, which is the wrong failure mode for a language meant to
+be learned from).
+
+### 12. The stored value wins, and an exported variable should not carry one
+
+Godot's model: once a variable is exported, the inspector is the source of
+truth. The initializer is the default used when the component is first created
+or the field is explicitly reverted. This is what makes per-instance tuning work
+at all - two nodes running one script at different speeds.
+
+Beyond the mechanism, the intended idiom is that **an exported variable does not
+carry a meaningful value in the script**. If the inspector owns the value, a
+number in the source is a second answer to the same question, and the one the
+reader sees first is the one that loses. The mechanism above defines what
+happens; this says what a well-written script looks like.
+
+Note: how far to push that is open, and recorded below. It ranges from
+documenting it, to a warning on an exported variable with a non-trivial
+initializer, to letting an exported `let` omit its initializer entirely - which
+today is not expressible, since a state declaration's initializer is not
+optional.
+
+### 13. `start()` and `on_destroy()`, but not `fixed_update` yet
+
+`start()` runs once before the first update; `on_destroy()` runs when the node
+or script goes away. Both are one more exported-name lookup in the host.
+
+`start()` also clarifies something currently subtle: a top-level `let` is doing
+double duty as init code, and the demo script needs a comment to explain it.
+`on_destroy()` is cheap now and awkward to retrofit once instances have real
+lifetimes.
+
+`fixed_update(dt)` was deliberately not taken. It needs an accumulator in the
+runtime and a decided ordering against `update`, which is M5 runtime design
+rather than language design, and it should be settled there with the game loop
+in front of us.
+
+## Open
+
+- **How hard to push the "no value in an exported variable" idiom** (from
+  decision 12): documentation only, a warning when an exported variable has a
+  non-trivial initializer, or a grammar change letting `@export let speed: f32;`
+  stand without an initializer. The last one is the only one that needs the
+  parser and a defaulting rule per type, and it is the only one that makes the
+  idiom the path of least resistance rather than advice.
+- **Arrays: reference or value semantics.** Deliberately deferred to when arrays
+  are actually scheduled, rather than decided ahead of the work. The tension is
+  recorded so it is not rediscovered: reference semantics match ADR 0006's "GC
+  reference semantics for objects, value semantics for small structs" and are
+  what Godot and Python do, at the cost of the aliasing surprise that is the
+  classic Godot gotcha; value semantics would be consistent with `Vec2` and
+  surprise nobody, but copy on every pass unless the compiler grows escape
+  analysis, which is the kind of optimization ADR 0007 rules out.
+
+Not in question: a script defining `func update()` with the wrong signature
+currently gets silence, because the host looks up exactly one hardcoded name at
+`f32 -> ()`. That needs a diagnostic regardless of anything above.
 
 ## Still to decide
 
@@ -222,11 +269,14 @@ Not yet put, and roughly in the order they will start to matter:
   that atlas already owns every widget each one would map to - the slider, the
   drag-scrub numeric field, the colour picker, the asset field with its drop
   target, the text area. This is wiring rather than new UI.
-- **Arrays and structs.** The Milestone 4 plan deferred them to "a fast-follow
-  once the single-refcounted-type case is proven", and `String` proves it, so
-  this is due rather than new. Open within it: whether structs are value or
-  reference types, and that reference structs will immediately expose the cycle
-  leak ADR 0007 names as a known limitation.
+- **Arrays and structs - when to schedule them.** The Milestone 4 plan deferred
+  them to "a fast-follow once the single-refcounted-type case is proven", and
+  `String` proves it, so this is due rather than new. Array semantics are
+  deliberately deferred with them (see "Open"); the parallel question for
+  structs is whether they are value or reference types, and reference structs
+  are the other place ADR 0007's cycle leak becomes reachable. Generics
+  (decision 10) means `Array<T>` is now an ordinary declaration rather than a
+  builtin, which makes this cheaper than it was when the plan deferred it.
 - **Tuples and multiple return values.** WASM multi-value makes this nearly free
   and it removes the need for out-parameters.
 - **`const` declarations**, distinct from mutable state.
@@ -268,6 +318,13 @@ Collected so they are not rediscovered during implementation:
   collector exist - becomes reachable from ordinary user code once an enum
   variant can hold a reference (decision 7), rather than staying theoretical
   until reference structs arrive.
-- The checker may grow a type-parameter concept (the open generics question),
-  which would be the first thing in the pipeline that is not resolvable in a
-  single pass over the tree.
+- The checker grows a type-parameter concept (decision 10), the first thing in
+  the pipeline not resolvable by a single pass over the tree. How generics are
+  compiled is a separate, still-open choice: monomorphizing at emit keeps
+  codegen close to what it is today.
+- The host looks up exactly one hardcoded exported name at one hardcoded
+  signature (`UPDATE`, `f32 -> ()`), so decision 13 touches helios as well as
+  comet, and the wrong-signature diagnostic has to know all three names.
+- `ScriptComponent` grows from a single `source: String` into source plus stored
+  exported values (decisions 11 and 12), which is what makes decision 3's
+  dynamic `Reflect` load-bearing rather than merely tidy.
