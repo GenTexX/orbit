@@ -211,6 +211,9 @@ pub(crate) const CHECKBOX_RADIUS: f32 = 4.0;
 /// The gap between the checkbox box and its caption, in pixels.
 pub(crate) const CHECKBOX_GAP: f32 = 8.0;
 
+/// How tall a mark on a scrollbar track is, in pixels.
+pub(crate) const SCROLLBAR_MARK_H: f32 = 2.0;
+
 /// Horizontal padding either side of a gutter's line numbers, in pixels.
 pub(crate) const GUTTER_PAD: f32 = 8.0;
 /// How much dimmer a gutter's line numbers are than the text beside them, and

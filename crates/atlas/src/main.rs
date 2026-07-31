@@ -4336,6 +4336,25 @@ impl State {
             }
         }
         self.ui.set_decorations(editor, decorations);
+
+        // Where the problems are in a file you cannot see all of. Positions are
+        // by line rather than by byte, so a long line does not read as a big
+        // stretch of trouble.
+        let lines = self.script_text.split('\n').count().max(1) as f32;
+        let marks = self
+            .script_diagnostics
+            .iter()
+            .map(|d| {
+                let at = (d.span.start as usize).min(self.script_text.len());
+                let line = self.script_text[..at].matches('\n').count() as f32;
+                let color = match d.severity {
+                    comet::Severity::Error => theme.code_error,
+                    comet::Severity::Warning => theme.code_warning,
+                };
+                (line / lines, color)
+            })
+            .collect();
+        self.ui.set_scroll_marks(editor, marks);
     }
 
     /// Read the Code pane's live text back out of the Ui.

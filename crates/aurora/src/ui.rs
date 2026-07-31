@@ -177,6 +177,8 @@ pub struct Ui {
     /// there - for double- and triple-click selection.
     last_press: Option<(WidgetId, usize, std::time::Instant)>,
     press_count: u32,
+    /// Marks on a widget's scrollbar track, each a 0..1 fraction of content.
+    scroll_marks: SecondaryMap<WidgetId, Vec<(f32, Color)>>,
     /// The x a run of vertical caret moves is aiming for, per field. Set on the
     /// first Up/Down and cleared by anything horizontal.
     goal_x: SecondaryMap<WidgetId, f32>,
@@ -266,6 +268,7 @@ impl Ui {
             placeholder_buffers: SecondaryMap::new(),
             text_spans: SecondaryMap::new(),
             decorations: SecondaryMap::new(),
+            scroll_marks: SecondaryMap::new(),
             last_press: None,
             press_count: 0,
             goal_x: SecondaryMap::new(),
@@ -1535,19 +1538,16 @@ impl Ui {
     /// can move. `None` when there is nothing to scroll. Shared by the scrollbar
     /// drawing and its hit-testing so they always agree.
     fn scrollbar_metrics(&self, id: WidgetId) -> Option<(Rect, f32, f32)> {
-        if !self.widgets[id].scroll {
-            return None;
-        }
         let rect = self.rect(id)?;
-        let content = self.scroll_content.get(id).copied()?;
-        if content <= rect.size.y {
+        let (view, content) = self.scrollable_extent(id)?;
+        if content <= view {
             return None;
         }
         let track = rect.size.y - 2.0 * theme::SCROLLBAR_INSET;
-        let thumb_h = (track * rect.size.y / content).max(theme::SCROLLBAR_MIN_THUMB);
+        let thumb_h = (track * view / content).max(theme::SCROLLBAR_MIN_THUMB);
         let travel = (track - thumb_h).max(0.0);
-        let max_offset = content - rect.size.y;
-        let t = (self.scroll_offset(id) / max_offset).clamp(0.0, 1.0);
+        let max_offset = content - view;
+        let t = (self.scrollable_offset(id) / max_offset).clamp(0.0, 1.0);
         let track_top = rect.pos.y + theme::SCROLLBAR_INSET;
         let thumb = Rect::new(
             Vec2::new(
@@ -1562,9 +1562,7 @@ impl Ui {
     /// The scroll container whose scrollbar thumb is under `point`, with its
     /// thumb rect - what a press hit-tests against to start a thumb drag.
     fn scrollbar_thumb_at(&self, point: Vec2) -> Option<(WidgetId, Rect)> {
-        let container = self
-            .hit_test(point)
-            .and_then(|id| self.scroll_ancestor(id))?;
+        let container = self.scrollbar_owner_at(point)?;
         let (thumb, ..) = self.scrollbar_metrics(container)?;
         thumb.contains(point).then_some((container, thumb))
     }
@@ -1572,9 +1570,7 @@ impl Ui {
     /// The scroll container whose scrollbar track (its right-edge column, minus
     /// the thumb) is under `point` - a click there jumps the thumb to it.
     fn scrollbar_track_at(&self, point: Vec2) -> Option<WidgetId> {
-        let container = self
-            .hit_test(point)
-            .and_then(|id| self.scroll_ancestor(id))?;
+        let container = self.scrollbar_owner_at(point)?;
         let (thumb, ..) = self.scrollbar_metrics(container)?;
         let rect = self.rect(container)?;
         let column_left = rect.max().x - theme::SCROLLBAR_INSET - theme::SCROLLBAR_WIDTH;
@@ -1588,19 +1584,101 @@ impl Ui {
     /// Set a scroll container's offset so its thumb's top sits at `thumb_top`
     /// (clamped to the track) - used while dragging or clicking the scrollbar.
     fn scroll_to_thumb_top(&mut self, id: WidgetId, thumb_top: f32) {
-        let (Some((_, track_top, travel)), Some(rect)) =
-            (self.scrollbar_metrics(id), self.rect(id))
-        else {
+        let Some((_, track_top, travel)) = self.scrollbar_metrics(id) else {
             return;
         };
-        let content = self.scroll_content.get(id).copied().unwrap_or(0.0);
-        let max_offset = (content - rect.size.y).max(0.0);
+        let Some((view, content)) = self.scrollable_extent(id) else {
+            return;
+        };
+        let max_offset = (content - view).max(0.0);
         let t = if travel > 0.0 {
             ((thumb_top - track_top) / travel).clamp(0.0, 1.0)
         } else {
             0.0
         };
-        self.scroll_offsets.insert(id, t * max_offset);
+        let offset = t * max_offset;
+        if self.widgets[id].scroll {
+            self.scroll_offsets.insert(id, offset);
+        } else {
+            self.set_text_scroll(id, offset);
+        }
+    }
+
+    /// Draw a scrollbar over anything that scrolls: its length mirrors the
+    /// visible fraction and its position the scrolled fraction. It brightens
+    /// while hovered or dragged, so it reads as grabbable.
+    ///
+    /// Marks set with [`set_scroll_marks`](Self::set_scroll_marks) sit on the
+    /// track behind it - where the problems are in a file you cannot see all of.
+    fn emit_scrollbar(&self, id: WidgetId, list: &mut DrawList) {
+        let Some((thumb, track_top, travel)) = self.scrollbar_metrics(id) else {
+            return;
+        };
+        if let Some(marks) = self.scroll_marks.get(id) {
+            let track_h = travel + thumb.size.y;
+            for (at, color) in marks {
+                let y = track_top + at.clamp(0.0, 1.0) * (track_h - theme::SCROLLBAR_MARK_H);
+                list.commands.push(DrawCommand::FillRect {
+                    rect: Rect::new(
+                        Vec2::new(thumb.pos.x, y),
+                        Vec2::new(theme::SCROLLBAR_WIDTH, theme::SCROLLBAR_MARK_H),
+                    ),
+                    color: *color,
+                });
+            }
+        }
+        let active = self.scrollbar_drag.map(|(c, _)| c) == Some(id)
+            || self.cursor.is_some_and(|p| thumb.contains(p));
+        let color = if active {
+            self.theme.scrollbar_thumb.lighten(0.25)
+        } else {
+            self.theme.scrollbar_thumb
+        };
+        list.commands.push(DrawCommand::RoundedRect {
+            rect: thumb,
+            color,
+            radius: [theme::SCROLLBAR_WIDTH * 0.5; 4],
+            border_width: 0.0,
+            border_color: Color::TRANSPARENT,
+            border_sides: [true; 4],
+        });
+    }
+
+    /// Mark positions on a widget's scrollbar track, each a 0..1 fraction of the
+    /// content. Where the errors are in a file you cannot see all of.
+    pub fn set_scroll_marks(&mut self, id: WidgetId, marks: Vec<(f32, Color)>) {
+        self.scroll_marks.insert(id, marks);
+    }
+
+    /// Whose scrollbar `point` is over: a text area directly under it, or the
+    /// nearest scroll-container ancestor. The text area wins, because its bar is
+    /// drawn inside its own rect and over any container behind it.
+    fn scrollbar_owner_at(&self, point: Vec2) -> Option<WidgetId> {
+        let hit = self.hit_test(point)?;
+        if self.text_area_extent(hit).is_some() {
+            return Some(hit);
+        }
+        self.scroll_ancestor(hit)
+    }
+
+    /// A widget's visible and total height, whether it scrolls because it is a
+    /// scroll container or because it is a text area taller than its box. One
+    /// answer, so the scrollbar works the same over both.
+    fn scrollable_extent(&self, id: WidgetId) -> Option<(f32, f32)> {
+        if self.widgets[id].scroll {
+            let rect = self.rect(id)?;
+            return Some((rect.size.y, self.scroll_content.get(id).copied()?));
+        }
+        self.text_area_extent(id)
+    }
+
+    /// The current offset of whichever kind of scrolling `id` does.
+    fn scrollable_offset(&self, id: WidgetId) -> f32 {
+        if self.widgets[id].scroll {
+            self.scroll_offset(id)
+        } else {
+            self.vscroll_of(id)
+        }
     }
 
     /// Apply a wheel delta to whatever is under the cursor: an overflowing text
@@ -3004,26 +3082,7 @@ impl Ui {
             list.commands.push(DrawCommand::PopClip);
         }
 
-        // A scrollbar thumb over scrolling content (its length mirrors the
-        // visible fraction, its position the scrolled fraction). It brightens
-        // while hovered or dragged, so it reads as grabbable.
-        if let Some((thumb, ..)) = self.scrollbar_metrics(id) {
-            let active = self.scrollbar_drag.map(|(c, _)| c) == Some(id)
-                || self.cursor.is_some_and(|p| thumb.contains(p));
-            let color = if active {
-                self.theme.scrollbar_thumb.lighten(0.25)
-            } else {
-                self.theme.scrollbar_thumb
-            };
-            list.commands.push(DrawCommand::RoundedRect {
-                rect: thumb,
-                color,
-                radius: [theme::SCROLLBAR_WIDTH * 0.5; 4],
-                border_width: 0.0,
-                border_color: Color::TRANSPARENT,
-                border_sides: [true; 4],
-            });
-        }
+        self.emit_scrollbar(id, list);
 
         // Slide everything this widget and its subtree drew.
         if let Some(from) = move_from {
@@ -5682,6 +5741,54 @@ mod tests {
         );
         ui.layout(Vec2::new(400.0, 200.0)).unwrap();
         (ui, field)
+    }
+
+    #[test]
+    fn a_text_area_taller_than_its_box_gets_a_scrollbar_you_can_drag() {
+        let (mut ui, field) = scrollable_area();
+        ui.focus_caret(field, 0);
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+
+        let thumb = ui
+            .draw_list()
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                DrawCommand::RoundedRect { rect, color, .. }
+                    if *color == ui.theme.scrollbar_thumb =>
+                {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .expect("a scrollbar over content that does not fit");
+
+        // Dragging the thumb scrolls the text, without moving the caret.
+        ui.handle_input(InputEvent::PointerMoved(thumb.pos + thumb.size * 0.5));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerMoved(
+            thumb.pos + thumb.size * 0.5 + Vec2::new(0.0, 40.0),
+        ));
+        ui.handle_input(InputEvent::PointerReleased);
+        assert!(ui.text_scroll(field).unwrap().0 > 0.0, "it scrolled");
+        assert_eq!(ui.caret_offset(), Some(0), "and left the caret alone");
+    }
+
+    #[test]
+    fn scroll_marks_are_drawn_on_the_track() {
+        let (mut ui, field) = scrollable_area();
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        ui.set_scroll_marks(field, vec![(0.0, RED), (0.5, RED), (1.0, RED)]);
+        let marks = fills_of(&ui, RED);
+        assert_eq!(marks.len(), 3);
+        // Spread down the track, in order, and all inside the field.
+        assert!(marks[0].pos.y < marks[1].pos.y && marks[1].pos.y < marks[2].pos.y);
+        let rect = ui.rect(field).unwrap();
+        assert!(
+            marks
+                .iter()
+                .all(|m| m.pos.y >= rect.pos.y && m.pos.y <= rect.max().y)
+        );
     }
 
     #[test]
