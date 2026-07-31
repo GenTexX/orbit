@@ -12,6 +12,7 @@ nav:
       - internals/roadmap.md
       - internals/ideas.md
       - internals/code-editor-backlog.md
+      - internals/comet-language-design.md
       - Plans:
           - internals/plans/milestone-1-walking-skeleton.md
           - internals/plans/milestone-2-aurora.md
