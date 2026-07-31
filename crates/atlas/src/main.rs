@@ -357,6 +357,9 @@ struct State {
     tooltip_rested: std::time::Instant,
     /// The go-to-line box's contents while it is open.
     go_to_line: Option<String>,
+    /// Set by ctrl+space: offer the list wherever the caret is, rather than only
+    /// where a name is being typed. Cleared as soon as it has been used.
+    force_completions: bool,
     /// When the caret's blink phase last flipped, and what the caret was doing
     /// then - so it holds solid while you type instead of blinking under you.
     caret_phase: std::time::Instant,
@@ -1045,6 +1048,7 @@ impl State {
             tooltip_cursor: Vec2::ZERO,
             tooltip_rested: std::time::Instant::now(),
             go_to_line: None,
+            force_completions: false,
             caret_phase: std::time::Instant::now(),
             caret_visible: true,
             caret_was: None,
@@ -4129,6 +4133,17 @@ impl State {
         // Any key takes a hover tooltip down: it describes what the pointer is
         // resting on, and once you are typing you are not looking there.
         self.hide_hover();
+        // ctrl+space asks for the list explicitly - the way to see what is
+        // available without typing a letter first and deleting it.
+        if self.modifiers.control_key()
+            && event.logical_key == WinitKey::Named(NamedKey::Space)
+            && self.ui.focused() == self.rows.code_editor
+        {
+            self.force_completions = true;
+            self.refresh_completions();
+            self.force_completions = false;
+            return true;
+        }
         let WinitKey::Named(named) = &event.logical_key else {
             return false;
         };
@@ -4239,6 +4254,21 @@ impl State {
     /// Open, refresh, or close the completion popup for the word the caret is
     /// in. Called after every edit, so the offered set follows what is typed.
     fn refresh_completions(&mut self) {
+        let was_open = self.completions.is_some();
+        self.refresh_completions_inner();
+        // Every exit from here has to mark the shell dirty when the popup's
+        // presence changed. Five of them used to just clear the state and
+        // return, so the popup vanished from `self.completions` but the old Ui
+        // kept drawing it - which is the whole of "sometimes it does not
+        // disappear". It only ever went away when something else happened to
+        // ask for a rebuild that frame.
+        if self.completions.is_some() != was_open {
+            self.dirty = true;
+        }
+    }
+
+    /// Decide what the popup should be, without worrying about redraws.
+    fn refresh_completions_inner(&mut self) {
         let (Some(editor), true) = (self.rows.code_editor, self.open_script.is_some()) else {
             self.completions = None;
             return;
@@ -4251,9 +4281,15 @@ impl State {
             self.completions = None;
             return;
         };
-        let Some(start) = completion_anchor(&self.script_text, caret) else {
-            self.completions = None;
-            return;
+        // ctrl+space asks for the list wherever the caret is, even on an empty
+        // prefix; otherwise it appears only where a name is being typed.
+        let anchor = match completion_anchor(&self.script_text, caret) {
+            Some(start) => start,
+            None if self.force_completions => caret,
+            None => {
+                self.completions = None;
+                return;
+            }
         };
         let (_, prefix) = word_before(&self.script_text, caret);
         let items: Vec<aurora::list::ListItem> =
@@ -4267,14 +4303,14 @@ impl State {
         // the window. update_completion_anchor sets it after layout instead.
         match &mut self.completions {
             Some((list, at)) => {
-                *at = start..caret;
+                *at = anchor..caret;
                 list.set_items(items);
                 list.set_filter(prefix);
             }
             None => {
                 let mut list = aurora::list::ListPopup::new(items, self.completion_anchor_now());
                 list.set_filter(prefix);
-                self.completions = Some((list, start..caret));
+                self.completions = Some((list, anchor..caret));
             }
         }
         // Nothing left to offer is the same as nothing to show.
@@ -4468,15 +4504,21 @@ impl State {
     /// The invariant the frame order exists to keep: after a rebuild, the
     /// widget's text is `script_text`. If a sync ever moves back after the
     /// rebuild, this fires in a debug build instead of silently eating edits.
-    fn debug_check_editor_in_sync(&self) {
-        debug_assert!(
-            self.rows
-                .code_editor
-                .and_then(|id| self.ui.text_of(id))
-                .is_none_or(|shown| shown == self.script_text),
-            "the code editor and script_text disagreed after a rebuild - \
-             something synced the buffer after the rebuild rather than before it"
-        );
+    fn check_editor_in_sync(&self, when: &str) {
+        let Some(shown) = self.rows.code_editor.and_then(|id| self.ui.text_of(id)) else {
+            return;
+        };
+        if shown != self.script_text {
+            // Logged rather than asserted: this fires in a session someone is
+            // using, and a crash is a worse way to learn about it than a line
+            // in the Console pane. If it ever appears, an edit was about to be
+            // thrown away by a rebuild reading a stale mirror.
+            tracing::error!(
+                "code editor and script_text disagree {when} ({} vs {} bytes)",
+                shown.len(),
+                self.script_text.len()
+            );
+        }
     }
 
     /// Read the Code pane's live text back out of the Ui.
@@ -4692,6 +4734,11 @@ impl State {
         // every frame during a reparent: that would reset Aurora's retained
         // `pressed`/`hovered` between a press and its release, killing a plain
         // click's selection and making the held-still insertion line flicker.
+        // Once more before the rebuild: react() above can change the editor's
+        // text - accepting a completion, a replace, a line command - and the
+        // rebuild reconstructs the field from `script_text`. Cheap when nothing
+        // changed, and it closes the window in which the two could disagree.
+        self.sync_script_buffer();
         let rebuilt = self.dirty;
         if self.dirty {
             // Capture the search box's caret before discarding the old Ui, so it
@@ -4802,7 +4849,7 @@ impl State {
                 );
             }
             self.dirty = false;
-            self.debug_check_editor_in_sync();
+            self.check_editor_in_sync("after a rebuild");
             // The fresh Ui has no cursor, so its layout-time hover refresh would
             // find nothing hovered. Seed the cursor so hover (and clicking the
             // same spot again, e.g. an eye toggle) survives the rebuild without
@@ -4920,6 +4967,7 @@ impl State {
         // them - the docking equivalent of the old capture_panel_sizes.
         self.apply_script_marks();
         self.update_completion_anchor();
+        self.check_editor_in_sync("at the end of a frame");
         self.sync_dock_state();
         self.maybe_save_editor_state();
 
