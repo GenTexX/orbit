@@ -21,6 +21,43 @@ use crate::parser::parse;
 use crate::span::Span;
 use crate::tir::Type;
 
+/// Everything an editor asks about one revision of a file, computed once.
+///
+/// `diagnostics`, `highlight`, `completions_at` and `brackets` each lex and
+/// parse from scratch, which is three or four passes over the same text per
+/// keystroke to learn the same things. An editor that asks more than one
+/// question per edit should build one of these and read from it.
+#[derive(Debug, Clone, Default)]
+pub struct Analysis {
+    pub diagnostics: Vec<Diagnostic>,
+    pub tokens: Vec<TokenSpan>,
+    pub brackets: Vec<Bracket>,
+}
+
+impl Analysis {
+    /// Run the whole frontend over `source` once.
+    pub fn new(source: &str) -> Self {
+        let (with_comments, _) = lex_with_comments(source);
+        let (script, mut diagnostics) = parse(source);
+        let (_, checked) = crate::check::check(&script);
+        diagnostics.extend(checked);
+        diagnostics.sort_by_key(|d| (d.span.start, d.span.end));
+        Self {
+            diagnostics,
+            tokens: classify(&with_comments),
+            brackets: pair_up(&with_comments),
+        }
+    }
+
+    /// The bracket touching `offset` on either side, and its partner.
+    pub fn bracket_at(&self, offset: usize) -> Option<Bracket> {
+        self.brackets.iter().copied().find(|b| {
+            let (lo, hi) = (b.span.start as usize, b.span.end as usize);
+            offset == lo || offset == hi
+        })
+    }
+}
+
 /// Everything wrong with `source`, sorted by position.
 ///
 /// Never fails and never stops early: a typo on line 3 does not blank out the
@@ -74,6 +111,11 @@ pub struct TokenSpan {
 /// tree cannot describe.
 pub fn highlight(source: &str) -> Vec<TokenSpan> {
     let (tokens, _) = lex_with_comments(source);
+    classify(&tokens)
+}
+
+/// Classify an already-lexed stream.
+fn classify(tokens: &[crate::lexer::Token]) -> Vec<TokenSpan> {
     let mut out = Vec::with_capacity(tokens.len());
     for (index, token) in tokens.iter().enumerate() {
         let next = tokens.get(index + 1).map(|t| &t.kind);
@@ -143,10 +185,15 @@ pub struct Bracket {
 /// the characters gets wrong, and the reason this lives in comet rather than in
 /// the editor.
 pub fn brackets(source: &str) -> Vec<Bracket> {
-    let (tokens, _) = crate::lexer::lex(source);
+    let (tokens, _) = lex_with_comments(source);
+    pair_up(&tokens)
+}
+
+/// Pair up the brackets in an already-lexed stream.
+fn pair_up(tokens: &[crate::lexer::Token]) -> Vec<Bracket> {
     let mut out: Vec<Bracket> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
-    for token in &tokens {
+    for token in tokens {
         let (open, closes) = match token.kind {
             TokenKind::LBrace => (true, None),
             TokenKind::LParen => (true, None),
@@ -169,7 +216,7 @@ pub fn brackets(source: &str) -> Vec<Bracket> {
         let matched = stack
             .last()
             .copied()
-            .filter(|&i| kind_of(&tokens, out[i].span) == closes);
+            .filter(|&i| kind_of(tokens, out[i].span) == closes);
         match matched {
             Some(i) => {
                 stack.pop();
@@ -233,6 +280,10 @@ pub enum CompletionKind {
 pub struct CompletionItem {
     pub label: String,
     pub kind: CompletionKind,
+    /// A short line about what it is - a type, a signature, a sentence. Shown
+    /// beside the name, because a list of bare names does not teach anyone what
+    /// `pos` or `print` actually are.
+    pub detail: String,
 }
 
 /// The keywords a script can start a statement with.
@@ -241,8 +292,8 @@ const KEYWORDS: &[&str] = &[
 ];
 /// The type names a script can write.
 const TYPES: &[&str] = &["f32", "bool", "Vec2", "String"];
-/// The functions the engine provides.
-const BUILTINS: &[&str] = &["print"];
+/// The magic name bound to the owning node's position.
+const POS_NAME: &str = "pos";
 /// `Vec2`'s whole member set.
 const VEC2_FIELDS: &[&str] = &["x", "y"];
 
@@ -261,7 +312,7 @@ pub fn completions_at(source: &str, offset: usize) -> Vec<CompletionItem> {
         return match receiver_type(&script, offset, receiver) {
             Some(Type::Vec2) => VEC2_FIELDS
                 .iter()
-                .map(|name| item(name, CompletionKind::Field))
+                .map(|name| detailed(name, CompletionKind::Field, "f32".to_string()))
                 .collect(),
             // An unknown receiver offers nothing rather than guessing: a wrong
             // list read as a real one is worse than an empty one read as "I do
@@ -272,21 +323,34 @@ pub fn completions_at(source: &str, offset: usize) -> Vec<CompletionItem> {
 
     let mut items = Vec::new();
     for name in names_in_scope(&script, offset) {
-        items.push(item(&name, CompletionKind::Variable));
+        let detail = type_of_name(&script, offset, &name)
+            .map(|ty| ty.name().to_string())
+            .unwrap_or_default();
+        items.push(detailed(&name, CompletionKind::Variable, detail));
     }
     for function in &script.functions {
         if !function.name.is_empty() {
-            items.push(item(&function.name, CompletionKind::Function));
+            items.push(detailed(
+                &function.name,
+                CompletionKind::Function,
+                signature_of(function),
+            ));
         }
     }
-    for name in BUILTINS {
-        items.push(item(name, CompletionKind::Function));
-    }
+    items.push(detailed(
+        "print",
+        CompletionKind::Function,
+        "func print(s: String)".to_string(),
+    ));
     for name in TYPES {
         items.push(item(name, CompletionKind::Type));
     }
     for name in KEYWORDS {
-        items.push(item(name, CompletionKind::Keyword));
+        items.push(detailed(
+            name,
+            CompletionKind::Keyword,
+            keyword_detail(name).to_string(),
+        ));
     }
     // dedup_by only removes ADJACENT duplicates, and the same name reaching the
     // list from two scopes - a parameter shadowed by a local, a function whose
@@ -298,10 +362,130 @@ pub fn completions_at(source: &str, offset: usize) -> Vec<CompletionItem> {
 }
 
 fn item(label: &str, kind: CompletionKind) -> CompletionItem {
+    detailed(label, kind, String::new())
+}
+
+fn detailed(label: &str, kind: CompletionKind, detail: String) -> CompletionItem {
     CompletionItem {
         label: label.to_string(),
         kind,
+        detail,
     }
+}
+
+/// What each keyword is for, in one line. This is the language's only
+/// documentation that reaches a person while they are writing it.
+fn keyword_detail(word: &str) -> &'static str {
+    match word {
+        "func" => "define a function",
+        "let" => "bind a name; at the top level, script state",
+        "if" => "run a block when a condition holds",
+        "else" => "run a block when the `if` did not",
+        "while" => "repeat a block while a condition holds",
+        "return" => "leave a function with a value",
+        "true" | "false" => "a bool literal",
+        _ => "",
+    }
+}
+
+/// The type of a name visible at `offset`.
+///
+/// Script state goes through the checker, so `let speed = 1.0;` reports `f32`
+/// rather than nothing - almost every `let` is inferred, and a hover that only
+/// worked on annotated ones would almost never fire. A local inside a function
+/// still needs its annotation: the checker resolves those to slots, and nothing
+/// maps a slot back to the name it came from yet.
+fn type_of_name(script: &Script, offset: usize, name: &str) -> Option<Type> {
+    if name == POS_NAME {
+        return Some(Type::Vec2);
+    }
+    if script.state.iter().any(|s| s.name == name) {
+        let (typed, _) = crate::check::check(script);
+        return typed
+            .state
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.ty)
+            .filter(|ty| !ty.is_error());
+    }
+    let function = enclosing_function(script, offset)?;
+    for param in &function.params {
+        if param.name == name {
+            return Type::from_name(&param.ty.name);
+        }
+    }
+    let mut found = None;
+    visit_lets(&function.body, offset, &mut |n, ty, _| {
+        if n == name {
+            found = ty.and_then(Type::from_name);
+        }
+    });
+    found
+}
+
+/// A function's signature as written, for a completion's detail and for hover.
+fn signature_of(function: &Function) -> String {
+    let params: Vec<String> = function
+        .params
+        .iter()
+        .map(|p| format!("{}: {}", p.name, p.ty.name))
+        .collect();
+    match &function.ret {
+        Some(ret) => format!(
+            "func {}({}) -> {}",
+            function.name,
+            params.join(", "),
+            ret.name
+        ),
+        None => format!("func {}({})", function.name, params.join(", ")),
+    }
+}
+
+/// What the editor should say about the name at `offset`, if anything.
+///
+/// Hovering a name is how you find out what `dt` is without reading the
+/// signature again - and in a teaching language that is most of what a person
+/// needs while writing.
+pub fn hover_at(source: &str, offset: usize) -> Option<String> {
+    let offset = offset.min(source.len());
+    let (script, _) = parse(source);
+    let (start, end) = word_span(source, offset)?;
+    let name = &source[start..end];
+
+    if let Some(function) = script.functions.iter().find(|f| f.name == name) {
+        return Some(signature_of(function));
+    }
+    if name == "print" {
+        return Some("func print(s: String)".to_string());
+    }
+    if let Some(ty) = Type::from_name(name) {
+        return Some(format!("type {}", ty.name()));
+    }
+    if !keyword_detail(name).is_empty() {
+        return Some(format!("{name} - {}", keyword_detail(name)));
+    }
+    let ty = type_of_name(&script, offset, name)?;
+    Some(format!("{name}: {}", ty.name()))
+}
+
+/// The identifier surrounding `offset`, if it is in one.
+fn word_span(source: &str, offset: usize) -> Option<(usize, usize)> {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    if !source.is_char_boundary(offset) {
+        return None;
+    }
+    let start = source[..offset]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_word(*c))
+        .last()
+        .map_or(offset, |(i, _)| i);
+    let end = source[offset..]
+        .char_indices()
+        .take_while(|(_, c)| is_word(*c))
+        .last()
+        .map_or(offset, |(i, c)| offset + i + c.len_utf8());
+    (start < end).then_some((start, end))
 }
 
 /// The identifier before the `.` immediately left of `offset`, if the caret is
@@ -326,7 +510,7 @@ fn field_receiver(source: &str, offset: usize) -> Option<&str> {
 /// The type of `receiver` as seen from `offset`: the magic `pos`, a declared
 /// local, or a piece of script state.
 fn receiver_type(script: &Script, offset: usize, receiver: &str) -> Option<Type> {
-    if receiver == "pos" {
+    if receiver == POS_NAME {
         return Some(Type::Vec2);
     }
     // A `let` with an explicit type says what it is; one without needs the
@@ -363,7 +547,7 @@ fn names_in_scope(script: &Script, offset: usize) -> Vec<String> {
         .map(|state| state.name.clone())
         .collect();
     // `pos` is always there, and is the name a script reaches for first.
-    names.insert(0, "pos".to_string());
+    names.insert(0, POS_NAME.to_string());
 
     if let Some(function) = enclosing_function(script, offset) {
         for param in &function.params {
@@ -573,6 +757,26 @@ func third(c: f32) { let x = nope; }
         assert!(spans.iter().all(|s| s.span.end <= source.len() as u32));
     }
 
+    #[test]
+    fn one_analysis_answers_what_three_passes_used_to() {
+        // The point of it: an editor asking more than one question per edit was
+        // lexing and parsing the same text three or four times to learn the
+        // same things.
+        let source = include_str!("../tests/fixtures/type_error.cmt");
+        let analysis = Analysis::new(source);
+        assert_eq!(analysis.diagnostics, diagnostics(source));
+        assert_eq!(analysis.tokens, highlight(source));
+        assert_eq!(analysis.brackets, brackets(source));
+    }
+
+    #[test]
+    fn an_analysis_finds_a_bracket_the_same_way_the_standalone_call_does() {
+        let source = "func f() { }";
+        let analysis = Analysis::new(source);
+        assert_eq!(analysis.bracket_at(9), bracket_at(source, 9));
+        assert_eq!(analysis.bracket_at(5), None);
+    }
+
     // --- brackets ---
 
     #[test]
@@ -709,6 +913,86 @@ func third(c: f32) { let x = nope; }
         assert!(
             offered.contains(&"other".to_string()),
             "but the function itself is callable"
+        );
+    }
+
+    #[test]
+    fn a_completion_says_what_it_is() {
+        // A list of bare names does not teach anyone what `pos` or `print` are.
+        let source =
+            "let speed = 1.0;\nfunc helper(a: f32) -> f32 { a }\nfunc update(dt: f32) {  }";
+        let at = source.len() - 2;
+        let items = completions_at(source, at);
+        let detail = |name: &str| {
+            items
+                .iter()
+                .find(|i| i.label == name)
+                .map(|i| i.detail.as_str())
+                .unwrap_or("<missing>")
+        };
+        assert_eq!(detail("dt"), "f32", "a parameter shows its type");
+        assert_eq!(detail("pos"), "Vec2");
+        assert_eq!(detail("helper"), "func helper(a: f32) -> f32");
+        assert_eq!(detail("print"), "func print(s: String)");
+        assert_eq!(detail("while"), "repeat a block while a condition holds");
+    }
+
+    #[test]
+    fn a_field_completion_says_its_type_too() {
+        // Just after the dot, which is where the caret is when you type one.
+        let items = completions_at("func update(dt: f32) { pos. }", 27);
+        assert_eq!(items[0].label, "x");
+        assert_eq!(items[0].detail, "f32");
+    }
+
+    // --- hover ---
+
+    #[test]
+    fn hovering_a_name_says_what_it_is() {
+        let source = "let speed = 1.0;\nfunc helper(a: f32) -> f32 { a }\nfunc update(dt: f32) { pos.x += dt; }";
+        let at = |needle: &str| source.find(needle).unwrap() + 1;
+        assert_eq!(hover_at(source, at("dt: f32")), Some("dt: f32".to_string()));
+        assert_eq!(
+            hover_at(source, at("helper")),
+            Some("func helper(a: f32) -> f32".to_string())
+        );
+        assert_eq!(hover_at(source, at("pos.x")), Some("pos: Vec2".to_string()));
+        assert_eq!(
+            hover_at(source, at("speed")),
+            Some("speed: f32".to_string()),
+            "script state, whose type is inferred from its initializer"
+        );
+    }
+
+    #[test]
+    fn hovering_a_keyword_or_a_type_explains_it() {
+        let source = "func update(dt: f32) { while true { } }";
+        assert!(
+            hover_at(source, source.find("while").unwrap() + 1)
+                .is_some_and(|h| h.contains("repeat")),
+        );
+        assert_eq!(
+            hover_at(source, source.find("f32").unwrap() + 1),
+            Some("type f32".to_string())
+        );
+    }
+
+    #[test]
+    fn hovering_whitespace_or_an_unknown_name_says_nothing() {
+        let source = "func update(dt: f32) { mystery; }";
+        // Between two non-word characters there is no name to describe.
+        assert_eq!(hover_at(source, 20), None, "the space before the brace");
+        assert_eq!(hover_at(source, 25), None, "a name nothing declares");
+        // But the boundary just after a word is still that word, which is what
+        // hovering the end of one feels like.
+        assert_eq!(hover_at(source, 4), Some("func - define a function".into()));
+    }
+
+    #[test]
+    fn hover_survives_a_file_that_does_not_parse() {
+        assert_eq!(
+            hover_at("func update(dt: f32) { pos.x += dt", 32),
+            Some("dt: f32".to_string())
         );
     }
 

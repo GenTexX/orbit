@@ -332,6 +332,9 @@ struct State {
     script_diagnostics: Vec<comet::Diagnostic>,
     /// The open script's syntax colors from the last service run.
     script_spans: Vec<aurora::TextSpan>,
+    /// Everything the language service knows about the current buffer, computed
+    /// once per edit rather than once per question.
+    analysis: comet::service::Analysis,
     /// How the open script was encoded on disk, so a save writes it back the
     /// same way.
     script_encoding: TextEncoding,
@@ -350,6 +353,11 @@ struct State {
     diagnostic_tooltip: Option<String>,
     /// The go-to-line box's contents while it is open.
     go_to_line: Option<String>,
+    /// When the caret's blink phase last flipped, and what the caret was doing
+    /// then - so it holds solid while you type instead of blinking under you.
+    caret_phase: std::time::Instant,
+    caret_visible: bool,
+    caret_was: Option<usize>,
     /// Text undo for the Code pane: snapshots of the buffer and where the caret
     /// was, newest last.
     ///
@@ -477,6 +485,9 @@ struct ReparentDrag {
     source: NodeId,
     target: Option<DropSpot>,
 }
+
+/// How long each half of the caret's blink lasts.
+const CARET_BLINK: std::time::Duration = std::time::Duration::from_millis(530);
 
 /// How many text-undo steps the Code pane keeps. Deep enough that a session
 /// never notices, bounded so a long one cannot grow without limit.
@@ -994,12 +1005,16 @@ impl State {
             script_modified: false,
             script_diagnostics: Vec::new(),
             script_spans: Vec::new(),
+            analysis: comet::service::Analysis::default(),
             script_encoding: TextEncoding::default(),
             quit_requested: false,
             script_orphaned: false,
             focus_find: false,
             diagnostic_tooltip: None,
             go_to_line: None,
+            caret_phase: std::time::Instant::now(),
+            caret_visible: true,
+            caret_was: None,
             script_undo: Vec::new(),
             script_redo: Vec::new(),
             script_caret: 0,
@@ -2703,8 +2718,7 @@ impl State {
             && self.ui.focused() == Some(editor)
         {
             if let Some(at) = self.ui.caret_offset()
-                && let Some(partner) =
-                    comet::service::bracket_at(&self.script_text, at).and_then(|b| b.partner)
+                && let Some(partner) = self.analysis.bracket_at(at).and_then(|b| b.partner)
             {
                 self.ui.focus_caret(editor, partner.end as usize);
                 self.dirty = true;
@@ -3684,11 +3698,19 @@ impl State {
         narrowest_at(&self.script_diagnostics, offset)
     }
 
-    /// The diagnostic message the pointer is over in the Code pane.
-    fn diagnostic_under_pointer(&self) -> Option<String> {
+    /// What to say about whatever the pointer is over in the Code pane: the
+    /// diagnostic there, or failing that what the name under it is.
+    ///
+    /// A diagnostic wins - an error is the more urgent news about a name, and
+    /// showing the type of something the compiler has already rejected reads as
+    /// the editor missing the point.
+    fn hover_under_pointer(&self) -> Option<String> {
         let editor = self.rows.code_editor?;
         let offset = self.ui.offset_at_point(editor, self.cursor)?;
-        self.diagnostic_at(offset).map(|d| d.message.clone())
+        if let Some(d) = self.diagnostic_at(offset) {
+            return Some(d.message.clone());
+        }
+        comet::service::hover_at(&self.script_text, offset)
     }
 
     /// Move the caret to the next problem after it, or the previous one before
@@ -3726,6 +3748,24 @@ impl State {
         }
     }
 
+    /// Blink the caret, holding it solid while the caret is moving.
+    ///
+    /// A caret that blinks through your own typing is worse than one that does
+    /// not blink at all: the phase restarts on every keystroke, so what you see
+    /// while writing is a steady bar.
+    fn tick_caret(&mut self) {
+        let caret = self.ui.caret_offset();
+        if caret != self.caret_was {
+            self.caret_was = caret;
+            self.caret_phase = std::time::Instant::now();
+            self.caret_visible = true;
+        } else if self.caret_phase.elapsed() >= CARET_BLINK {
+            self.caret_phase = std::time::Instant::now();
+            self.caret_visible = !self.caret_visible;
+        }
+        self.ui.set_caret_on(self.caret_visible);
+    }
+
     /// Keep the hovered-diagnostic tooltip in step with the pointer.
     ///
     /// Gated on the pointer being up for the reason every poller here is: a
@@ -3735,7 +3775,7 @@ impl State {
         if self.pointer_down {
             return;
         }
-        let message = self.diagnostic_under_pointer();
+        let message = self.hover_under_pointer();
         if message != self.diagnostic_tooltip {
             self.diagnostic_tooltip = message;
             self.dirty = true;
@@ -4137,9 +4177,18 @@ impl State {
             self.completions = None;
             return;
         }
-        let items: Vec<String> = comet::service::completions_at(&self.script_text, caret)
-            .into_iter()
-            .map(|item| item.label)
+        let offered = comet::service::completions_at(&self.script_text, caret);
+        // The detail rides along after two spaces, so the list shows what each
+        // name is; accept_completion takes the label back off the front.
+        let items: Vec<String> = offered
+            .iter()
+            .map(|item| {
+                if item.detail.is_empty() {
+                    item.label.clone()
+                } else {
+                    format!("{}  {}", item.label, item.detail)
+                }
+            })
             .collect();
         // Anchor below the caret so the popup does not cover the word being
         // typed; layout nudges it back on screen near an edge.
@@ -4169,7 +4218,12 @@ impl State {
     }
 
     /// Replace the word the popup was completing with `label`.
+    ///
+    /// A row's text is "name  detail", so only the part before the gap is the
+    /// name to insert.
     fn accept_completion(&mut self, label: &str) {
+        let label = label.split("  ").next().unwrap_or(label).to_string();
+        let label = label.as_str();
         let (Some(editor), Some((_, start))) = (self.rows.code_editor, self.completions.as_ref())
         else {
             return;
@@ -4191,14 +4245,21 @@ impl State {
     /// a script-sized file, but re-lexing it sixty times a second to learn
     /// nothing new is still work nobody asked for.
     fn analyze_script(&mut self) {
-        if self.open_script.is_none() {
+        if self.open_script.is_none() && !self.script_orphaned {
+            self.analysis = comet::service::Analysis::default();
             self.script_spans.clear();
             self.script_diagnostics.clear();
             return;
         }
+        // One pass for everything: diagnostics, syntax classes and brackets all
+        // come out of the same lex and parse rather than three of each.
+        self.analysis = comet::service::Analysis::new(&self.script_text);
         let theme = &self.theme;
-        self.script_spans = comet::service::highlight(&self.script_text)
-            .into_iter()
+        self.script_spans = self
+            .analysis
+            .tokens
+            .iter()
+            .copied()
             .filter_map(|token| {
                 let color = match token.class {
                     comet::service::TokenClass::Keyword => theme.code_keyword,
@@ -4218,7 +4279,7 @@ impl State {
                 })
             })
             .collect();
-        self.script_diagnostics = comet::service::diagnostics(&self.script_text);
+        self.script_diagnostics = self.analysis.diagnostics.clone();
     }
 
     /// Push the cached syntax colors and diagnostics onto the live Ui, along
@@ -4257,7 +4318,7 @@ impl State {
         // only way to pair a `}` with its `{`.
         if self.ui.focused() == Some(editor)
             && let Some(at) = self.ui.caret_offset()
-            && let Some(bracket) = comet::service::bracket_at(&self.script_text, at)
+            && let Some(bracket) = self.analysis.bracket_at(at)
         {
             let (color, style) = match bracket.partner {
                 Some(_) => (theme.code_function, aurora::DecorationStyle::Highlight),
@@ -4453,6 +4514,7 @@ impl State {
         self.flush_pointer();
         self.poll_settings();
         self.poll_diagnostic_tooltip();
+        self.tick_caret();
         self.react();
         self.sync_tree_filter();
         // Incidental background maintenance that can flip `dirty` and so force a
