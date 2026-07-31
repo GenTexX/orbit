@@ -438,10 +438,7 @@ impl Parser {
 
     fn binary(&mut self, min_prec: u8) -> Expr {
         let mut lhs = self.unary();
-        loop {
-            let Some((op, prec)) = binary_op(self.peek()) else {
-                break;
-            };
+        while let Some((op, prec)) = binary_op(self.peek()) {
             if prec < min_prec {
                 break;
             }

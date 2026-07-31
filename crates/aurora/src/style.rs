@@ -146,9 +146,12 @@ impl Style {
     /// Fill the parent (100% width and height). For the root, this fills the
     /// available space passed to [`Ui::layout`](crate::Ui::layout).
     pub fn fill(mut self) -> Self {
+        // Suffixed: `percent` is generic over `Into<f32>`, so a bare literal
+        // falls back to f32 rather than being inferred as one - which newer
+        // toolchains warn about and will eventually reject.
         self.layout.size = Size {
-            width: percent(1.0),
-            height: percent(1.0),
+            width: percent(1.0_f32),
+            height: percent(1.0_f32),
         };
         self
     }

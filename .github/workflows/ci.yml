@@ -28,8 +28,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      # libvulkan1 is the loader, mesa-vulkan-drivers carries lavapipe, and
+      # vulkan-tools is how we check the two found each other.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
+      # Prove a device exists before running anything. Without this a missing
+      # driver surfaces as eight identical test panics about RequestAdapter,
+      # which says nothing about what actually went wrong.
+      - name: Check a software Vulkan device is present
+        run: |
+          echo "--- installed ICDs:"
+          ls -l /usr/share/vulkan/icd.d/
+          echo "--- devices:"
+          vulkaninfo --summary
+      # No VK_ICD_FILENAMES here on purpose: it *overrides* the loader's own
+      # discovery, so pinning a filename that has drifted (lvp_icd.x86_64.json
+      # is not stable across Mesa versions) finds nothing at all rather than
+      # falling back. The loader reads /usr/share/vulkan/icd.d itself.
       - run: cargo test -p photon -- --include-ignored
         env:
           WGPU_BACKEND: vulkan
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
