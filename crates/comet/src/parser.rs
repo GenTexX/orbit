@@ -22,6 +22,8 @@ pub fn parse(source: &str) -> (Script, Vec<Diagnostic>) {
         tokens,
         pos: 0,
         diagnostics: Vec::new(),
+        depth: 0,
+        depth_reported: false,
     };
     let script = parser.script();
     diagnostics.append(&mut parser.diagnostics);
@@ -29,10 +31,27 @@ pub fn parse(source: &str) -> (Script, Vec<Diagnostic>) {
     (script, diagnostics)
 }
 
+/// How deeply expressions and blocks may nest before the parser gives up.
+///
+/// A recursive-descent parser uses stack proportional to nesting, and nothing
+/// stops a file from containing a hundred thousand open parentheses - typed by
+/// hand, no, but pasted or generated, yes. Overflowing the stack aborts the
+/// process, which in an editor means the file being edited is gone. Reporting
+/// the depth and stopping is the only outcome that keeps the editor alive.
+///
+/// The limit is far above anything a person writes: real code nests single
+/// digits deep, and the deepest expression in comet's own fixtures is four.
+const MAX_DEPTH: u32 = 128;
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     diagnostics: Vec<Diagnostic>,
+    /// How deep the current descent is. See [`MAX_DEPTH`].
+    depth: u32,
+    /// Whether the depth limit has already been reported, so one runaway file
+    /// yields one diagnostic rather than one per level on the way back out.
+    depth_reported: bool,
 }
 
 impl Parser {
@@ -66,6 +85,13 @@ impl Parser {
     }
 
     fn error(&mut self, span: Span, message: impl Into<String>) {
+        // Past the depth limit the parser is unwinding through a hundred levels
+        // of half-parsed groups and then recovering into the wreckage. None of
+        // what it finds there is a fact about the file, and a hundred thousand
+        // diagnostics is its own kind of crash.
+        if self.depth_reported {
+            return;
+        }
         self.diagnostics.push(Diagnostic::error(span, message));
     }
 
@@ -199,6 +225,25 @@ impl Parser {
 
     fn block(&mut self) -> Block {
         let start = self.peek_span();
+        // Blocks nest through `if`/`while`/`for` bodies, and each level is
+        // another frame - so they are counted against the same budget as
+        // expressions. An empty block with the tokens left alone is enough:
+        // the enclosing statement's recovery takes it from here.
+        if self.depth >= MAX_DEPTH {
+            self.too_deep();
+            return Block {
+                stmts: Vec::new(),
+                tail: None,
+                span: start,
+            };
+        }
+        self.depth += 1;
+        let block = self.block_inner(start);
+        self.depth -= 1;
+        block
+    }
+
+    fn block_inner(&mut self, start: Span) -> Block {
         self.expect(&TokenKind::LBrace, "`{`");
         let mut stmts = Vec::new();
         let mut tail = None;
@@ -365,7 +410,29 @@ impl Parser {
     // --- expressions (precedence climbing) ---
 
     fn expr(&mut self) -> Expr {
-        self.binary(0)
+        // The one place expressions are entered from, so this is the one place
+        // the depth has to be counted.
+        if self.depth >= MAX_DEPTH {
+            return self.too_deep();
+        }
+        self.depth += 1;
+        let expr = self.binary(0);
+        self.depth -= 1;
+        expr
+    }
+
+    /// Give up on a construct that nests past [`MAX_DEPTH`], reporting it once.
+    ///
+    /// The tokens are left where they are. Recovery at the statement level will
+    /// skip to the next `;` or `}`, which is the same thing it does for any
+    /// other malformed expression.
+    fn too_deep(&mut self) -> Expr {
+        let span = self.peek_span();
+        if !self.depth_reported {
+            self.error(span, format!("nested more than {MAX_DEPTH} levels deep"));
+            self.depth_reported = true;
+        }
+        Expr::Number { value: 0.0, span }
     }
 
     fn binary(&mut self, min_prec: u8) -> Expr {
@@ -810,5 +877,53 @@ mod tests {
         for source in ["func f() { ", "func f() { ) ) ) }", "{{{{", "let", "func"] {
             let _ = parse(source);
         }
+    }
+
+    #[test]
+    fn nesting_past_the_limit_is_reported_rather_than_overflowing_the_stack() {
+        // A recursive-descent parser uses stack proportional to nesting, and a
+        // hundred thousand open parentheses is a file, not an impossibility.
+        // Overflowing aborts the process, which in an editor loses the file.
+        let depth = MAX_DEPTH as usize + 50;
+        let source = format!(
+            "func f() {{ let x = {}1.0{}; }}",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let (_, diagnostics) = parse(&source);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "one message, not one per level unwound: {diagnostics:?}"
+        );
+        assert!(diagnostics[0].message.contains("nested more than"));
+    }
+
+    #[test]
+    fn nested_blocks_count_against_the_same_budget() {
+        let depth = MAX_DEPTH as usize + 50;
+        let source = format!(
+            "func f() {{ {}{} }}",
+            "if true { ".repeat(depth),
+            "}".repeat(depth)
+        );
+        let (_, diagnostics) = parse(&source);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn nesting_a_person_would_write_is_nowhere_near_the_limit() {
+        // The limit only ever fires on generated or pasted input. Real code
+        // nests single digits deep.
+        let source = "func f(a: f32) -> f32 {\n\
+             if a > 0.0 {\n\
+                 while a > 1.0 {\n\
+                     if a > 2.0 { return max(a, min(a, abs(a - 1.0))); }\n\
+                 }\n\
+             }\n\
+             0.0\n\
+         }";
+        let (_, diagnostics) = parse(source);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 }

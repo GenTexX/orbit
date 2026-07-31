@@ -2604,7 +2604,7 @@ Ui::last_measure_count before deciding how far to take any of it.
   double-clicking the wrong file in the explorer. The backlog carries this
   only as a parenthetical note under draw culling.
 
-- **Bound the parser's recursion** (S, comet)
+- ~~**Bound the parser's recursion**~~ DONE (S, comet)
   Parsing input nested past a fixed depth stops with a diagnostic ("expression
   nested too deeply") instead of recursing further, and the editor keeps
   working.
