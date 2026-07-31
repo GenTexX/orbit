@@ -558,6 +558,60 @@ pub fn function_line(source: &str, name: &str) -> Option<usize> {
     Some(source[..at].matches('\n').count() + 1)
 }
 
+/// What kind of thing a [`Symbol`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolKind {
+    Function,
+    /// A top-level `let`: script state, which survives across calls.
+    State,
+}
+
+/// One named thing a script declares at the top level.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Symbol {
+    pub name: String,
+    pub kind: SymbolKind,
+    /// The span of the name itself, so jumping to it lands on the word rather
+    /// than on the `func` in front of it.
+    pub span: Span,
+    /// The 1-based line the declaration is on, for a "name:line" readout.
+    pub line: usize,
+}
+
+/// Everything a script declares at the top level, in source order.
+///
+/// State first or functions first is not this function's call to make: they
+/// come back in the order they were written, because a palette that reorders
+/// what you wrote is harder to navigate than one that does not.
+pub fn symbols(source: &str) -> Vec<Symbol> {
+    let (script, _) = parse(source);
+    let line_of = |at: u32| {
+        source[..(at as usize).min(source.len())]
+            .matches('\n')
+            .count()
+            + 1
+    };
+    let mut all: Vec<Symbol> = script
+        .state
+        .iter()
+        .map(|state| Symbol {
+            name: state.name.clone(),
+            kind: SymbolKind::State,
+            span: state.name_span,
+            line: line_of(state.name_span.start),
+        })
+        .chain(script.functions.iter().map(|function| Symbol {
+            name: function.name.clone(),
+            kind: SymbolKind::Function,
+            span: function.name_span,
+            line: line_of(function.name_span.start),
+        }))
+        .filter(|symbol| !symbol.name.is_empty())
+        .collect();
+    all.sort_by_key(|symbol| symbol.span.start);
+    all
+}
+
 /// The identifier surrounding `offset`, if it is in one.
 fn word_span(source: &str, offset: usize) -> Option<(usize, usize)> {
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
@@ -1234,5 +1288,44 @@ func third(c: f32) { let x = nope; }
             1,
             "the declaration only"
         );
+    }
+
+    #[test]
+    fn symbols_come_back_in_the_order_they_were_written() {
+        let source = "let speed: f32 = 1.0;\nfunc update(dt: f32) { }\nlet hits: f32 = 0.0;\nfunc reset() { }";
+        let all = symbols(source);
+        let found: Vec<(&str, SymbolKind, usize)> = all
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind, s.line))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("speed", SymbolKind::State, 1),
+                ("update", SymbolKind::Function, 2),
+                ("hits", SymbolKind::State, 3),
+                ("reset", SymbolKind::Function, 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_symbol_span_is_the_name_and_not_the_keyword_in_front_of_it() {
+        let source = "func update(dt: f32) { }";
+        let symbol = &symbols(source)[0];
+        assert_eq!(
+            &source[symbol.span.start as usize..symbol.span.end as usize],
+            "update"
+        );
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_still_lists_what_it_can() {
+        // The palette has to work while the file is being typed, which is most
+        // of the time it is useful.
+        let source = "func first() { let = ; }\nfunc second() { }";
+        let all = symbols(source);
+        let names: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["first", "second"]);
     }
 }

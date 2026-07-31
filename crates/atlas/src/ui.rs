@@ -445,6 +445,9 @@ pub struct EditorRows {
     pub find: aurora::find::FindRows,
     /// The go-to-line box's field, while it is open.
     pub go_to_line: Option<WidgetId>,
+    /// The go-to-symbol palette's query field, and the rows of its list.
+    pub symbol_query: Option<WidgetId>,
+    pub symbol_rows: aurora::list::ListRows,
     /// The open modal dialog: its card (for backdrop-click dismiss detection),
     /// close button, footer action buttons, and settings-form controls.
     pub modal_card: Option<WidgetId>,
@@ -2029,6 +2032,39 @@ fn asset_field_icon(path: &str, kind: AssetKind) -> Icon {
 }
 
 /// A one-field "go to line" box over the code editor.
+/// The go-to-symbol palette's query field, over the code editor. The list of
+/// matches is an ordinary `ListPopup` built underneath it.
+pub fn add_symbol_query(
+    ui: &mut Ui,
+    anchor: Vec2,
+    value: &str,
+    theme: &EditorTheme,
+) -> Option<WidgetId> {
+    let card = ui.popup(
+        anchor,
+        Style::new()
+            .row()
+            .gap(6.0)
+            .padding(6.0)
+            .align_center()
+            .background(theme.aurora.menu_bg)
+            .corner_radius(theme.aurora.card_radius)
+            .border(theme.aurora.border_width, theme.aurora.card_border),
+    );
+    ui.label(card, "Go to", Style::new().foreground(theme.aurora.subhead));
+    Some(
+        ui.text_input(
+            card,
+            value.to_string(),
+            Style::new()
+                .width(220.0)
+                .padding(4.0)
+                .corner_radius(theme.aurora.control_radius)
+                .placeholder("function or state name"),
+        ),
+    )
+}
+
 pub fn add_go_to_line(
     ui: &mut Ui,
     anchor: Vec2,

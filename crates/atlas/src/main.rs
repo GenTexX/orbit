@@ -357,6 +357,9 @@ struct State {
     tooltip_rested: std::time::Instant,
     /// The go-to-line box's contents while it is open.
     go_to_line: Option<String>,
+    /// The go-to-symbol palette: what has been typed into it, and the list of
+    /// matching declarations. Open only over the Code pane.
+    symbol_palette: Option<(String, aurora::list::ListPopup)>,
     /// Set by ctrl+space: offer the list wherever the caret is, rather than only
     /// where a name is being typed. Cleared as soon as it has been used.
     force_completions: bool,
@@ -676,6 +679,27 @@ fn completion_colors(
         // An identifier is plain in the editor, and its note is its type.
         K::Variable | K::Field => (None, Some(theme.code_type)),
     }
+}
+
+/// Where ctrl+up / ctrl+down should put the caret, or `None` when there is no
+/// declaration that way.
+///
+/// Strictly past the caret in the direction of travel, so holding the key walks
+/// the file rather than sticking on the declaration it is already on. At the
+/// last one, going further does nothing: wrapping to the top would look
+/// identical to not having moved.
+fn step_symbol_target(
+    symbols: &[comet::service::Symbol],
+    caret: usize,
+    forward: bool,
+) -> Option<usize> {
+    let caret = caret as u32;
+    let target = if forward {
+        symbols.iter().find(|s| s.span.start > caret)
+    } else {
+        symbols.iter().rev().find(|s| s.span.start < caret)
+    };
+    target.map(|s| s.span.start as usize)
 }
 
 /// Where a completion popup should be anchored for a caret at `caret`, or
@@ -1078,6 +1102,7 @@ impl State {
             tooltip_cursor: Vec2::ZERO,
             tooltip_rested: std::time::Instant::now(),
             go_to_line: None,
+            symbol_palette: None,
             force_completions: false,
             caret_phase: std::time::Instant::now(),
             caret_visible: true,
@@ -2813,6 +2838,12 @@ impl State {
                 self.open_go_to_line();
                 return true;
             }
+            // ctrl+shift+o: jump to a declaration by name. ctrl+g is by line
+            // number, which is what you have when a diagnostic told you one.
+            if c.eq_ignore_ascii_case("o") {
+                self.open_symbol_palette();
+                return true;
+            }
             if c.eq_ignore_ascii_case("z") {
                 self.script_history(self.modifiers.shift_key());
                 return true;
@@ -3923,6 +3954,81 @@ impl State {
         self.dirty = true;
     }
 
+    /// Open the go-to-symbol palette over the editor, listing every function
+    /// and every piece of script state.
+    ///
+    /// The list is built once on open rather than on every keystroke: the file
+    /// cannot change while the palette owns the keyboard, and rebuilding it
+    /// would throw away the highlighted row on every letter typed.
+    fn open_symbol_palette(&mut self) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let anchor = self
+            .ui
+            .rect(editor)
+            .map(|r| Vec2::new(r.pos.x + 40.0, r.pos.y + 6.0))
+            .unwrap_or_default();
+        let items: Vec<aurora::list::ListItem> = comet::service::symbols(&self.script_text)
+            .into_iter()
+            .map(|symbol| {
+                let (label_color, detail_color) = match symbol.kind {
+                    comet::service::SymbolKind::Function => (
+                        Some(self.theme.code_function),
+                        Some(self.theme.code_function),
+                    ),
+                    comet::service::SymbolKind::State => (None, Some(self.theme.code_type)),
+                };
+                aurora::list::ListItem {
+                    label: symbol.name,
+                    detail: format!("line {}", symbol.line),
+                    label_color,
+                    detail_color,
+                }
+            })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        self.symbol_palette = Some((
+            String::new(),
+            aurora::list::ListPopup::new(items, Vec2::new(anchor.x, anchor.y + 34.0)),
+        ));
+        self.dirty = true;
+    }
+
+    /// Put the caret on the declaration named `name`, if the script has one.
+    fn go_to_symbol(&mut self, name: &str) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let Some(symbol) = comet::service::symbols(&self.script_text)
+            .into_iter()
+            .find(|symbol| symbol.name == name)
+        else {
+            return;
+        };
+        self.symbol_palette = None;
+        self.ui.focus_caret(editor, symbol.span.start as usize);
+        self.dirty = true;
+    }
+
+    /// Move the caret to the next declaration after it, or the previous one.
+    ///
+    /// A script is a list of functions and you navigate it by function; without
+    /// this the only way down a long file is PageDown and reading.
+    fn step_symbol(&mut self, forward: bool) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let caret = self.editor_caret();
+        let symbols = comet::service::symbols(&self.script_text);
+        if let Some(at) = step_symbol_target(&symbols, caret, forward) {
+            self.ui.focus_caret(editor, at);
+            self.dirty = true;
+        }
+    }
+
     /// Move the caret to the start of 1-based `line`, clamped to the file.
     fn go_to_line_number(&mut self, line: usize) {
         let Some(editor) = self.rows.code_editor else {
@@ -4090,6 +4196,19 @@ impl State {
     }
 
     /// The completion label a click on `id` would insert.
+    /// The symbol the palette row `id` stands for, if it is one.
+    fn symbol_row(&self, id: aurora::WidgetId) -> Option<String> {
+        let (_, list) = self.symbol_palette.as_ref()?;
+        let index = self
+            .rows
+            .symbol_rows
+            .rows
+            .iter()
+            .find(|(widget, _)| *widget == id)
+            .map(|(_, index)| *index)?;
+        list.item(index).map(str::to_string)
+    }
+
     fn completion_row(&self, id: aurora::WidgetId) -> Option<String> {
         let (list, _) = self.completions.as_ref()?;
         let index = self
@@ -4236,6 +4355,16 @@ impl State {
             self.move_lines(*named == NamedKey::ArrowDown);
             return true;
         }
+        // ctrl+up / ctrl+down jump to the previous or next declaration. ctrl on
+        // the horizontal arrows is word motion; on the vertical ones aurora has
+        // no meaning for it, so the pane can have them.
+        if self.modifiers.control_key()
+            && self.ui.focused() == self.rows.code_editor
+            && matches!(named, NamedKey::ArrowUp | NamedKey::ArrowDown)
+        {
+            self.step_symbol(*named == NamedKey::ArrowDown);
+            return true;
+        }
         // F3 steps find matches without the bar being focused; shift+F3 back.
         if *named == NamedKey::F3 && self.find.is_some() {
             let back = self.modifiers.shift_key();
@@ -4274,6 +4403,10 @@ impl State {
         }
         // Escape closes what is open, innermost first.
         if *named == NamedKey::Escape {
+            if self.symbol_palette.take().is_some() {
+                self.dirty = true;
+                return true;
+            }
             if self.go_to_line.take().is_some() {
                 self.dirty = true;
                 return true;
@@ -4283,6 +4416,29 @@ impl State {
                 return true;
             }
             return false;
+        }
+        // The symbol palette owns the arrows and Enter while it is open.
+        if let Some((_, list)) = &mut self.symbol_palette {
+            let key = match named {
+                NamedKey::ArrowDown => aurora::Key::Down,
+                NamedKey::ArrowUp => aurora::Key::Up,
+                NamedKey::Enter => aurora::Key::Enter,
+                _ => return false,
+            };
+            return match list.key(key) {
+                aurora::list::ListKey::Moved => {
+                    self.dirty = true;
+                    true
+                }
+                aurora::list::ListKey::Accepted(index) => {
+                    let name = list.item(index).map(str::to_string);
+                    if let Some(name) = name {
+                        self.go_to_symbol(&name);
+                    }
+                    true
+                }
+                aurora::list::ListKey::Ignored => false,
+            };
         }
         // ctrl+Enter opens a line; the popup must not take it as "accept". A
         // chord the list has no meaning for belongs to the editor underneath.
@@ -4654,6 +4810,28 @@ impl State {
     }
 
     /// Re-search as the query is typed, rather than only on Enter.
+    /// Read what has been typed into the symbol palette's query field back into
+    /// the palette, narrowing the list. Same shape as the find query, and for
+    /// the same reason: the field lives in the Ui, the state lives here, and a
+    /// rebuild reconstructs the field from the state.
+    fn sync_symbol_query(&mut self) {
+        let Some(field) = self.rows.symbol_query else {
+            return;
+        };
+        let Some(text) = self.ui.text_of(field).map(str::to_string) else {
+            return;
+        };
+        let Some((query, list)) = &mut self.symbol_palette else {
+            return;
+        };
+        if *query == text {
+            return;
+        }
+        query.clone_from(&text);
+        list.set_filter(&text);
+        self.dirty = true;
+    }
+
     fn sync_find_query(&mut self) {
         let Some(query_id) = self.rows.find.query else {
             return;
@@ -4790,6 +4968,7 @@ impl State {
         // one place to the left.
         self.sync_script_buffer();
         self.sync_find_query();
+        self.sync_symbol_query();
         self.poll_settings();
         self.poll_diagnostic_tooltip();
         self.tick_caret();
@@ -4900,6 +5079,23 @@ impl State {
             }
             if let Some(find) = &self.find {
                 self.rows.find = find.build(&mut self.ui, &self.theme.aurora);
+            }
+            if let Some((query, list)) = &self.symbol_palette
+                && let Some(editor) = self.rows.code_editor
+                && let Some(rect) = self.ui.rect(editor)
+            {
+                let anchor = Vec2::new(rect.pos.x + 40.0, rect.pos.y + 6.0);
+                let query = query.clone();
+                self.rows.symbol_rows = list.build(&mut self.ui, &self.theme.aurora);
+                self.rows.symbol_query =
+                    ui::add_symbol_query(&mut self.ui, anchor, &query, &self.theme);
+                // The query field takes the keyboard: the palette exists to be
+                // typed into, and a caret left in the source would put the next
+                // letter in the file.
+                if let Some(field) = self.rows.symbol_query {
+                    let len = query.len();
+                    self.ui.focus_selection(field, len, len);
+                }
             }
             if let Some(value) = self.go_to_line.clone()
                 && let Some(editor) = self.rows.code_editor
@@ -5229,6 +5425,11 @@ impl State {
                 }
                 AuroraEvent::Clicked(id) if self.find_button(id).is_some() => {
                     self.find_action(id);
+                }
+                AuroraEvent::Clicked(id) if self.symbol_row(id).is_some() => {
+                    if let Some(name) = self.symbol_row(id) {
+                        self.go_to_symbol(&name);
+                    }
                 }
                 AuroraEvent::Clicked(id) if self.completion_row(id).is_some() => {
                     if let Some(label) = self.completion_row(id) {
@@ -5741,8 +5942,8 @@ fn translate_key(event: &winit::event::KeyEvent, ctrl: bool, shift: bool) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        TextEncoding, coalesces, completion_anchor, narrowest_at, toggle_comment_block,
-        word_before, write_atomic,
+        TextEncoding, coalesces, completion_anchor, narrowest_at, step_symbol_target,
+        toggle_comment_block, word_before, write_atomic,
     };
     use comet::{Diagnostic, Span};
 
@@ -5894,5 +6095,36 @@ mod tests {
         assert_eq!(word_before("", 0), (0, ""));
         // Past the end is clamped rather than panicking.
         assert_eq!(word_before("abc", 99), (0, "abc"));
+    }
+
+    #[test]
+    fn stepping_by_declaration_walks_the_file_and_stops_at_each_end() {
+        let source = "let speed: f32 = 1.0;\nfunc update(dt: f32) { }\nfunc reset() { }";
+        let symbols = comet::service::symbols(source);
+        let at = |name: &str| source.find(name).expect("in the fixture");
+
+        // From the top, forward, one declaration at a time.
+        assert_eq!(
+            step_symbol_target(&symbols, 0, true),
+            Some(at("speed")),
+            "the first declaration"
+        );
+        assert_eq!(
+            step_symbol_target(&symbols, at("speed"), true),
+            Some(at("update")),
+            "strictly past, so holding the key does not stick"
+        );
+        assert_eq!(
+            step_symbol_target(&symbols, at("reset"), true),
+            None,
+            "past the last one, nothing - wrapping would look like not moving"
+        );
+
+        // And back up.
+        assert_eq!(
+            step_symbol_target(&symbols, at("reset"), false),
+            Some(at("update"))
+        );
+        assert_eq!(step_symbol_target(&symbols, 0, false), None);
     }
 }

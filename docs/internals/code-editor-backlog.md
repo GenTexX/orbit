@@ -1680,7 +1680,7 @@ text is projected.
   whether to offer that. Line numbers are not in the AST, so it builds its own
   line index.
 
-- **comet::service::symbols(source)** (S, comet)
+- ~~**comet::service::symbols(source)**~~ DONE (S, comet)
   One entry per top-level let and per func in source order: name, kind (State
   | Function), name_span (what a jump selects), full span (what a fold
   covers), and for a function its parameter names and types plus its return
@@ -1806,7 +1806,7 @@ text is projected.
   Following the caret needs a caret move to trigger a refresh, which today it
   deliberately does not.
 
-- **Go to symbol (a filtered symbol palette)** (S, atlas)
+- ~~**Go to symbol (a filtered symbol palette)**~~ DONE (S, atlas)
   A shortcut opens a popup of the script's symbols; typing filters; Up/Down
   move; Enter or click selects that symbol's name span and reveals it; Escape
   closes and puts the caret back where it started.
@@ -1841,7 +1841,7 @@ text is projected.
   range onto a separate label - spans are absolute offsets into the widget's
   text, so they cannot be reused unshifted.
 
-- **Jump to the previous or next function** (S, atlas)
+- ~~**Jump to the previous or next function**~~ DONE (S, atlas)
   One shortcut moves the caret to the func line of the previous top-level
   function, another to the next; at the ends it stops rather than wrapping.
   The line is revealed with context above it, not pinned to the very top.
