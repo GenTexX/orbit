@@ -1955,14 +1955,21 @@ impl Ui {
     }
 
     /// Replace the lines `range` touches with `text`, and select the result -
-    /// so the same command can be run again on what it just produced.
+    /// so the same command can be run again on what it just produced. Focuses
+    /// `id`.
     pub fn replace_lines(&mut self, id: WidgetId, range: std::ops::Range<usize>, text: &str) {
+        if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
+            return;
+        }
+        // Takes focus. There is one caret in a Ui and it belongs to the focused
+        // widget, so a line command editing an unfocused field could not select
+        // what it produced - and a promise that silently does not apply is worse
+        // than a command that takes focus.
+        self.focused = Some(id);
         let (block, _) = self.line_block(id, range);
         let at = self.replace_range(id, block, text);
-        if self.focused == Some(id) {
-            self.selection_anchor = Some(at.start);
-            self.caret = at.end;
-        }
+        self.selection_anchor = Some(at.start);
+        self.caret = at.end;
     }
 
     /// Indent (or outdent) every line touched by `lo..hi`, and re-select the
