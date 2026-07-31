@@ -363,6 +363,12 @@ struct State {
     /// Where the caret and the view were, per script, so reopening a file this
     /// session puts you back where you left rather than at the top.
     script_positions: std::collections::HashMap<String, (usize, f32)>,
+    /// A transient line for the status bar - what a jump found, or why it did
+    /// not go anywhere - and when it was set, so it fades rather than lingering.
+    status_note: Option<(String, std::time::Instant)>,
+    /// An in-progress symbol rename: where in the buffer, the name being typed,
+    /// and why the last attempt was refused.
+    symbol_rename: Option<SymbolRename>,
     /// Set when a script is opened: focus the editor after the next rebuild.
     /// A file that appears with no caret swallows the first keystroke.
     focus_editor: bool,
@@ -511,6 +517,20 @@ struct ReparentDrag {
 
 /// How long the pointer must rest before a hover tooltip appears.
 const HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// How long a status-bar note stays up before the ordinary readout returns.
+const STATUS_NOTE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// An in-progress rename of the symbol at `offset`.
+#[derive(Debug, Clone)]
+struct SymbolRename {
+    /// Where in the buffer the symbol was, so the rename resolves against the
+    /// same declaration no matter where the caret goes while typing.
+    offset: usize,
+    draft: String,
+    /// Why the last confirm was refused, shown beside the field.
+    error: Option<String>,
+}
 
 /// How long each half of the caret's blink lasts.
 const CARET_BLINK: std::time::Duration = std::time::Duration::from_millis(530);
@@ -974,6 +994,17 @@ impl ApplicationHandler for App {
                             return;
                         }
                         state.ui.handle_input(InputEvent::PointerPressed);
+                        // ctrl+click in the code editor jumps to what declares
+                        // the name under the pointer. After the press, so the
+                        // caret has already moved to where the click landed and
+                        // go_to_definition reads the name that was clicked.
+                        if state.modifiers.control_key()
+                            && hit.is_some()
+                            && hit == state.rows.code_editor
+                        {
+                            state.go_to_definition();
+                            return;
+                        }
                         // A press on a dock tab arms a reorder drag along its own
                         // bar. Non-consuming: a plain click still activates the
                         // tab, and dragging off the bar still becomes a dock move.
@@ -1272,6 +1303,8 @@ impl State {
             symbol_palette: None,
             script_positions: std::collections::HashMap::new(),
             focus_editor: false,
+            status_note: None,
+            symbol_rename: None,
             force_completions: false,
             caret_phase: std::time::Instant::now(),
             caret_visible: true,
@@ -4224,6 +4257,116 @@ impl State {
         self.dirty = true;
     }
 
+    /// Say something in the status bar for a few seconds.
+    fn note(&mut self, text: impl Into<String>) {
+        self.status_note = Some((text.into(), std::time::Instant::now()));
+    }
+
+    /// Jump to what declares the name at the caret, or say why there is nowhere
+    /// to go.
+    ///
+    /// A builtin and an unknown name both report rather than doing nothing: a
+    /// key that silently does nothing is indistinguishable from one that is not
+    /// bound.
+    fn go_to_definition(&mut self) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let at = self.editor_caret();
+        match comet::service::definition_at(&self.script_text, at) {
+            Some(found) if found.kind.is_in_source() => {
+                self.ui
+                    .select_range(editor, found.span.start as usize, found.span.end as usize);
+                let line = self.script_text[..found.span.start as usize]
+                    .matches('\n')
+                    .count()
+                    + 1;
+                self.note(format!(
+                    "{} is {} (line {line})",
+                    found.name,
+                    found.kind.describe()
+                ));
+            }
+            Some(found) => {
+                self.note(format!(
+                    "{} is {} - the engine provides it",
+                    found.name,
+                    found.kind.describe()
+                ));
+            }
+            None => self.note("nothing here declares that name"),
+        }
+        self.dirty = true;
+    }
+
+    /// Start renaming the symbol at the caret, if it is one this file declares.
+    fn start_symbol_rename(&mut self) {
+        let at = self.editor_caret();
+        let Some(found) = comet::service::definition_at(&self.script_text, at) else {
+            self.note("put the caret on a name to rename it");
+            return;
+        };
+        if !found.kind.is_in_source() {
+            self.note(format!(
+                "{} is provided by the engine and cannot be renamed",
+                found.name
+            ));
+            return;
+        }
+        self.symbol_rename = Some(SymbolRename {
+            offset: at,
+            draft: found.name,
+            error: None,
+        });
+        self.dirty = true;
+    }
+
+    /// Apply the in-progress rename, or refuse it with a reason.
+    ///
+    /// Every site is rewritten back to front, so the earlier spans stay valid
+    /// while the later ones are replaced. script_undo snapshots the whole
+    /// buffer, so the whole rename is naturally one step - but the coalescing
+    /// run has to be broken, or the next character typed folds into it.
+    fn commit_symbol_rename(&mut self) {
+        let Some(rename) = self.symbol_rename.clone() else {
+            return;
+        };
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let name = rename.draft.trim().to_string();
+        if !comet::service::is_identifier(&name) {
+            self.set_rename_error("that is not a name");
+            return;
+        }
+        if !comet::service::rename_is_safe(&self.script_text, rename.offset, &name) {
+            self.set_rename_error(format!("`{name}` already means something here"));
+            return;
+        }
+        let Some(mut spans) = comet::service::rename_spans(&self.script_text, rename.offset) else {
+            self.set_rename_error("nothing to rename");
+            return;
+        };
+        spans.sort_by_key(|span| std::cmp::Reverse(span.start));
+        let sites = spans.len();
+        for span in spans {
+            self.ui
+                .replace_range(editor, span.start as usize..span.end as usize, &name);
+        }
+        self.script_coalescing = false;
+        self.symbol_rename = None;
+        self.sync_script_buffer();
+        self.note(format!("renamed {sites} occurrences"));
+        self.dirty = true;
+    }
+
+    fn set_rename_error(&mut self, message: impl Into<String>) {
+        if let Some(rename) = &mut self.symbol_rename {
+            rename.error = Some(message.into());
+        }
+        self.dirty = true;
+    }
+
     /// Open the go-to-symbol palette over the editor, listing every function
     /// and every piece of script state.
     ///
@@ -4766,6 +4909,27 @@ impl State {
             self.dirty = true;
             return true;
         }
+        // F12 jumps to what declares the name at the caret; F2 renames it.
+        // Both only with the editor focused - F2 elsewhere renames a node or a
+        // file, and that binding is older.
+        if self.ui.focused() == self.rows.code_editor && self.rows.code_editor.is_some() {
+            if *named == NamedKey::F12 {
+                self.go_to_definition();
+                return true;
+            }
+            if *named == NamedKey::F2 {
+                self.start_symbol_rename();
+                return true;
+            }
+        }
+        if *named == NamedKey::Enter
+            && self.symbol_rename.is_some()
+            && self.ui.focused() == self.rows.symbol_rename
+        {
+            self.sync_symbol_rename();
+            self.commit_symbol_rename();
+            return true;
+        }
         // F8 steps to the next problem, shift+F8 to the previous. With the
         // message in the status bar this is how a broken file gets walked.
         if *named == NamedKey::F8 && self.rows.code_editor.is_some() {
@@ -4790,6 +4954,11 @@ impl State {
         }
         // Escape closes what is open, innermost first.
         if *named == NamedKey::Escape {
+            // A rename in progress leaves the buffer untouched.
+            if self.symbol_rename.take().is_some() {
+                self.dirty = true;
+                return true;
+            }
             if self.symbol_palette.take().is_some() {
                 self.dirty = true;
                 return true;
@@ -5246,6 +5415,25 @@ impl State {
         self.dirty = true;
     }
 
+    /// Read the rename field's text back into the pending rename.
+    fn sync_symbol_rename(&mut self) {
+        let Some(field) = self.rows.symbol_rename else {
+            return;
+        };
+        let Some(text) = self.ui.text_of(field).map(str::to_string) else {
+            return;
+        };
+        let Some(rename) = &mut self.symbol_rename else {
+            return;
+        };
+        if rename.draft == text {
+            return;
+        }
+        rename.draft = text;
+        // Typing is an answer to whatever the last refusal said.
+        rename.error = None;
+    }
+
     fn sync_find_query(&mut self) {
         let Some(query_id) = self.rows.find.query else {
             return;
@@ -5325,11 +5513,18 @@ impl State {
                     .caret_line_column()
                     .map(|(line, column)| format!("Ln {line}, Col {column}"))
                     .unwrap_or_default();
-                let message = self
-                    .ui
-                    .caret_offset()
-                    .and_then(|at| self.diagnostic_at(at))
-                    .map(|d| d.message.clone())
+                // A note about what just happened wins over the standing
+                // diagnostic readout, for as long as it is fresh.
+                let note = self.status_note.as_ref().and_then(|(text, at)| {
+                    (at.elapsed() < STATUS_NOTE_LIFETIME).then(|| text.clone())
+                });
+                let message = note
+                    .or_else(|| {
+                        self.ui
+                            .caret_offset()
+                            .and_then(|at| self.diagnostic_at(at))
+                            .map(|d| d.message.clone())
+                    })
                     .unwrap_or_else(|| match self.script_diagnostics.len() {
                         0 => String::new(),
                         // Not on one, but the file has some: say how many, so a
@@ -5383,6 +5578,7 @@ impl State {
         self.sync_script_buffer();
         self.sync_find_query();
         self.sync_symbol_query();
+        self.sync_symbol_rename();
         self.poll_settings();
         self.poll_diagnostic_tooltip();
         self.tick_caret();
@@ -5493,6 +5689,25 @@ impl State {
             }
             if let Some(find) = &self.find {
                 self.rows.find = find.build(&mut self.ui, &self.theme.aurora);
+            }
+            if let Some(rename) = &self.symbol_rename
+                && let Some(editor) = self.rows.code_editor
+                && let Some(rect) = self.ui.rect(editor)
+            {
+                let anchor = Vec2::new(rect.pos.x + 40.0, rect.pos.y + 6.0);
+                let draft = rename.draft.clone();
+                let error = rename.error.clone();
+                self.rows.symbol_rename = ui::add_symbol_rename(
+                    &mut self.ui,
+                    anchor,
+                    &draft,
+                    error.as_deref(),
+                    &self.theme,
+                );
+                if let Some(field) = self.rows.symbol_rename {
+                    let len = draft.len();
+                    self.ui.focus_selection(field, 0, len);
+                }
             }
             if let Some((query, list)) = &self.symbol_palette
                 && let Some(editor) = self.rows.code_editor

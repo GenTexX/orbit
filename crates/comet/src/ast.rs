@@ -42,6 +42,9 @@ pub struct Function {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,
+    /// The span of the name alone. `span` covers `name: Type`, which is the
+    /// wrong thing to select when jumping to, or renaming, a parameter.
+    pub name_span: Span,
     pub ty: TypeName,
     pub span: Span,
 }

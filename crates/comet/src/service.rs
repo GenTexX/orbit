@@ -558,6 +558,385 @@ pub fn function_line(source: &str, name: &str) -> Option<usize> {
     Some(source[..at].matches('\n').count() + 1)
 }
 
+/// What declares the name a jump landed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefinitionKind {
+    /// A `let` inside a function body.
+    Local,
+    /// A function parameter.
+    Param,
+    /// A `for` loop's counter.
+    LoopVar,
+    /// A top-level `let`: script state.
+    State,
+    Function,
+    /// A host function like `print`. Nowhere to jump to, but worth saying so
+    /// rather than doing nothing.
+    Builtin,
+    /// A type name like `Vec2`. Also nowhere to jump to.
+    Type,
+}
+
+impl DefinitionKind {
+    /// Whether this is somewhere in the file, as opposed to something the
+    /// engine provides.
+    pub fn is_in_source(self) -> bool {
+        !matches!(self, DefinitionKind::Builtin | DefinitionKind::Type)
+    }
+
+    /// What to call it in a message.
+    pub fn describe(self) -> &'static str {
+        match self {
+            DefinitionKind::Local => "a local",
+            DefinitionKind::Param => "a parameter",
+            DefinitionKind::LoopVar => "a loop variable",
+            DefinitionKind::State => "script state",
+            DefinitionKind::Function => "a function",
+            DefinitionKind::Builtin => "a built-in function",
+            DefinitionKind::Type => "a built-in type",
+        }
+    }
+}
+
+/// What a name at some offset refers to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Definition {
+    pub name: String,
+    pub kind: DefinitionKind,
+    /// Where the declaration's name is written. Empty for a builtin or a type,
+    /// which are declared nowhere in the file.
+    pub span: Span,
+}
+
+/// What the name at `offset` refers to, or `None` if `offset` is not in a name
+/// or nothing declares it.
+///
+/// Real scoping, innermost first: a `let` in an inner block shadows an outer
+/// one, and a declaration below the caret does not count. That is stricter than
+/// [`completions_at`], which deliberately over-offers - a name it suggests that
+/// turns out not to compile is a small annoyance, but a *jump* to the wrong
+/// declaration teaches something false.
+pub fn definition_at(source: &str, offset: usize) -> Option<Definition> {
+    let (start, end) = word_span(source, offset)?;
+    let name = &source[start..end];
+    if name.is_empty() {
+        return None;
+    }
+    // A call resolves against functions first: `print` the call is the builtin
+    // even if some local is also called `print`.
+    let called = source[end..].trim_start().starts_with('(');
+    resolve(
+        source,
+        offset,
+        name,
+        called,
+        Span::new(start as u32, end as u32),
+    )
+}
+
+/// What `name` would refer to if it were written at `offset` - which is how a
+/// rename learns whether the name it is about to introduce already means
+/// something there.
+pub fn declaration_visible_at(source: &str, offset: usize, name: &str) -> Option<Definition> {
+    resolve(source, offset, name, false, Span::new(0, 0))
+}
+
+/// The shared scope walk behind [`definition_at`] and
+/// [`declaration_visible_at`]. `written` is where the name appears, used only
+/// as the span of an engine-provided name, which is declared nowhere.
+fn resolve(
+    source: &str,
+    offset: usize,
+    name: &str,
+    called: bool,
+    written: Span,
+) -> Option<Definition> {
+    let (script, _) = parse(source);
+
+    // Standing on a declaration resolves to that declaration. Without this the
+    // scope walk below, which only looks above the caret, finds nothing for a
+    // caret on `speed` in `let speed = 1.0;` - so go-to-definition on a
+    // declaration did nothing, and a rename started from one refused.
+    if written.end > written.start
+        && let Some(found) = declaration_at(&script, offset, name)
+    {
+        return Some(found);
+    }
+
+    if called {
+        if let Some(function) = script.functions.iter().find(|f| f.name == *name) {
+            return Some(Definition {
+                name: name.to_string(),
+                kind: DefinitionKind::Function,
+                span: function.name_span,
+            });
+        }
+        if BUILTINS.iter().any(|(builtin, _)| *builtin == name) {
+            return Some(Definition {
+                name: name.to_string(),
+                kind: DefinitionKind::Builtin,
+                span: written,
+            });
+        }
+    }
+
+    // Inside a function: its blocks innermost-first, then its parameters.
+    if let Some(function) = enclosing_function(&script, offset) {
+        if let Some(found) = block_definition(&function.body, offset, name) {
+            return Some(found);
+        }
+        if let Some(param) = function.params.iter().find(|p| p.name == *name) {
+            return Some(Definition {
+                name: name.to_string(),
+                kind: DefinitionKind::Param,
+                span: param.name_span,
+            });
+        }
+    }
+
+    if let Some(state) = script.state.iter().find(|s| s.name == *name) {
+        return Some(Definition {
+            name: name.to_string(),
+            kind: DefinitionKind::State,
+            span: state.name_span,
+        });
+    }
+    if let Some(function) = script.functions.iter().find(|f| f.name == *name) {
+        return Some(Definition {
+            name: name.to_string(),
+            kind: DefinitionKind::Function,
+            span: function.name_span,
+        });
+    }
+    let engine = if BUILTINS.iter().any(|(builtin, _)| *builtin == name) {
+        DefinitionKind::Builtin
+    } else if TYPES.contains(&name) || name == "pos" {
+        DefinitionKind::Type
+    } else {
+        return None;
+    };
+    Some(Definition {
+        name: name.to_string(),
+        kind: engine,
+        span: written,
+    })
+}
+
+/// Every span a rename of the symbol at `offset` must rewrite: its declaration
+/// and every use that resolves to it.
+///
+/// Each candidate occurrence is resolved on its own and kept only if it lands
+/// on the same declaration, so a shadowed inner `x` is left alone and a field
+/// `pos.x` is never touched. That is one resolution per occurrence, which is
+/// more work than a textual sweep and is the entire point: renaming is the one
+/// operation where being nearly right corrupts the file.
+///
+/// `None` when `offset` is not on a renameable name - a builtin or a type has
+/// no declaration in this file to rename.
+pub fn rename_spans(source: &str, offset: usize) -> Option<Vec<Span>> {
+    let target = definition_at(source, offset)?;
+    if !target.kind.is_in_source() {
+        return None;
+    }
+    let mut spans: Vec<Span> = occurrences_at(source, target.span.start as usize)
+        .into_iter()
+        .filter(|span| {
+            definition_at(source, span.start as usize)
+                .is_some_and(|found| found.span == target.span)
+        })
+        .collect();
+    // The declaration itself, in case it is not among the occurrences - which
+    // happens when the name is written somewhere the token scan does not reach
+    // back to, and costs nothing to guard against.
+    if !spans.contains(&target.span) {
+        spans.push(target.span);
+    }
+    spans.sort_by_key(|span| span.start);
+    spans.dedup();
+    Some(spans)
+}
+
+/// Whether renaming the symbol at `offset` to `name` is safe.
+///
+/// A rename onto a name that already means something where the symbol is used
+/// would silently capture every use of it, so it is refused rather than done -
+/// in a language whose only feedback would be `cannot find X in this scope`,
+/// quietly changing which declaration a name resolves to is the worst outcome
+/// available.
+pub fn rename_is_safe(source: &str, offset: usize, name: &str) -> bool {
+    is_identifier(name) && declaration_visible_at(source, offset, name).is_none()
+}
+
+/// Whether `text` is a single identifier - what a rename is allowed to produce.
+pub fn is_identifier(text: &str) -> bool {
+    // Through the lexer, so "what is a name" has one definition: one Ident
+    // token and nothing else. A keyword lexes as itself and is refused here,
+    // which is what stops a rename to `while`.
+    let (tokens, diagnostics) = crate::lexer::lex(text);
+    diagnostics.is_empty() && tokens.len() == 2 && matches!(tokens[0].kind, TokenKind::Ident(_))
+}
+
+/// The declaration whose own name `offset` sits in, if it is on one.
+fn declaration_at(script: &Script, offset: usize, name: &str) -> Option<Definition> {
+    let on = |span: Span| contains(span, offset);
+    for state in &script.state {
+        if state.name == name && on(state.name_span) {
+            return Some(Definition {
+                name: name.to_string(),
+                kind: DefinitionKind::State,
+                span: state.name_span,
+            });
+        }
+    }
+    for function in &script.functions {
+        if function.name == name && on(function.name_span) {
+            return Some(Definition {
+                name: name.to_string(),
+                kind: DefinitionKind::Function,
+                span: function.name_span,
+            });
+        }
+        for param in &function.params {
+            if param.name == name && on(param.name_span) {
+                return Some(Definition {
+                    name: name.to_string(),
+                    kind: DefinitionKind::Param,
+                    span: param.name_span,
+                });
+            }
+        }
+        if let Some(found) = block_declaration(&function.body, offset, name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The `let` or `for` in `block` whose own name `offset` sits in.
+fn block_declaration(block: &Block, offset: usize, name: &str) -> Option<Definition> {
+    for stmt in &block.stmts {
+        let found = match stmt {
+            Stmt::Let {
+                name: bound,
+                name_span,
+                ..
+            } if bound == name && contains(*name_span, offset) => Some(Definition {
+                name: name.to_string(),
+                kind: DefinitionKind::Local,
+                span: *name_span,
+            }),
+            Stmt::For {
+                name: counter,
+                name_span,
+                ..
+            } if counter == name && contains(*name_span, offset) => Some(Definition {
+                name: name.to_string(),
+                kind: DefinitionKind::LoopVar,
+                span: *name_span,
+            }),
+            Stmt::If(if_stmt) => if_declaration(if_stmt, offset, name),
+            Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                block_declaration(body, offset, name)
+            }
+            _ => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+fn if_declaration(if_stmt: &crate::ast::IfStmt, offset: usize, name: &str) -> Option<Definition> {
+    if let Some(found) = block_declaration(&if_stmt.then, offset, name) {
+        return Some(found);
+    }
+    match if_stmt.otherwise.as_deref() {
+        Some(Else::Block(block)) => block_declaration(block, offset, name),
+        Some(Else::If(nested)) => if_declaration(nested, offset, name),
+        None => None,
+    }
+}
+
+/// The declaration of `name` visible at `offset` within `block`, innermost
+/// scope first.
+///
+/// Recurses into the nested block containing `offset` before looking at this
+/// one, so an inner `let` wins; and only considers declarations written above
+/// the caret, because a `let` further down has not happened yet.
+fn block_definition(block: &Block, offset: usize, name: &str) -> Option<Definition> {
+    // Innermost first: whichever nested block holds the offset gets asked
+    // before this one does. Only the one that *holds* it - recursing into every
+    // nested block regardless is what makes visit_lets loose, and it resolved a
+    // use after an `if` to a `let` inside that `if`.
+    for stmt in &block.stmts {
+        let found = match stmt {
+            Stmt::If(if_stmt) => if_definition(if_stmt, offset, name),
+            Stmt::While { body, .. } | Stmt::For { body, .. } if contains(body.span, offset) => {
+                block_definition(body, offset, name)
+            }
+            _ => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+        // A `for` counter is in scope only inside its own body.
+        if let Stmt::For {
+            name: counter,
+            name_span,
+            body,
+            ..
+        } = stmt
+            && counter == name
+            && contains(body.span, offset)
+        {
+            return Some(Definition {
+                name: name.to_string(),
+                kind: DefinitionKind::LoopVar,
+                span: *name_span,
+            });
+        }
+    }
+    // Then this block's own lets, last one above the caret winning - a later
+    // `let` of the same name shadows the earlier one from there on.
+    block
+        .stmts
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Let {
+                name: bound,
+                name_span,
+                span,
+                ..
+            } if bound == name && (span.end as usize) <= offset => Some(Definition {
+                name: name.to_string(),
+                kind: DefinitionKind::Local,
+                span: *name_span,
+            }),
+            _ => None,
+        })
+        .next_back()
+}
+
+fn if_definition(if_stmt: &crate::ast::IfStmt, offset: usize, name: &str) -> Option<Definition> {
+    if contains(if_stmt.then.span, offset)
+        && let Some(found) = block_definition(&if_stmt.then, offset, name)
+    {
+        return Some(found);
+    }
+    match if_stmt.otherwise.as_deref() {
+        Some(Else::Block(block)) if contains(block.span, offset) => {
+            block_definition(block, offset, name)
+        }
+        Some(Else::If(nested)) => if_definition(nested, offset, name),
+        _ => None,
+    }
+}
+
+fn contains(span: Span, offset: usize) -> bool {
+    offset >= span.start as usize && offset <= span.end as usize
+}
+
 /// What kind of thing a [`Symbol`] names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
@@ -1327,5 +1706,150 @@ func third(c: f32) { let x = nope; }
         let all = symbols(source);
         let names: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["first", "second"]);
+    }
+
+    #[test]
+    fn a_definition_is_the_innermost_declaration_above_the_caret() {
+        let source = "\
+func f(dt: f32) {
+    let x = 1.0;
+    if dt > 0.0 {
+        let x = 2.0;
+        print(str(x));
+    }
+    print(str(x));
+}";
+        // find() is the use inside the `if`; rfind() the one after it.
+        let inner_use = source.find("str(x)").expect("in the fixture") + 4;
+        let outer_use = source.rfind("str(x)").expect("in the fixture") + 4;
+        // The two uses of `x` are in different scopes and must not resolve to
+        // the same declaration.
+        let inner = definition_at(source, inner_use).expect("resolves");
+        let outer = definition_at(source, outer_use).expect("resolves");
+        assert_eq!(inner.kind, DefinitionKind::Local);
+        assert_ne!(inner.span, outer.span);
+        assert_eq!(inner.span.start as usize, source.find("x = 2.0").unwrap());
+        assert_eq!(outer.span.start as usize, source.find("x = 1.0").unwrap());
+    }
+
+    #[test]
+    fn a_declaration_below_the_caret_does_not_count() {
+        let source = "func f() {\n    print(str(y));\n    let y = 1.0;\n}";
+        let at = source.find("str(y)").expect("in the fixture") + 4;
+        assert_eq!(definition_at(source, at), None, "`y` has not happened yet");
+    }
+
+    #[test]
+    fn parameters_state_and_functions_all_resolve() {
+        let source = "\
+let speed: f32 = 1.0;
+func helper(a: f32) -> f32 { a }
+func update(dt: f32) {
+    print(str(helper(dt * speed)));
+}";
+        let kind = |needle: &str, skip: usize| {
+            definition_at(source, source.rfind(needle).unwrap() + skip)
+                .expect("resolves")
+                .kind
+        };
+        assert_eq!(kind("dt *", 0), DefinitionKind::Param);
+        assert_eq!(kind("speed)", 0), DefinitionKind::State);
+        assert_eq!(kind("helper(dt", 0), DefinitionKind::Function);
+
+        // The jump lands on the name, not on `func` or on `a: f32`.
+        let def = definition_at(source, source.rfind("dt *").unwrap()).expect("resolves");
+        assert_eq!(
+            &source[def.span.start as usize..def.span.end as usize],
+            "dt"
+        );
+    }
+
+    #[test]
+    fn a_loop_variable_resolves_only_inside_its_own_loop() {
+        let source = "func f() {\n    for i in 0.0..3.0 {\n        print(str(i));\n    }\n}";
+        let inside = source.find("str(i)").expect("in the fixture") + 4;
+        let found = definition_at(source, inside).expect("resolves");
+        assert_eq!(found.kind, DefinitionKind::LoopVar);
+        assert_eq!(found.span.start as usize, source.find("i in").unwrap());
+    }
+
+    #[test]
+    fn the_engines_own_names_say_what_they_are_rather_than_nothing() {
+        let source = r#"func f() { print("hi"); }"#;
+        let found = definition_at(source, source.find("print").unwrap()).expect("resolves");
+        assert_eq!(found.kind, DefinitionKind::Builtin);
+        assert!(!found.kind.is_in_source(), "nowhere in the file to jump to");
+    }
+
+    #[test]
+    fn a_rename_reaches_the_declaration_and_every_use_that_resolves_to_it() {
+        let source = "\
+func f(dt: f32) {
+    let speed = 1.0;
+    if dt > 0.0 {
+        let speed = 2.0;
+        print(str(speed));
+    }
+    print(str(speed * dt));
+}";
+        let at = source.find("speed = 1.0").expect("in the fixture");
+        let spans = rename_spans(source, at).expect("renameable");
+        // The declaration and the use after the `if` - not the shadowed pair
+        // inside it.
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        assert_eq!(spans[0].start as usize, at);
+        assert_eq!(spans[1].start as usize, source.rfind("speed * dt").unwrap());
+    }
+
+    #[test]
+    fn renaming_the_shadowing_binding_touches_only_its_own_scope() {
+        let source = "\
+func f() {
+    let x = 1.0;
+    if true {
+        let x = 2.0;
+        print(str(x));
+    }
+    print(str(x));
+}";
+        let inner = source.find("x = 2.0").expect("in the fixture");
+        let spans = rename_spans(source, inner).expect("renameable");
+        assert_eq!(spans.len(), 2);
+        assert!(
+            spans
+                .iter()
+                .all(|s| (s.start as usize) < source.rfind("str(x)").unwrap()),
+            "the use after the block belongs to the outer binding"
+        );
+    }
+
+    #[test]
+    fn a_builtin_cannot_be_renamed() {
+        let source = r#"func f() { print("hi"); }"#;
+        assert_eq!(rename_spans(source, source.find("print").unwrap()), None);
+    }
+
+    #[test]
+    fn a_rename_onto_a_name_that_already_means_something_is_refused() {
+        let source = "func f(dt: f32) {\n    let speed = 1.0;\n    print(str(speed * dt));\n}";
+        let at = source.find("speed = 1.0").expect("in the fixture");
+        assert!(rename_is_safe(source, at, "velocity"));
+        assert!(
+            !rename_is_safe(source, at, "dt"),
+            "would capture the parameter"
+        );
+        assert!(
+            !rename_is_safe(source, at, "print"),
+            "would shadow the builtin"
+        );
+
+        // And the result has to be a name at all.
+        assert!(
+            !rename_is_safe(source, at, "while"),
+            "a keyword is not a name"
+        );
+        assert!(!rename_is_safe(source, at, "two words"));
+        assert!(!rename_is_safe(source, at, ""));
+        assert!(!rename_is_safe(source, at, "1st"));
     }
 }

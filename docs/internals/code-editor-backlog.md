@@ -2028,7 +2028,7 @@ fixes - most of which read a TypedScript that already exists.
   Note: Once signature help exists this is a re-sort of an already-computed
   list against one expected Type. Mostly free.
 
-- **Rename a symbol across the file** (M, comet (resolve every occurrence) + atlas (drive the edit))
+- ~~**Rename a symbol across the file**~~ DONE (M, comet (resolve every occurrence) + atlas (drive the edit))
   F2 on a local, parameter, state name or function name opens a small inline
   field; confirming rewrites the declaration and every reference as one undo
   step; a name colliding with an existing name in the same scope is refused
@@ -2056,7 +2056,7 @@ fixes - most of which read a TypedScript that already exists.
   expr carries its own field_span, which is what makes the distinction
   possible.
 
-- **Go to definition** (M, comet (definition_at(source, offset) -> Option<Span>) + atlas)
+- ~~**Go to definition**~~ DONE (M, comet (definition_at(source, offset) -> Option<Span>) + atlas)
   ctrl+click and F12 on a name select and reveal what declares it: the
   enclosing function's parameter, the nearest let in an enclosing block
   declared above the caret, a top-level state declaration, or a function

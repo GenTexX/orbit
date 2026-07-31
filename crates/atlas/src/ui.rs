@@ -447,6 +447,8 @@ pub struct EditorRows {
     pub go_to_line: Option<WidgetId>,
     /// The go-to-symbol palette's query field, and the rows of its list.
     pub symbol_query: Option<WidgetId>,
+    /// The symbol-rename field over the editor.
+    pub symbol_rename: Option<WidgetId>,
     pub symbol_rows: aurora::list::ListRows,
     /// The open modal dialog: its card (for backdrop-click dismiss detection),
     /// close button, footer action buttons, and settings-form controls.
@@ -2064,6 +2066,45 @@ pub fn add_symbol_query(
                 .placeholder("function or state name"),
         ),
     )
+}
+
+/// The rename field over the code editor, with the reason the last attempt was
+/// refused beside it when there was one.
+pub fn add_symbol_rename(
+    ui: &mut Ui,
+    anchor: Vec2,
+    value: &str,
+    error: Option<&str>,
+    theme: &EditorTheme,
+) -> Option<WidgetId> {
+    let card = ui.popup(
+        anchor,
+        Style::new()
+            .row()
+            .gap(6.0)
+            .padding(6.0)
+            .align_center()
+            .background(theme.aurora.menu_bg)
+            .corner_radius(theme.aurora.card_radius)
+            .border(theme.aurora.border_width, theme.aurora.card_border),
+    );
+    ui.label(
+        card,
+        "Rename to",
+        Style::new().foreground(theme.aurora.subhead),
+    );
+    let field = ui.text_input(
+        card,
+        value.to_string(),
+        Style::new()
+            .width(180.0)
+            .padding(4.0)
+            .corner_radius(theme.aurora.control_radius),
+    );
+    if let Some(error) = error {
+        ui.label(card, error, Style::new().foreground(theme.code_error));
+    }
+    Some(field)
 }
 
 pub fn add_go_to_line(

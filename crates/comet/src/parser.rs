@@ -187,11 +187,12 @@ impl Parser {
         if self.expect(&TokenKind::LParen, "`(` after a function name") {
             while !self.at_end() && !matches!(self.peek(), TokenKind::RParen) {
                 let p_start = self.peek_span();
-                let (p_name, _) = self.ident("a parameter name");
+                let (p_name, p_name_span) = self.ident("a parameter name");
                 self.expect(&TokenKind::Colon, "`:` after a parameter name");
                 let ty = self.type_name();
                 params.push(Param {
                     name: p_name,
+                    name_span: p_name_span,
                     span: p_start.to(ty.span),
                     ty,
                 });
