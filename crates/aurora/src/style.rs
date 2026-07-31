@@ -81,6 +81,9 @@ pub struct Style {
     pub gutter: bool,
     /// Whether typing an opening bracket or quote inserts its partner.
     pub auto_pairs: bool,
+    /// Whether a text area lets long lines run off the right edge and scrolls
+    /// horizontally, instead of wrapping them.
+    pub no_wrap: bool,
     /// Whether this widget is a drag source: pressing and moving past a small
     /// threshold starts a drag carrying this widget (see `Event::DragStarted`).
     pub draggable: bool,
@@ -125,6 +128,7 @@ impl Default for Style {
             border_bottom_color: Color::TRANSPARENT,
             gutter: false,
             auto_pairs: false,
+            no_wrap: false,
             draggable: false,
             drop_target: false,
             drag_kind: u32::MAX,
@@ -393,6 +397,17 @@ impl Style {
     /// character is a word - typing `(` before a name means wrapping it.
     pub fn auto_pairs(mut self) -> Self {
         self.auto_pairs = true;
+        self
+    }
+
+    /// Stop a text area wrapping: long lines run off the right edge and the
+    /// field scrolls horizontally to follow the caret.
+    ///
+    /// Code should not wrap. While it does, a line number no longer names a row
+    /// and a column ruler or an indent guide means nothing, because one logical
+    /// line occupies several of them.
+    pub fn no_wrap(mut self) -> Self {
+        self.no_wrap = true;
         self
     }
 

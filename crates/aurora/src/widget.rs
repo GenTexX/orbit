@@ -243,6 +243,8 @@ pub(crate) struct Widget {
     pub gutter: bool,
     /// Whether typing an opener auto-closes it (see [`crate::Style::auto_pairs`]).
     pub auto_pairs: bool,
+    /// Whether a text area scrolls horizontally instead of wrapping.
+    pub no_wrap: bool,
     /// Whether this text input is multi-line (a text area): Enter inserts a
     /// newline instead of submitting, and the caret moves by line. Other kinds
     /// ignore it.

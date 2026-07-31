@@ -1082,6 +1082,7 @@ impl Ui {
             font_family: style.font_family,
             gutter: style.gutter,
             auto_pairs: style.auto_pairs,
+            no_wrap: style.no_wrap,
             multiline: style.multiline,
             text_center: style.text_center,
             icon_button: style.icon_button,
@@ -2418,8 +2419,8 @@ impl Ui {
             self.focused_hscroll = 0.0;
             return;
         };
-        if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) || self.widgets[id].multiline
-        {
+        let scrolls = !self.widgets[id].multiline || self.widgets[id].no_wrap;
+        if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) || !scrolls {
             self.focused_hscroll = 0.0;
             return;
         }
@@ -2427,9 +2428,17 @@ impl Ui {
         else {
             return;
         };
-        let left_pad = origin.x - rect.pos.x;
-        let content_w = (rect.size.x - 2.0 * left_pad).max(1.0);
-        let caret_x = self.caret_x_offset(id);
+        // From the text's own origin to the right edge, so a gutter's strip is
+        // not counted as room for text.
+        let right_pad = origin.x - rect.pos.x - self.gutter_width(id);
+        let content_w = (rect.pos.x + rect.size.x - origin.x - right_pad).max(1.0);
+        // A multiline glyph's `start` is an offset within its buffer line, not
+        // within the whole text, so x_offset_at would find the wrong glyph.
+        let caret_x = if self.widgets[id].multiline {
+            self.multiline_caret(id).map_or(0.0, |(x, _)| x)
+        } else {
+            self.caret_x_offset(id)
+        };
         let total_w = self
             .buffers
             .get(id)
@@ -2452,7 +2461,8 @@ impl Ui {
     /// The focused single-line field's current horizontal scroll (0 for other
     /// or multiline fields), applied to its text, selection, caret, and clicks.
     fn hscroll_of(&self, id: WidgetId) -> f32 {
-        if self.focused == Some(id) && !self.widgets[id].multiline {
+        let scrolls = !self.widgets[id].multiline || self.widgets[id].no_wrap;
+        if self.focused == Some(id) && scrolls {
             self.focused_hscroll
         } else {
             0.0
@@ -3438,6 +3448,9 @@ impl Ui {
         if width <= 0.0 {
             return;
         }
+        // Vertical scroll only: the numbers ride the text's rows, but a
+        // horizontal scroll must not carry them off the left edge.
+        let origin = Vec2::new(origin.x + self.hscroll_of(id), origin.y);
         let (Some(buffer), Some(numbers)) = (self.buffers.get(id), self.gutter_numbers.get(id))
         else {
             return;
@@ -4061,7 +4074,9 @@ fn measure_widget(
     // whatever a gutter takes off the left, or the text would wrap as though the
     // strip were not there and run off the right edge under the clip.
     let gutter = gutter_widths.get(id).copied().unwrap_or(0.0);
-    let wrap_width = if one_line {
+    // A no-wrap area shapes unconstrained, like a one-line field: long lines run
+    // off the edge and the field scrolls to them.
+    let wrap_width = if one_line || widgets[id].no_wrap {
         None
     } else {
         known
@@ -5650,6 +5665,67 @@ mod tests {
         for c in text.chars() {
             ui.handle_input(InputEvent::Text(c));
         }
+    }
+
+    /// A no-wrap code area with a line far too long for its box.
+    fn wide_area(text: &str) -> (Ui, crate::WidgetId) {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(400.0, 200.0));
+        let field = ui.text_input(
+            root,
+            text.to_string(),
+            Style::new()
+                .size(300.0, 160.0)
+                .multiline()
+                .monospace()
+                .no_wrap(),
+        );
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        (ui, field)
+    }
+
+    #[test]
+    fn a_no_wrap_area_keeps_one_row_per_line_however_long() {
+        // With wrapping on, a line number stops naming a row - one logical line
+        // occupies several - which is what makes a gutter or a ruler lie.
+        let long = "x".repeat(400);
+        let (wrapped, wrapped_id) = {
+            let mut ui = Ui::new();
+            let root = ui.root_panel(Style::new().size(400.0, 200.0));
+            let f = ui.text_input(
+                root,
+                long.clone(),
+                Style::new().size(300.0, 160.0).multiline().monospace(),
+            );
+            ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+            (ui, f)
+        };
+        let rows = |ui: &Ui, id: crate::WidgetId| {
+            ui.buffers.get(id).map_or(0, |b| b.layout_runs().count())
+        };
+        assert!(rows(&wrapped, wrapped_id) > 1, "wrapping splits it");
+
+        let (ui, field) = wide_area(&long);
+        assert_eq!(rows(&ui, field), 1, "no-wrap keeps it as one row");
+    }
+
+    #[test]
+    fn a_no_wrap_area_scrolls_sideways_to_follow_the_caret() {
+        let (mut ui, field) = wide_area(&format!("{}end", "x".repeat(300)));
+        ui.focus_caret(field, 0);
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        assert_eq!(ui.hscroll_of(field), 0.0, "starts at the left");
+
+        ui.focus_caret(field, 303);
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        assert!(
+            ui.hscroll_of(field) > 0.0,
+            "scrolled right to reach the caret"
+        );
+
+        ui.focus_caret(field, 0);
+        ui.layout(Vec2::new(400.0, 200.0)).unwrap();
+        assert_eq!(ui.hscroll_of(field), 0.0, "and back");
     }
 
     #[test]
