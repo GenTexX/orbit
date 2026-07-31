@@ -3518,9 +3518,39 @@ impl State {
         self.script_orphaned = false;
         self.script_text = text;
         self.script_modified = false;
-        self.analyze_script();
+        self.adopt_open_script();
         self.dock.activate(dock::Pane::Code);
         self.dirty = true;
+    }
+
+    /// Make the Code pane show `script_text` after the app has replaced it
+    /// wholesale, and forget everything that belonged to the previous file.
+    ///
+    /// `sync_script_buffer` treats the widget as the source of truth and the
+    /// mirror as following it. That is right while someone is typing, and
+    /// exactly wrong here: the app has just swapped the buffer and the widget
+    /// is the stale one. Without pushing the text across, the sync that runs
+    /// just before the rebuild copied the previous file's text back over the
+    /// one being opened - so the title bar changed and the content did not.
+    ///
+    /// The history goes with it. Undo steps hold whole-buffer snapshots, so a
+    /// step left over from the last file would not just look wrong, it would
+    /// put that file's text into this one - and the next save would write it.
+    fn adopt_open_script(&mut self) {
+        if let Some(editor) = self.rows.code_editor {
+            self.ui.set_text_input(editor, self.script_text.clone());
+        }
+        self.script_undo.clear();
+        self.script_redo.clear();
+        self.script_caret = 0;
+        self.script_coalescing = false;
+        // A completion list and a find bar are both about the buffer that just
+        // went away.
+        self.completions = None;
+        if let Some(find) = &mut self.find {
+            find.refresh(&self.script_text);
+        }
+        self.analyze_script();
     }
 
     /// Write the Code pane's buffer back to its file, in the encoding it came
