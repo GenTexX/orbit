@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use wasmtime::{Caller, Engine, Extern, Instance, Linker, Module, Store};
+use wasmtime::{Caller, Engine, Error, Extern, Instance, Linker, Module, Store};
 
 fn main() {
     let options = match Options::parse(std::env::args().skip(1)) {
@@ -188,6 +188,29 @@ impl Runner {
             .func_wrap(host, "set_position", |mut c: Caller<'_, Host>, x, y| {
                 c.data_mut().position = (x, y);
             })
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "str",
+                |mut c: Caller<'_, Host>, value: f32| -> Result<i32, Error> {
+                    // The one host function that allocates. It calls back into the
+                    // module rather than reserving memory of its own, so what it
+                    // returns is an ordinary refcounted block the script releases
+                    // like any other String.
+                    let text = comet::format_f32(value);
+                    let Some(Extern::Func(alloc)) = c.get_export("comet_alloc") else {
+                        return Err(Error::msg("every comet module exports comet_alloc"));
+                    };
+                    let alloc = alloc.typed::<i32, i32>(&c)?;
+                    let ptr = alloc.call(&mut c, text.len() as i32)?;
+                    let Some(Extern::Memory(memory)) = c.get_export("memory") else {
+                        return Err(Error::msg("every comet module exports its memory"));
+                    };
+                    comet::write_str(memory.data_mut(&mut c), ptr, &text);
+                    Ok(ptr)
+                },
+            )
             .expect("host binding");
         linker
             .func_wrap(host, "sin", |_: Caller<'_, Host>, x: f32| x.sin())

@@ -59,6 +59,39 @@ pub const HOST_MODULE: &str = "orbit";
 
 /// Bytes of header on every heap block: `[size][refcount][len]`.
 const HEADER: i32 = 12;
+
+/// Fill in the `String` block at `ptr`, which the host has just obtained from
+/// the module's `comet_alloc` with a size of `text.len()`.
+///
+/// The block layout is codegen's business rather than the host's, so this lives
+/// here, over plain bytes, and every host uses the same one instead of
+/// hardcoding offsets that only this file gets to choose.
+///
+/// Panics if the block does not fit, which would mean `comet_alloc` returned a
+/// pointer for a smaller size than the one it was asked for.
+pub fn write_str(memory: &mut [u8], ptr: i32, text: &str) {
+    let base = ptr as usize;
+    let len_at = base + OFF_LEN as usize;
+    memory[len_at..len_at + 4].copy_from_slice(&(text.len() as u32).to_le_bytes());
+    let start = base + HEADER as usize;
+    memory[start..start + text.len()].copy_from_slice(text.as_bytes());
+}
+
+/// How comet renders an f32 as text: what `str(x)` returns, and the one place
+/// that decides whether `10.0 / 2.0` prints as "5" or "5.0".
+///
+/// Shortest-round-trip, which is Rust's `Display` for f32 - so a value that came
+/// from a literal prints the way it was written, and a whole number prints
+/// without a decimal point.
+pub fn format_f32(value: f32) -> String {
+    if value.is_infinite() {
+        return if value < 0.0 { "-inf" } else { "inf" }.to_string();
+    }
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    format!("{value}")
+}
 const OFF_SIZE: u64 = 0;
 const OFF_RC: u64 = 4;
 const OFF_LEN: u64 = 8;
@@ -74,18 +107,21 @@ const F_GET_X: u32 = 0;
 const F_GET_Y: u32 = 1;
 const F_SET_POS: u32 = 2;
 const F_PRINT: u32 = 3;
+/// `str(f32) -> String`. The host formats and allocates: float-to-decimal is a
+/// page of code nobody should emit into every module.
+const F_STR: u32 = 4;
 /// The transcendentals. WebAssembly has no opcodes for these, so they are the
 /// only maths that leaves the module; abs, sqrt, floor, ceil, min and max are
 /// one instruction each and are emitted inline.
-const F_SIN: u32 = 4;
-const F_COS: u32 = 5;
-const F_ATAN2: u32 = 6;
-const F_POW: u32 = 7;
-const F_ALLOC: u32 = 8;
-const F_RETAIN: u32 = 9;
-const F_RELEASE: u32 = 10;
+const F_SIN: u32 = 5;
+const F_COS: u32 = 6;
+const F_ATAN2: u32 = 7;
+const F_POW: u32 = 8;
+const F_ALLOC: u32 = 9;
+const F_RETAIN: u32 = 10;
+const F_RELEASE: u32 = 11;
 /// The first script-defined function's index.
-const USER_BASE: u32 = 11;
+const USER_BASE: u32 = 12;
 
 /// Emit a WebAssembly module for `script`.
 ///
@@ -107,6 +143,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     let t_get = types.get(vec![], vec![ValType::F32]);
     let t_set = types.get(vec![ValType::F32, ValType::F32], vec![]);
     let t_print = types.get(vec![ValType::I32, ValType::I32], vec![]);
+    let t_str = types.get(vec![ValType::F32], vec![ValType::I32]);
     let t_unary = types.get(vec![ValType::F32], vec![ValType::F32]);
     let t_binary = types.get(vec![ValType::F32, ValType::F32], vec![ValType::F32]);
     let t_alloc = types.get(vec![ValType::I32], vec![ValType::I32]);
@@ -118,6 +155,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     imports.import(HOST_MODULE, "get_position_y", EntityType::Function(t_get));
     imports.import(HOST_MODULE, "set_position", EntityType::Function(t_set));
     imports.import(HOST_MODULE, "print", EntityType::Function(t_print));
+    imports.import(HOST_MODULE, "str", EntityType::Function(t_str));
     imports.import(HOST_MODULE, "sin", EntityType::Function(t_unary));
     imports.import(HOST_MODULE, "cos", EntityType::Function(t_unary));
     imports.import(HOST_MODULE, "atan2", EntityType::Function(t_binary));
@@ -200,6 +238,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     names.append(F_GET_Y, "orbit::get_position_y");
     names.append(F_SET_POS, "orbit::set_position");
     names.append(F_PRINT, "orbit::print");
+    names.append(F_STR, "orbit::str");
     names.append(F_SIN, "orbit::sin");
     names.append(F_COS, "orbit::cos");
     names.append(F_ATAN2, "orbit::atan2");
@@ -575,7 +614,8 @@ fn emit_release(globals: &Globals) -> Function {
 // --- script functions ---
 
 fn emit_function(f: &TypedFn, globals: &Globals, literals: &Literals) -> Function {
-    let mut out = FnGen::new(&f.locals, f.param_count, globals, literals);
+    let depth = block_depth(&f.body);
+    let mut out = FnGen::new(&f.locals, f.param_count, depth, globals, literals);
     // A tail expression is the return value. It stays on the stack while the
     // locals it may have been read from are released - it already holds its own
     // reference, so releasing theirs cannot free it.
@@ -592,12 +632,72 @@ fn emit_function(f: &TypedFn, globals: &Globals, literals: &Literals) -> Functio
 
 /// The start function: run each state initializer once, at instantiation.
 fn emit_init(script: &TypedScript, globals: &Globals, literals: &Literals) -> Function {
-    let mut out = FnGen::new(&[], 0, globals, literals);
+    let depth = script.state.iter().map(|s| expr_depth(&s.init)).max();
+    let mut out = FnGen::new(&[], 0, depth.unwrap_or(0), globals, literals);
     for state in &script.state {
         out.expr(&state.init);
         out.store_global(state.slot);
     }
     out.finish()
+}
+
+/// The scratch locals available at one level of nesting.
+#[derive(Debug, Clone, Copy)]
+struct Frame {
+    f32s: [u32; 2],
+    i32s: [u32; 4],
+}
+
+/// How many wasm locals one [`Frame`] occupies.
+const FRAME_WIDTH: u32 = 6;
+
+/// The greatest number of [`Frame`]s a block can need at once.
+fn block_depth(block: &TypedBlock) -> usize {
+    let stmts = block.stmts.iter().map(stmt_depth);
+    let tail = block.tail.iter().map(expr_depth);
+    stmts.chain(tail).max().unwrap_or(0)
+}
+
+fn stmt_depth(stmt: &TypedStmt) -> usize {
+    match stmt {
+        TypedStmt::Let { init, .. } => expr_depth(init),
+        TypedStmt::Assign { value, .. } => expr_depth(value),
+        TypedStmt::If {
+            cond,
+            then,
+            otherwise,
+        } => expr_depth(cond)
+            .max(block_depth(then))
+            .max(otherwise.as_ref().map_or(0, block_depth)),
+        TypedStmt::While { cond, body } => expr_depth(cond).max(block_depth(body)),
+        TypedStmt::Return { value } => value.as_ref().map_or(0, expr_depth),
+        TypedStmt::Expr(e) => expr_depth(e),
+    }
+}
+
+/// Whether emitting `expr` needs a frame of its own, and how deep the ones
+/// inside it go.
+fn expr_depth(expr: &TypedExpr) -> usize {
+    use TypedExprKind as K;
+    let (mine, children): (usize, Vec<&TypedExpr>) = match &expr.kind {
+        K::Binary { op, lhs, rhs } => {
+            let mine = usize::from(matches!(op, BinaryOp::RemF32 | BinaryOp::ConcatStr));
+            (mine, vec![lhs, rhs])
+        }
+        // Print parks the string to release it after the call.
+        K::HostCall { host, args } => (
+            usize::from(*host == Host::Print),
+            args.iter().collect::<Vec<_>>(),
+        ),
+        K::Unary { operand, .. } => (0, vec![operand]),
+        K::Field { receiver, .. } => (0, vec![receiver]),
+        K::MakeVec2 { x, y } => (0, vec![x, y]),
+        K::Call { args, .. } => (0, args.iter().collect()),
+        K::Number(_) | K::Bool(_) | K::Str(_) | K::Local(_) | K::Global(_) | K::Pos | K::Error => {
+            (0, Vec::new())
+        }
+    };
+    mine + children.into_iter().map(expr_depth).max().unwrap_or(0)
 }
 
 struct FnGen<'a> {
@@ -607,11 +707,10 @@ struct FnGen<'a> {
     slot_types: &'a [Type],
     /// Slots holding a `String`, released on the way out of the function.
     owned: Vec<u32>,
-    scratch_f32: u32,
-    /// A second f32 scratch, for the one operation that needs both operands
-    /// twice.
-    scratch_f32b: u32,
-    scratch_i32: u32,
+    /// One set of scratch locals per level of nesting that needs them, and a
+    /// cursor into it. See [`FnGen::enter_frame`].
+    frames: Vec<Frame>,
+    frame: usize,
     globals: &'a Globals,
     literals: &'a Literals,
 }
@@ -620,6 +719,7 @@ impl<'a> FnGen<'a> {
     fn new(
         slot_types: &'a [Type],
         param_count: usize,
+        depth: usize,
         globals: &'a Globals,
         literals: &'a Literals,
     ) -> Self {
@@ -629,20 +729,36 @@ impl<'a> FnGen<'a> {
             slot_base.push(next);
             next += val_types(*ty).len() as u32;
         }
-        // Two scratch locals, always. They are only ever written immediately
-        // before they are read, so one of each type is enough no matter how
-        // deeply expressions nest - and a fixed layout means the local indices
-        // are known before a single instruction is emitted, which is what
-        // wasm-encoder wants.
-        let scratch_f32 = next;
-        let scratch_f32b = next + 1;
-        let scratch_i32 = next + 2;
+        // Scratch locals come in frames, one per level of nesting that needs
+        // them. A single shared set would be wrong: the outer `%` in
+        // `(a % b) % (c % d)` parks its left operand, then evaluates a right
+        // operand that parks its own - and would overwrite it. wasm-encoder
+        // wants the local list before the first instruction, so the depth is
+        // measured up front rather than discovered while emitting.
+        let frames: Vec<Frame> = (0..depth + 1)
+            .map(|i| {
+                let base = next + (i as u32) * FRAME_WIDTH;
+                Frame {
+                    f32s: [base, base + 1],
+                    i32s: [base + 2, base + 3, base + 4, base + 5],
+                }
+            })
+            .collect();
 
         let declared: Vec<ValType> = slot_types[param_count..]
             .iter()
             .flat_map(|ty| val_types(*ty))
             .copied()
-            .chain([ValType::F32, ValType::F32, ValType::I32])
+            .chain(frames.iter().flat_map(|_| {
+                [
+                    ValType::F32,
+                    ValType::F32,
+                    ValType::I32,
+                    ValType::I32,
+                    ValType::I32,
+                    ValType::I32,
+                ]
+            }))
             .collect();
 
         let owned = slot_types
@@ -657,12 +773,31 @@ impl<'a> FnGen<'a> {
             slot_base,
             slot_types,
             owned,
-            scratch_f32,
-            scratch_f32b,
-            scratch_i32,
+            frames,
+            frame: 0,
             globals,
             literals,
         }
+    }
+
+    /// Take this level's scratch locals and move the cursor down, so anything
+    /// evaluated inside gets a different set. Returns the frame by value, which
+    /// is what keeps the borrow checker from letting two levels share one.
+    fn enter_frame(&mut self) -> Frame {
+        let frame = self.frames[self.frame];
+        self.frame += 1;
+        frame
+    }
+
+    fn leave_frame(&mut self) {
+        self.frame -= 1;
+    }
+
+    /// The innermost frame no enclosing construct has taken. For the users that
+    /// write a scratch local and read it back with nothing evaluated in
+    /// between - which is every user except `%`, `+` on strings, and `print`.
+    fn scratch(&self) -> Frame {
+        self.frames[self.frame]
     }
 
     fn finish(mut self) -> Function {
@@ -707,7 +842,7 @@ impl<'a> FnGen<'a> {
         let base = self.globals.base[slot as usize];
         let ty = self.globals.types[slot as usize];
         if ty == Type::Str {
-            let tmp = self.scratch_i32;
+            let tmp = self.scratch().i32s[0];
             self.ins().local_set(tmp);
             self.ins().global_get(base).call(F_RELEASE);
             self.ins().local_get(tmp);
@@ -729,7 +864,7 @@ impl<'a> FnGen<'a> {
 
     /// Take a reference to the `String` pointer on the stack, leaving it there.
     fn retain_top(&mut self) {
-        let tmp = self.scratch_i32;
+        let tmp = self.scratch().i32s[0];
         self.ins().local_tee(tmp).call(F_RETAIN).local_get(tmp);
     }
 
@@ -826,7 +961,7 @@ impl<'a> FnGen<'a> {
                 if ty == Type::Str {
                     // Park the new reference before dropping the old one, so
                     // `s = s` cannot free the object between the two.
-                    let tmp = self.scratch_i32;
+                    let tmp = self.scratch().i32s[0];
                     self.ins().local_set(tmp);
                     self.load_slot(*slot);
                     self.ins().call(F_RELEASE);
@@ -863,7 +998,7 @@ impl<'a> FnGen<'a> {
                 // Position is written whole, so the other axis has to be read
                 // back and passed through untouched.
                 self.expr(value);
-                let tmp = self.scratch_f32;
+                let tmp = self.scratch().f32s[0];
                 self.ins().local_set(tmp);
                 match axis {
                     Axis::X => {
@@ -938,7 +1073,7 @@ impl<'a> FnGen<'a> {
                         self.ins().drop();
                     }
                     Axis::Y => {
-                        let tmp = self.scratch_f32;
+                        let tmp = self.scratch().f32s[0];
                         self.ins().local_set(tmp).drop().local_get(tmp);
                     }
                 }
@@ -952,6 +1087,12 @@ impl<'a> FnGen<'a> {
             }
 
             TypedExprKind::HostCall { host, args } => match host {
+                // The host formats and allocates, and hands back an owned
+                // reference like any other String expression.
+                Host::Str => {
+                    self.expr(&args[0]);
+                    self.ins().call(F_STR);
+                }
                 // The transcendentals are ordinary calls: arguments on the
                 // stack, one import, a result.
                 Host::Sin | Host::Cos | Host::Atan2 | Host::Pow => {
@@ -966,13 +1107,14 @@ impl<'a> FnGen<'a> {
                     });
                 }
                 Host::Print => {
+                    let tmp = self.enter_frame().i32s[0];
                     self.expr(&args[0]);
-                    let tmp = self.scratch_i32;
                     self.ins().local_set(tmp);
                     self.ins().local_get(tmp).i32_const(HEADER).i32_add();
                     self.ins().local_get(tmp).i32_load(mem(OFF_LEN));
                     self.ins().call(F_PRINT);
                     self.ins().local_get(tmp).call(F_RELEASE);
+                    self.leave_frame();
                 }
             },
 
@@ -1019,12 +1161,56 @@ impl<'a> FnGen<'a> {
             _ => {}
         }
 
+        // Concatenation is the first thing in the language that allocates, and
+        // the only operator that does. Both operands arrive owned, so both are
+        // released once their bytes have been copied out.
+        if op == BinaryOp::ConcatStr {
+            let [a, b, total, out] = self.enter_frame().i32s;
+            self.expr(lhs);
+            self.ins().local_set(a);
+            self.expr(rhs);
+            self.ins().local_set(b);
+
+            self.ins().local_get(a).i32_load(mem(OFF_LEN));
+            self.ins().local_get(b).i32_load(mem(OFF_LEN));
+            self.ins().i32_add().local_set(total);
+
+            self.ins().local_get(total).call(F_ALLOC).local_set(out);
+            self.ins()
+                .local_get(out)
+                .local_get(total)
+                .i32_store(mem(OFF_LEN));
+
+            // memory.copy takes destination, source, length.
+            self.ins().local_get(out).i32_const(HEADER).i32_add();
+            self.ins().local_get(a).i32_const(HEADER).i32_add();
+            self.ins().local_get(a).i32_load(mem(OFF_LEN));
+            self.ins().memory_copy(0, 0);
+
+            self.ins()
+                .local_get(out)
+                .i32_const(HEADER)
+                .i32_add()
+                .local_get(a)
+                .i32_load(mem(OFF_LEN))
+                .i32_add();
+            self.ins().local_get(b).i32_const(HEADER).i32_add();
+            self.ins().local_get(b).i32_load(mem(OFF_LEN));
+            self.ins().memory_copy(0, 0);
+
+            self.ins().local_get(a).call(F_RELEASE);
+            self.ins().local_get(b).call(F_RELEASE);
+            self.ins().local_get(out);
+            self.leave_frame();
+            return;
+        }
+
         // Remainder has no WebAssembly instruction: a - trunc(a / b) * b. Both
         // operands are parked first because both are needed twice, and an
         // operand can be a call - evaluating one twice would run its effects
         // twice.
         if op == BinaryOp::RemF32 {
-            let (a, b) = (self.scratch_f32, self.scratch_f32b);
+            let [a, b] = self.enter_frame().f32s;
             self.expr(lhs);
             self.ins().local_set(a);
             self.expr(rhs);
@@ -1033,6 +1219,7 @@ impl<'a> FnGen<'a> {
             self.ins().local_get(a).local_get(b).f32_div().f32_trunc();
             self.ins().local_get(b).f32_mul();
             self.ins().f32_sub();
+            self.leave_frame();
             return;
         }
 
@@ -1041,7 +1228,7 @@ impl<'a> FnGen<'a> {
         let mut i = self.func.instructions();
         match op {
             BinaryOp::AddF32 => i.f32_add(),
-            BinaryOp::RemF32 => unreachable!("handled above"),
+            BinaryOp::RemF32 | BinaryOp::ConcatStr => unreachable!("handled above"),
             BinaryOp::MinF32 => i.f32_min(),
             BinaryOp::MaxF32 => i.f32_max(),
             BinaryOp::SubF32 => i.f32_sub(),
@@ -1182,6 +1369,7 @@ mod tests {
             "get_position_y",
             "set_position",
             "print",
+            "str",
             "sin",
             "cos",
             "atan2",

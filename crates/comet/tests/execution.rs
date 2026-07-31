@@ -12,14 +12,15 @@
 //! the compiler has to be provably correct on its own before anything real
 //! depends on it.
 
-use wasmtime::{Caller, Engine, Extern, Instance, Linker, Module, Store, WasmParams, WasmResults};
+use wasmtime::{
+    Caller, Engine, Error, Extern, Instance, Linker, Module, Store, WasmParams, WasmResults,
+};
 
 /// Bytes of header on a heap block: `[size][refcount][len]`, with the string's
 /// bytes following. This is comet's documented ABI - a host is allowed to know
 /// it, and this test acts as one.
 const HEADER: i32 = 12;
 const OFF_RC: i32 = 4;
-const OFF_LEN: i32 = 8;
 
 #[derive(Default)]
 struct Host {
@@ -63,6 +64,29 @@ impl Script {
             .func_wrap(host, "set_position", |mut c: Caller<'_, Host>, x, y| {
                 c.data_mut().position = (x, y);
             })
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "str",
+                |mut c: Caller<'_, Host>, value: f32| -> Result<i32, Error> {
+                    // The only host function that allocates. It calls back into the
+                    // module rather than reserving memory of its own, so the string
+                    // it returns is an ordinary refcounted block that the script
+                    // releases like any other.
+                    let text = comet::format_f32(value);
+                    let Some(Extern::Func(alloc)) = c.get_export("comet_alloc") else {
+                        return Err(Error::msg("every comet module exports comet_alloc"));
+                    };
+                    let alloc = alloc.typed::<i32, i32>(&c)?;
+                    let ptr = alloc.call(&mut c, text.len() as i32)?;
+                    let Some(Extern::Memory(memory)) = c.get_export("memory") else {
+                        return Err(Error::msg("every comet module exports its memory"));
+                    };
+                    comet::write_str(memory.data_mut(&mut c), ptr, &text);
+                    Ok(ptr)
+                },
+            )
             .expect("host binding");
         linker
             .func_wrap(host, "sin", |_: Caller<'_, Host>, x: f32| x.sin())
@@ -170,11 +194,7 @@ impl Script {
     /// and the bytes are the caller's to write.
     fn write_string(&mut self, ptr: i32, text: &str) {
         let memory = self.memory();
-        let data = memory.data_mut(&mut self.store);
-        let len = ptr as usize + OFF_LEN as usize;
-        data[len..len + 4].copy_from_slice(&(text.len() as i32).to_le_bytes());
-        let bytes = ptr as usize + HEADER as usize;
-        data[bytes..bytes + text.len()].copy_from_slice(text.as_bytes());
+        comet::write_str(memory.data_mut(&mut self.store), ptr, text);
     }
 
     /// The block address of a string literal, found by its bytes in the data
@@ -713,4 +733,99 @@ fn the_allocator_grows_memory_rather_than_running_off_the_end() {
     script.call::<i32, ()>("keep", big);
     script.call::<(), ()>("show", ());
     assert_eq!(script.printed(), ["at the far end"]);
+}
+
+#[test]
+fn concatenation_joins_two_strings() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            print("hello, " + "world");
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["hello, world"]);
+}
+
+#[test]
+fn nested_concatenation_does_not_lose_an_operand() {
+    // `(a + b) + (c + d)` is the shape that a single shared set of scratch
+    // locals gets wrong: the outer join parks its left operand, then evaluates a
+    // right operand that parks its own over the top of it. Each level of nesting
+    // gets its own frame precisely so this reads "abcd" and not "cdcd".
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            print(("a" + "b") + ("c" + "d"));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["abcd"]);
+}
+
+#[test]
+fn nested_remainder_does_not_lose_an_operand() {
+    // The same trap, on the operator that had it first: `%` parks both operands
+    // because it computes `a - trunc(a / b) * b` and needs each twice.
+    let mut script = Script::new(
+        r#"
+        let result: f32 = 0.0;
+        func update(dt: f32) {
+            result = (17.0 % 10.0) % (9.0 % 5.0);
+        }
+        func value() -> f32 { result }
+        "#,
+    );
+    script.update(0.0);
+    // 17 % 10 = 7, 9 % 5 = 4, 7 % 4 = 3.
+    assert_eq!(script.call::<(), f32>("value", ()), 3.0);
+}
+
+#[test]
+fn str_formats_a_number_the_way_it_was_written() {
+    // What a beginner's first debug line looks like. A whole number prints
+    // without a decimal point - "score: 3", not "score: 3.0000000".
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            print("score: " + str(3.0));
+            print("ratio: " + str(1.0 / 4.0));
+            print(str(0.0 - 2.5));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["score: 3", "ratio: 0.25", "-2.5"]);
+}
+
+#[test]
+fn a_concatenated_string_can_be_joined_again_without_leaking() {
+    // Building a line in pieces, which is what a loop body does. Each join
+    // allocates and then releases both of its operands, so the intermediates -
+    // and the strings `str` allocated - come straight back to the free list.
+    // A missing release shows up as the heap growing without bound, which is
+    // what this measures.
+    let mut script = Script::new(
+        r#"
+        let line: String = "";
+        func update(dt: f32) {
+            line = "x=" + str(dt) + " y=" + str(dt + 1.0);
+        }
+        func print_line() { print(line); }
+        "#,
+    );
+    script.update(1.0);
+    let after_first = script.memory_bytes();
+    for _ in 0..100 {
+        script.update(1.0);
+    }
+    script.call::<(), ()>("print_line", ());
+    assert_eq!(script.printed(), ["x=1 y=2"]);
+    assert_eq!(
+        script.memory_bytes(),
+        after_first,
+        "intermediates are reused from the free list rather than growing memory"
+    );
 }

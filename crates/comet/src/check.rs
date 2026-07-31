@@ -717,6 +717,35 @@ impl Checker {
         }
 
         let (typed_op, result) = match op {
+            // `+` on two strings joins them. Every other arithmetic operator,
+            // and every other type, stays f32-only.
+            B::Add if lhs.ty == Type::Str && rhs.ty == Type::Str => {
+                (BinaryOp::ConcatStr, Type::Str)
+            }
+            // Joining a string to a number is the mistake everyone makes on
+            // their first debug line. There is no coercion in the language, so
+            // this stays an error - but it says what to write instead rather
+            // than reporting a bare type mismatch.
+            B::Add if lhs.ty == Type::Str || rhs.ty == Type::Str => {
+                let (number, span) = if lhs.ty == Type::Str {
+                    (rhs.ty, rhs.span)
+                } else {
+                    (lhs.ty, lhs.span)
+                };
+                let hint = if number == Type::F32 {
+                    " - use `str(...)` to turn a number into a String"
+                } else {
+                    ""
+                };
+                let name = number.name();
+                let a = if name.starts_with(['f', 'a', 'e', 'i', 'o', 'u']) {
+                    "an"
+                } else {
+                    "a"
+                };
+                self.error(span, format!("cannot join a String and {a} {name}{hint}"));
+                return (TypedExprKind::Error, Type::Error);
+            }
             B::Add | B::Sub | B::Mul | B::Div | B::Rem => {
                 self.expect_type(Type::F32, lhs.ty, lhs.span);
                 self.expect_type(Type::F32, rhs.ty, rhs.span);
@@ -839,6 +868,7 @@ fn builtin(name: &str) -> Option<(Builtin, &'static [Type], Type)> {
     use Type::{F32, Str, Unit};
     Some(match name {
         "print" => (Builtin::Host(Host::Print), &[Str], Unit),
+        "str" => (Builtin::Host(Host::Str), &[F32], Str),
         "abs" => (Builtin::Unary(UnaryOp::Abs), &[F32], F32),
         "sqrt" => (Builtin::Unary(UnaryOp::Sqrt), &[F32], F32),
         "floor" => (Builtin::Unary(UnaryOp::Floor), &[F32], F32),
@@ -1368,5 +1398,38 @@ mod tests {
         let (typed, _) = check(&script);
         let update = typed.function("update").expect("update still parsed");
         assert_eq!(update.locals[1], Type::F32, "`let speed` was still typed");
+    }
+
+    #[test]
+    fn plus_joins_two_strings_but_nothing_else_does() {
+        check_clean(r#"func f() -> String { "a" + "b" }"#);
+
+        // Every other operator stays f32-only, and so does a mixed `+`. The
+        // message names both sides so it is clear which one is the surprise.
+        assert_eq!(
+            messages(r#"func f() { let s: String = "a" + 1.0; }"#),
+            ["cannot join a String and an f32 - use `str(...)` to turn a number into a String"]
+        );
+        assert_eq!(
+            messages(r#"func f() { let s: String = 1.0 + "a"; }"#),
+            ["cannot join a String and an f32 - use `str(...)` to turn a number into a String"]
+        );
+        // Only `+` gets the hint; the rest are plain f32 operators and say so.
+        assert_eq!(
+            messages(r#"func f() { let s: String = "a" - "b"; }"#),
+            [
+                "expected `f32`, found `String`",
+                "expected `f32`, found `String`"
+            ]
+        );
+    }
+
+    #[test]
+    fn str_turns_a_number_into_a_string() {
+        check_clean(r#"func f(x: f32) -> String { "x: " + str(x) }"#);
+        assert_eq!(
+            messages(r#"func f() { let s: String = str("already"); }"#),
+            ["expected `f32`, found `String`"]
+        );
     }
 }

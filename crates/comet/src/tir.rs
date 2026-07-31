@@ -218,6 +218,9 @@ pub enum TypedExprKind {
 pub enum Host {
     /// `print(String)` - the debug output call.
     Print,
+    /// `str(f32) -> String` - number formatting. Done by the host because
+    /// float-to-decimal is a page of code nobody should emit into every module.
+    Str,
     /// The transcendentals, which WebAssembly has no instructions for. Everything
     /// else - abs, sqrt, floor, ceil, min, max - is one opcode and never leaves
     /// the module.
@@ -254,6 +257,9 @@ pub enum BinaryOp {
     /// The f32 instructions that happen to be binary: min and max.
     MinF32,
     MaxF32,
+    /// String concatenation. Allocates - the first thing in the language that
+    /// does - and yields an owned reference like any other String expression.
+    ConcatStr,
     /// Equality on f32 or bool; the operand type decides the instruction.
     Eq(Type),
     NotEq(Type),

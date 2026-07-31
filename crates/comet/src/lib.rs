@@ -45,7 +45,7 @@ pub use ast::{
     TypeName, UnaryOp,
 };
 pub use check::check;
-pub use codegen::{HOST_MODULE, emit};
+pub use codegen::{HOST_MODULE, emit, format_f32, write_str};
 pub use diagnostic::{Diagnostic, Severity};
 pub use lexer::{Token, TokenKind, lex, lex_with_comments};
 pub use parser::parse;

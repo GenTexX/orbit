@@ -2636,7 +2636,7 @@ backlog.
   need bind_host. This makes every other completion feature look better
   immediately.
 
-- **Strings can be built, not only printed as literals** (M, comet (check + codegen))
+- ~~**Strings can be built, not only printed as literals** (M, comet (check + codegen))~~ DONE
   `print("x is " + pos.x)` works: + on String concatenates, and an f32 becomes
   a String (an interpolation form, or a str(x) builtin). Two Strings can be
   compared.
@@ -2649,6 +2649,13 @@ backlog.
   place for String, so concatenation is a host call or an emitted helper
   rather than new infrastructure. Number formatting is the fiddlier half and
   is probably a host import next to print.
+  Done: `+` on two Strings lowers to BinaryOp::ConcatStr, which allocates
+  through comet_alloc and memory.copy's both operands in - the first thing a
+  script can write that reaches the allocator at all. `str(f32)` is a host
+  import, as the note guessed, and it calls back into the module to allocate
+  so what it returns is an ordinary refcounted block. Joining a String to a
+  number is still an error, but one that names the fix. Comparison of two
+  Strings is not done.
 
 - **Vec2 can be constructed and mutated** (M, comet (check + codegen))
   `let target = Vec2(100.0, 0.0);` builds one and `target.x = 5.0;` assigns

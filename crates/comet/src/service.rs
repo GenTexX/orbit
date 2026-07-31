@@ -303,6 +303,7 @@ const BUILTINS: &[(&str, &str)] = &[
     ("ceil", "func ceil(a: f32) -> f32"),
     ("min", "func min(a: f32, b: f32) -> f32"),
     ("max", "func max(a: f32, b: f32) -> f32"),
+    ("str", "func str(value: f32) -> String"),
     ("sin", "func sin(a: f32) -> f32"),
     ("cos", "func cos(a: f32) -> f32"),
     ("atan2", "func atan2(y: f32, x: f32) -> f32"),
