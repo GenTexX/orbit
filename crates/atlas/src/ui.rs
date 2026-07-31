@@ -1385,6 +1385,7 @@ fn build_settings_body(
     for (field, label) in [
         (SettingField::ShowGrid, "Show grid"),
         (SettingField::ShowAxes, "Show world axes"),
+        (SettingField::TidyOnSave, "Tidy scripts on save"),
         (SettingField::SnapEnabled, "Enable snapping"),
     ] {
         let cb = ui.checkbox(
@@ -2966,10 +2967,10 @@ mod tests {
     }
 
     #[test]
-    fn a_settings_modal_lays_out_with_three_checks_inputs_and_two_buttons() {
-        let draft = SettingsDraft::new(true, true, crate::settings::SnapSettings::default());
+    fn a_settings_modal_lays_out_with_four_checks_three_inputs_and_two_buttons() {
+        let draft = SettingsDraft::new(true, true, true, crate::settings::SnapSettings::default());
         let rows = laid_out_modal(&Modal::settings(draft));
-        assert_eq!(rows.modal_checks.len(), 3, "grid / axes / snap");
+        assert_eq!(rows.modal_checks.len(), 4, "grid / axes / tidy / snap");
         assert_eq!(rows.modal_inputs.len(), 3, "move / rotate / scale step");
         assert_eq!(rows.modal_buttons.len(), 2, "Cancel + Save");
     }

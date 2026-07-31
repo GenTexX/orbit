@@ -46,6 +46,11 @@ pub struct Settings {
     pub show_grid: bool,
     #[serde(default = "default_true")]
     pub show_axes: bool,
+    /// Tidy a script on save: strip trailing whitespace from every line, and
+    /// end the file with exactly one newline. On by default, and switchable
+    /// because silently rewriting someone's file should be their call.
+    #[serde(default = "default_true")]
+    pub tidy_on_save: bool,
     pub snap: SnapSettings,
 }
 
@@ -55,6 +60,7 @@ impl Default for Settings {
             theme: ThemeDoc::default(),
             show_grid: true,
             show_axes: true,
+            tidy_on_save: true,
             snap: SnapSettings::default(),
         }
     }

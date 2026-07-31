@@ -117,6 +117,7 @@ pub enum ModalAction {
 pub enum SettingField {
     ShowGrid,
     ShowAxes,
+    TidyOnSave,
     SnapEnabled,
     MoveStep,
     RotateStep,
@@ -234,6 +235,7 @@ impl Modal {
 pub struct SettingsDraft {
     pub show_grid: bool,
     pub show_axes: bool,
+    pub tidy_on_save: bool,
     pub snap_enabled: bool,
     pub move_step: f32,
     pub rotate_step_deg: f32,
@@ -242,10 +244,11 @@ pub struct SettingsDraft {
 
 impl SettingsDraft {
     /// Seed a draft from the current view toggles and snap settings.
-    pub fn new(show_grid: bool, show_axes: bool, snap: SnapSettings) -> Self {
+    pub fn new(show_grid: bool, show_axes: bool, tidy_on_save: bool, snap: SnapSettings) -> Self {
         Self {
             show_grid,
             show_axes,
+            tidy_on_save,
             snap_enabled: snap.enabled,
             move_step: snap.move_step,
             rotate_step_deg: snap.rotate_step_deg,
@@ -268,6 +271,7 @@ impl SettingsDraft {
         match field {
             SettingField::ShowGrid => self.show_grid,
             SettingField::ShowAxes => self.show_axes,
+            SettingField::TidyOnSave => self.tidy_on_save,
             SettingField::SnapEnabled => self.snap_enabled,
             _ => false,
         }
@@ -278,6 +282,7 @@ impl SettingsDraft {
         match field {
             SettingField::ShowGrid => self.show_grid = on,
             SettingField::ShowAxes => self.show_axes = on,
+            SettingField::TidyOnSave => self.tidy_on_save = on,
             SettingField::SnapEnabled => self.snap_enabled = on,
             _ => {}
         }
@@ -378,7 +383,7 @@ mod tests {
             rotate_step_deg: 15.0,
             scale_step: 0.1,
         };
-        let mut draft = SettingsDraft::new(true, false, snap);
+        let mut draft = SettingsDraft::new(true, false, true, snap);
         assert!(draft.checked(SettingField::ShowGrid));
         assert!(!draft.checked(SettingField::ShowAxes));
         assert_eq!(draft.number(SettingField::MoveStep), Some(16.0));

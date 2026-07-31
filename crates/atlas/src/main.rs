@@ -413,6 +413,8 @@ struct State {
     /// Viewport view toggles (from the toolbar; persisted in global settings).
     show_grid: bool,
     show_axes: bool,
+    /// Strip trailing whitespace and fix the final newline when saving a script.
+    tidy_on_save: bool,
     /// Transform snapping (on/off + increments); persisted in global settings.
     /// Ctrl held during a drag inverts the on/off state for that drag.
     snap: settings::SnapSettings,
@@ -685,6 +687,165 @@ fn completion_colors(
         // An identifier is plain in the editor, and its note is its type.
         K::Variable | K::Field => (None, Some(theme.code_type)),
     }
+}
+
+/// Which way [`State::change_case`] is going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Case {
+    Upper,
+    Lower,
+    Title,
+}
+
+impl Case {
+    fn apply(self, text: &str) -> String {
+        match self {
+            Case::Upper => text.to_uppercase(),
+            Case::Lower => text.to_lowercase(),
+            // Title case runs over words, and `_` separates them as much as a
+            // space does in code.
+            Case::Title => {
+                let mut out = String::with_capacity(text.len());
+                let mut fresh = true;
+                for ch in text.chars() {
+                    if fresh {
+                        out.extend(ch.to_uppercase());
+                    } else {
+                        out.extend(ch.to_lowercase());
+                    }
+                    fresh = !ch.is_alphanumeric();
+                }
+                out
+            }
+        }
+    }
+}
+
+/// Collapse `block` onto one line: trailing whitespace goes, the next line's
+/// indent goes, and the two are joined by a single space - or by nothing when
+/// one side is empty, so a blank line does not become a stray space.
+fn join_block(block: &str) -> String {
+    let mut out = String::with_capacity(block.len());
+    for line in block.split('\n') {
+        let piece = line.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(piece);
+    }
+    // The first line keeps its indentation: joining is about the seam, not
+    // about moving the block to the margin.
+    let indent: String = block
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    format!("{indent}{out}")
+}
+
+/// The swap ctrl+t should make at `caret`: the range to replace and what to put
+/// there, or `None` when there is nothing to swap.
+///
+/// Characters, not bytes, so a multi-byte character is never split in half.
+fn transposition(text: &str, caret: usize) -> Option<(std::ops::Range<usize>, String)> {
+    let caret = caret.min(text.len());
+    if !text.is_char_boundary(caret) {
+        return None;
+    }
+    let line_start = text[..caret].rfind('\n').map_or(0, |at| at + 1);
+    let line_end = text[caret..].find('\n').map_or(text.len(), |at| caret + at);
+    let before = text[line_start..caret].chars().next_back()?;
+    // At the end of a line there is nothing after the caret to swap with, so
+    // take the two behind it - which is where the typo you just spotted is.
+    let after = text[caret..line_end].chars().next();
+    match after {
+        Some(after) => {
+            let start = caret - before.len_utf8();
+            let end = caret + after.len_utf8();
+            Some((start..end, format!("{after}{before}")))
+        }
+        None => {
+            let earlier = text[line_start..caret - before.len_utf8()]
+                .chars()
+                .next_back()?;
+            let start = caret - before.len_utf8() - earlier.len_utf8();
+            Some((start..caret, format!("{before}{earlier}")))
+        }
+    }
+}
+
+/// The word the caret is in or next to: where it starts, and its text.
+///
+/// Unlike [`word_before`], this reaches forward as well, so the caret sitting at
+/// the start of a name still finds that name.
+fn word_before_or_around(text: &str, caret: usize) -> (usize, &str) {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let caret = caret.min(text.len());
+    if !text.is_char_boundary(caret) {
+        return (caret, "");
+    }
+    let start = text[..caret]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_word(*c))
+        .last()
+        .map_or(caret, |(i, _)| i);
+    let end = text[caret..]
+        .char_indices()
+        .take_while(|(_, c)| is_word(*c))
+        .last()
+        .map_or(caret, |(i, c)| caret + i + c.len_utf8());
+    (start, &text[start..end])
+}
+
+/// Strip trailing spaces and tabs from every line, and end the text with
+/// exactly one newline. Returns the result and where `caret` ended up.
+///
+/// The caret's own line is spared when it holds nothing but whitespace: that is
+/// a fresh auto-indent being typed into, and yanking it away on save would move
+/// the caret to the margin under someone's hands.
+///
+/// The caret is kept on the same character. It has to be: the tidy runs through
+/// the buffer, so the widget is rewritten under a caret that is still live.
+fn tidy_for_save(text: &str, caret: usize) -> (String, usize) {
+    let caret = caret.min(text.len());
+    let mut out = String::with_capacity(text.len());
+    let mut removed_before_caret = 0usize;
+    let mut at = 0usize;
+    for line in text.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let blank = !body.is_empty() && body.bytes().all(|b| b == b' ' || b == b'\t');
+        let caret_here = caret >= at && caret <= at + body.len();
+        let trimmed = if caret_here && blank {
+            body
+        } else {
+            body.trim_end_matches([' ', '\t'])
+        };
+        let cut_from = at + trimmed.len();
+        if caret >= at + body.len() {
+            removed_before_caret += body.len() - trimmed.len();
+        } else if caret > cut_from {
+            removed_before_caret += caret - cut_from;
+        }
+        out.push_str(trimmed);
+        if line.len() != body.len() {
+            out.push('\n');
+        }
+        at += line.len();
+    }
+    // One trailing newline, not none and not four. Files this editor writes get
+    // diffed and concatenated, and a missing final newline is a spurious
+    // one-line diff forever.
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    let caret = caret.saturating_sub(removed_before_caret).min(out.len());
+    (out, caret)
 }
 
 /// Where ctrl+up / ctrl+down should put the caret, or `None` when there is no
@@ -1127,6 +1288,7 @@ impl State {
             gizmo_mode,
             show_grid: settings.show_grid,
             show_axes: settings.show_axes,
+            tidy_on_save: settings.tidy_on_save,
             snap: settings.snap,
             clipboard: arboard::Clipboard::new()
                 .inspect_err(|err| tracing::warn!("no clipboard available: {err}"))
@@ -1761,7 +1923,8 @@ impl State {
 
     /// Open the settings overlay, seeded from the current view toggles and snap.
     fn open_settings_modal(&mut self) {
-        let draft = modal::SettingsDraft::new(self.show_grid, self.show_axes, self.snap);
+        let draft =
+            modal::SettingsDraft::new(self.show_grid, self.show_axes, self.tidy_on_save, self.snap);
         self.open_modal(modal::Modal::settings(draft));
     }
 
@@ -1896,6 +2059,7 @@ impl State {
         }
         self.show_grid = draft.show_grid;
         self.show_axes = draft.show_axes;
+        self.tidy_on_save = draft.tidy_on_save;
         self.snap = draft.snap();
         self.persist_view_prefs();
         self.close_modal();
@@ -2795,8 +2959,9 @@ impl State {
             return false;
         };
         // With the code editor focused, ctrl+s saves the script rather than the
-        // scene: it is the file you are looking at.
-        if c.eq_ignore_ascii_case("s") {
+        // scene: it is the file you are looking at. Only without shift, which
+        // sorts the selected lines below.
+        if c.eq_ignore_ascii_case("s") && !self.modifiers.shift_key() {
             if self.ui.focused() == self.rows.code_editor && self.open_script.is_some() {
                 self.save_script();
             } else {
@@ -2840,6 +3005,38 @@ impl State {
             }
             if c.eq_ignore_ascii_case("k") {
                 self.delete_lines();
+                return true;
+            }
+            // ctrl+shift+j joins lines, the inverse of Enter. ctrl+j alone is
+            // left free: it is a newline on some terminals and the surprise
+            // would be expensive.
+            if c.eq_ignore_ascii_case("j") && self.modifiers.shift_key() {
+                self.join_lines();
+                return true;
+            }
+            if c.eq_ignore_ascii_case("t") {
+                self.transpose_chars();
+                return true;
+            }
+            // ctrl+shift+u upper, ctrl+shift+l lower, ctrl+shift+y title. The
+            // result stays selected so the three can be tried in sequence,
+            // which is how this actually gets used. Plain ctrl+y is still redo:
+            // this arm requires shift.
+            if self.modifiers.shift_key()
+                && let Some(case) = match c.to_ascii_lowercase().as_str() {
+                    "u" => Some(Case::Upper),
+                    "l" => Some(Case::Lower),
+                    "y" => Some(Case::Title),
+                    _ => None,
+                }
+            {
+                self.change_case(case);
+                return true;
+            }
+            // ctrl+shift+s sorts the selected lines; with alt, dropping
+            // duplicates. Plain ctrl+s is save and is handled far above.
+            if c.eq_ignore_ascii_case("s") && self.modifiers.shift_key() {
+                self.sort_lines(self.modifiers.alt_key());
                 return true;
             }
             if c.eq_ignore_ascii_case("g") {
@@ -3292,6 +3489,7 @@ impl State {
             theme: self.theme_doc.clone(),
             show_grid: self.show_grid,
             show_axes: self.show_axes,
+            tidy_on_save: self.tidy_on_save,
             snap: self.snap,
         };
         if let Err(err) = settings::save(&settings) {
@@ -3577,6 +3775,9 @@ impl State {
         let Some(relative) = self.open_script.clone() else {
             return;
         };
+        if self.tidy_on_save {
+            self.tidy_script();
+        }
         let path = self.project_dir.join(&relative);
         let body = self.script_encoding.encode(&self.script_text);
         match write_atomic(&path, body.as_bytes()) {
@@ -3586,6 +3787,27 @@ impl State {
             }
             Err(err) => self.open_modal(modal::Modal::error("Cannot save script", &err)),
         }
+    }
+
+    /// Strip trailing whitespace and fix the file's ending, in the buffer.
+    ///
+    /// Through the widget as well as the mirror: writing only to disk would
+    /// leave the two disagreeing, and the modified mark would come straight
+    /// back on the next sync.
+    fn tidy_script(&mut self) {
+        let (tidied, caret) = tidy_for_save(&self.script_text, self.editor_caret());
+        if tidied == self.script_text {
+            return;
+        }
+        self.script_text = tidied;
+        if let Some(editor) = self.rows.code_editor {
+            self.ui.set_text_input(editor, self.script_text.clone());
+            if self.ui.focused() == Some(editor) {
+                self.ui.focus_caret(editor, caret);
+            }
+        }
+        self.script_caret = caret;
+        self.analyze_script();
     }
 
     /// Select every entry in the current folder (explorer ctrl+a).
@@ -4123,6 +4345,108 @@ impl State {
         let (range, block) = self.ui.selected_lines(editor);
         self.ui
             .replace_lines(editor, range, &format!("{block}\n{block}"));
+        self.sync_script_buffer();
+        self.dirty = true;
+    }
+
+    /// Join the lines the selection touches into one, the inverse of Enter.
+    ///
+    /// The trailing whitespace of each line goes and the next line's indent goes
+    /// with it, so joining an indented block does not leave a trail of double
+    /// spaces. A line that would join onto nothing - the next one is blank -
+    /// just loses its newline rather than gaining a space before nothing.
+    fn join_lines(&mut self) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let (range, block) = self.ui.selected_lines(editor);
+        // One line selected means "join the one below onto this one", so the
+        // block has to reach a line further than the selection does.
+        let end = self.script_text[range.end..]
+            .find('\n')
+            .map(|at| range.end + 1 + at)
+            .unwrap_or(self.script_text.len());
+        let block = if block.contains('\n') {
+            block
+        } else {
+            self.script_text[range.start..end].to_string()
+        };
+        let joined = join_block(&block);
+        let range = range.start..range.start + block.len();
+        self.ui.replace_lines(editor, range.clone(), &joined);
+        // Selecting the result would be wrong here: after a join you want to
+        // carry on typing at the seam, not replace what you just joined.
+        let at = range.start + joined.len();
+        let len = self.ui.text_of(editor).map_or(at, str::len);
+        self.ui.focus_caret(editor, at.min(len));
+        self.sync_script_buffer();
+        self.dirty = true;
+    }
+
+    /// Swap the characters either side of the caret, the standard fix for the
+    /// commonest typo. At the end of a line it swaps the two before the caret,
+    /// which is where the typo you just noticed actually is.
+    fn transpose_chars(&mut self) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let caret = self.editor_caret();
+        let Some((range, swapped)) = transposition(&self.script_text, caret) else {
+            return;
+        };
+        let end = range.start + swapped.len();
+        self.ui.replace_range(editor, range, &swapped);
+        self.ui.focus_caret(editor, end);
+        self.sync_script_buffer();
+        self.dirty = true;
+    }
+
+    /// Recase the selection, or the word under the caret when there is none.
+    ///
+    /// The result stays selected so the three cases can be tried in sequence -
+    /// which is how you actually use this, rather than getting it right first
+    /// time.
+    fn change_case(&mut self, case: Case) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let range = match self.ui.selection_range() {
+            Some(range) => range,
+            None => {
+                let caret = self.editor_caret();
+                let (start, word) = word_before_or_around(&self.script_text, caret);
+                if word.is_empty() {
+                    return;
+                }
+                start..start + word.len()
+            }
+        };
+        let recased = case.apply(&self.script_text[range.clone()]);
+        // to_uppercase can change the byte length, so the new end comes from the
+        // replacement rather than from the range that was replaced.
+        let start = range.start;
+        self.ui.replace_range(editor, range, &recased);
+        self.ui
+            .focus_selection(editor, start, start + recased.len());
+        self.sync_script_buffer();
+        self.dirty = true;
+    }
+
+    /// Sort the lines the selection touches, optionally dropping duplicates.
+    fn sort_lines(&mut self, dedup: bool) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let (range, block) = self.ui.selected_lines(editor);
+        let mut lines: Vec<&str> = block.split('\n').collect();
+        if lines.len() < 2 {
+            return;
+        }
+        lines.sort();
+        if dedup {
+            lines.dedup();
+        }
+        self.ui.replace_lines(editor, range, &lines.join("\n"));
         self.sync_script_buffer();
         self.dirty = true;
     }
@@ -4666,10 +4990,31 @@ impl State {
             return;
         };
         let range = range.clone();
+        // A function completion brings its call parens, with the caret between
+        // them: every one of them is followed within a keystroke by `(`. The
+        // kind comes from asking the service rather than from state kept beside
+        // the popup, which is one fewer thing that can drift - and it costs one
+        // pipeline run per acceptance, not per keystroke.
+        let is_call = comet::service::completions_at(&self.script_text, range.start)
+            .iter()
+            .find(|item| item.label == label)
+            .is_some_and(|item| item.kind == comet::service::CompletionKind::Function);
+        // Unless there is already one there, in which case adding another is
+        // how you end up with `print(())`.
+        let has_parens = self.script_text[range.end..].trim_start().starts_with('(');
+        let insertion = if is_call && !has_parens {
+            format!("{label}()")
+        } else {
+            label.to_string()
+        };
         // select_range re-focuses the editor, which a click on a row had taken
         // focus away from.
         self.ui.select_range(editor, range.start, range.end);
-        self.ui.insert_str(label);
+        self.ui.insert_str(&insertion);
+        if is_call && !has_parens {
+            self.ui
+                .focus_caret(editor, range.start + insertion.len() - 1);
+        }
         self.completions = None;
         self.sync_script_buffer();
         self.dirty = true;
@@ -6027,8 +6372,9 @@ fn translate_key(event: &winit::event::KeyEvent, ctrl: bool, shift: bool) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        TextEncoding, coalesces, completion_anchor, narrowest_at, step_symbol_target,
-        toggle_comment_block, word_before, write_atomic,
+        Case, TextEncoding, coalesces, completion_anchor, join_block, narrowest_at,
+        step_symbol_target, tidy_for_save, toggle_comment_block, transposition, word_before,
+        word_before_or_around, write_atomic,
     };
     use comet::{Diagnostic, Span};
 
@@ -6211,5 +6557,111 @@ mod tests {
             Some(at("update"))
         );
         assert_eq!(step_symbol_target(&symbols, 0, false), None);
+    }
+
+    #[test]
+    fn saving_strips_trailing_whitespace_and_fixes_the_file_ending() {
+        // Four trailing newlines collapse to the one that terminates the last
+        // line - no blank line after it.
+        let (out, _) = tidy_for_save("let a = 1.0;   \nlet b = 2.0;\t\n\n\n\n", 0);
+        assert_eq!(out, "let a = 1.0;\nlet b = 2.0;\n");
+
+        // A file with no final newline gets exactly one.
+        let (out, _) = tidy_for_save("func f() { }", 0);
+        assert_eq!(out, "func f() { }\n");
+
+        // An empty buffer stays empty rather than becoming a blank line.
+        let (out, _) = tidy_for_save("", 0);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn tidying_leaves_the_caret_on_the_same_character() {
+        // Caret on the `2` of the second line, after a line that loses three
+        // trailing spaces.
+        let text = "let a = 1.0;   \nlet b = 2.0;\n";
+        let caret = text.find("2.0").expect("in the fixture");
+        let (out, moved) = tidy_for_save(text, caret);
+        assert_eq!(&out[moved..moved + 3], "2.0");
+
+        // A caret standing inside a run that gets trimmed lands at the trim.
+        let (out, moved) = tidy_for_save("let a = 1.0;   \n", 14);
+        assert_eq!(moved, out.find('\n').expect("a newline"));
+    }
+
+    #[test]
+    fn a_fresh_auto_indent_under_the_caret_is_not_yanked_away() {
+        // Pressing Enter inside a block leaves the caret on a line of nothing
+        // but spaces. Saving there must not pull it back to the margin.
+        let text = "func f() {\n    \n}\n";
+        let caret = text.find("\n}").expect("in the fixture");
+        let (out, moved) = tidy_for_save(text, caret);
+        assert_eq!(out, text, "the caret's own blank line is left alone");
+        assert_eq!(moved, caret);
+
+        // With the caret elsewhere, the same line is stripped.
+        let (out, _) = tidy_for_save(text, 0);
+        assert_eq!(out, "func f() {\n\n}\n");
+    }
+
+    #[test]
+    fn joining_lines_collapses_the_indent_rather_than_leaving_double_spaces() {
+        assert_eq!(
+            join_block("    let x =\n        compute(a);"),
+            "    let x = compute(a);"
+        );
+        // The first line keeps its own indentation: a join is about the seam,
+        // not about moving the block to the margin.
+        assert_eq!(join_block("        a\n        b"), "        a b");
+        // A blank line contributes nothing, rather than a stray space.
+        assert_eq!(join_block("a\n\nb"), "a b");
+        assert_eq!(join_block("a\n"), "a");
+    }
+
+    #[test]
+    fn transpose_swaps_across_the_caret_and_behind_it_at_a_line_end() {
+        // "teh|" -> the two before the caret, because there is nothing after.
+        let (range, text) = transposition("teh", 3).expect("something to swap");
+        assert_eq!((range, text.as_str()), (1..3, "he"));
+
+        // Mid-line, it swaps across the caret.
+        let (range, text) = transposition("abcd", 2).expect("something to swap");
+        assert_eq!((range, text.as_str()), (1..3, "cb"));
+
+        // At the very start of a line there is nothing behind it.
+        assert!(transposition("abc", 0).is_none());
+        assert!(transposition("ab\ncd", 3).is_none());
+    }
+
+    #[test]
+    fn transpose_moves_whole_characters_not_bytes() {
+        // Splitting a multi-byte character in half would panic on the slice.
+        // Written as an escape so this file stays ASCII: \u{fc} is a two-byte
+        // `u` with an umlaut, the character that crashed the lexer once.
+        let (range, text) = transposition("a\u{fc}", 3).expect("something to swap");
+        assert_eq!(text, "\u{fc}a");
+        assert_eq!(range, 0..3);
+    }
+
+    #[test]
+    fn changing_case_covers_the_three_and_title_case_treats_underscore_as_a_break() {
+        assert_eq!(Case::Upper.apply("max_speed"), "MAX_SPEED");
+        assert_eq!(Case::Lower.apply("MAX_SPEED"), "max_speed");
+        assert_eq!(Case::Title.apply("max_speed limit"), "Max_Speed Limit");
+    }
+
+    #[test]
+    fn the_word_for_a_recase_reaches_forward_as_well_as_back() {
+        let text = "let speed = 1.0;";
+        let at = text.find("speed").expect("in the fixture");
+        // At the start of the word, which word_before alone would miss.
+        assert_eq!(word_before_or_around(text, at), (at, "speed"));
+        // And in the middle of it.
+        assert_eq!(word_before_or_around(text, at + 2), (at, "speed"));
+        // Just after a word still finds it - that is where the caret is when
+        // you finish typing a name and reach for a recase.
+        assert_eq!(word_before_or_around(text, 3), (0, "let"));
+        // Surrounded by whitespace, there is no word.
+        assert_eq!(word_before_or_around("a  b", 2).1, "");
     }
 }

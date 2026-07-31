@@ -862,7 +862,7 @@ what makes typing a block feel finished rather than half-done.
   Note: Store per open buffer, not globally, so it does not leak into the next
   file.
 
-- **Trailing whitespace is stripped on save, and on demand** (S, atlas)
+- ~~**Trailing whitespace is stripped on save**~~ DONE (on save only, no on-demand command yet) (S, atlas)
   An opt-in setting (default on) removes trailing spaces and tabs from every
   line on write, skipping the caret's own line when it is currently
   whitespace-only so a fresh auto-indent is not yanked away. A command does
@@ -876,7 +876,7 @@ what makes typing a block feel finished rather than half-done.
   or the buffer and the file disagree and the modified flag comes straight
   back.
 
-- **A final newline is ensured on save** (S, atlas)
+- ~~**A final newline is ensured on save**~~ DONE (S, atlas)
   An opt-in setting (default on) appends a single '\n' when the buffer does
   not end in one and collapses two or more trailing blank lines to one. The
   caret does not move.
@@ -1155,7 +1155,7 @@ group carries more weight here than in a typical editor.
   has no line primitive. Shape the API like set_decorations rather than
   inferring more state inside aurora.
 
-- **Accepting a function completion brings its call parens** (S, atlas)
+- ~~**Accepting a function completion brings its call parens**~~ DONE (S, atlas)
   Accepting a completion whose kind is Function inserts `name()` with the
   caret between the parens. Variable, field, type and keyword completions
   insert their label unchanged.
@@ -1233,7 +1233,7 @@ if-ladder.
   Home, shift+Down, Delete is three keys and gets the trailing newline wrong
   half the time.
 
-- **Join lines (ctrl+shift+j)** (S, atlas)
+- ~~**Join lines (ctrl+shift+j)**~~ DONE (S, atlas)
   Replace the newline at the end of the caret's line with a single space,
   collapsing the next line's leading indentation, caret at the join. With a
   selection spanning N lines, join all of them. If the next line is empty,
@@ -1269,7 +1269,7 @@ if-ladder.
   and the highlighter colours it as code. Until then the honest fallback is to
   comment each line with // and say so.
 
-- **Transpose characters (ctrl+t)** (S, atlas)
+- ~~**Transpose characters (ctrl+t)**~~ DONE (S, atlas)
   Swap the character before the caret with the one after and advance one
   character. At end of line, swap the two before the caret. At line start, a
   no-op. Operates on chars, not bytes.
@@ -1278,7 +1278,7 @@ if-ladder.
   Note: Use prev_boundary/next_boundary or char_indices so a multi-byte
   character is never split.
 
-- **Change the case of the selection (upper / lower / title)** (S, atlas)
+- ~~**Change the case of the selection (upper / lower / title)**~~ DONE (S, atlas)
   ctrl+shift+u uppercases the selection, ctrl+shift+l lowercases, a third
   binding title-cases (first letter of each word up, rest down). With no
   selection, act on the word under the caret. The selection survives so the
@@ -1289,7 +1289,7 @@ if-ladder.
   end from the replacement's length - the same trap find.rs's case-folded
   search documents.
 
-- **Sort selected lines, and drop duplicates** (S, atlas)
+- ~~**Sort selected lines, and drop duplicates**~~ DONE (S, atlas)
   Sort the touched lines in place, ascending by byte order, stably, keeping
   each line's indentation; a second binding reverses and another removes
   adjacent duplicates. The selection still covers the same lines. Fewer than
