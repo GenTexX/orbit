@@ -288,6 +288,7 @@ impl Checker {
                             ast::AssignOp::Sub => BinaryOp::SubF32,
                             ast::AssignOp::Mul => BinaryOp::MulF32,
                             ast::AssignOp::Div => BinaryOp::DivF32,
+                            ast::AssignOp::Rem => BinaryOp::RemF32,
                             ast::AssignOp::Set => unreachable!("handled above"),
                         };
                         self.expect_type(Type::F32, target_ty, target.span());
@@ -556,14 +557,42 @@ impl Checker {
     ) -> (TypedExprKind, Type) {
         let args: Vec<TypedExpr> = args.iter().map(|a| self.expr(a)).collect();
 
-        if let Some(host) = host_fn(callee) {
-            let (params, ret) = host_signature(host);
+        if let Some((builtin, params, ret)) = builtin(callee) {
             self.check_args(callee, &args, params, span);
             let ok = args.len() == params.len() && args.iter().zip(params).all(|(a, p)| a.ty == *p);
-            return if ok {
-                (TypedExprKind::HostCall { host, args }, ret)
-            } else {
-                (TypedExprKind::Error, Type::Error)
+            if !ok {
+                return (TypedExprKind::Error, Type::Error);
+            }
+            let mut args = args.into_iter();
+            return match builtin {
+                Builtin::Host(host) => (
+                    TypedExprKind::HostCall {
+                        host,
+                        args: args.collect(),
+                    },
+                    ret,
+                ),
+                // One WebAssembly instruction, so it lowers inline rather than
+                // costing a call out of the module.
+                Builtin::Unary(op) => (
+                    TypedExprKind::Unary {
+                        op,
+                        operand: Box::new(args.next().expect("arity checked")),
+                    },
+                    ret,
+                ),
+                Builtin::Binary(op) => {
+                    let lhs = args.next().expect("arity checked");
+                    let rhs = args.next().expect("arity checked");
+                    (
+                        TypedExprKind::Binary {
+                            op,
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        },
+                        ret,
+                    )
+                }
             };
         }
 
@@ -617,7 +646,7 @@ impl Checker {
         }
 
         let (typed_op, result) = match op {
-            B::Add | B::Sub | B::Mul | B::Div => {
+            B::Add | B::Sub | B::Mul | B::Div | B::Rem => {
                 self.expect_type(Type::F32, lhs.ty, lhs.span);
                 self.expect_type(Type::F32, rhs.ty, rhs.span);
                 if lhs.ty != Type::F32 || rhs.ty != Type::F32 {
@@ -628,6 +657,7 @@ impl Checker {
                     B::Sub => BinaryOp::SubF32,
                     B::Mul => BinaryOp::MulF32,
                     B::Div => BinaryOp::DivF32,
+                    B::Rem => BinaryOp::RemF32,
                     _ => unreachable!("matched on the arithmetic operators"),
                 };
                 (op, Type::F32)
@@ -721,15 +751,39 @@ fn axis(field: &str) -> Option<Axis> {
     }
 }
 
-fn host_fn(name: &str) -> Option<Host> {
-    match name {
-        "print" => Some(Host::Print),
-        _ => None,
-    }
+/// What a builtin call lowers to once its arguments have checked.
+#[derive(Debug, Clone, Copy)]
+enum Builtin {
+    Host(Host),
+    Unary(UnaryOp),
+    Binary(BinaryOp),
+}
+
+/// The functions the engine provides, with their signatures.
+///
+/// Most of the maths is one WebAssembly instruction, so it lowers inline and
+/// never leaves the module; only the transcendentals, which wasm has no opcodes
+/// for, cost a host call.
+fn builtin(name: &str) -> Option<(Builtin, &'static [Type], Type)> {
+    use Type::{F32, Str, Unit};
+    Some(match name {
+        "print" => (Builtin::Host(Host::Print), &[Str], Unit),
+        "abs" => (Builtin::Unary(UnaryOp::Abs), &[F32], F32),
+        "sqrt" => (Builtin::Unary(UnaryOp::Sqrt), &[F32], F32),
+        "floor" => (Builtin::Unary(UnaryOp::Floor), &[F32], F32),
+        "ceil" => (Builtin::Unary(UnaryOp::Ceil), &[F32], F32),
+        "min" => (Builtin::Binary(BinaryOp::MinF32), &[F32, F32], F32),
+        "max" => (Builtin::Binary(BinaryOp::MaxF32), &[F32, F32], F32),
+        "sin" => (Builtin::Host(Host::Sin), &[F32], F32),
+        "cos" => (Builtin::Host(Host::Cos), &[F32], F32),
+        "atan2" => (Builtin::Host(Host::Atan2), &[F32, F32], F32),
+        "pow" => (Builtin::Host(Host::Pow), &[F32, F32], F32),
+        _ => return None,
+    })
 }
 
 fn is_host_name(name: &str) -> bool {
-    host_fn(name).is_some()
+    builtin(name).is_some()
 }
 
 /// Names the compiled module already uses for something. Every script function
@@ -739,12 +793,6 @@ fn is_host_name(name: &str) -> bool {
 /// span, which is the only form of it a person can act on.
 fn is_reserved_name(name: &str) -> bool {
     name.starts_with("comet_") || name == "memory"
-}
-
-fn host_signature(host: Host) -> (&'static [Type], Type) {
-    match host {
-        Host::Print => (&[Type::Str], Type::Unit),
-    }
 }
 
 /// Whether every path through this block ends in a `return`. Used only to report

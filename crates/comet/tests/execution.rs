@@ -65,6 +65,20 @@ impl Script {
             })
             .expect("host binding");
         linker
+            .func_wrap(host, "sin", |_: Caller<'_, Host>, x: f32| x.sin())
+            .expect("host binding");
+        linker
+            .func_wrap(host, "cos", |_: Caller<'_, Host>, x: f32| x.cos())
+            .expect("host binding");
+        linker
+            .func_wrap(host, "atan2", |_: Caller<'_, Host>, y: f32, x: f32| {
+                y.atan2(x)
+            })
+            .expect("host binding");
+        linker
+            .func_wrap(host, "pow", |_: Caller<'_, Host>, a: f32, b: f32| a.powf(b))
+            .expect("host binding");
+        linker
             .func_wrap(
                 host,
                 "print",
@@ -280,6 +294,68 @@ const OPERATORS: &str = "
     func eq(a: f32, b: f32) -> bool { a == b }
     func ne(a: f32, b: f32) -> bool { a != b }
 ";
+
+#[test]
+fn the_maths_builtins_compute_what_they_say() {
+    // Most of these are one WebAssembly instruction, so this is really asking
+    // whether the right opcode was chosen - which structure cannot tell.
+    let mut script = Script::new(
+        "
+        func f_abs(a: f32) -> f32 { abs(a) }
+        func f_sqrt(a: f32) -> f32 { sqrt(a) }
+        func f_floor(a: f32) -> f32 { floor(a) }
+        func f_ceil(a: f32) -> f32 { ceil(a) }
+        func f_min(a: f32, b: f32) -> f32 { min(a, b) }
+        func f_max(a: f32, b: f32) -> f32 { max(a, b) }
+        func f_rem(a: f32, b: f32) -> f32 { a % b }
+        func f_pow(a: f32, b: f32) -> f32 { pow(a, b) }
+        func f_sin(a: f32) -> f32 { sin(a) }
+        func f_cos(a: f32) -> f32 { cos(a) }
+        ",
+    );
+    assert_eq!(script.call::<f32, f32>("f_abs", -3.5), 3.5);
+    assert_eq!(script.call::<f32, f32>("f_sqrt", 9.0), 3.0);
+    assert_eq!(script.call::<f32, f32>("f_floor", 2.7), 2.0);
+    assert_eq!(script.call::<f32, f32>("f_ceil", 2.1), 3.0);
+    // Asymmetric arguments, so min and max cannot be swapped unnoticed.
+    assert_eq!(script.call::<(f32, f32), f32>("f_min", (2.0, 7.0)), 2.0);
+    assert_eq!(script.call::<(f32, f32), f32>("f_max", (2.0, 7.0)), 7.0);
+    assert_eq!(script.call::<(f32, f32), f32>("f_pow", (2.0, 10.0)), 1024.0);
+
+    // Remainder has no instruction - it is emitted as a - trunc(a / b) * b - and
+    // takes the sign of the left operand, like Rust's `%`.
+    assert_eq!(script.call::<(f32, f32), f32>("f_rem", (7.0, 3.0)), 1.0);
+    assert_eq!(script.call::<(f32, f32), f32>("f_rem", (-7.0, 3.0)), -1.0);
+    assert_eq!(script.call::<(f32, f32), f32>("f_rem", (7.5, 2.0)), 1.5);
+
+    let half_pi = std::f32::consts::FRAC_PI_2;
+    assert!((script.call::<f32, f32>("f_sin", half_pi) - 1.0).abs() < 1e-6);
+    assert!(script.call::<f32, f32>("f_cos", 0.0) == 1.0);
+}
+
+#[test]
+fn an_operand_of_a_remainder_is_evaluated_once() {
+    // Both operands are needed twice by the formula, so a naive emission
+    // evaluates them twice - and an operand can be a call.
+    let mut script = Script::new(
+        "
+        let calls = 0.0;
+        func counted(v: f32) -> f32 {
+            calls += 1.0;
+            v
+        }
+        func how_many() -> f32 { calls }
+        func update(dt: f32) { pos.x = counted(7.0) % counted(3.0); }
+        ",
+    );
+    script.update(0.0);
+    assert_eq!(script.position().0, 1.0);
+    assert_eq!(
+        script.call::<(), f32>("how_many", ()),
+        2.0,
+        "once per operand, not twice"
+    );
+}
 
 #[test]
 fn arithmetic_keeps_its_operands_in_order() {

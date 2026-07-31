@@ -209,6 +209,13 @@ pub enum TypedExprKind {
 pub enum Host {
     /// `print(String)` - the debug output call.
     Print,
+    /// The transcendentals, which WebAssembly has no instructions for. Everything
+    /// else - abs, sqrt, floor, ceil, min, max - is one opcode and never leaves
+    /// the module.
+    Sin,
+    Cos,
+    Atan2,
+    Pow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +224,11 @@ pub enum UnaryOp {
     Neg,
     /// Invert a bool.
     Not,
+    /// The f32 instructions that happen to be unary.
+    Abs,
+    Sqrt,
+    Floor,
+    Ceil,
 }
 
 /// A binary operation with its operand types already settled - `AddF32` rather
@@ -227,6 +239,12 @@ pub enum BinaryOp {
     SubF32,
     MulF32,
     DivF32,
+    /// Remainder. WebAssembly has no f32 rem, so codegen emits
+    /// `a - trunc(a / b) * b`.
+    RemF32,
+    /// The f32 instructions that happen to be binary: min and max.
+    MinF32,
+    MaxF32,
     /// Equality on f32 or bool; the operand type decides the instruction.
     Eq(Type),
     NotEq(Type),

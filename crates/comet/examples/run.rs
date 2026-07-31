@@ -190,6 +190,20 @@ impl Runner {
             })
             .expect("host binding");
         linker
+            .func_wrap(host, "sin", |_: Caller<'_, Host>, x: f32| x.sin())
+            .expect("host binding");
+        linker
+            .func_wrap(host, "cos", |_: Caller<'_, Host>, x: f32| x.cos())
+            .expect("host binding");
+        linker
+            .func_wrap(host, "atan2", |_: Caller<'_, Host>, y: f32, x: f32| {
+                y.atan2(x)
+            })
+            .expect("host binding");
+        linker
+            .func_wrap(host, "pow", |_: Caller<'_, Host>, a: f32, b: f32| a.powf(b))
+            .expect("host binding");
+        linker
             .func_wrap(
                 host,
                 "print",

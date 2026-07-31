@@ -5,7 +5,7 @@ let direction = 1.0;
 func update(dt: f32) {
     
     print("Hello Comet!");
-
+    
     pos.x += speed * direction * dt;
 
     if pos.x > 200.0 {

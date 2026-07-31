@@ -325,6 +325,26 @@ fn bind_host(linker: &mut Linker<ScriptState>) -> Result<(), ScriptError> {
             },
         )
         .map_err(ScriptError::runtime)?;
+    // The transcendentals. Everything else comet needs from maths is one
+    // WebAssembly instruction and never leaves the module.
+    linker
+        .func_wrap(host, "sin", |_: Caller<'_, ScriptState>, x: f32| x.sin())
+        .map_err(ScriptError::runtime)?;
+    linker
+        .func_wrap(host, "cos", |_: Caller<'_, ScriptState>, x: f32| x.cos())
+        .map_err(ScriptError::runtime)?;
+    linker
+        .func_wrap(
+            host,
+            "atan2",
+            |_: Caller<'_, ScriptState>, y: f32, x: f32| y.atan2(x),
+        )
+        .map_err(ScriptError::runtime)?;
+    linker
+        .func_wrap(host, "pow", |_: Caller<'_, ScriptState>, a: f32, b: f32| {
+            a.powf(b)
+        })
+        .map_err(ScriptError::runtime)?;
     linker
         .func_wrap(
             host,

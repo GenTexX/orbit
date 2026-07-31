@@ -123,6 +123,7 @@ pub enum AssignOp {
     Sub,
     Mul,
     Div,
+    Rem,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -205,6 +206,7 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    Rem,
     Eq,
     NotEq,
     Lt,

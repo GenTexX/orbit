@@ -34,6 +34,7 @@ pub enum TokenKind {
     Minus,
     Star,
     Slash,
+    Percent,
 
     Eq,
     EqEq,
@@ -50,6 +51,7 @@ pub enum TokenKind {
     MinusEq,
     StarEq,
     SlashEq,
+    PercentEq,
 
     /// A `//` line comment, including the slashes. Only [`lex_with_comments`]
     /// reports these - [`lex`] drops them, because nothing downstream of the
@@ -113,6 +115,7 @@ impl<'src> Lexer<'src> {
             match c {
                 b' ' | b'\t' | b'\r' | b'\n' => self.pos += 1,
                 b'/' if self.peek_at(1) == Some(b'/') => self.lex_line_comment(start),
+                b'/' if self.peek_at(1) == Some(b'*') => self.lex_block_comment(start),
                 b'"' => self.lex_string(start),
                 b'0'..=b'9' => self.lex_number(start),
                 b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_ident_or_keyword(start),
@@ -136,6 +139,30 @@ impl<'src> Lexer<'src> {
             kind,
             span: Span::new(start as u32, end as u32),
         });
+    }
+
+    /// A `/* ... */` comment. Unterminated is reported rather than swallowing
+    /// the rest of the file in silence - while typing, the opening two
+    /// characters exist long before the closing two do.
+    fn lex_block_comment(&mut self, start: usize) {
+        self.pos += 2;
+        loop {
+            match self.peek() {
+                None => {
+                    self.diagnostics.push(Diagnostic::error(
+                        Span::new(start as u32, (start + 2) as u32),
+                        "unterminated block comment",
+                    ));
+                    break;
+                }
+                Some(b'*') if self.peek_at(1) == Some(b'/') => {
+                    self.pos += 2;
+                    break;
+                }
+                Some(_) => self.pos += 1,
+            }
+        }
+        self.push(TokenKind::Comment, start, self.pos);
     }
 
     fn lex_line_comment(&mut self, start: usize) {
@@ -237,6 +264,7 @@ impl<'src> Lexer<'src> {
             (Some(b'-'), Some(b'=')) => (TokenKind::MinusEq, 2),
             (Some(b'*'), Some(b'=')) => (TokenKind::StarEq, 2),
             (Some(b'/'), Some(b'=')) => (TokenKind::SlashEq, 2),
+            (Some(b'%'), Some(b'=')) => (TokenKind::PercentEq, 2),
             (Some(b'-'), Some(b'>')) => (TokenKind::Arrow, 2),
             (Some(b'{'), _) => (TokenKind::LBrace, 1),
             (Some(b'}'), _) => (TokenKind::RBrace, 1),
@@ -250,6 +278,7 @@ impl<'src> Lexer<'src> {
             (Some(b'-'), _) => (TokenKind::Minus, 1),
             (Some(b'*'), _) => (TokenKind::Star, 1),
             (Some(b'/'), _) => (TokenKind::Slash, 1),
+            (Some(b'%'), _) => (TokenKind::Percent, 1),
             (Some(b'='), _) => (TokenKind::Eq, 1),
             (Some(b'<'), _) => (TokenKind::Lt, 1),
             (Some(b'>'), _) => (TokenKind::Gt, 1),

@@ -286,6 +286,7 @@ impl Parser {
                     TokenKind::MinusEq => Some(AssignOp::Sub),
                     TokenKind::StarEq => Some(AssignOp::Mul),
                     TokenKind::SlashEq => Some(AssignOp::Div),
+                    TokenKind::PercentEq => Some(AssignOp::Rem),
                     _ => None,
                 };
                 if let Some(op) = op {
@@ -481,6 +482,7 @@ fn binary_op(kind: &TokenKind) -> Option<(BinaryOp, u8)> {
         TokenKind::Minus => (BinaryOp::Sub, 5),
         TokenKind::Star => (BinaryOp::Mul, 6),
         TokenKind::Slash => (BinaryOp::Div, 6),
+        TokenKind::Percent => (BinaryOp::Rem, 6),
         _ => return None,
     })
 }

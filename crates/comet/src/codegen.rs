@@ -74,11 +74,18 @@ const F_GET_X: u32 = 0;
 const F_GET_Y: u32 = 1;
 const F_SET_POS: u32 = 2;
 const F_PRINT: u32 = 3;
-const F_ALLOC: u32 = 4;
-const F_RETAIN: u32 = 5;
-const F_RELEASE: u32 = 6;
+/// The transcendentals. WebAssembly has no opcodes for these, so they are the
+/// only maths that leaves the module; abs, sqrt, floor, ceil, min and max are
+/// one instruction each and are emitted inline.
+const F_SIN: u32 = 4;
+const F_COS: u32 = 5;
+const F_ATAN2: u32 = 6;
+const F_POW: u32 = 7;
+const F_ALLOC: u32 = 8;
+const F_RETAIN: u32 = 9;
+const F_RELEASE: u32 = 10;
 /// The first script-defined function's index.
-const USER_BASE: u32 = 7;
+const USER_BASE: u32 = 11;
 
 /// Emit a WebAssembly module for `script`.
 ///
@@ -100,6 +107,8 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     let t_get = types.get(vec![], vec![ValType::F32]);
     let t_set = types.get(vec![ValType::F32, ValType::F32], vec![]);
     let t_print = types.get(vec![ValType::I32, ValType::I32], vec![]);
+    let t_unary = types.get(vec![ValType::F32], vec![ValType::F32]);
+    let t_binary = types.get(vec![ValType::F32, ValType::F32], vec![ValType::F32]);
     let t_alloc = types.get(vec![ValType::I32], vec![ValType::I32]);
     let t_rc = types.get(vec![ValType::I32], vec![]);
     let t_init = types.get(vec![], vec![]);
@@ -109,6 +118,10 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     imports.import(HOST_MODULE, "get_position_y", EntityType::Function(t_get));
     imports.import(HOST_MODULE, "set_position", EntityType::Function(t_set));
     imports.import(HOST_MODULE, "print", EntityType::Function(t_print));
+    imports.import(HOST_MODULE, "sin", EntityType::Function(t_unary));
+    imports.import(HOST_MODULE, "cos", EntityType::Function(t_unary));
+    imports.import(HOST_MODULE, "atan2", EntityType::Function(t_binary));
+    imports.import(HOST_MODULE, "pow", EntityType::Function(t_binary));
 
     let mut functions = FunctionSection::new();
     functions.function(t_alloc);
@@ -187,6 +200,10 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     names.append(F_GET_Y, "orbit::get_position_y");
     names.append(F_SET_POS, "orbit::set_position");
     names.append(F_PRINT, "orbit::print");
+    names.append(F_SIN, "orbit::sin");
+    names.append(F_COS, "orbit::cos");
+    names.append(F_ATAN2, "orbit::atan2");
+    names.append(F_POW, "orbit::pow");
     names.append(F_ALLOC, "comet_alloc");
     names.append(F_RETAIN, "comet_retain");
     names.append(F_RELEASE, "comet_release");
@@ -583,6 +600,9 @@ struct FnGen<'a> {
     /// Slots holding a `String`, released on the way out of the function.
     owned: Vec<u32>,
     scratch_f32: u32,
+    /// A second f32 scratch, for the one operation that needs both operands
+    /// twice.
+    scratch_f32b: u32,
     scratch_i32: u32,
     globals: &'a Globals,
     literals: &'a Literals,
@@ -607,13 +627,14 @@ impl<'a> FnGen<'a> {
         // are known before a single instruction is emitted, which is what
         // wasm-encoder wants.
         let scratch_f32 = next;
-        let scratch_i32 = next + 1;
+        let scratch_f32b = next + 1;
+        let scratch_i32 = next + 2;
 
         let declared: Vec<ValType> = slot_types[param_count..]
             .iter()
             .flat_map(|ty| val_types(*ty))
             .copied()
-            .chain([ValType::F32, ValType::I32])
+            .chain([ValType::F32, ValType::F32, ValType::I32])
             .collect();
 
         let owned = slot_types
@@ -629,6 +650,7 @@ impl<'a> FnGen<'a> {
             slot_types,
             owned,
             scratch_f32,
+            scratch_f32b,
             scratch_i32,
             globals,
             literals,
@@ -901,6 +923,19 @@ impl<'a> FnGen<'a> {
             }
 
             TypedExprKind::HostCall { host, args } => match host {
+                // The transcendentals are ordinary calls: arguments on the
+                // stack, one import, a result.
+                Host::Sin | Host::Cos | Host::Atan2 | Host::Pow => {
+                    for arg in args {
+                        self.expr(arg);
+                    }
+                    self.ins().call(match host {
+                        Host::Sin => F_SIN,
+                        Host::Cos => F_COS,
+                        Host::Atan2 => F_ATAN2,
+                        _ => F_POW,
+                    });
+                }
                 Host::Print => {
                     self.expr(&args[0]);
                     let tmp = self.scratch_i32;
@@ -917,6 +952,10 @@ impl<'a> FnGen<'a> {
                 match op {
                     UnaryOp::Neg => self.ins().f32_neg(),
                     UnaryOp::Not => self.ins().i32_eqz(),
+                    UnaryOp::Abs => self.ins().f32_abs(),
+                    UnaryOp::Sqrt => self.ins().f32_sqrt(),
+                    UnaryOp::Floor => self.ins().f32_floor(),
+                    UnaryOp::Ceil => self.ins().f32_ceil(),
                 };
             }
 
@@ -951,11 +990,31 @@ impl<'a> FnGen<'a> {
             _ => {}
         }
 
+        // Remainder has no WebAssembly instruction: a - trunc(a / b) * b. Both
+        // operands are parked first because both are needed twice, and an
+        // operand can be a call - evaluating one twice would run its effects
+        // twice.
+        if op == BinaryOp::RemF32 {
+            let (a, b) = (self.scratch_f32, self.scratch_f32b);
+            self.expr(lhs);
+            self.ins().local_set(a);
+            self.expr(rhs);
+            self.ins().local_set(b);
+            self.ins().local_get(a);
+            self.ins().local_get(a).local_get(b).f32_div().f32_trunc();
+            self.ins().local_get(b).f32_mul();
+            self.ins().f32_sub();
+            return;
+        }
+
         self.expr(lhs);
         self.expr(rhs);
         let mut i = self.func.instructions();
         match op {
             BinaryOp::AddF32 => i.f32_add(),
+            BinaryOp::RemF32 => unreachable!("handled above"),
+            BinaryOp::MinF32 => i.f32_min(),
+            BinaryOp::MaxF32 => i.f32_max(),
             BinaryOp::SubF32 => i.f32_sub(),
             BinaryOp::MulF32 => i.f32_mul(),
             BinaryOp::DivF32 => i.f32_div(),
@@ -1083,15 +1142,25 @@ mod tests {
     }
 
     #[test]
-    fn every_module_asks_the_host_for_the_same_four_functions() {
+    fn every_module_asks_the_host_for_the_same_functions() {
         // The import list is fixed rather than per-script: a host that can run
-        // one comet module can run all of them, and B2 has one binding table to
-        // write instead of one per script.
-        let expected: Vec<(String, String)> =
-            ["get_position_x", "get_position_y", "set_position", "print"]
-                .iter()
-                .map(|name| (HOST_MODULE.to_string(), name.to_string()))
-                .collect();
+        // one comet module can run all of them, and there is one binding table
+        // to write rather than one per script. Only the transcendentals are
+        // imported - the rest of the maths is one instruction each and never
+        // leaves the module.
+        let expected: Vec<(String, String)> = [
+            "get_position_x",
+            "get_position_y",
+            "set_position",
+            "print",
+            "sin",
+            "cos",
+            "atan2",
+            "pow",
+        ]
+        .iter()
+        .map(|name| (HOST_MODULE.to_string(), name.to_string()))
+        .collect();
 
         assert_eq!(imports(&compile_valid(KITCHEN_SINK)), expected);
         assert_eq!(
