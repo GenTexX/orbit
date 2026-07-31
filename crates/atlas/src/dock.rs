@@ -20,17 +20,21 @@ pub enum Pane {
     /// The script editor. One script at a time (milestone 4's cut), so which
     /// file it shows is editor state rather than part of the pane.
     Code,
+    /// Every diagnostic in the open script at once - the view stepping through
+    /// them one at a time cannot give you.
+    Problems,
 }
 
 impl Pane {
     /// Every pane, so a loaded layout can be checked for completeness.
-    pub const ALL: [Pane; 6] = [
+    pub const ALL: [Pane; 7] = [
         Pane::SceneTree,
         Pane::Viewport,
         Pane::Files,
         Pane::Inspector,
         Pane::Console,
         Pane::Code,
+        Pane::Problems,
     ];
 
     /// The pane's tab caption.
@@ -42,6 +46,7 @@ impl Pane {
             Pane::Inspector => "Inspector",
             Pane::Console => "Console",
             Pane::Code => "Code",
+            Pane::Problems => "Problems",
         }
     }
 }
@@ -128,7 +133,7 @@ impl DockNode {
                         active: 0,
                     }),
                     second: Box::new(DockNode::Leaf {
-                        panes: vec![Pane::Files, Pane::Console],
+                        panes: vec![Pane::Files, Pane::Console, Pane::Problems],
                         active: 0,
                     }),
                 }),
@@ -433,6 +438,7 @@ mod tests {
                 Pane::Console,
                 Pane::Files,
                 Pane::Inspector,
+                Pane::Problems,
                 Pane::SceneTree,
                 Pane::Viewport
             ]
@@ -469,6 +475,7 @@ mod tests {
                 Pane::Console,
                 Pane::Files,
                 Pane::Inspector,
+                Pane::Problems,
                 Pane::SceneTree,
                 Pane::Viewport
             ]

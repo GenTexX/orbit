@@ -236,6 +236,8 @@ pub struct Ui {
     /// The fixed end of a selection (the caret is the moving end), or `None`
     /// for no selection. The selected range is `min..max` of the two.
     selection_anchor: Option<usize>,
+    /// Lines to mark in each text area's gutter, and in what colour.
+    gutter_marks: SecondaryMap<WidgetId, Vec<(usize, Color)>>,
     /// The selection each text input had when focus last left it: its range and
     /// its caret. Drawn in the inactive colours while something else holds the
     /// keyboard, so the range you were working on stays visible.
@@ -295,6 +297,7 @@ impl Ui {
             focused_hscroll: 0.0,
             selection_anchor: None,
             parked_selection: SecondaryMap::new(),
+            gutter_marks: SecondaryMap::new(),
             shift: false,
             caret_on: true,
             events: Vec::new(),
@@ -1720,6 +1723,16 @@ impl Ui {
     /// content. Where the errors are in a file you cannot see all of.
     pub fn set_scroll_marks(&mut self, id: WidgetId, marks: Vec<(f32, Color)>) {
         self.scroll_marks.insert(id, marks);
+    }
+
+    /// Mark lines in the gutter: a small coloured bar beside the number, and
+    /// the number tinted to match. Lines are 0-based.
+    ///
+    /// What a diagnostic looks like when you are not on it. The squiggle is
+    /// easy to miss under a coloured token or off to the right of a long line;
+    /// the gutter is a fixed column your eye already tracks.
+    pub fn set_gutter_marks(&mut self, id: WidgetId, marks: Vec<(usize, Color)>) {
+        self.gutter_marks.insert(id, marks);
     }
 
     /// Whose scrollbar `point` is over: a text area directly under it, or the
@@ -3782,6 +3795,12 @@ impl Ui {
             theme::GUTTER_CURRENT_FADE * 0.45
         });
         let right = origin.x - theme::GUTTER_PAD;
+        let marks = self.gutter_marks.get(id);
+        let mark_of = |line: usize| {
+            marks
+                .and_then(|marks| marks.iter().find(|(at, _)| *at == line))
+                .map(|&(_, color)| color)
+        };
 
         let mut last_line = None;
         for run in buffer.layout_runs() {
@@ -3801,6 +3820,21 @@ impl Ui {
                 continue;
             }
             last_line = Some(run.line_i);
+            // The mark sits at the gutter's left edge, clear of the numbers, so
+            // it stays in the same column whatever the line count is.
+            let marked = mark_of(run.line_i);
+            if let Some(color) = marked {
+                list.commands.push(DrawCommand::FillRect {
+                    rect: Rect::new(
+                        Vec2::new(
+                            rect.pos.x + theme::GUTTER_PAD,
+                            origin.y + run.line_top + 3.0,
+                        ),
+                        Vec2::new(theme::GUTTER_MARK_WIDTH, (run.line_height - 6.0).max(1.0)),
+                    ),
+                    color,
+                });
+            }
             let Some(number) = numbers.layout_runs().nth(run.line_i) else {
                 continue;
             };
@@ -3820,10 +3854,12 @@ impl Ui {
                 });
             }
             if !glyphs.is_empty() {
-                let color = if caret_line == Some(run.line_i) {
-                    widget.foreground
-                } else {
-                    widget.foreground.fade(theme::GUTTER_NUMBER_FADE)
+                // A marked line's number takes the mark's colour: the mark says
+                // there is something here, the number says what kind.
+                let color = match (marked, caret_line == Some(run.line_i)) {
+                    (Some(color), _) => color,
+                    (None, true) => widget.foreground,
+                    (None, false) => widget.foreground.fade(theme::GUTTER_NUMBER_FADE),
                 };
                 list.commands.push(DrawCommand::Text { glyphs, color });
             }

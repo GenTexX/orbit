@@ -449,6 +449,8 @@ pub struct EditorRows {
     pub symbol_query: Option<WidgetId>,
     /// The symbol-rename field over the editor.
     pub symbol_rename: Option<WidgetId>,
+    /// Each Problems row and the span it points at.
+    pub problem_rows: Vec<(WidgetId, comet::Span)>,
     pub symbol_rows: aurora::list::ListRows,
     /// The open modal dialog: its card (for backdrop-click dismiss detection),
     /// close button, footer action buttons, and settings-form controls.
@@ -555,6 +557,7 @@ pub fn build_editor_ui(
     script_text: &str,
     script_modified: bool,
     script_orphaned: bool,
+    diagnostics: &[comet::Diagnostic],
     tab_bars: &[TabBar],
     theme: &EditorTheme,
 ) -> (Ui, EditorRows) {
@@ -597,6 +600,7 @@ pub fn build_editor_ui(
         script_text,
         script_modified,
         script_orphaned,
+        diagnostics,
         tab_bars,
         theme,
     };
@@ -646,6 +650,8 @@ struct PaneCtx<'a> {
     script_modified: bool,
     /// The buffer's file was deleted or moved away underneath it.
     script_orphaned: bool,
+    /// Every diagnostic in the open script, for the Problems pane.
+    diagnostics: &'a [comet::Diagnostic],
     /// One tab bar per dock group, in the order the dock is walked. aurora owns
     /// their interaction and animation state; the shell just hands them over.
     tab_bars: &'a [TabBar],
@@ -810,6 +816,10 @@ fn build_pane(ui: &mut Ui, parent: WidgetId, pane: Pane, ctx: &PaneCtx, rows: &m
             build_code_pane(ui, parent, ctx, rows);
             None
         }
+        Pane::Problems => {
+            build_problems_pane(ui, parent, ctx, rows);
+            None
+        }
         Pane::Console => {
             // The console handles its own scroll: follow the newest line unless
             // the user has scrolled up (then restore where they were).
@@ -913,6 +923,78 @@ fn build_code_pane(ui: &mut Ui, parent: WidgetId, ctx: &PaneCtx, rows: &mut Edit
 }
 
 /// The console pane: recent log lines, newest at the bottom, colored by level.
+/// Every problem in the open script, one clickable row each.
+///
+/// The Console's shape, because it is the same thing: a list of lines, coloured
+/// by how bad they are, that you scan rather than read. Stepping with F8 shows
+/// one at a time; this is the only view that says how many there are.
+fn build_problems_pane(
+    ui: &mut Ui,
+    parent: WidgetId,
+    ctx: &PaneCtx,
+    rows: &mut EditorRows,
+) -> WidgetId {
+    let panel = ui.panel(
+        parent,
+        Style::new()
+            .column()
+            .grow(1.0)
+            .padding(6.0)
+            .gap(1.0)
+            .scroll(),
+    );
+    if ctx.open_script.is_none() && !ctx.script_orphaned {
+        ui.label(
+            panel,
+            "No script open.",
+            Style::new().foreground(ctx.theme.aurora.subhead),
+        );
+        return panel;
+    }
+    if ctx.diagnostics.is_empty() {
+        ui.label(
+            panel,
+            "No problems.",
+            Style::new().foreground(ctx.theme.aurora.subhead),
+        );
+        return panel;
+    }
+    for diagnostic in ctx.diagnostics {
+        let at = (diagnostic.span.start as usize).min(ctx.script_text.len());
+        let line = ctx.script_text[..at].matches('\n').count() + 1;
+        let color = match diagnostic.severity {
+            comet::Severity::Error => ctx.theme.code_error,
+            comet::Severity::Warning => ctx.theme.code_warning,
+        };
+        // A button rather than a label: clicking a row should take you there,
+        // and a panel emits no Clicked.
+        let row = ui.button(
+            panel,
+            "",
+            Style::new()
+                .row()
+                .gap(6.0)
+                .padding(2.0)
+                .background(aurora::Color::TRANSPARENT),
+        );
+        ui.label(
+            row,
+            format!("{line}"),
+            Style::new().width(40.0).foreground(color),
+        );
+        ui.label(
+            row,
+            diagnostic.message.clone(),
+            Style::new()
+                .grow(1.0)
+                .foreground(ctx.theme.aurora.heading)
+                .ellipsis(),
+        );
+        rows.problem_rows.push((row, diagnostic.span));
+    }
+    panel
+}
+
 fn build_console_pane(
     ui: &mut Ui,
     parent: WidgetId,
@@ -3094,6 +3176,7 @@ mod tests {
             false,
             false,
             &[],
+            &[],
             theme,
         )
     }
@@ -3153,6 +3236,7 @@ mod tests {
             "",
             false,
             false,
+            &[],
             &[],
             &EditorTheme::default(),
         );
@@ -3556,6 +3640,7 @@ mod tests {
             false,
             false,
             &[],
+            &[],
             &EditorTheme::default(),
         )
     }
@@ -3607,6 +3692,7 @@ mod tests {
             "",
             false,
             false,
+            &[],
             &[],
             &EditorTheme::default(),
         );
@@ -3660,6 +3746,7 @@ mod tests {
             "",
             false,
             false,
+            &[],
             &[],
             &EditorTheme::default(),
         );

@@ -1915,7 +1915,7 @@ fixes - most of which read a TypedScript that already exists.
   Note: script_diagnostics is already sorted by (span.start, span.end), so
   stepping is a partition_point.
 
-- **A problems list** (S, atlas)
+- ~~**A problems list**~~ DONE (S, atlas)
   A list - its own pane or a tab of the Console - shows every diagnostic
   across open documents as `12: cannot find spede in this scope`, sorted,
   staying live as you type; clicking a row opens that file at that span.
@@ -2275,7 +2275,7 @@ differently depending on which way it goes.
   Note: The app supplies line numbers; aurora must not learn what a diagnostic
   is.
 
-- **Diagnostic marks in the gutter** (M, aurora (Ui::set_gutter_marks(id, Vec<(line, Color)>) consumed by emit_gutter) + atlas)
+- ~~**Diagnostic marks in the gutter**~~ DONE (M, aurora (Ui::set_gutter_marks(id, Vec<(line, Color)>) consumed by emit_gutter) + atlas)
   A line carrying an error or warning gets a small coloured mark in the gutter
   beside its number and its number tinted to match; clicking the mark selects
   that diagnostic's span.

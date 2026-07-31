@@ -231,6 +231,9 @@ pub(crate) const GUTTER_PAD: f32 = 8.0;
 /// how faint the current-line band is. Derived from the theme's own colors
 /// rather than added as tokens: a gutter is chrome, not a new palette.
 pub(crate) const GUTTER_NUMBER_FADE: f32 = 0.55;
+/// How wide a gutter mark's bar is. Narrow enough to sit beside the numbers
+/// without pushing them, wide enough to see at a glance.
+pub(crate) const GUTTER_MARK_WIDTH: f32 = 3.0;
 pub(crate) const GUTTER_CURRENT_FADE: f32 = 0.35;
 
 /// The smallest a splitter will resize its target down to, in pixels.

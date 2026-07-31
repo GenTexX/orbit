@@ -1240,6 +1240,7 @@ impl State {
             false,
             false,
             &[],
+            &[],
             &theme,
         );
 
@@ -4257,6 +4258,24 @@ impl State {
         self.dirty = true;
     }
 
+    /// Select `span` in the code editor and bring it into view.
+    ///
+    /// Selecting rather than only placing the caret: arriving from a list you
+    /// want to see what you arrived at, and select_range scrolls it in.
+    fn reveal_span(&mut self, span: comet::Span) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let len = self.script_text.len();
+        self.ui.select_range(
+            editor,
+            (span.start as usize).min(len),
+            (span.end as usize).min(len),
+        );
+        self.dock.activate(dock::Pane::Code);
+        self.dirty = true;
+    }
+
     /// Say something in the status bar for a few seconds.
     fn note(&mut self, text: impl Into<String>) {
         self.status_note = Some((text.into(), std::time::Instant::now()));
@@ -5321,6 +5340,25 @@ impl State {
             })
             .collect();
         self.ui.set_scroll_marks(editor, marks);
+
+        // The same problems in the gutter, by line rather than by fraction. An
+        // error on a line wins over a warning: the line cannot compile either
+        // way, and the more serious colour is the useful one.
+        let mut gutter: Vec<(usize, aurora::Color)> = Vec::new();
+        for d in &self.script_diagnostics {
+            let at = (d.span.start as usize).min(self.script_text.len());
+            let line = self.script_text[..at].matches('\n').count();
+            let color = match d.severity {
+                comet::Severity::Error => theme.code_error,
+                comet::Severity::Warning => theme.code_warning,
+            };
+            match gutter.iter_mut().find(|(existing, _)| *existing == line) {
+                Some(entry) if d.severity == comet::Severity::Error => entry.1 = color,
+                Some(_) => {}
+                None => gutter.push((line, color)),
+            }
+        }
+        self.ui.set_gutter_marks(editor, gutter);
     }
 
     /// Assert the editor shows what we think it does.
@@ -5673,6 +5711,7 @@ impl State {
                 &self.script_text,
                 self.script_modified,
                 self.script_orphaned,
+                &self.script_diagnostics,
                 &self.tab_bars,
                 &self.theme,
             );
@@ -6070,6 +6109,15 @@ impl State {
                 }
                 AuroraEvent::Clicked(id) if self.find_button(id).is_some() => {
                     self.find_action(id);
+                }
+                AuroraEvent::Clicked(id)
+                    if self.rows.problem_rows.iter().any(|(row, _)| *row == id) =>
+                {
+                    if let Some(&(_, span)) =
+                        self.rows.problem_rows.iter().find(|(row, _)| *row == id)
+                    {
+                        self.reveal_span(span);
+                    }
                 }
                 AuroraEvent::Clicked(id) if self.symbol_row(id).is_some() => {
                     if let Some(name) = self.symbol_row(id) {
