@@ -439,6 +439,8 @@ pub struct EditorRows {
     /// The Code pane's autocomplete popup and find bar, while open.
     pub completions: aurora::list::ListRows,
     pub find: aurora::find::FindRows,
+    /// The go-to-line box's field, while it is open.
+    pub go_to_line: Option<WidgetId>,
     /// The open modal dialog: its card (for backdrop-click dismiss detection),
     /// close button, footer action buttons, and settings-form controls.
     pub modal_card: Option<WidgetId>,
@@ -2019,6 +2021,42 @@ fn asset_field_icon(path: &str, kind: AssetKind) -> Icon {
             AssetKind::Script => Icon::FileScript,
         },
     }
+}
+
+/// A one-field "go to line" box over the code editor.
+pub fn add_go_to_line(
+    ui: &mut Ui,
+    anchor: Vec2,
+    value: &str,
+    theme: &EditorTheme,
+) -> Option<WidgetId> {
+    let card = ui.popup(
+        anchor,
+        Style::new()
+            .row()
+            .gap(6.0)
+            .padding(6.0)
+            .align_center()
+            .background(theme.aurora.menu_bg)
+            .corner_radius(theme.aurora.card_radius)
+            .border(theme.aurora.border_width, theme.aurora.card_border),
+    );
+    ui.label(
+        card,
+        "Go to line",
+        Style::new().foreground(theme.aurora.subhead),
+    );
+    Some(
+        ui.text_input(
+            card,
+            value.to_string(),
+            Style::new()
+                .width(70.0)
+                .padding(4.0)
+                .mask(aurora::Mask::Integer)
+                .corner_radius(theme.aurora.control_radius),
+        ),
+    )
 }
 
 /// Overlay a diagnostic's message near the pointer, the same way the file

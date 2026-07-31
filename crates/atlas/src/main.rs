@@ -348,6 +348,8 @@ struct State {
     /// The diagnostic message currently shown as a tooltip, so the shell only
     /// rebuilds when what is under the pointer changes.
     diagnostic_tooltip: Option<String>,
+    /// The go-to-line box's contents while it is open.
+    go_to_line: Option<String>,
     /// Text undo for the Code pane: snapshots of the buffer and where the caret
     /// was, newest last.
     ///
@@ -492,6 +494,47 @@ fn coalesces(before: &str, after: &str) -> bool {
         .as_bytes()
         .last()
         .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// Comment or uncomment a block of lines.
+///
+/// Uncomments only when every non-blank line is already commented, so a block
+/// where half is commented gets the rest commented rather than each line
+/// flipped and the same mess left inverted. The `//` goes at the shallowest
+/// indentation in the block, so the code keeps its shape, and uncommenting
+/// takes back the single space it added - a round trip is exact.
+fn toggle_comment_block(block: &str) -> String {
+    let lines: Vec<&str> = block.split('\n').collect();
+    let content: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let all_commented =
+        !content.is_empty() && content.iter().all(|l| l.trim_start().starts_with("//"));
+    let indent = content
+        .iter()
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+
+    lines
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                return (*line).to_string();
+            }
+            if all_commented {
+                let at = line.find("//").expect("every content line has one");
+                let rest = &line[at + 2..];
+                let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                format!("{}{rest}", &line[..at])
+            } else {
+                format!("{}// {}", &line[..indent], &line[indent..])
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The diagnostic covering `offset`, narrowest first.
@@ -956,6 +999,7 @@ impl State {
             script_orphaned: false,
             focus_find: false,
             diagnostic_tooltip: None,
+            go_to_line: None,
             script_undo: Vec::new(),
             script_redo: Vec::new(),
             script_caret: 0,
@@ -2669,8 +2713,25 @@ impl State {
         }
         // With the code editor focused, ctrl+z/y walk the script's own text
         // history rather than the scene's - undoing a typo should not also undo
-        // moving a sprite.
+        // moving a sprite. The line commands live here for the same reason:
+        // ctrl+d keeps meaning "duplicate node" everywhere else in the editor.
         if self.ui.focused() == self.rows.code_editor && self.rows.code_editor.is_some() {
+            if c == "/" {
+                self.toggle_comment();
+                return true;
+            }
+            if c.eq_ignore_ascii_case("d") {
+                self.duplicate_lines();
+                return true;
+            }
+            if c.eq_ignore_ascii_case("k") {
+                self.delete_lines();
+                return true;
+            }
+            if c.eq_ignore_ascii_case("g") {
+                self.open_go_to_line();
+                return true;
+            }
             if c.eq_ignore_ascii_case("z") {
                 self.script_history(self.modifiers.shift_key());
                 return true;
@@ -3681,6 +3742,129 @@ impl State {
         }
     }
 
+    /// Jump to a line by number.
+    ///
+    /// Reuses the find bar rather than adding a dialog: a number typed into a
+    /// box that already exists, with `:` as the marker, is less to build and
+    /// less to learn than a second floating box that looks the same.
+    fn open_go_to_line(&mut self) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let line = self.ui.caret_line_column().map_or(1, |(line, _)| line);
+        self.go_to_line = Some(line.to_string());
+        let _ = editor;
+        self.dirty = true;
+    }
+
+    /// Move the caret to the start of 1-based `line`, clamped to the file.
+    fn go_to_line_number(&mut self, line: usize) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let line = line.max(1);
+        let offset = self
+            .script_text
+            .split_inclusive('\n')
+            .take(line - 1)
+            .map(str::len)
+            .sum::<usize>()
+            .min(self.script_text.len());
+        self.ui.focus_caret(editor, offset);
+        self.go_to_line = None;
+        self.dirty = true;
+    }
+
+    /// Toggle `//` on every line the selection touches.
+    ///
+    /// Uncomments only when every non-blank line is already commented - so a
+    /// block where you commented half of it comments the rest, rather than
+    /// flipping each line and leaving the same mess inverted. The `//` goes at
+    /// the shallowest indentation in the block, so the code keeps its shape.
+    fn toggle_comment(&mut self) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let (range, block) = self.ui.selected_lines(editor);
+        if block.is_empty() && range.start == range.end {
+            return;
+        }
+        let toggled = toggle_comment_block(&block);
+        self.ui.replace_lines(editor, range, &toggled);
+        self.sync_script_buffer();
+        self.dirty = true;
+    }
+
+    /// Duplicate the lines the selection touches, below themselves.
+    fn duplicate_lines(&mut self) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let (range, block) = self.ui.selected_lines(editor);
+        self.ui
+            .replace_lines(editor, range, &format!("{block}\n{block}"));
+        self.sync_script_buffer();
+        self.dirty = true;
+    }
+
+    /// Delete the lines the selection touches.
+    fn delete_lines(&mut self) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let (range, _) = self.ui.selected_lines(editor);
+        // Take the newline that followed too, or deleting a line leaves a blank
+        // one where it was.
+        let end = if self.script_text[range.end..].starts_with('\n') {
+            range.end + 1
+        } else {
+            range.end
+        };
+        let start = if end == range.end && range.start > 0 {
+            range.start - 1
+        } else {
+            range.start
+        };
+        self.ui.replace_range(editor, start..end, "");
+        self.sync_script_buffer();
+        self.dirty = true;
+    }
+
+    /// Move the lines the selection touches up or down by one.
+    fn move_lines(&mut self, down: bool) {
+        let Some(editor) = self.rows.code_editor else {
+            return;
+        };
+        let (range, block) = self.ui.selected_lines(editor);
+        let text = self.script_text.clone();
+        if down {
+            let Some(rest) = text.get(range.end..).filter(|r| r.starts_with('\n')) else {
+                return; // already the last line
+            };
+            let next_end = rest[1..]
+                .find('\n')
+                .map_or(text.len(), |at| range.end + 1 + at);
+            let next = &text[range.end + 1..next_end];
+            self.ui
+                .replace_lines(editor, range.start..next_end, &format!("{next}\n{block}"));
+            // Keep the moved lines selected, so alt+down repeats.
+            let start = range.start + next.len() + 1;
+            self.ui.focus_selection(editor, start, start + block.len());
+        } else {
+            if range.start == 0 {
+                return;
+            }
+            let prev_start = text[..range.start - 1].rfind('\n').map_or(0, |at| at + 1);
+            let prev = &text[prev_start..range.start - 1];
+            self.ui
+                .replace_lines(editor, prev_start..range.end, &format!("{block}\n{prev}"));
+            self.ui
+                .focus_selection(editor, prev_start, prev_start + block.len());
+        }
+        self.sync_script_buffer();
+        self.dirty = true;
+    }
+
     /// Which find-bar button `id` is, if any.
     fn find_button(&self, id: aurora::WidgetId) -> Option<FindAction> {
         let rows = &self.rows.find;
@@ -3847,14 +4031,57 @@ impl State {
             }
             return true;
         }
+        // alt+up / alt+down move the selected lines. Not a ctrl chord, because
+        // ctrl+arrow is word motion in the field underneath.
+        if self.modifiers.alt_key()
+            && self.ui.focused() == self.rows.code_editor
+            && matches!(named, NamedKey::ArrowUp | NamedKey::ArrowDown)
+        {
+            self.move_lines(*named == NamedKey::ArrowDown);
+            return true;
+        }
+        // F3 steps find matches without the bar being focused; shift+F3 back.
+        if *named == NamedKey::F3 && self.find.is_some() {
+            let back = self.modifiers.shift_key();
+            if let Some(find) = &mut self.find {
+                if back {
+                    find.find_previous();
+                } else {
+                    find.find_next();
+                }
+            }
+            self.reveal_find_match();
+            self.dirty = true;
+            return true;
+        }
         // F8 steps to the next problem, shift+F8 to the previous. With the
         // message in the status bar this is how a broken file gets walked.
         if *named == NamedKey::F8 && self.rows.code_editor.is_some() {
             self.step_diagnostic(!self.modifiers.shift_key());
             return true;
         }
+        if *named == NamedKey::Enter
+            && self.go_to_line.is_some()
+            && self.ui.focused() == self.rows.go_to_line
+        {
+            let typed = self
+                .rows
+                .go_to_line
+                .and_then(|id| self.ui.text_of(id))
+                .and_then(|t| t.trim().parse::<usize>().ok());
+            match typed {
+                Some(line) => self.go_to_line_number(line),
+                None => self.go_to_line = None,
+            }
+            self.dirty = true;
+            return true;
+        }
         // Escape closes what is open, innermost first.
         if *named == NamedKey::Escape {
+            if self.go_to_line.take().is_some() {
+                self.dirty = true;
+                return true;
+            }
             if self.completions.take().is_some() || self.find.take().is_some() {
                 self.dirty = true;
                 return true;
@@ -4328,6 +4555,18 @@ impl State {
             }
             if let Some(find) = &self.find {
                 self.rows.find = find.build(&mut self.ui, &self.theme.aurora);
+            }
+            if let Some(value) = self.go_to_line.clone()
+                && let Some(editor) = self.rows.code_editor
+                && let Some(rect) = self.ui.rect(editor)
+            {
+                let anchor = Vec2::new(rect.pos.x + rect.size.x - 200.0, rect.pos.y + 6.0);
+                self.rows.go_to_line =
+                    ui::add_go_to_line(&mut self.ui, anchor, &value, &self.theme);
+                if let Some(field) = self.rows.go_to_line {
+                    let len = value.len();
+                    self.ui.focus_selection(field, 0, len);
+                }
             }
             // A carried tab: a small floating copy that follows the pointer, so
             // there is something in hand while its pane is out of the layout.
@@ -5130,7 +5369,9 @@ fn translate_key(event: &winit::event::KeyEvent, ctrl: bool) -> Vec<InputEvent> 
 
 #[cfg(test)]
 mod tests {
-    use super::{TextEncoding, coalesces, narrowest_at, word_before, write_atomic};
+    use super::{
+        TextEncoding, coalesces, narrowest_at, toggle_comment_block, word_before, write_atomic,
+    };
     use comet::{Diagnostic, Span};
 
     #[test]
@@ -5145,6 +5386,31 @@ mod tests {
         assert!(!coalesces("let xy", "let x"));
         assert!(!coalesces("let x", "let xyz"));
         assert!(!coalesces("let x", "Xlet x"));
+    }
+
+    #[test]
+    fn commenting_a_block_keeps_its_shape_and_round_trips() {
+        let block = "    let a = 1;\n        let b = 2;";
+        let commented = toggle_comment_block(block);
+        assert_eq!(commented, "    // let a = 1;\n    //     let b = 2;");
+        assert_eq!(
+            toggle_comment_block(&commented),
+            block,
+            "uncommenting takes back exactly what commenting added"
+        );
+    }
+
+    #[test]
+    fn a_half_commented_block_gets_commented_rather_than_flipped() {
+        // Flipping each line would leave the same mess inverted.
+        let block = "// a\nb";
+        assert_eq!(toggle_comment_block(block), "// // a\n// b");
+    }
+
+    #[test]
+    fn a_blank_line_in_a_block_gains_no_trailing_comment() {
+        assert_eq!(toggle_comment_block("a\n\nb"), "// a\n\n// b");
+        assert_eq!(toggle_comment_block("// a\n\n// b"), "a\n\nb");
     }
 
     #[test]

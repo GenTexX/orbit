@@ -1928,6 +1928,43 @@ impl Ui {
         true
     }
 
+    /// The byte range of the whole lines `range` touches, and the text in them.
+    ///
+    /// Every line command works on this: half a line selected still means the
+    /// whole line, and re-selecting the whole block is what makes a command
+    /// repeatable.
+    pub fn line_block(
+        &self,
+        id: WidgetId,
+        range: std::ops::Range<usize>,
+    ) -> (std::ops::Range<usize>, String) {
+        let Some(text) = self.text_of(id) else {
+            return (0..0, String::new());
+        };
+        let lo = snap_boundary(text, range.start.min(text.len()));
+        let hi = snap_boundary(text, range.end.min(text.len())).max(lo);
+        let start = text[..lo].rfind('\n').map_or(0, |at| at + 1);
+        let end = text[hi..].find('\n').map_or(text.len(), |at| hi + at);
+        (start..end, text[start..end].to_string())
+    }
+
+    /// The lines the focused field's caret or selection touches.
+    pub fn selected_lines(&self, id: WidgetId) -> (std::ops::Range<usize>, String) {
+        let (lo, hi) = self.selection_bounds(id);
+        self.line_block(id, lo..hi)
+    }
+
+    /// Replace the lines `range` touches with `text`, and select the result -
+    /// so the same command can be run again on what it just produced.
+    pub fn replace_lines(&mut self, id: WidgetId, range: std::ops::Range<usize>, text: &str) {
+        let (block, _) = self.line_block(id, range);
+        let at = self.replace_range(id, block, text);
+        if self.focused == Some(id) {
+            self.selection_anchor = Some(at.start);
+            self.caret = at.end;
+        }
+    }
+
     /// Indent (or outdent) every line touched by `lo..hi`, and re-select the
     /// whole of those lines so the same key can be pressed again.
     fn shift_lines(&mut self, id: WidgetId, lo: usize, hi: usize, outdent: bool) {
@@ -5457,6 +5494,24 @@ mod tests {
         for c in text.chars() {
             ui.handle_input(InputEvent::Text(c));
         }
+    }
+
+    #[test]
+    fn a_line_block_reaches_whole_lines_and_can_be_replaced() {
+        // Every line command is built on this: half a line selected still means
+        // the whole line, and re-selecting the result makes a command repeatable.
+        let (mut ui, field) = code_area("aaa\nbbb\nccc");
+        let (range, block) = ui.line_block(field, 5..6);
+        assert_eq!(range, 4..7);
+        assert_eq!(block, "bbb");
+
+        ui.replace_lines(field, 5..6, "XX\nYY");
+        assert_eq!(ui.text_of(field), Some("aaa\nXX\nYY\nccc"));
+        assert_eq!(
+            ui.selected_text().as_deref(),
+            Some("XX\nYY"),
+            "and the result is selected, so the command repeats"
+        );
     }
 
     #[test]
