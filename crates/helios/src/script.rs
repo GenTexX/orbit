@@ -60,9 +60,51 @@ pub enum ScriptError {
     /// wasmtime refused the module, or the script trapped while running.
     #[error("{0}")]
     Runtime(String),
+    /// The script trapped while running, in a function comet can name.
+    ///
+    /// Separate from [`Runtime`](Self::Runtime) because an editor can act on
+    /// this one: it has somewhere to put the caret.
+    #[error("{message} (in `{function}`)")]
+    Trapped { function: String, message: String },
 }
 
 impl ScriptError {
+    /// The script function a trap happened in, if the error is one and the
+    /// module's name section named it.
+    pub fn trapped_in(&self) -> Option<&str> {
+        match self {
+            ScriptError::Trapped { function, .. } => Some(function),
+            _ => None,
+        }
+    }
+
+    /// Turn a wasmtime failure into an error that names the script function it
+    /// happened in, where the backtrace has one.
+    ///
+    /// comet emits a name section, so the frames carry real names rather than
+    /// `wasm-function[7]`. The innermost script frame is the useful one: the
+    /// runtime helpers below it (`comet_alloc` and friends) are true but not
+    /// where anybody's mistake is.
+    fn trap(err: wasmtime::Error) -> Self {
+        let function = err
+            .downcast_ref::<wasmtime::WasmBacktrace>()
+            .and_then(|backtrace| {
+                backtrace
+                    .frames()
+                    .iter()
+                    .filter_map(|frame| frame.func_name())
+                    .find(|name| !name.starts_with("comet_") && !name.starts_with("orbit::"))
+                    .map(str::to_string)
+            });
+        match function {
+            Some(function) => ScriptError::Trapped {
+                function,
+                message: format!("{err:#}"),
+            },
+            None => ScriptError::runtime(err),
+        }
+    }
+
     fn runtime(err: impl std::fmt::Display) -> Self {
         // `{:#}` keeps wasmtime's error chain, which is where the trap and its
         // backtrace live - a bare `{}` would report only the outermost sentence.
@@ -135,7 +177,9 @@ impl ScriptHost {
             self.modules.insert(path.to_path_buf(), module);
         }
         let module = self.modules[path].clone();
-        self.start(&module, scene, node)
+        let mut instance = self.start(&module, scene, node)?;
+        instance.set_label(path.display().to_string());
+        Ok(instance)
     }
 
     /// Forget the compiled module for `path`, so the next instantiation reads
@@ -170,7 +214,11 @@ impl ScriptHost {
             .map_err(ScriptError::runtime)?;
         let update = instance.get_typed_func::<f32, ()>(&mut store, UPDATE).ok();
         scene.node_mut(node).transform.translation = store.data().position;
-        Ok(ScriptInstance { store, update })
+        Ok(ScriptInstance {
+            store,
+            update,
+            label: scene.node(node).name.clone(),
+        })
     }
 }
 
@@ -180,6 +228,8 @@ impl ScriptHost {
 pub struct ScriptInstance {
     store: Store<ScriptState>,
     update: Option<TypedFunc<f32, ()>>,
+    /// What this instance's printed output is tagged with.
+    label: String,
 }
 
 /// Neither a wasmtime `Store` nor a `TypedFunc` is `Debug`, so this reports what
@@ -188,6 +238,7 @@ pub struct ScriptInstance {
 impl std::fmt::Debug for ScriptInstance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScriptInstance")
+            .field("label", &self.label)
             .field("has_update", &self.update.is_some())
             .field("printed", &self.store.data().printed.len())
             .finish()
@@ -211,7 +262,7 @@ impl ScriptInstance {
         self.store.data_mut().position = scene.node(node).transform.translation;
         update
             .call(&mut self.store, dt)
-            .map_err(ScriptError::runtime)?;
+            .map_err(ScriptError::trap)?;
         scene.node_mut(node).transform.translation = self.store.data().position;
         Ok(())
     }
@@ -219,6 +270,28 @@ impl ScriptInstance {
     /// Take the lines this script printed since the last call, leaving it empty.
     pub fn take_printed(&mut self) -> Vec<String> {
         std::mem::take(&mut self.store.data_mut().printed)
+    }
+
+    /// The same, each line prefixed with where it came from - what a console
+    /// showing several scripts at once needs, since `print("hi")` from two
+    /// nodes is otherwise two identical lines.
+    pub fn take_printed_tagged(&mut self) -> Vec<String> {
+        let label = self.label.clone();
+        self.take_printed()
+            .into_iter()
+            .map(|line| format!("[{label}] {line}"))
+            .collect()
+    }
+
+    /// What this instance's output is tagged with - its script's path, or the
+    /// node it runs for when it was compiled from source.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Rename the instance, for a host that knows better than the default.
+    pub fn set_label(&mut self, label: impl Into<String>) {
+        self.label = label.into();
     }
 }
 
@@ -511,6 +584,66 @@ mod tests {
         // from - reporting only "it failed" would be useless there.
         assert!(diagnostics[0].span.end > diagnostics[0].span.start);
         assert!(err.to_string().contains("expected `f32`"));
+    }
+
+    #[test]
+    fn a_trap_names_the_script_function_it_happened_in() {
+        // A wasm trap otherwise reports `wasm-function[7]`. comet emits a name
+        // section so the frames carry real names, and the runtime helpers are
+        // skipped - true, but not where anybody's mistake is.
+        let mut host = ScriptHost::new().unwrap();
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        // A script with a type error cannot compile, so reach for the one thing
+        // that traps at runtime: an allocation far larger than memory can grow.
+        // Unbounded recursion is the trap a person actually writes by accident.
+        let mut script = host
+            .instantiate(
+                "
+                func forever(n: f32) -> f32 { forever(n) }
+                func update(dt: f32) { pos.x = forever(dt); }
+                ",
+                &mut scene,
+                node,
+            )
+            .unwrap();
+        let err = script
+            .update(&mut scene, node, 1.0)
+            .expect_err("recursing forever must trap");
+        assert_eq!(
+            err.trapped_in(),
+            Some("forever"),
+            "named, not wasm-function[n]: {err}"
+        );
+        assert!(err.to_string().contains("forever"));
+
+        // And comet can turn that name into a line to put the caret on.
+        assert_eq!(
+            comet::service::function_line(
+                "\nfunc forever(n: f32) -> f32 { forever(n) }\n",
+                "forever"
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn printed_output_can_say_which_script_it_came_from() {
+        // Two nodes printing the same words are otherwise two identical lines.
+        let mut host = ScriptHost::new().unwrap();
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate(
+                r#"func update(dt: f32) { print("tick"); }"#,
+                &mut scene,
+                node,
+            )
+            .unwrap();
+        script.update(&mut scene, node, 0.1).unwrap();
+        assert_eq!(script.take_printed_tagged(), ["[player] tick"]);
+
+        script.set_label("scripts/ticker.cmt");
+        script.update(&mut scene, node, 0.1).unwrap();
+        assert_eq!(script.take_printed_tagged(), ["[scripts/ticker.cmt] tick"]);
     }
 
     #[test]

@@ -45,7 +45,8 @@ use std::collections::HashMap;
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
     Function, FunctionSection, GlobalSection, GlobalType, Ieee32, ImportSection, InstructionSink,
-    MemArg, MemorySection, MemoryType, Module, StartSection, TypeSection, ValType,
+    MemArg, MemorySection, MemoryType, Module, NameMap, NameSection, StartSection, TypeSection,
+    ValType,
 };
 
 use crate::tir::{
@@ -178,6 +179,26 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
         });
     }
     module.section(&code);
+    // A name section, so a trap's backtrace reads as `update` rather than as
+    // `wasm-function[7]`. It costs a few dozen bytes and is the difference
+    // between a runtime error naming something and naming nothing.
+    let mut names = NameMap::new();
+    names.append(F_GET_X, "orbit::get_position_x");
+    names.append(F_GET_Y, "orbit::get_position_y");
+    names.append(F_SET_POS, "orbit::set_position");
+    names.append(F_PRINT, "orbit::print");
+    names.append(F_ALLOC, "comet_alloc");
+    names.append(F_RETAIN, "comet_retain");
+    names.append(F_RELEASE, "comet_release");
+    for (i, f) in script.functions.iter().enumerate() {
+        names.append(USER_BASE + i as u32, &f.name);
+    }
+    if has_state {
+        names.append(USER_BASE + script.functions.len() as u32, "<script state>");
+    }
+    let mut name_section = NameSection::new();
+    name_section.functions(&names);
+    module.section(&name_section);
     if !literals.data.is_empty() {
         let mut data = DataSection::new();
         data.active(

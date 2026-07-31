@@ -468,6 +468,19 @@ pub fn hover_at(source: &str, offset: usize) -> Option<String> {
     Some(format!("{name}: {}", ty.name()))
 }
 
+/// The 1-based line a function is declared on, for turning a runtime trap into
+/// a place in the source.
+///
+/// A wasm trap names a function, not a line - there is no source map yet - so
+/// the function's own line is the most precise honest answer. An editor can put
+/// the caret there.
+pub fn function_line(source: &str, name: &str) -> Option<usize> {
+    let (script, _) = parse(source);
+    let function = script.functions.iter().find(|f| f.name == name)?;
+    let at = (function.span.start as usize).min(source.len());
+    Some(source[..at].matches('\n').count() + 1)
+}
+
 /// The identifier surrounding `offset`, if it is in one.
 fn word_span(source: &str, offset: usize) -> Option<(usize, usize)> {
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
