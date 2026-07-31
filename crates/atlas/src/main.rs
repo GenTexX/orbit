@@ -648,6 +648,24 @@ enum FindAction {
     Close,
 }
 
+/// Where a completion popup should be anchored for a caret at `caret`, or
+/// `None` if none should be open there.
+///
+/// One predicate, so "should there be a popup" has exactly one answer rather
+/// than being decided in pieces at each place that might close one. A popup is
+/// wanted while a name is being typed, and right after a `.` where the name has
+/// not been started yet - and nowhere else, which is what takes it down when
+/// the caret is clicked into whitespace eleven lines away.
+fn completion_anchor(text: &str, caret: usize) -> Option<usize> {
+    let (start, prefix) = word_before(text, caret);
+    if !prefix.is_empty() {
+        return Some(start);
+    }
+    // Right after a dot: field completions are the whole point of asking there.
+    let after_dot = start > 0 && text.as_bytes()[start - 1] == b'.';
+    after_dot.then_some(start)
+}
+
 /// The identifier the caret sits in or just after: where it starts, and its
 /// text. An empty name means the caret is not in one.
 fn word_before(text: &str, caret: usize) -> (usize, &str) {
@@ -3769,7 +3787,7 @@ impl State {
             // The caret moving is also what makes an open completion popup
             // stale: it was offering names for a word the caret has left.
             // Refreshing closes it when there is no longer a word there.
-            if self.completions.is_some() && self.caret_was.is_some() {
+            if self.completions.is_some() {
                 self.refresh_completions();
             }
             self.caret_was = caret;
@@ -4228,14 +4246,11 @@ impl State {
             self.completions = None;
             return;
         };
-        let (start, prefix) = word_before(&self.script_text, caret);
-        // A popup over an empty prefix would open on every space. `.` is the
-        // exception: field completions are the whole point of asking there.
-        let after_dot = start > 0 && self.script_text.as_bytes()[start - 1] == b'.';
-        if prefix.is_empty() && !after_dot {
+        let Some(start) = completion_anchor(&self.script_text, caret) else {
             self.completions = None;
             return;
-        }
+        };
+        let (_, prefix) = word_before(&self.script_text, caret);
         let items: Vec<aurora::list::ListItem> =
             comet::service::completions_at(&self.script_text, caret)
                 .into_iter()
@@ -4401,6 +4416,22 @@ impl State {
             })
             .collect();
         self.ui.set_scroll_marks(editor, marks);
+    }
+
+    /// Assert the editor shows what we think it does.
+    ///
+    /// The invariant the frame order exists to keep: after a rebuild, the
+    /// widget's text is `script_text`. If a sync ever moves back after the
+    /// rebuild, this fires in a debug build instead of silently eating edits.
+    fn debug_check_editor_in_sync(&self) {
+        debug_assert!(
+            self.rows
+                .code_editor
+                .and_then(|id| self.ui.text_of(id))
+                .is_none_or(|shown| shown == self.script_text),
+            "the code editor and script_text disagreed after a rebuild - \
+             something synced the buffer after the rebuild rather than before it"
+        );
     }
 
     /// Read the Code pane's live text back out of the Ui.
@@ -4577,6 +4608,15 @@ impl State {
         profiling::scope!("editor_frame");
         let fstart = std::time::Instant::now();
         self.flush_pointer();
+        // BEFORE anything that can set `dirty`. A rebuild reconstructs the code
+        // editor from `self.script_text`, so that has to already hold what the
+        // user typed into the old Ui - otherwise the rebuild puts the stale text
+        // back and the edit is gone. That was the bug behind "backspace
+        // sometimes just moves the cursor back": the character was deleted in
+        // the Ui, a rebuild restored the pre-edit text, and the caret came back
+        // one place to the left.
+        self.sync_script_buffer();
+        self.sync_find_query();
         self.poll_settings();
         self.poll_diagnostic_tooltip();
         self.tick_caret();
@@ -4717,6 +4757,7 @@ impl State {
                 );
             }
             self.dirty = false;
+            self.debug_check_editor_in_sync();
             // The fresh Ui has no cursor, so its layout-time hover refresh would
             // find nothing hovered. Seed the cursor so hover (and clicking the
             // same spot again, e.g. an eye toggle) survives the rebuild without
@@ -4832,8 +4873,6 @@ impl State {
         // frame's rebuild, if any, has already restructured the dock), read the
         // live splitter sizes and pane scroll back so the next rebuild restores
         // them - the docking equivalent of the old capture_panel_sizes.
-        self.sync_script_buffer();
-        self.sync_find_query();
         self.apply_script_marks();
         self.sync_dock_state();
         self.maybe_save_editor_state();
@@ -5503,7 +5542,8 @@ fn translate_key(event: &winit::event::KeyEvent, ctrl: bool) -> Vec<InputEvent> 
 #[cfg(test)]
 mod tests {
     use super::{
-        TextEncoding, coalesces, narrowest_at, toggle_comment_block, word_before, write_atomic,
+        TextEncoding, coalesces, completion_anchor, narrowest_at, toggle_comment_block,
+        word_before, write_atomic,
     };
     use comet::{Diagnostic, Span};
 
@@ -5630,6 +5670,20 @@ mod tests {
             .filter(|n| n != "script.cmt")
             .collect();
         assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn a_completion_popup_is_wanted_only_where_a_name_is_being_typed() {
+        // The stale-popup bug: a popup anchored eleven lines up stayed open
+        // after the caret was clicked into whitespace. There is now one
+        // predicate for "should there be a popup", so every place that might
+        // close one gets the same answer.
+        assert_eq!(completion_anchor("pos.x", 5), Some(4), "mid-name");
+        assert_eq!(completion_anchor("pos.", 4), Some(4), "just after a dot");
+        assert_eq!(completion_anchor("let ", 4), None, "after a space");
+        assert_eq!(completion_anchor("}\n\n", 3), None, "in empty space");
+        assert_eq!(completion_anchor("", 0), None);
+        assert_eq!(completion_anchor("a = 1;", 6), None, "after punctuation");
     }
 
     #[test]
