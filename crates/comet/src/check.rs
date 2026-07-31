@@ -31,6 +31,7 @@ pub fn check(script: &ast::Script) -> (TypedScript, Vec<Diagnostic>) {
         by_name: HashMap::new(),
         locals: Vec::new(),
         scopes: Vec::new(),
+        bindings: Vec::new(),
         ret: Type::Unit,
     };
     let typed = checker.script(script);
@@ -62,6 +63,9 @@ struct Checker {
     locals: Vec<Type>,
     /// Lexical scopes, innermost last. Shadowing an outer name is allowed.
     scopes: Vec<HashMap<String, u32>>,
+    /// One entry per local slot: what a `let` bound, and whether anything has
+    /// read it. `None` for parameters and for slots the checker introduced.
+    bindings: Vec<Option<Binding>>,
     ret: Type,
 }
 
@@ -196,11 +200,16 @@ impl Checker {
         self.locals = param_types;
         self.ret = ret;
         self.scopes = vec![HashMap::new()];
+        // Parameters get no binding entry: an unused parameter is normal - a
+        // handler takes `dt` whether or not it needs it - and warning about one
+        // would train people to ignore warnings.
+        self.bindings = f.params.iter().map(|_| None).collect();
         for (i, p) in f.params.iter().enumerate() {
             self.scopes[0].insert(p.name.clone(), i as u32);
         }
 
         let body = self.block(&f.body);
+        self.report_unused();
 
         // The body's tail is the function's value when it has one.
         if let Some(tail) = &body.tail {
@@ -221,6 +230,35 @@ impl Checker {
             locals: std::mem::take(&mut self.locals),
             param_count: f.params.len(),
             body,
+        }
+    }
+
+    /// Warn about every `let` in the function just checked that nothing read.
+    ///
+    /// The first thing in comet to emit a warning rather than an error: the
+    /// script still compiles and still runs. It is here because an unused
+    /// binding is usually a typo one line later - the value went into `speed`
+    /// and the line below reads `sped`, which is already an error, and this is
+    /// the other half of the same story.
+    fn report_unused(&mut self) {
+        let unused: Vec<(Span, String)> = std::mem::take(&mut self.bindings)
+            .into_iter()
+            .flatten()
+            .filter(|b| !b.used)
+            .map(|b| (b.span, b.name))
+            .collect();
+        for (span, name) in unused {
+            self.diagnostics.push(Diagnostic::warning(
+                span,
+                format!("`{name}` is never used - prefix it with `_` if that is deliberate"),
+            ));
+        }
+    }
+
+    /// Note that something read the local in `slot`.
+    fn mark_used(&mut self, slot: u32) {
+        if let Some(Some(binding)) = self.bindings.get_mut(slot as usize) {
+            binding.used = true;
         }
     }
 
@@ -279,10 +317,12 @@ impl Checker {
         // neither is in scope after the loop and neither shadows anything for
         // longer than the loop lasts.
         self.scopes.push(HashMap::new());
-        let slot = self.declare_local(name, Type::F32);
+        // The counter is declared without a span: a `for` that does not use its
+        // own variable is an ordinary way to repeat something N times.
+        let slot = self.declare_local(name, Type::F32, None);
         // A name with a space in it: no source text can lex to this, so the
         // bound cannot be read or written by the script that produced it.
-        let end_slot = self.declare_local("for end", Type::F32);
+        let end_slot = self.declare_local("for end", Type::F32, None);
         out.push(TypedStmt::Let { slot, init: start });
         out.push(TypedStmt::Let {
             slot: end_slot,
@@ -322,9 +362,20 @@ impl Checker {
         out.push(TypedStmt::While { cond, body });
     }
 
-    fn declare_local(&mut self, name: &str, ty: Type) -> u32 {
+    /// Declare a local, recording where its name was written so an unused one
+    /// can be pointed at. `span` is `None` for a slot the checker introduced
+    /// itself, which nobody can use and nobody should be warned about.
+    fn declare_local(&mut self, name: &str, ty: Type, span: Option<Span>) -> u32 {
         let slot = self.locals.len() as u32;
         self.locals.push(ty);
+        // `_` is the way to say "I know, and I mean it" - for a binding kept
+        // for its shape, or a loop counter the body does not care about.
+        self.bindings
+            .push(span.filter(|_| !name.starts_with('_')).map(|span| Binding {
+                name: name.to_string(),
+                span,
+                used: false,
+            }));
         self.scopes
             .last_mut()
             .expect("a scope is always open while checking a body")
@@ -336,10 +387,10 @@ impl Checker {
         match stmt {
             ast::Stmt::Let {
                 name,
+                name_span,
                 ty,
                 init,
                 span,
-                ..
             } => {
                 let init = self.expr(init);
                 let declared = ty.as_ref().map(|t| self.resolve_type(t));
@@ -353,7 +404,7 @@ impl Checker {
                 if ty == Type::Unit {
                     self.error(*span, "a `let` needs a value, but this produces nothing");
                 }
-                let slot = self.declare_local(name, ty);
+                let slot = self.declare_local(name, ty, Some(*name_span));
                 TypedStmt::Let { slot, init }
             }
 
@@ -477,9 +528,7 @@ impl Checker {
                 if let Some(&slot) = self.globals.get(name) {
                     return (Place::Global(slot), self.global_types[slot as usize]);
                 }
-                if !name.is_empty() {
-                    self.error(*span, format!("cannot find `{name}` in this scope"));
-                }
+                self.unresolved(*span, name);
                 (Place::Error, Type::Error)
             }
             ast::Expr::Field {
@@ -528,9 +577,7 @@ impl Checker {
                             }
                         };
                     }
-                    if !name.is_empty() {
-                        self.error(*span, format!("cannot find `{name}` in this scope"));
-                    }
+                    self.unresolved(*span, name);
                     return (Place::Error, Type::Error);
                 }
                 let receiver = self.expr(receiver);
@@ -561,6 +608,11 @@ impl Checker {
     /// The expression that reads a place - what compound assignment needs for
     /// its left operand.
     fn place_read(&mut self, place: &Place, ty: Type, span: Span) -> TypedExpr {
+        // Reading a place is what compound assignment does: `x += 1` uses `x`,
+        // where a plain `x = 1` does not.
+        if let Place::Local(slot) | Place::LocalField(slot, _) = place {
+            self.mark_used(*slot);
+        }
         let kind = match place {
             Place::Local(slot) => TypedExprKind::Local(*slot),
             Place::Global(slot) => TypedExprKind::Global(*slot),
@@ -598,6 +650,34 @@ impl Checker {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
     }
 
+    /// Report a name nothing resolved, with the nearest thing that would have.
+    ///
+    /// A typo is the most common error a beginner makes and the least
+    /// informative to be told about: "cannot find `spede`" sends you reading,
+    /// "did you mean `speed`?" does not. Everything visible from here is a
+    /// candidate - locals, script state, functions, builtins - because a typo
+    /// does not know what kind of thing it was aiming at.
+    fn unresolved(&mut self, span: Span, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        let candidates = self
+            .scopes
+            .iter()
+            .flat_map(|scope| scope.keys())
+            .chain(self.globals.keys())
+            .chain(self.by_name.keys())
+            .map(String::as_str)
+            .chain(BUILTIN_NAMES.iter().copied());
+        let message = match nearest(name, candidates) {
+            Some(suggestion) => {
+                format!("cannot find `{name}` in this scope - did you mean `{suggestion}`?")
+            }
+            None => format!("cannot find `{name}` in this scope"),
+        };
+        self.error(span, message);
+    }
+
     // --- expressions ---
 
     fn expr(&mut self, expr: &ast::Expr) -> TypedExpr {
@@ -611,6 +691,7 @@ impl Checker {
                 if name == POS {
                     (TypedExprKind::Pos, Type::Vec2)
                 } else if let Some(slot) = self.lookup_local(name) {
+                    self.mark_used(slot);
                     (TypedExprKind::Local(slot), self.locals[slot as usize])
                 } else if let Some(&slot) = self.globals.get(name) {
                     (
@@ -618,9 +699,7 @@ impl Checker {
                         self.global_types[slot as usize],
                     )
                 } else {
-                    if !name.is_empty() {
-                        self.error(span, format!("cannot find `{name}` in this scope"));
-                    }
+                    self.unresolved(span, name);
                     (TypedExprKind::Error, Type::Error)
                 }
             }
@@ -760,7 +839,20 @@ impl Checker {
 
         let Some(&index) = self.by_name.get(callee) else {
             if !callee.is_empty() {
-                self.error(callee_span, format!("cannot find function `{callee}`"));
+                // Only callable names are candidates here: what follows the
+                // typo is a `(`, so a nearby local would not have helped.
+                let candidates = self
+                    .by_name
+                    .keys()
+                    .map(String::as_str)
+                    .chain(BUILTIN_NAMES.iter().copied());
+                let message = match nearest(callee, candidates) {
+                    Some(suggestion) => {
+                        format!("cannot find function `{callee}` - did you mean `{suggestion}`?")
+                    }
+                    None => format!("cannot find function `{callee}`"),
+                };
+                self.error(callee_span, message);
             }
             return (TypedExprKind::Error, Type::Error);
         };
@@ -955,6 +1047,60 @@ enum Builtin {
 /// Most of the maths is one WebAssembly instruction, so it lowers inline and
 /// never leaves the module; only the transcendentals, which wasm has no opcodes
 /// for, cost a host call.
+/// The names a suggestion may propose that are not in any table the checker
+/// builds: the host functions, which live in [`builtin`] and `vec2`.
+const BUILTIN_NAMES: &[&str] = &[
+    "print", "str", "vec2", "abs", "sqrt", "floor", "ceil", "min", "max", "sin", "cos", "atan2",
+    "pow", "pos",
+];
+
+/// The candidate closest to `name`, if one is close enough to be worth saying.
+///
+/// "Close enough" is an edit distance of at most a third of the name's length,
+/// with a floor of one - and nothing under three characters gets a guess at
+/// all. Every one-letter name is one edit from every other, so `i` was cheerily
+/// suggesting `f`. Suggesting something unrelated is worse than suggesting
+/// nothing, because it reads as an answer.
+fn nearest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let len = name.chars().count();
+    if len < 3 {
+        return None;
+    }
+    let budget = (len / 3).max(1);
+    candidates
+        .filter(|candidate| *candidate != name)
+        .map(|candidate| (edit_distance(name, candidate), candidate))
+        .filter(|(distance, _)| *distance <= budget)
+        // Ties go to the alphabetically first, so the message does not depend on
+        // the iteration order of a HashMap.
+        .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
+        .map(|(_, candidate)| candidate)
+}
+
+/// Levenshtein distance, one row at a time.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            let next = (row[j] + 1).min(row[j + 1] + 1).min(previous + cost);
+            previous = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    row[b.len()]
+}
+
+/// A `let` the checker is watching, so it can say when nothing ever read it.
+struct Binding {
+    name: String,
+    span: Span,
+    used: bool,
+}
+
 fn builtin(name: &str) -> Option<(Builtin, &'static [Type], Type)> {
     use Type::{F32, Str, Unit};
     Some(match name {
@@ -1008,6 +1154,7 @@ fn always_returns(block: &TypedBlock) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic::Severity;
     use crate::parser::parse;
 
     /// Check a source string, asserting it parsed cleanly first so a test about
@@ -1021,16 +1168,33 @@ mod tests {
         check(&script)
     }
 
+    /// The error messages a script produces. Warnings are advisory and have
+    /// their own tests; a test about a type rule should not have to keep every
+    /// fixture's bindings used to stay passing.
     fn messages(source: &str) -> Vec<String> {
-        check_src(source).1.into_iter().map(|d| d.message).collect()
+        of_severity(source, Severity::Error)
+    }
+
+    fn warnings(source: &str) -> Vec<String> {
+        of_severity(source, Severity::Warning)
+    }
+
+    fn of_severity(source: &str, severity: Severity) -> Vec<String> {
+        check_src(source)
+            .1
+            .into_iter()
+            .filter(|d| d.severity == severity)
+            .map(|d| d.message)
+            .collect()
     }
 
     fn check_clean(source: &str) -> TypedScript {
         let (typed, diagnostics) = check_src(source);
-        assert!(
-            diagnostics.is_empty(),
-            "expected no errors, got {diagnostics:?}"
-        );
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "expected no errors, got {errors:?}");
         typed
     }
 
@@ -1572,5 +1736,64 @@ mod tests {
             messages(r#"func f() { for i in "a"..3.0 { } }"#),
             ["expected `f32`, found `String`"]
         );
+    }
+
+    #[test]
+    fn a_typo_suggests_the_name_it_almost_matched() {
+        assert_eq!(
+            messages("func f() { let speed = 1.0; let x = sped; }"),
+            ["cannot find `sped` in this scope - did you mean `speed`?"]
+        );
+        // Builtins and functions are candidates too - a typo does not know what
+        // kind of thing it was aiming at.
+        assert_eq!(
+            messages(r#"func f() { print(strr(1.0)); }"#),
+            ["cannot find function `strr` - did you mean `str`?"]
+        );
+    }
+
+    #[test]
+    fn a_name_with_nothing_near_it_gets_no_guess() {
+        assert_eq!(
+            messages("func f() { let speed = 1.0; let x = wombat; }"),
+            ["cannot find `wombat` in this scope"]
+        );
+        // Every one-letter name is one edit from every other, so short names
+        // get no guess at all: a wrong suggestion reads as an answer.
+        assert_eq!(
+            messages("func f() { let a = 1.0; let b = q; }"),
+            ["cannot find `q` in this scope"]
+        );
+    }
+
+    #[test]
+    fn a_binding_nothing_reads_is_a_warning_not_an_error() {
+        let source = "func f() { let unused = 1.0; }";
+        assert_eq!(
+            warnings(source),
+            ["`unused` is never used - prefix it with `_` if that is deliberate"]
+        );
+        assert!(messages(source).is_empty(), "the script still compiles");
+    }
+
+    #[test]
+    fn writing_to_a_binding_is_not_reading_it() {
+        // `x = 2.0` stores; nothing has looked at what is in there.
+        assert_eq!(warnings("func f() { let x = 1.0; x = 2.0; }").len(), 1);
+        // `x += 1.0` reads it first, so it counts.
+        assert!(warnings("func f() { let x = 1.0; x += 1.0; }").is_empty());
+        // And so does reading one field of it.
+        assert!(warnings("func f() { let v = pos; let y = v.x; print(str(y)); }").is_empty());
+    }
+
+    #[test]
+    fn the_things_that_should_not_warn_do_not() {
+        // An unused parameter is normal - a handler takes `dt` whether or not
+        // it needs it.
+        assert!(warnings("func update(dt: f32) { }").is_empty());
+        // A `for` that repeats something N times need not name its counter.
+        assert!(warnings(r#"func f() { for i in 0.0..3.0 { print("x"); } }"#).is_empty());
+        // And an underscore says "I know".
+        assert!(warnings("func f() { let _spare = 1.0; }").is_empty());
     }
 }

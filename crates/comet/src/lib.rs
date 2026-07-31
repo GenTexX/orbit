@@ -23,8 +23,8 @@ mod tir;
 
 /// Compile a script to a WebAssembly module.
 ///
-/// The whole pipeline: lex, parse, check, emit. A script with any error
-/// diagnostic produces no module - it is the one place in comet that refuses to
+/// The whole pipeline: lex, parse, check, emit. A script with any *error*
+/// diagnostic produces no module - warnings do not stop it - it is the one place in comet that refuses to
 /// carry on, because emitting code for a program known to be wrong is the only
 /// outcome worse than reporting it. Everything upstream stays error-tolerant, so
 /// the returned diagnostics cover the whole file rather than stopping at the

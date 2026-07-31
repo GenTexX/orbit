@@ -2083,7 +2083,7 @@ fixes - most of which read a TypedScript that already exists.
   inside apply_script_marks - a second set_decorations caller erases the
   squiggles.
 
-- **Did-you-mean suggestions in name diagnostics** (S, comet)
+- ~~**Did-you-mean suggestions in name diagnostics**~~ DONE (S, comet)
   `cannot find spede in this scope` becomes `... - did you mean speed?`. Same
   at the three other sites: unknown function, unknown type (Vecc2 -> Vec2),
   and `Vec2 has no field z` -> x/y. Suggest only within edit distance 2 (1 for
@@ -2095,7 +2095,7 @@ fixes - most of which read a TypedScript that already exists.
   Note: About 25 lines of Levenshtein plus four call-site edits. No plumbing,
   and it is what makes the spelling quick fix possible.
 
-- **Unused-variable and unreachable-code warnings** (M, comet)
+- ~~**Unused-variable and unreachable-code warnings**~~ DONE (unreachable code not yet) (M, comet)
   A let (local, parameter or state) that is never read gets a warning squiggle
   on its name; a name starting with _ is exempt. A statement after a return in
   the same block gets "this code is never reached", spanning to the end of the

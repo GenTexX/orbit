@@ -897,3 +897,23 @@ fn nested_for_loops_each_get_their_own_counter() {
     script.update(0.0);
     assert_eq!(script.printed(), ["0,0", "1,0", "0,1", "1,1"]);
 }
+
+#[test]
+fn a_warning_does_not_stop_a_script_running() {
+    // Warnings are advice. The unused binding below is real and reported, and
+    // the script still compiles and still runs.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let forgotten = 1.0;
+            print("ran");
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["ran"]);
+
+    let (_, diagnostics) = comet::check(&comet::parse("func f() { let x = 1.0; }").0);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].severity, comet::Severity::Warning);
+}

@@ -6,10 +6,8 @@
 
 use crate::span::Span;
 
-/// How serious a diagnostic is. Only `Error` is emitted anywhere in v1, but the
-/// distinction is real from day one: an editor squiggle needs to know which
-/// color to draw, and `Warning` will not be a new concept when something first
-/// needs it.
+/// How serious a diagnostic is. An `Error` means the script will not compile; a
+/// `Warning` means it will, and probably should not have been written that way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Error,
@@ -29,6 +27,14 @@ impl Diagnostic {
         Self {
             span,
             severity: Severity::Error,
+            message: message.into(),
+        }
+    }
+
+    pub fn warning(span: Span, message: impl Into<String>) -> Self {
+        Self {
+            span,
+            severity: Severity::Warning,
             message: message.into(),
         }
     }
