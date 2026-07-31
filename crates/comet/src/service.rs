@@ -292,6 +292,22 @@ const KEYWORDS: &[&str] = &[
 ];
 /// The type names a script can write.
 const TYPES: &[&str] = &["f32", "bool", "Vec2", "String"];
+/// The engine-provided functions, with what each one is, for completion detail
+/// and hover. Kept beside the checker's table by a test that compares the two.
+const BUILTINS: &[(&str, &str)] = &[
+    ("print", "func print(s: String)"),
+    ("vec2", "func vec2(x: f32, y: f32) -> Vec2"),
+    ("abs", "func abs(a: f32) -> f32"),
+    ("sqrt", "func sqrt(a: f32) -> f32"),
+    ("floor", "func floor(a: f32) -> f32"),
+    ("ceil", "func ceil(a: f32) -> f32"),
+    ("min", "func min(a: f32, b: f32) -> f32"),
+    ("max", "func max(a: f32, b: f32) -> f32"),
+    ("sin", "func sin(a: f32) -> f32"),
+    ("cos", "func cos(a: f32) -> f32"),
+    ("atan2", "func atan2(y: f32, x: f32) -> f32"),
+    ("pow", "func pow(a: f32, b: f32) -> f32"),
+];
 /// The magic name bound to the owning node's position.
 const POS_NAME: &str = "pos";
 /// `Vec2`'s whole member set.
@@ -337,11 +353,13 @@ pub fn completions_at(source: &str, offset: usize) -> Vec<CompletionItem> {
             ));
         }
     }
-    items.push(detailed(
-        "print",
-        CompletionKind::Function,
-        "func print(s: String)".to_string(),
-    ));
+    for (name, signature) in BUILTINS {
+        items.push(detailed(
+            name,
+            CompletionKind::Function,
+            signature.to_string(),
+        ));
+    }
     for name in TYPES {
         items.push(item(name, CompletionKind::Type));
     }
@@ -455,8 +473,8 @@ pub fn hover_at(source: &str, offset: usize) -> Option<String> {
     if let Some(function) = script.functions.iter().find(|f| f.name == name) {
         return Some(signature_of(function));
     }
-    if name == "print" {
-        return Some("func print(s: String)".to_string());
+    if let Some((_, signature)) = BUILTINS.iter().find(|(n, _)| *n == name) {
+        return Some(signature.to_string());
     }
     if let Some(ty) = Type::from_name(name) {
         return Some(format!("type {}", ty.name()));
@@ -859,6 +877,28 @@ func third(c: f32) { let x = nope; }
     fn at_caret(source: &str) -> Vec<String> {
         let offset = source.find('|').expect("mark the caret with |");
         labels(&source.replace('|', ""), offset)
+    }
+
+    #[test]
+    fn every_builtin_the_checker_knows_is_offered_and_explained() {
+        // Two lists that must not drift: the checker decides what compiles, this
+        // one decides what is offered, and a name in one but not the other is
+        // either an unusable suggestion or a working call nobody can discover.
+        let offered = at_caret("func update(dt: f32) { | }");
+        for (name, _) in super::BUILTINS {
+            assert!(
+                offered.contains(&name.to_string()),
+                "`{name}` is not offered"
+            );
+            assert!(
+                hover_at(&format!("func f() {{ {name} }}"), 11).is_some(),
+                "`{name}` has no hover"
+            );
+        }
+        // And nothing is offered that would not compile.
+        for name in ["sine", "square", "vec3"] {
+            assert!(!offered.contains(&name.to_string()));
+        }
     }
 
     #[test]

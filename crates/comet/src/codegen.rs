@@ -230,6 +230,14 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
 
 // --- module-level layout ---
 
+/// Which of a `Vec2`'s two slots an axis is.
+fn axis_offset(axis: Axis) -> u32 {
+    match axis {
+        Axis::X => 0,
+        Axis::Y => 1,
+    }
+}
+
 fn align4(value: u32) -> u32 {
     value.div_ceil(4) * 4
 }
@@ -837,6 +845,20 @@ impl<'a> FnGen<'a> {
                 self.ins().call(F_SET_POS);
             }
 
+            // One axis of a named Vec2. A Vec2 is two adjacent slots, so
+            // writing one component is a store into one of them and the other
+            // is simply left alone - no read-modify-write needed.
+            Place::LocalField(slot, axis) => {
+                self.expr(value);
+                let base = self.slot_base[*slot as usize];
+                self.ins().local_set(base + axis_offset(*axis));
+            }
+            Place::GlobalField(slot, axis) => {
+                self.expr(value);
+                let base = self.globals.base[*slot as usize];
+                self.ins().global_set(base + axis_offset(*axis));
+            }
+
             Place::PosField(axis) => {
                 // Position is written whole, so the other axis has to be read
                 // back and passed through untouched.
@@ -890,6 +912,13 @@ impl<'a> FnGen<'a> {
 
             TypedExprKind::Pos => {
                 self.ins().call(F_GET_X).call(F_GET_Y);
+            }
+
+            // A Vec2 is two f32s on the stack, so constructing one is just
+            // evaluating both components in order.
+            TypedExprKind::MakeVec2 { x, y } => {
+                self.expr(x);
+                self.expr(y);
             }
 
             TypedExprKind::Field { receiver, axis } => {

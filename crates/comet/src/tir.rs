@@ -141,7 +141,11 @@ pub enum TypedStmt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Place {
     Local(u32),
+    /// One axis of a local `Vec2`. The other component is left as it was, which
+    /// is what makes `v.x = 1.0` a partial write rather than a whole one.
+    LocalField(u32, Axis),
     Global(u32),
+    GlobalField(u32, Axis),
     /// The owning node's position, written back through the host.
     Pos,
     /// One axis of the owning node's position.
@@ -178,6 +182,11 @@ pub enum TypedExprKind {
     Field {
         receiver: Box<TypedExpr>,
         axis: Axis,
+    },
+    /// `vec2(x, y)` - the two components, in order, on the stack.
+    MakeVec2 {
+        x: Box<TypedExpr>,
+        y: Box<TypedExpr>,
     },
     /// A call to a function defined in this script. The index is into
     /// [`TypedScript::functions`].

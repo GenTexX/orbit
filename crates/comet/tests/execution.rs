@@ -475,6 +475,51 @@ fn a_vec2_is_copied_not_aliased() {
 }
 
 #[test]
+fn a_vec2_can_be_built_and_taken_apart() {
+    // Before this a Vec2 could only ever come from `pos`, so there was no way
+    // to have a second one - a home position, a velocity, a target.
+    let mut script = Script::at(
+        "
+        let home = vec2(10.0, 20.0);
+        func make(a: f32, b: f32) -> Vec2 { vec2(a, b) }
+        func x_of(v: Vec2) -> f32 { v.x }
+        func update(dt: f32) { pos = home; }
+        ",
+        99.0,
+        99.0,
+    );
+    assert_eq!(
+        script.call::<(f32, f32), (f32, f32)>("make", (3.0, 4.0)),
+        (3.0, 4.0)
+    );
+    assert_eq!(script.call::<(f32, f32), f32>("x_of", (3.0, 4.0)), 3.0);
+    script.update(0.0);
+    assert_eq!(script.position(), (10.0, 20.0), "state built with vec2");
+}
+
+#[test]
+fn one_axis_of_a_named_vec2_can_be_written() {
+    // A partial write: the other component must be left exactly as it was.
+    let mut script = Script::new(
+        "
+        let home = vec2(1.0, 2.0);
+        func update(dt: f32) {
+            let v = vec2(5.0, 6.0);
+            v.x = 50.0;
+            home.y = 20.0;
+            pos = vec2(v.x + v.y, home.x + home.y);
+        }
+        ",
+    );
+    script.update(0.0);
+    assert_eq!(
+        script.position(),
+        (56.0, 21.0),
+        "v is (50, 6) and home is (1, 20) - only one axis moved in each"
+    );
+}
+
+#[test]
 fn a_vec2_crosses_the_boundary_as_two_f32s() {
     let mut script = Script::at(
         "

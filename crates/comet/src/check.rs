@@ -408,14 +408,45 @@ impl Checker {
                         }
                     };
                 }
-                // Only `pos` is assignable through a field in v1: a local `Vec2`
-                // is a value, so writing one component of it would need a
-                // read-modify-write this milestone does not emit.
+                // A named `Vec2` - a local, a parameter, or script state - can
+                // have one axis written. Anything else cannot: there is nowhere
+                // to put the result of assigning into a temporary.
+                if let ast::Expr::Ident { name, span } = receiver.as_ref() {
+                    let axis = match axis(field) {
+                        Some(axis) => axis,
+                        None => {
+                            self.error(*field_span, format!("`Vec2` has no field `{field}`"));
+                            return (Place::Error, Type::Error);
+                        }
+                    };
+                    if let Some(slot) = self.lookup_local(name) {
+                        return match self.locals[slot as usize] {
+                            Type::Vec2 => (Place::LocalField(slot, axis), Type::F32),
+                            other => {
+                                self.no_fields(*span, other);
+                                (Place::Error, Type::Error)
+                            }
+                        };
+                    }
+                    if let Some(&slot) = self.globals.get(name) {
+                        return match self.global_types[slot as usize] {
+                            Type::Vec2 => (Place::GlobalField(slot, axis), Type::F32),
+                            other => {
+                                self.no_fields(*span, other);
+                                (Place::Error, Type::Error)
+                            }
+                        };
+                    }
+                    if !name.is_empty() {
+                        self.error(*span, format!("cannot find `{name}` in this scope"));
+                    }
+                    return (Place::Error, Type::Error);
+                }
                 let receiver = self.expr(receiver);
                 if !receiver.ty.is_error() {
                     self.error(
                         target.span(),
-                        "only `pos` can be assigned through a field in this version",
+                        "only a named `Vec2` can be assigned through a field",
                     );
                 }
                 (Place::Error, Type::Error)
@@ -429,12 +460,35 @@ impl Checker {
         }
     }
 
+    /// Report that a type has no fields, unless it is already poisoned.
+    fn no_fields(&mut self, span: Span, ty: Type) {
+        if !ty.is_error() {
+            self.error(span, format!("`{}` has no fields", ty.name()));
+        }
+    }
+
     /// The expression that reads a place - what compound assignment needs for
     /// its left operand.
     fn place_read(&mut self, place: &Place, ty: Type, span: Span) -> TypedExpr {
         let kind = match place {
             Place::Local(slot) => TypedExprKind::Local(*slot),
             Place::Global(slot) => TypedExprKind::Global(*slot),
+            Place::LocalField(slot, axis) => TypedExprKind::Field {
+                receiver: Box::new(TypedExpr {
+                    kind: TypedExprKind::Local(*slot),
+                    ty: Type::Vec2,
+                    span,
+                }),
+                axis: *axis,
+            },
+            Place::GlobalField(slot, axis) => TypedExprKind::Field {
+                receiver: Box::new(TypedExpr {
+                    kind: TypedExprKind::Global(*slot),
+                    ty: Type::Vec2,
+                    span,
+                }),
+                axis: *axis,
+            },
             Place::Pos => TypedExprKind::Pos,
             Place::PosField(axis) => TypedExprKind::Field {
                 receiver: Box::new(TypedExpr {
@@ -557,6 +611,23 @@ impl Checker {
     ) -> (TypedExprKind, Type) {
         let args: Vec<TypedExpr> = args.iter().map(|a| self.expr(a)).collect();
 
+        // `vec2(x, y)` is a constructor rather than a call: it becomes two
+        // values on the stack, which is what a Vec2 already is.
+        if callee == "vec2" {
+            self.check_args(callee, &args, &[Type::F32, Type::F32], span);
+            let ok = args.len() == 2 && args.iter().all(|a| a.ty == Type::F32);
+            if !ok {
+                return (TypedExprKind::Error, Type::Error);
+            }
+            let mut args = args.into_iter();
+            return (
+                TypedExprKind::MakeVec2 {
+                    x: Box::new(args.next().expect("arity checked")),
+                    y: Box::new(args.next().expect("arity checked")),
+                },
+                Type::Vec2,
+            );
+        }
         if let Some((builtin, params, ret)) = builtin(callee) {
             self.check_args(callee, &args, params, span);
             let ok = args.len() == params.len() && args.iter().zip(params).all(|(a, p)| a.ty == *p);
@@ -783,7 +854,7 @@ fn builtin(name: &str) -> Option<(Builtin, &'static [Type], Type)> {
 }
 
 fn is_host_name(name: &str) -> bool {
-    builtin(name).is_some()
+    builtin(name).is_some() || name == "vec2"
 }
 
 /// Names the compiled module already uses for something. Every script function
