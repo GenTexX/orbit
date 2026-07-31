@@ -246,11 +246,17 @@ impl ListPopup {
                 .align_center()
                 .padding_x(8.0)
                 .padding_y(3.0)
+                .flat()
                 .corner_radius(theme.control_radius);
             if selected {
                 style = style.background(theme.row_selected);
             }
-            let row = ui.panel(card, style);
+            // A button rather than a panel: a panel emits no Clicked, so
+            // clicking a row did nothing at all - and took focus off the editor
+            // on the way, which is what left the popup stranded. An empty
+            // caption makes it a container whose children draw the text, the
+            // same shape the file explorer's rows use.
+            let row = ui.button(card, "", style);
             ui.label(row, &item.label, Style::new().foreground(theme.heading));
             if !item.detail.is_empty() {
                 // A real column rather than a spacer plus a label. Given the
@@ -572,6 +578,29 @@ mod tests {
         let (_, rows) = built(&list);
         assert!(rows.card.is_none(), "no empty box floating over the text");
         assert!(rows.rows.is_empty());
+    }
+
+    #[test]
+    fn a_row_is_interactive_so_clicking_one_reports_it() {
+        // The bug this pins: a redesign made rows plain panels, which emit no
+        // Clicked at all - so clicking a completion did nothing, and the press
+        // took focus off the editor on the way.
+        let mut list = list();
+        list.set_filter("");
+        let (mut ui, rows) = built(&list);
+        let (row, index) = rows.rows[1];
+        let at = {
+            let r = ui.rect(row).unwrap();
+            r.pos + r.size * 0.5
+        };
+        ui.handle_input(crate::input::InputEvent::PointerMoved(at));
+        ui.handle_input(crate::input::InputEvent::PointerPressed);
+        ui.handle_input(crate::input::InputEvent::PointerReleased);
+        assert!(
+            ui.drain_events().contains(&crate::Event::Clicked(row)),
+            "a row must be clickable"
+        );
+        assert_eq!(list.item(index), Some("print"));
     }
 
     #[test]

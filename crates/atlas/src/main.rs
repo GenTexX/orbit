@@ -378,8 +378,13 @@ struct State {
     /// space's step and one undo would swallow both.
     script_coalescing: bool,
     /// The autocomplete popup over the Code pane, while one is open, and the
-    /// byte offset the word it is completing starts at.
-    completions: Option<(aurora::list::ListPopup, usize)>,
+    /// byte range of the word it is completing.
+    ///
+    /// The range is held rather than re-read on accept, because pressing a row
+    /// moves focus to that row - a button is not a text input - and the caret is
+    /// a property of the focused widget, so by the time the click arrives there
+    /// is no caret to ask about.
+    completions: Option<(aurora::list::ListPopup, std::ops::Range<usize>)>,
     /// The find bar over the Code pane, while one is open.
     find: Option<aurora::find::FindBar>,
     /// Set when the per-project view state (dock, camera, tool, collapse) changed
@@ -4256,24 +4261,20 @@ impl State {
                 .into_iter()
                 .map(|item| aurora::list::ListItem::with_detail(item.label, item.detail))
                 .collect();
-        // Anchor below the caret so the popup does not cover the word being
-        // typed; layout nudges it back on screen near an edge.
-        let anchor = self
-            .ui
-            .caret_rect(editor)
-            .map(|r| r.pos + Vec2::new(0.0, r.size.y + 2.0))
-            .unwrap_or_default();
+        // No anchor here on purpose. The buffer has just been edited and not
+        // re-shaped, so the caret has no on-screen position yet - asking for one
+        // returns None, and defaulting to zero put the popup in the corner of
+        // the window. update_completion_anchor sets it after layout instead.
         match &mut self.completions {
             Some((list, at)) => {
-                *at = start;
+                *at = start..caret;
                 list.set_items(items);
                 list.set_filter(prefix);
-                list.set_anchor(anchor);
             }
             None => {
-                let mut list = aurora::list::ListPopup::new(items, anchor);
+                let mut list = aurora::list::ListPopup::new(items, self.completion_anchor_now());
                 list.set_filter(prefix);
-                self.completions = Some((list, start));
+                self.completions = Some((list, start..caret));
             }
         }
         // Nothing left to offer is the same as nothing to show.
@@ -4283,17 +4284,61 @@ impl State {
         self.dirty = true;
     }
 
+    /// Where the completion popup should sit right now: just under the caret,
+    /// so it does not cover the word being typed.
+    ///
+    /// Falls back to the last anchor rather than to the origin: the caret has no
+    /// position between an edit and the next layout, and a popup that jumps to
+    /// the corner of the window whenever that happens is worse than one that
+    /// waits a frame.
+    fn completion_anchor_now(&self) -> Vec2 {
+        let previous = self
+            .completions
+            .as_ref()
+            .map(|(list, _)| list.anchor())
+            .unwrap_or_default();
+        self.rows
+            .code_editor
+            .and_then(|editor| self.ui.caret_rect(editor))
+            .map_or(previous, |r| r.pos + Vec2::new(0.0, r.size.y + 2.0))
+    }
+
+    /// Move the popup under the caret, after layout has given the caret a
+    /// position. Also the backstop that takes it down when the editor is no
+    /// longer the focused widget - clicking away should not leave it floating.
+    fn update_completion_anchor(&mut self) {
+        if self.completions.is_none() {
+            return;
+        }
+        // Not while the pointer is down: a press on a row moves focus to that
+        // row, and closing here would destroy the row before its release could
+        // become a click.
+        if !self.pointer_down
+            && (self.ui.focused() != self.rows.code_editor || self.rows.code_editor.is_none())
+        {
+            self.completions = None;
+            self.dirty = true;
+            return;
+        }
+        let anchor = self.completion_anchor_now();
+        if let Some((list, _)) = &mut self.completions
+            && list.anchor() != anchor
+        {
+            list.set_anchor(anchor);
+            self.dirty = true;
+        }
+    }
+
     /// Replace the word the popup was completing with `label`.
     fn accept_completion(&mut self, label: &str) {
-        let (Some(editor), Some((_, start))) = (self.rows.code_editor, self.completions.as_ref())
+        let (Some(editor), Some((_, range))) = (self.rows.code_editor, self.completions.as_ref())
         else {
             return;
         };
-        let start = *start;
-        let Some(caret) = self.ui.caret_offset() else {
-            return;
-        };
-        self.ui.select_range(editor, start, caret);
+        let range = range.clone();
+        // select_range re-focuses the editor, which a click on a row had taken
+        // focus away from.
+        self.ui.select_range(editor, range.start, range.end);
         self.ui.insert_str(label);
         self.completions = None;
         self.sync_script_buffer();
@@ -4874,6 +4919,7 @@ impl State {
         // live splitter sizes and pane scroll back so the next rebuild restores
         // them - the docking equivalent of the old capture_panel_sizes.
         self.apply_script_marks();
+        self.update_completion_anchor();
         self.sync_dock_state();
         self.maybe_save_editor_state();
 
