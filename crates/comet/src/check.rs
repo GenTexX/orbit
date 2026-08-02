@@ -145,6 +145,7 @@ impl Checker {
                     format!("`{}` is reserved for the runtime", f.name),
                 );
             }
+            self.check_hook(index, f);
         }
 
         // Then script state, in order: an initializer sees the globals declared
@@ -230,6 +231,41 @@ impl Checker {
             locals: std::mem::take(&mut self.locals),
             param_count: f.params.len(),
             body,
+        }
+    }
+
+    /// Reject a function that takes one of the engine's hook names but does not
+    /// have that hook's signature.
+    ///
+    /// The host looks the name up at exactly one signature and quietly gets
+    /// nothing back when it does not match, so a script that declares
+    /// `func update()` compiles to a perfectly good module that is then never
+    /// called. From inside the editor that is indistinguishable from the script
+    /// not running, with nothing anywhere saying why. This is the only place a
+    /// person finds out before wondering why their node does not move.
+    ///
+    /// An error rather than a warning: the module would be valid WebAssembly,
+    /// but it is not a valid script for this engine, and a diagnostic nobody
+    /// can miss is the entire point of the check.
+    fn check_hook(&mut self, index: usize, f: &ast::Function) {
+        let Some(hook) = HOOKS.iter().find(|hook| hook.name == f.name) else {
+            return;
+        };
+        let signature = &self.signatures[index];
+        // A signature with a type that did not resolve has already been
+        // reported; one mistake yields one diagnostic.
+        if signature.ret.is_error() || signature.params.iter().any(|ty| ty.is_error()) {
+            return;
+        }
+        if signature.params != hook.params || signature.ret != hook.ret {
+            let written = hook.written;
+            self.error(
+                f.name_span,
+                format!(
+                    "`{}` is called by the engine and must be written `{written}`",
+                    f.name
+                ),
+            );
         }
     }
 
@@ -1094,6 +1130,27 @@ fn edit_distance(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
+/// A function the engine looks up by name, and the shape it must have.
+struct Hook {
+    name: &'static str,
+    params: &'static [Type],
+    ret: Type,
+    /// The declaration as it should be written, for the diagnostic. Held rather
+    /// than rendered from the types above because a parameter name is part of
+    /// what a person needs to be shown and is not in the signature.
+    written: &'static str,
+}
+
+/// Only `update`. `start` and `on_destroy` are decided but not yet called by
+/// helios, and rejecting a signature nothing looks up would be inventing a
+/// contract the engine does not have.
+const HOOKS: &[Hook] = &[Hook {
+    name: "update",
+    params: &[Type::F32],
+    ret: Type::Unit,
+    written: "func update(dt: f32)",
+}];
+
 /// A `let` the checker is watching, so it can say when nothing ever read it.
 struct Binding {
     name: String,
@@ -1795,5 +1852,48 @@ mod tests {
         assert!(warnings(r#"func f() { for i in 0.0..3.0 { print("x"); } }"#).is_empty());
         // And an underscore says "I know".
         assert!(warnings("func f() { let _spare = 1.0; }").is_empty());
+    }
+
+    #[test]
+    fn an_update_with_the_wrong_signature_is_reported_rather_than_ignored() {
+        // The host looks `update` up at one signature and silently gets nothing
+        // back otherwise, so without this the script compiles, never runs, and
+        // says nothing about why.
+        let expected =
+            ["`update` is called by the engine and must be written `func update(dt: f32)`"];
+        assert_eq!(messages("func update() { }"), expected, "no parameter");
+        assert_eq!(
+            messages("func update(dt: f32) -> f32 { 1.0 }"),
+            expected,
+            "returns something"
+        );
+        assert_eq!(
+            messages("func update(dt: Vec2) { }"),
+            expected,
+            "wrong parameter type"
+        );
+        assert_eq!(
+            messages("func update(a: f32, b: f32) { }"),
+            expected,
+            "too many parameters"
+        );
+    }
+
+    #[test]
+    fn the_parameter_name_of_update_is_the_authors_to_choose() {
+        check_clean("func update(elapsed: f32) { }");
+        // And a function that is not a hook can have any shape at all.
+        check_clean("func tick() -> Vec2 { pos }");
+    }
+
+    #[test]
+    fn an_update_whose_type_did_not_resolve_reports_only_that() {
+        // One mistake, one diagnostic: the unresolved type is the thing to fix,
+        // and adding "must be written func update(dt: f32)" on top of it would
+        // be a second complaint about the same character.
+        assert_eq!(
+            messages("func update(dt: Vector) { }"),
+            ["unknown type `Vector`"]
+        );
     }
 }

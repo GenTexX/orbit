@@ -22,7 +22,8 @@ Five `.cmt` scripts in the syntax this plan assumes, written so each one becomes
 - **Semicolons are required** after every statement.
 - **A block's last line, if it is a bare expression with no trailing semicolon, is that block's value** - Rust's tail-expression rule, borrowed exactly. This is the only implicit return: an early return mid-function still needs an explicit `return value;`. See `clamp` below - two explicit early returns, one implicit tail return.
 - Functions: `func name(param: Type) -> ReturnType { ... }`.
-- Bare integer literals (`200`, not `200.0`) are valid `f32` literals - there is no separate integer type in v1, so there is nothing to coerce.
+- ~~Bare integer literals (`200`, not `200.0`) are valid `f32` literals - there is no separate integer type in v1, so there is nothing to coerce.~~
+  **Superseded** by decision 5 in [the Comet language design record](../comet-language-design.md): an `int` type is added, `200` becomes an `int`, and an `int` widens to `f32` implicitly. Every script written against this line keeps compiling - which is why the widening is implicit - but it does so for a different reason than the one stated here.
 - `//` line comments.
 - `print(s: String)` is the one host-bound debug function, and the only thing that exercises the refcounted `String` path in v1.
 

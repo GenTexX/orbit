@@ -284,9 +284,15 @@ natural default.
   surprise nobody, but copy on every pass unless the compiler grows escape
   analysis, which is the kind of optimization ADR 0007 rules out.
 
-Not in question: a script defining `func update()` with the wrong signature
+~~Not in question: a script defining `func update()` with the wrong signature
 currently gets silence, because the host looks up exactly one hardcoded name at
-`f32 -> ()`. That needs a diagnostic regardless of anything above.
+`f32 -> ()`. That needs a diagnostic regardless of anything above.~~ **Done.**
+The checker now rejects a function taking a hook's name without that hook's
+signature, from a `HOOKS` table holding the one name helios actually looks up.
+An error rather than a warning: the module would be valid WebAssembly, but it
+is not a valid script for this engine. `start` and `on_destroy` join the table
+when decision 13 is built and helios calls them - listing a name nothing looks
+up would invent a contract the engine does not have.
 
 ## Still to decide
 
