@@ -120,7 +120,23 @@ impl Parser {
 
     fn type_name(&mut self) -> TypeName {
         let (name, span) = self.ident("a type name");
-        TypeName { name, span }
+        let mut args = Vec::new();
+        let mut end = span;
+        if self.eat(&TokenKind::Lt) {
+            while !self.at_end() && !matches!(self.peek(), TokenKind::Gt) {
+                args.push(self.type_name());
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            end = self.peek_span();
+            self.expect(&TokenKind::Gt, "`>` after a type's arguments");
+        }
+        TypeName {
+            name,
+            args,
+            span: span.to(end),
+        }
     }
 
     // --- top level ---
@@ -174,6 +190,16 @@ impl Parser {
         let start = self.peek_span();
         self.advance(); // `enum`
         let (name, name_span) = self.ident("an enum name");
+        let mut params = Vec::new();
+        if self.eat(&TokenKind::Lt) {
+            while !self.at_end() && !matches!(self.peek(), TokenKind::Gt) {
+                params.push(self.ident("a type parameter name"));
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::Gt, "`>` after an enum's type parameters");
+        }
         if !self.expect(&TokenKind::LBrace, "`{` after an enum name") {
             self.recover_to_top_level();
             return None;
@@ -208,6 +234,7 @@ impl Parser {
         Some(EnumDecl {
             name,
             name_span,
+            params,
             variants,
             span: start.to(end),
         })

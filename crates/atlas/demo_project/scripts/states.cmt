@@ -28,6 +28,8 @@ func describe(c: Contact) -> String {
 }
 
 func start() {
+    print(report(safe_divide(9.0, 2.0)));
+    print(report(safe_divide(1.0, 0.0)));
     print(describe(Contact::None));
     print(describe(Contact::Wall(1.5)));
     print(describe(Contact::Corner(2.0, 3.0)));
@@ -35,4 +37,26 @@ func start() {
 
 func update(dt: f32) {
     transform.position.y = wobble(mood) * dt;
+}
+
+// `Option<T>` is not built into the compiler - it is an ordinary enum the
+// language always has in scope:
+//
+//     enum Option<T> { None, Some(T) }
+//
+// A variant that carries nothing has no type of its own, so the annotation is
+// what says which Option this is.
+
+func safe_divide(a: f32, b: f32) -> Option<f32> {
+    if b == 0.0 {
+        return Option::None;
+    }
+    Option::Some(a / b)
+}
+
+func report(o: Option<f32>) -> String {
+    match o {
+        None => "undefined",
+        Some(v) => str(v),
+    }
 }

@@ -19,8 +19,9 @@ alongside the enum work. A further set, listed under "Still to decide", has not
 been put yet.
 
 **Implemented so far:** decisions 6 and 13 (iteration 4.1), decisions 1 and 2
-(iteration 4.2, ADR 0020), decisions 4 and 5 (iteration 4.3, ADR 0021), and decisions 3, 11, 12 and 14
-(iteration 4.4, ADR 0022). 
+(iteration 4.2, ADR 0020), decisions 4 and 5 (iteration 4.3, ADR 0021), decisions 3, 11, 12 and 14
+(iteration 4.4, ADR 0022), and decisions 7, 8, 9 and 10 (iteration 4.5,
+ADR 0023). That is all fourteen. 
 
 ## Where the language actually stands
 

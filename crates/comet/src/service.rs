@@ -344,7 +344,7 @@ const KEYWORDS: &[&str] = &[
     "func", "let", "if", "else", "while", "for", "in", "enum", "match", "return", "true", "false",
 ];
 /// The type names a script can write.
-const TYPES: &[&str] = &["f32", "int", "bool", "Vec2", "String"];
+const TYPES: &[&str] = &["f32", "int", "bool", "Vec2", "String", "Option"];
 /// The engine-provided functions, with what each one is, for completion detail
 /// and hover. Kept beside the checker's table by a test that compares the two.
 const BUILTINS: &[(&str, &str)] = &[

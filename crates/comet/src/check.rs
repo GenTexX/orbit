@@ -22,7 +22,10 @@ use crate::tir::*;
 /// diagnostics still yields a tree - the bad parts are [`Type::Error`].
 pub fn check(script: &ast::Script, schema: &HostSchema) -> (TypedScript, Vec<Diagnostic>) {
     let mut checker = Checker {
+        templates: Vec::new(),
         enums: Vec::new(),
+        instances: HashMap::new(),
+        building: Vec::new(),
         schema,
         diagnostics: Vec::new(),
         globals: HashMap::new(),
@@ -47,8 +50,17 @@ struct Signature {
 }
 
 struct Checker<'a> {
-    /// The script's enums, in declaration order. `Type::Enum` indexes this.
+    /// Every enum as written, generic or not. A generic one describes a family
+    /// of types; nothing is laid out until it is used at concrete arguments.
+    templates: Vec<ast::EnumDecl>,
+    /// Concrete enums, in the order they were first needed. `Type::Enum`
+    /// indexes this, and it is what reaches codegen.
     enums: Vec<TypedEnum>,
+    /// Which concrete enum each (template, arguments) pair produced, so a type
+    /// used twice is laid out once.
+    instances: HashMap<(usize, Vec<Type>), u32>,
+    /// Instantiations in progress, to catch a type that contains itself.
+    building: Vec<(usize, Vec<Type>)>,
     /// What this script can reach outside itself. comet has no built-in idea of
     /// what a node is; the engine says.
     schema: &'a HostSchema,
@@ -84,13 +96,29 @@ impl Checker<'_> {
         if expected == found || expected.is_error() || found.is_error() {
             return;
         }
-        self.error(
-            span,
-            format!("expected `{}`, found `{}`", expected.name(), found.name()),
-        );
+        let (expected, found) = (self.name_of(expected), self.name_of(found));
+        self.error(span, format!("expected `{expected}`, found `{found}`"));
     }
 
-    /// `State::Idle`, or `Hit::Wall(3.0)`.
+    /// What to call a type in a diagnostic.
+    ///
+    /// `Type::name` cannot do this: an enum is an index, and only the checker
+    /// holds the table. Without it every enum reads as "enum", which turns a
+    /// mismatch into "expected `enum`, found `enum`".
+    fn name_of(&self, ty: Type) -> String {
+        match ty {
+            Type::Enum(index) => self.enums[index as usize].name.clone(),
+            other => other.name().to_string(),
+        }
+    }
+
+    /// `State::Idle`, or `Hit::Wall(3.0)`, or `Option::Some(1.0)`.
+    ///
+    /// A generic enum's arguments are worked out from the payload where the
+    /// payload says - `Some(1.0)` is an `Option<f32>` - and from the type this
+    /// expression is being checked against where it does not. `Option::None`
+    /// carries nothing, so `let x: Option<f32> = Option::None;` is the only
+    /// thing that can say what it is, and that is why the hint exists.
     fn make_variant(
         &mut self,
         enum_name: &str,
@@ -98,10 +126,11 @@ impl Checker<'_> {
         variant: &str,
         variant_span: Span,
         args: &[ast::Expr],
+        expected: Option<Type>,
     ) -> (TypedExprKind, Type) {
-        let Some(index) = self.enum_index(enum_name) else {
+        let Some(template) = self.template(enum_name) else {
             if !enum_name.is_empty() {
-                let candidates = self.enums.iter().map(|e| e.name.as_str());
+                let candidates = self.templates.iter().map(|t| t.name.as_str());
                 let message = match nearest(enum_name, candidates) {
                     Some(suggestion) => {
                         format!("cannot find enum `{enum_name}` - did you mean `{suggestion}`?")
@@ -112,15 +141,10 @@ impl Checker<'_> {
             }
             return (TypedExprKind::Error, Type::Error);
         };
-        let found = self.enums[index as usize]
-            .variants
-            .iter()
-            .position(|v| v.name == variant);
-        let Some(position) = found else {
-            let candidates = self.enums[index as usize]
-                .variants
-                .iter()
-                .map(|v| v.name.as_str());
+
+        let decl = self.templates[template].clone();
+        let Some(position) = decl.variants.iter().position(|v| v.name == variant) else {
+            let candidates = decl.variants.iter().map(|v| v.name.as_str());
             let message = match nearest(variant, candidates) {
                 Some(suggestion) => format!(
                     "`{enum_name}` has no variant `{variant}` - did you mean `{suggestion}`?"
@@ -131,23 +155,36 @@ impl Checker<'_> {
             return (TypedExprKind::Error, Type::Error);
         };
 
-        let payload = self.enums[index as usize].variants[position]
-            .payload
-            .clone();
-        let mut checked: Vec<TypedExpr> = args.iter().map(|a| self.expr(a)).collect();
-        if checked.len() != payload.len() {
+        let pattern = &decl.variants[position].payload;
+        if args.len() != pattern.len() {
             self.error(
                 variant_span,
                 format!(
                     "`{variant}` carries {} value{}, but {} {} given",
-                    payload.len(),
-                    if payload.len() == 1 { "" } else { "s" },
-                    checked.len(),
-                    if checked.len() == 1 { "was" } else { "were" }
+                    pattern.len(),
+                    if pattern.len() == 1 { "" } else { "s" },
+                    args.len(),
+                    if args.len() == 1 { "was" } else { "were" }
                 ),
             );
             return (TypedExprKind::Error, Type::Error);
         }
+
+        // Check the payload first: its types are what the arguments are read
+        // from, and a non-generic enum needs nothing else.
+        let mut checked: Vec<TypedExpr> = args.iter().map(|a| self.expr(a)).collect();
+        let Some(type_args) =
+            self.infer_arguments(&decl, position, &checked, expected, variant_span)
+        else {
+            return (TypedExprKind::Error, Type::Error);
+        };
+        let Some(index) = self.instantiate(template, &type_args, variant_span) else {
+            return (TypedExprKind::Error, Type::Error);
+        };
+
+        let payload = self.enums[index as usize].variants[position]
+            .payload
+            .clone();
         for (arg, want) in checked.iter_mut().zip(&payload) {
             let taken = std::mem::replace(
                 arg,
@@ -169,6 +206,71 @@ impl Checker<'_> {
         )
     }
 
+    /// Work out a generic enum's type arguments at a construction site.
+    ///
+    /// From the payload where a parameter is named directly, and otherwise from
+    /// the type this expression is being checked against. Only a bare parameter
+    /// is matched - `Some(T)` yes, `Some(Wrapper<T>)` no - which is enough for
+    /// every generic the language has, and keeps the checker a single pass.
+    fn infer_arguments(
+        &mut self,
+        decl: &ast::EnumDecl,
+        variant: usize,
+        args: &[TypedExpr],
+        expected: Option<Type>,
+        span: Span,
+    ) -> Option<Vec<Type>> {
+        if decl.params.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut bound: HashMap<&str, Type> = HashMap::new();
+        for (pattern, arg) in decl.variants[variant].payload.iter().zip(args) {
+            if decl.params.iter().any(|(p, _)| *p == pattern.name)
+                && !arg.ty.is_error()
+                && !bound.contains_key(pattern.name.as_str())
+            {
+                bound.insert(&pattern.name, arg.ty);
+            }
+        }
+        // What the surrounding context says this should be, for the parameters
+        // the payload could not settle.
+        let from_expected = expected.and_then(|ty| match ty {
+            Type::Enum(index) => self.instance_args(index),
+            _ => None,
+        });
+        let mut out = Vec::with_capacity(decl.params.len());
+        for (position, (param, _)) in decl.params.iter().enumerate() {
+            if let Some(found) = bound.get(param.as_str()) {
+                out.push(*found);
+            } else if let Some((template, args)) = &from_expected
+                && self.templates[*template].name == decl.name
+                && position < args.len()
+            {
+                out.push(args[position]);
+            } else {
+                self.error(
+                    span,
+                    format!(
+                        "cannot tell what `{param}` is here - nothing this variant carries says, \
+                         and neither does what it is being used as. Give the declaration a type, \
+                         as in `let x: {}<f32> = ...`",
+                        decl.name
+                    ),
+                );
+                return None;
+            }
+        }
+        Some(out)
+    }
+
+    /// Which template and arguments produced the concrete enum `index`.
+    fn instance_args(&self, index: u32) -> Option<(usize, Vec<Type>)> {
+        self.instances
+            .iter()
+            .find(|(_, produced)| **produced == index)
+            .map(|(key, _)| key.clone())
+    }
+
     /// `match x { ... }`, checked for exhaustiveness.
     ///
     /// Every variant must have an arm. There is no wildcard on purpose: a
@@ -179,6 +281,7 @@ impl Checker<'_> {
         scrutinee: &ast::Expr,
         arms: &[ast::MatchArm],
         span: Span,
+        expected: Option<Type>,
     ) -> (TypedExprKind, Type) {
         let scrutinee = self.expr(scrutinee);
         let Type::Enum(index) = scrutinee.ty else {
@@ -244,7 +347,12 @@ impl Checker<'_> {
                 .zip(&payload)
                 .map(|((name, name_span), ty)| self.declare_local(name, *ty, Some(*name_span)))
                 .collect();
-            let body = self.expr(&arm.body);
+            // An arm is checked against what the whole `match` should be, or
+            // against the first arm once there is one - so
+            // `match x { A => Option::None, B => Option::Some(1.0) }` works
+            // whichever order the arms are written in.
+            let hint = expected.or((!result.is_error()).then_some(result));
+            let body = self.expr_hinted(&arm.body, hint);
             self.scopes.pop();
 
             // Every arm has the same type: it is one expression with one value.
@@ -257,8 +365,8 @@ impl Checker<'_> {
                     format!(
                         "every arm of a `match` has to produce the same type - this one is {}, \
                          and the first is {}",
-                        body.ty.name(),
-                        result.name()
+                        self.name_of(body.ty),
+                        self.name_of(result)
                     ),
                 );
             }
@@ -297,6 +405,35 @@ impl Checker<'_> {
         )
     }
 
+    /// Work out which enums can hold a `String`, directly or through another.
+    ///
+    /// A property of the whole graph rather than of one declaration, so it
+    /// settles by repetition. The set only grows, so this terminates. Getting it
+    /// wrong in the false direction leaks; in the true direction it costs a tag
+    /// read that does nothing.
+    fn settle_holds_str(&mut self) {
+        loop {
+            let mut changed = false;
+            for index in 0..self.enums.len() {
+                if self.enums[index].holds_str {
+                    continue;
+                }
+                let holds = self.enums[index]
+                    .variants
+                    .iter()
+                    .flat_map(|v| &v.payload)
+                    .any(|ty| self.owns_str(*ty));
+                if holds {
+                    self.enums[index].holds_str = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+        }
+    }
+
     /// Whether releasing a value of this type has anything to do.
     fn owns_str(&self, ty: Type) -> bool {
         match ty {
@@ -324,12 +461,134 @@ impl Checker<'_> {
         }
     }
 
-    /// The index of the enum called `name`, if the script declares one.
-    fn enum_index(&self, name: &str) -> Option<u32> {
-        self.enums
+    /// The template called `name`, generic or not.
+    fn template(&self, name: &str) -> Option<usize> {
+        self.templates.iter().position(|t| t.name == name)
+    }
+
+    /// The concrete enum `name` at `args`, building it if this is the first use
+    /// at those arguments.
+    ///
+    /// This is the monomorphization: one layout per set of arguments, decided
+    /// here rather than at emission, so codegen never learns that a type
+    /// parameter exists. `TypedScript::enums` holds only concrete types.
+    fn instantiate(&mut self, template: usize, args: &[Type], span: Span) -> Option<u32> {
+        let decl = self.templates[template].clone();
+        if args.len() != decl.params.len() {
+            self.error(
+                span,
+                format!(
+                    "`{}` takes {} type argument{}, but {} {} given",
+                    decl.name,
+                    decl.params.len(),
+                    if decl.params.len() == 1 { "" } else { "s" },
+                    args.len(),
+                    if args.len() == 1 { "was" } else { "were" }
+                ),
+            );
+            return None;
+        }
+        let key = (template, args.to_vec());
+        if let Some(found) = self.instances.get(&key) {
+            return Some(*found);
+        }
+        // A type that contains itself has no finite layout, because an enum is
+        // flattened into its parent rather than boxed.
+        if self.building.contains(&key) {
+            self.error(
+                span,
+                format!(
+                    "`{}` contains itself, so it has no size - a value cannot hold one of its \
+                     own type",
+                    decl.name
+                ),
+            );
+            return None;
+        }
+        self.building.push(key.clone());
+
+        let bindings: HashMap<String, Type> = decl
+            .params
             .iter()
-            .position(|e| e.name == name)
-            .map(|i| i as u32)
+            .map(|(name, _)| name.clone())
+            .zip(args.iter().copied())
+            .collect();
+        let mut variants = Vec::new();
+        let mut widest = 0;
+        for variant in &decl.variants {
+            let payload: Vec<Type> = variant
+                .payload
+                .iter()
+                .map(|t| self.resolve_type_with(t, &bindings))
+                .collect();
+            widest = widest.max(payload.iter().map(|t| self.slots(*t)).sum::<usize>());
+            variants.push(TypedVariant {
+                name: variant.name.clone(),
+                payload,
+            });
+        }
+        self.building.retain(|k| k != &key);
+
+        let name = if args.is_empty() {
+            decl.name.clone()
+        } else {
+            let listed: Vec<&str> = args.iter().map(|t| t.name()).collect();
+            format!("{}<{}>", decl.name, listed.join(", "))
+        };
+        let index = self.enums.len() as u32;
+        self.enums.push(TypedEnum {
+            name,
+            variants,
+            holds_str: false,
+            payload_slots: widest,
+        });
+        self.instances.insert(key, index);
+        Some(index)
+    }
+
+    /// Resolve a written type, with any type parameters currently in scope.
+    fn resolve_type_with(
+        &mut self,
+        name: &ast::TypeName,
+        bindings: &HashMap<String, Type>,
+    ) -> Type {
+        if let Some(bound) = bindings.get(&name.name) {
+            if !name.args.is_empty() {
+                self.error(
+                    name.span,
+                    format!("`{}` is a type parameter and takes no arguments", name.name),
+                );
+            }
+            return *bound;
+        }
+        if let Some(template) = self.template(&name.name) {
+            let args: Vec<Type> = name
+                .args
+                .iter()
+                .map(|a| self.resolve_type_with(a, bindings))
+                .collect();
+            return match self.instantiate(template, &args, name.span) {
+                Some(index) => Type::Enum(index),
+                None => Type::Error,
+            };
+        }
+        match Type::from_name(&name.name) {
+            Some(ty) => {
+                if !name.args.is_empty() {
+                    self.error(
+                        name.span,
+                        format!("`{}` takes no type arguments", name.name),
+                    );
+                }
+                ty
+            }
+            None => {
+                if !name.name.is_empty() {
+                    self.error(name.span, format!("unknown type `{}`", name.name));
+                }
+                Type::Error
+            }
+        }
     }
 
     /// How many wasm slots a value of this type occupies. The checker needs it
@@ -437,6 +696,14 @@ impl Checker<'_> {
     /// through here - a `let` with an annotation, an argument, a return, an
     /// assignment - so the widening rule lives in one place instead of at each
     /// of them, where one would eventually be missed.
+    /// Check `expr` against `want` and make it fit: the hint on the way in, the
+    /// widening on the way out. Every site that knows what a type should be
+    /// goes through here.
+    fn checked_against(&mut self, expr: &ast::Expr, want: Type) -> TypedExpr {
+        let checked = self.expr_hinted(expr, Some(want));
+        self.coerce(checked, want)
+    }
+
     fn coerce(&mut self, expr: TypedExpr, want: Type) -> TypedExpr {
         if want == Type::F32 && expr.ty == Type::Int {
             let span = expr.span;
@@ -484,96 +751,44 @@ impl Checker<'_> {
     }
 
     fn resolve_type(&mut self, name: &ast::TypeName) -> Type {
-        match Type::from_name(&name.name) {
-            Some(ty) => ty,
-            None if self.enum_index(&name.name).is_some() => {
-                Type::Enum(self.enum_index(&name.name).expect("just checked"))
-            }
-            None => {
-                // An empty name means the parser already reported a missing
-                // type name; do not pile on.
-                if !name.name.is_empty() {
-                    self.error(name.span, format!("unknown type `{}`", name.name));
-                }
-                Type::Error
-            }
-        }
+        self.resolve_type_with(name, &HashMap::new())
     }
 
     // --- top level ---
 
     fn script(&mut self, script: &ast::Script) -> TypedScript {
-        // Enums first: a state initializer, a signature, or another enum's
-        // payload can name one, and none of them can be checked until the set
-        // of type names is known.
-        for (index, decl) in script.enums.iter().enumerate() {
-            if self.enum_index(&decl.name).is_some() && !decl.name.is_empty() {
+        // Enums first, as templates: a state initializer, a signature, or
+        // another enum's payload can name one, and none of them can be checked
+        // until the set of type names is known. A template's payload types stay
+        // unresolved, because a parameter has no meaning until it is given one.
+        for decl in prelude_enums().iter().chain(script.enums.iter()) {
+            if self.template(&decl.name).is_some() && !decl.name.is_empty() {
                 self.error(
                     decl.name_span,
                     format!("`{}` is already defined in this script", decl.name),
                 );
             }
-            self.enums.push(TypedEnum {
-                name: decl.name.clone(),
-                variants: Vec::new(),
-                holds_str: false,
-                payload_slots: 0,
-            });
-            let _ = index;
-        }
-        // Then their payloads, in a second pass, so one enum may carry another
-        // regardless of which was written first.
-        for (index, decl) in script.enums.iter().enumerate() {
-            let mut variants = Vec::new();
-            let mut widest = 0;
+            let mut seen: Vec<&str> = Vec::new();
             for variant in &decl.variants {
-                if variants
-                    .iter()
-                    .any(|v: &TypedVariant| v.name == variant.name)
-                {
+                if seen.contains(&variant.name.as_str()) {
                     self.error(
                         variant.name_span,
                         format!("`{}` is already a variant of this enum", variant.name),
                     );
                 }
-                let payload: Vec<Type> = variant
-                    .payload
-                    .iter()
-                    .map(|t| self.resolve_type(t))
-                    .collect();
-                widest = widest.max(payload.iter().map(|t| self.slots(*t)).sum::<usize>());
-                variants.push(TypedVariant {
-                    name: variant.name.clone(),
-                    payload,
-                });
+                seen.push(&variant.name);
             }
-            if variants.is_empty() && !decl.name.is_empty() {
+            if decl.variants.is_empty() && !decl.name.is_empty() {
                 self.error(decl.span, "an enum needs at least one variant");
             }
-            self.enums[index].variants = variants;
-            self.enums[index].payload_slots = widest;
+            self.templates.push(decl.clone());
         }
-        // Whether an enum can hold a String is a property of the whole graph -
-        // one enum's payload may be another - so it settles by repetition
-        // rather than in one pass. The set only grows, so this terminates.
-        loop {
-            let mut changed = false;
-            for index in 0..self.enums.len() {
-                if self.enums[index].holds_str {
-                    continue;
-                }
-                let holds = self.enums[index]
-                    .variants
-                    .iter()
-                    .flat_map(|v| &v.payload)
-                    .any(|ty| self.owns_str(*ty));
-                if holds {
-                    self.enums[index].holds_str = true;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
+        // A non-generic enum has exactly one layout, so it is built now and its
+        // name resolves like any other type's.
+        for index in 0..self.templates.len() {
+            if self.templates[index].params.is_empty() {
+                let span = self.templates[index].span;
+                self.instantiate(index, &[], span);
             }
         }
 
@@ -632,8 +847,7 @@ impl Checker<'_> {
             let declared = decl.ty.as_ref().map(|t| self.resolve_type(t));
             let (init, ty) = match (&decl.init, declared) {
                 (Some(written), Some(declared)) => {
-                    let init = self.expr(written);
-                    (self.coerce(init, declared), declared)
+                    (self.checked_against(written, declared), declared)
                 }
                 (Some(written), None) => {
                     let init = self.expr(written);
@@ -718,6 +932,10 @@ impl Checker<'_> {
             .enumerate()
             .map(|(index, f)| self.function(index, f))
             .collect();
+        // Last, because instantiation is lazy: a generic enum used only inside
+        // a function body does not exist until that body has been checked.
+        self.settle_holds_str();
+
         TypedScript {
             enums: std::mem::take(&mut self.enums),
             state,
@@ -741,7 +959,7 @@ impl Checker<'_> {
             self.scopes[0].insert(p.name.clone(), i as u32);
         }
 
-        let mut body = self.block(&f.body);
+        let mut body = self.block_hinted(&f.body, Some(ret));
         self.report_unused();
 
         // The body's tail is the function's value when it has one, so it is
@@ -858,6 +1076,12 @@ impl Checker<'_> {
     // --- statements ---
 
     fn block(&mut self, block: &ast::Block) -> TypedBlock {
+        self.block_hinted(block, None)
+    }
+
+    /// A block whose tail is checked against `expected` - what a function body
+    /// wants, so `func f() -> Option<f32> { Option::None }` can say what it is.
+    fn block_hinted(&mut self, block: &ast::Block, expected: Option<Type>) -> TypedBlock {
         self.scopes.push(HashMap::new());
         let mut stmts = Vec::with_capacity(block.stmts.len());
         for stmt in &block.stmts {
@@ -869,7 +1093,7 @@ impl Checker<'_> {
                 other => stmts.push(self.stmt(other)),
             }
         }
-        let tail = block.tail.as_ref().map(|e| self.expr(e));
+        let tail = block.tail.as_ref().map(|e| self.expr_hinted(e, expected));
         self.scopes.pop();
         let ty = tail.as_ref().map_or(Type::Unit, |t| t.ty);
         TypedBlock { stmts, tail, ty }
@@ -988,15 +1212,15 @@ impl Checker<'_> {
                 init,
                 span,
             } => {
-                let mut init = self.expr(init);
+                // The annotation is resolved first, so it can be the hint the
+                // initializer is checked against - which is what makes
+                // `let x: Option<f32> = Option::None;` work at all.
                 let declared = ty.as_ref().map(|t| self.resolve_type(t));
-                let ty = match declared {
-                    Some(declared) => {
-                        init = self.coerce(init, declared);
-                        declared
-                    }
-                    None => init.ty,
+                let init = match declared {
+                    Some(declared) => self.checked_against(init, declared),
+                    None => self.expr(init),
                 };
+                let ty = declared.unwrap_or(init.ty);
                 if ty == Type::Unit {
                     self.error(*span, "a `let` needs a value, but this produces nothing");
                 }
@@ -1008,7 +1232,10 @@ impl Checker<'_> {
                 target, op, value, ..
             } => {
                 let (place, target_ty) = self.place(target);
-                let value = self.expr(value);
+                let value = match op {
+                    ast::AssignOp::Set => self.expr_hinted(value, Some(target_ty)),
+                    _ => self.expr(value),
+                };
                 match op {
                     ast::AssignOp::Set => {
                         let value = self.coerce(value, target_ty);
@@ -1078,7 +1305,8 @@ impl Checker<'_> {
             }
 
             ast::Stmt::Return { value, span } => {
-                let mut value = value.as_ref().map(|v| self.expr(v));
+                let ret = self.ret;
+                let mut value = value.as_ref().map(|v| self.expr_hinted(v, Some(ret)));
                 match (&value, self.ret) {
                     (Some(_), ret) => value = value.map(|v| self.coerce(v, ret)),
                     (None, Type::Unit) | (None, Type::Error) => {}
@@ -1349,6 +1577,19 @@ impl Checker<'_> {
     // --- expressions ---
 
     fn expr(&mut self, expr: &ast::Expr) -> TypedExpr {
+        self.expr_hinted(expr, None)
+    }
+
+    /// Check an expression against `expected`, if the site knows what it should
+    /// be.
+    ///
+    /// The hint is advisory and only two things read it: constructing a generic
+    /// variant that carries nothing, and a `match` whose arms build one. This
+    /// is bidirectional checking kept to the smallest surface that makes
+    /// `let x: Option<f32> = Option::None;` work - a full expected-type
+    /// discipline would be a second pass, against a checker whose headline
+    /// property is being one.
+    fn expr_hinted(&mut self, expr: &ast::Expr, expected: Option<Type>) -> TypedExpr {
         let span = expr.span();
         let (kind, ty) = match expr {
             ast::Expr::Number { value, .. } => (TypedExprKind::Number(*value as f32), Type::F32),
@@ -1457,11 +1698,18 @@ impl Checker<'_> {
                 variant_span,
                 args,
                 ..
-            } => self.make_variant(enum_name, *enum_span, variant, *variant_span, args),
+            } => self.make_variant(
+                enum_name,
+                *enum_span,
+                variant,
+                *variant_span,
+                args,
+                expected,
+            ),
 
             ast::Expr::Match {
                 scrutinee, arms, ..
-            } => self.match_expr(scrutinee, arms, span),
+            } => self.match_expr(scrutinee, arms, span, expected),
 
             ast::Expr::Unary { op, operand, .. } => {
                 let operand = self.expr(operand);
@@ -1507,7 +1755,22 @@ impl Checker<'_> {
         args: &[ast::Expr],
         span: Span,
     ) -> (TypedExprKind, Type) {
-        let mut args: Vec<TypedExpr> = args.iter().map(|a| self.expr(a)).collect();
+        // Each argument is checked against the parameter it is going to, so a
+        // variant carrying nothing can take its type from there:
+        // `g(Option::None)` works when `g` says what it wants. Builtins have no
+        // generic parameters, so only a user function's signature is consulted.
+        let params: Option<Vec<Type>> = self
+            .by_name
+            .get(callee)
+            .map(|index| self.signatures[*index].params.clone());
+        let mut args: Vec<TypedExpr> = args
+            .iter()
+            .enumerate()
+            .map(|(at, a)| {
+                let hint = params.as_ref().and_then(|p| p.get(at)).copied();
+                self.expr_hinted(a, hint)
+            })
+            .collect();
 
         // `vec2(x, y)` is a constructor rather than a call: it becomes two
         // values on the stack, which is what a Vec2 already is.
@@ -2000,6 +2263,29 @@ fn is_host_name(name: &str) -> bool {
 /// a script calling a function `memory` would emit an invalid module. Reserving
 /// the `comet_` prefix and `memory` up front turns that into a diagnostic with a
 /// span, which is the only form of it a person can act on.
+/// Declarations the language always has in scope.
+///
+/// Parsed by the same parser as a script's own, so `Option` is demonstrably an
+/// ordinary enum rather than something the checker knows about: decision 9 says
+/// it gets no special treatment, and the only way to be sure is for it to take
+/// the same path. Nothing here can produce a diagnostic - if it ever did, the
+/// span would point into text no user wrote, so a failure to parse it is a bug
+/// in comet rather than in a script.
+const PRELUDE: &str = "enum Option<T> { None, Some(T) }";
+
+/// The prelude's enums, parsed once.
+fn prelude_enums() -> &'static [ast::EnumDecl] {
+    static PARSED: std::sync::OnceLock<Vec<ast::EnumDecl>> = std::sync::OnceLock::new();
+    PARSED.get_or_init(|| {
+        let (script, diagnostics) = crate::parser::parse(PRELUDE);
+        assert!(
+            diagnostics.is_empty(),
+            "the prelude must parse: {diagnostics:?}"
+        );
+        script.enums
+    })
+}
+
 /// How an operator is written, for a diagnostic that has to name it.
 ///
 fn symbol(op: ast::BinaryOp) -> &'static str {
@@ -3060,6 +3346,94 @@ mod tests {
         assert_eq!(
             messages("enum S { }"),
             ["an enum needs at least one variant"]
+        );
+    }
+
+    // --- generics ---
+
+    #[test]
+    fn option_is_declared_rather_than_known() {
+        // Decision 9: it gets no special treatment in the checker, and the only
+        // way to be sure is for it to come through the same parser as any other
+        // enum. If this ever needs changing, Option has stopped being ordinary.
+        let (script, diagnostics) = crate::parser::parse(PRELUDE);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(script.enums.len(), 1);
+        assert_eq!(script.enums[0].name, "Option");
+        assert_eq!(script.enums[0].params.len(), 1);
+    }
+
+    #[test]
+    fn a_generic_is_laid_out_once_per_set_of_arguments() {
+        let typed = check_clean(
+            "func f() { let a: Option<f32> = Option::None; let b: Option<f32> = Option::None; \
+             let c: Option<Vec2> = Option::None; print(str(1)); }",
+        );
+        let names: Vec<&str> = typed.enums.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Option<f32>", "Option<Vec2>"], "{names:?}");
+        // And their widths differ, which is the point of monomorphizing.
+        assert_eq!(typed.enums[0].payload_slots, 1);
+        assert_eq!(typed.enums[1].payload_slots, 2);
+    }
+
+    #[test]
+    fn a_type_argument_comes_from_the_payload_where_the_payload_says() {
+        let typed = check_clean("func f() { let a = Option::Some(1.0); print(str(1)); }");
+        assert_eq!(typed.enums[0].name, "Option<f32>");
+        let typed = check_clean("func f() { let a = Option::Some(true); print(str(1)); }");
+        assert_eq!(typed.enums[0].name, "Option<bool>");
+    }
+
+    #[test]
+    fn a_variant_carrying_nothing_takes_its_type_from_the_context() {
+        // The reason bidirectional checking exists at all: `Option::None` has
+        // nothing to infer from, and `Option<f32>::None` was not worth having.
+        check_clean("func f() { let a: Option<f32> = Option::None; print(str(1)); }");
+        check_clean("func f() -> Option<f32> { Option::None }");
+        check_clean("func g(o: Option<f32>) { }\nfunc f() { g(Option::None); }");
+        check_clean(
+            "func f(o: Option<f32>) -> Option<f32> { \
+             match o { None => Option::None, Some(v) => Option::Some(v) } }",
+        );
+    }
+
+    #[test]
+    fn a_type_argument_that_nothing_says_is_reported_rather_than_guessed() {
+        assert_eq!(
+            messages("func f() { let a = Option::None; print(str(1)); }"),
+            [
+                "cannot tell what `T` is here - nothing this variant carries says, and neither does what it is being used as. Give the declaration a type, as in `let x: Option<f32> = ...`"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_generic_needs_the_right_number_of_arguments() {
+        assert_eq!(
+            messages("func f(o: Option) { }"),
+            ["`Option` takes 1 type argument, but 0 were given"]
+        );
+        assert_eq!(
+            messages("func f(x: f32<f32>) { }"),
+            ["`f32` takes no type arguments"]
+        );
+    }
+
+    #[test]
+    fn a_type_that_contains_itself_has_no_size_and_says_so() {
+        // An enum is flattened into its parent rather than boxed, so this is
+        // not merely awkward - there is no finite layout.
+        assert_eq!(
+            messages("enum L<T> { Nil, Cons(T, L<T>) }\nfunc f(l: L<f32>) { }"),
+            ["`L` contains itself, so it has no size - a value cannot hold one of its own type"]
+        );
+    }
+
+    #[test]
+    fn two_instantiations_are_different_types() {
+        assert_eq!(
+            messages("func f(a: Option<f32>) { let b: Option<bool> = a; }"),
+            ["expected `Option<bool>`, found `Option<f32>`"]
         );
     }
 }

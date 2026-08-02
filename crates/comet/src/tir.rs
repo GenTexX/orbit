@@ -15,7 +15,7 @@
 use crate::span::Span;
 
 /// The closed set of types a Comet value can have in v1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Type {
     F32,
     /// A 32-bit signed integer: indices, counters, anything countable. Widens to

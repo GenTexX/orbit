@@ -232,7 +232,7 @@ so it was deleted rather than left dead - the same call made about decision 3 in
 
 ---
 
-## 4.5 - Sum types and generics (4.5a DONE, 4.5b next)
+## 4.5 - Sum types and generics (DONE)
 
 **Builds.** Decisions 7, 8, 9, 10: user-defined enums carrying payloads,
 exhaustive `match`, `Option<T>` as an ordinary declaration with no compiler
@@ -292,14 +292,29 @@ would have been an unverifiable lump.
 - **`val_types` stopped being `&'static`.** An enum's width depends on the
   script, so the layout spine now threads the enum table through codegen. That
   was the bulk of the work and 4.5b inherits it.
-- **The predicted refcount problem has not arrived yet.** No variant can hold a
-  `String` and be released correctly - the release path still reads a value's
-  static type. 4.5b is where that has to be faced, and it is the invariant the
-  plan warned about.
+- **The predicted refcount problem was faced in 4.5b**, and it took three
+  places, not one - reading, binding, and the `match` subject itself.
 
 Exported enums default to their first variant, per Philip's call, and only
 payload-free enums are exportable: the tag is one number and a payload is not.
 The inspector shows it as a number, which is provisional - a dropdown is 4.7's.
+
+**4.5b done**, as ADR 0023. Generics are monomorphized at *check* time rather
+than at emit: the checker substitutes and `TypedScript::enums` holds only
+concrete types, so codegen never learns that a type parameter exists. Same
+output shape as the decision asked for, and zero codegen change.
+
+Bidirectional checking landed on Philip's call, kept to the smallest surface
+that makes `Option::None` work: an expected type threaded to the six sites that
+know one, read by exactly two things. Inference from a payload matches only a
+bare parameter, which covers every generic the language has.
+
+Two bugs worth recording from this half. The `holds_str` fixpoint was silently
+lost in a rewrite and had to move to *after* function bodies anyway, because a
+generic used only inside one does not exist until then. And the refcount tests
+were wrong twice over: they put string *literals* in payloads - immortal, never
+freed - so they passed with the whole fix disabled, and the leak oracle was too
+coarse to see a 24-byte leak inside a 64KB page.
 
 A bug worth recording: `collect_literals` had a `_ => {}` arm, so a string
 inside a `match` was never interned and emission panicked with "every literal

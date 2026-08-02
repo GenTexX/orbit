@@ -1533,3 +1533,91 @@ fn an_enum_inside_an_enum_releases_through_both_tags() {
         "nested release is balanced too"
     );
 }
+
+#[test]
+fn option_is_an_ordinary_enum_that_happens_to_always_be_there() {
+    let mut script = Script::new(
+        r#"
+        func half(x: f32) -> Option<f32> {
+            if x < 0.0 {
+                return Option::None;
+            }
+            Option::Some(x / 2.0)
+        }
+        func show(o: Option<f32>) -> String {
+            match o {
+                None => "nothing",
+                Some(v) => str(v),
+            }
+        }
+        func update(dt: f32) {
+            print(show(half(9.0)));
+            print(show(half(0.0 - 1.0)));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["4.5", "nothing"]);
+}
+
+#[test]
+fn one_generic_enum_at_two_types_gets_two_layouts() {
+    // Monomorphization: `Option<f32>` and `Option<Vec2>` are different types
+    // with different widths, and neither is a pointer. Getting the layout from
+    // the wrong instantiation would read the wrong slots.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let a: Option<f32> = Option::Some(7.0);
+            let b: Option<Vec2> = Option::Some(vec2(1.0, 2.0));
+            let c: Option<Vec2> = Option::None;
+            print(match a { None => "-", Some(v) => str(v) });
+            print(match b { None => "-", Some(v) => str(v.x) + "," + str(v.y) });
+            print(match c { None => "-", Some(v) => str(v.x) });
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["7", "1,2", "-"]);
+}
+
+#[test]
+fn a_generic_enum_holding_a_string_is_released_through_its_tag() {
+    // The refcount rule has to survive monomorphization: `Option<String>` owns
+    // something and `Option<f32>` does not, and they are different types.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let held: Option<String> = Option::Some("kept " + str(dt));
+            let n: Option<f32> = Option::Some(1.0);
+            print(match held { None => "-", Some(t) => t });
+            print(match n { None => "-", Some(v) => str(v) });
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["kept 0", "1"]);
+
+    let before = script.memory_bytes();
+    for _ in 0..20_000 {
+        script.update(0.0);
+    }
+    assert_eq!(script.memory_bytes(), before, "no leak through the generic");
+}
+
+#[test]
+fn a_user_defined_generic_works_the_same_way() {
+    // Nothing about Option is special: a script's own generic behaves
+    // identically, which is what decision 9 claims.
+    let mut script = Script::new(
+        r#"
+        enum Pair<A, B> { Both(A, B) }
+        func update(dt: f32) {
+            let p = Pair::Both(3.0, true);
+            print(match p { Both(n, flag) => str(n) + " " + str(int(1)) });
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["3 1"]);
+}

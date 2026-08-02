@@ -13,6 +13,10 @@ use crate::span::Span;
 pub struct EnumDecl {
     pub name: String,
     pub name_span: Span,
+    /// `enum Option<T>`'s parameters. A declaration with any is a template: it
+    /// describes a family of types rather than one, and nothing is laid out
+    /// until it is used at concrete arguments.
+    pub params: Vec<(String, Span)>,
     pub variants: Vec<VariantDecl>,
     pub span: Span,
 }
@@ -102,6 +106,9 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeName {
     pub name: String,
+    /// `Option<f32>`'s arguments. Empty for every non-generic type, which is
+    /// all of them until a script declares one.
+    pub args: Vec<TypeName>,
     pub span: Span,
 }
 
