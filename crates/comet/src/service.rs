@@ -342,7 +342,7 @@ const KEYWORDS: &[&str] = &[
     "func", "let", "if", "else", "while", "for", "in", "return", "true", "false",
 ];
 /// The type names a script can write.
-const TYPES: &[&str] = &["f32", "bool", "Vec2", "String"];
+const TYPES: &[&str] = &["f32", "int", "bool", "Vec2", "String"];
 /// The engine-provided functions, with what each one is, for completion detail
 /// and hover. Kept beside the checker's table by a test that compares the two.
 const BUILTINS: &[(&str, &str)] = &[
@@ -355,6 +355,7 @@ const BUILTINS: &[(&str, &str)] = &[
     ("min", "func min(a: f32, b: f32) -> f32"),
     ("max", "func max(a: f32, b: f32) -> f32"),
     ("str", "func str(value: f32) -> String"),
+    ("int", "func int(value: f32) -> int"),
     ("sin", "func sin(a: f32) -> f32"),
     ("cos", "func cos(a: f32) -> f32"),
     ("atan2", "func atan2(y: f32, x: f32) -> f32"),

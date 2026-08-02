@@ -44,3 +44,4 @@ nav:
           - adr/0018-editor-gpu-integration.md
           - adr/0019-sprite-centered-on-node-origin.md
           - adr/0020-host-surface-is-a-schema.md
+          - adr/0021-two-numeric-types-widening-one-way.md

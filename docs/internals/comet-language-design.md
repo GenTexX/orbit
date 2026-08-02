@@ -18,8 +18,8 @@ language until then has an obvious default, and the enum case is answered
 alongside the enum work. A further set, listed under "Still to decide", has not
 been put yet.
 
-**Implemented so far:** decisions 6 and 13 (iteration 4.1), and decisions 1 and 2
-(iteration 4.2, ADR 0020). Decision 3 has moved to iteration 4.4, where
+**Implemented so far:** decisions 6 and 13 (iteration 4.1), decisions 1 and 2
+(iteration 4.2, ADR 0020), and decisions 4 and 5 (iteration 4.3, ADR 0021). Decision 3 has moved to iteration 4.4, where
 `ScriptComponent` first needs a field list that is not static.
 
 ## Where the language actually stands
@@ -27,8 +27,8 @@ been put yet.
 Recorded here because every decision below is relative to it, and the roadmap
 describes the milestone rather than the surface.
 
-Types are `f32`, `bool`, `Vec2` (a value type), `String` (the one refcounted
-heap type), plus `Unit` and an `Error` poison type. Declarations are a top-level
+Types are `f32`, `int`, `bool`, `Vec2` (a value type), `String` (the one
+refcounted heap type), plus `Unit` and an `Error` poison type. Declarations are a top-level
 `let` (persistent state, lowered to a WASM global) and `func f(p: T) -> R`.
 Statements are `let`, assignment with the compound forms, `if`/`else if`/`else`,
 `while`, `for i in a..b`, `return`, and a bare expression. Expressions are

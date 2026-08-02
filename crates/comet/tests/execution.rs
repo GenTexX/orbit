@@ -151,6 +151,25 @@ impl Script {
             )
             .expect("host binding");
         linker
+            .func_wrap(
+                host,
+                "str_int",
+                |mut c: Caller<'_, Host>, value: i32| -> Result<i32, Error> {
+                    let text = value.to_string();
+                    let Some(Extern::Func(alloc)) = c.get_export("comet_alloc") else {
+                        return Err(Error::msg("every comet module exports comet_alloc"));
+                    };
+                    let alloc = alloc.typed::<i32, i32>(&c)?;
+                    let ptr = alloc.call(&mut c, text.len() as i32)?;
+                    let Some(Extern::Memory(memory)) = c.get_export("memory") else {
+                        return Err(Error::msg("every comet module exports its memory"));
+                    };
+                    comet::write_str(memory.data_mut(&mut c), ptr, &text);
+                    Ok(ptr)
+                },
+            )
+            .expect("host binding");
+        linker
             .func_wrap(host, "sin", |_: Caller<'_, Host>, x: f32| x.sin())
             .expect("host binding");
         linker
@@ -905,7 +924,7 @@ fn a_for_loop_runs_from_the_lower_bound_up_to_but_not_including_the_upper() {
     let mut script = Script::new(
         r#"
         func update(dt: f32) {
-            for i in 0.0..4.0 {
+            for i in 0..4 {
                 print(str(i));
             }
         }
@@ -920,8 +939,8 @@ fn a_for_loop_whose_bounds_cross_runs_no_iterations() {
     let mut script = Script::new(
         r#"
         func update(dt: f32) {
-            for i in 3.0..3.0 { print("never"); }
-            for i in 5.0..1.0 { print("never"); }
+            for i in 3..3 { print("never"); }
+            for i in 5..1 { print("never"); }
             print("done");
         }
         "#,
@@ -937,12 +956,12 @@ fn a_for_loop_evaluates_its_upper_bound_once() {
     let mut script = Script::new(
         r#"
         let calls: f32 = 0.0;
-        func bound() -> f32 {
+        func bound() -> int {
             calls = calls + 1.0;
-            3.0
+            3
         }
         func update(dt: f32) {
-            for i in 0.0..bound() { }
+            for i in 0..bound() { }
         }
         func call_count() -> f32 { calls }
         "#,
@@ -956,8 +975,8 @@ fn nested_for_loops_each_get_their_own_counter() {
     let mut script = Script::new(
         r#"
         func update(dt: f32) {
-            for y in 0.0..2.0 {
-                for x in 0.0..2.0 {
+            for y in 0..2 {
+                for x in 0..2 {
                     print(str(x) + "," + str(y));
                 }
             }
@@ -1165,4 +1184,107 @@ fn an_object_name_can_be_shadowed_because_nothing_is_magic_now() {
     );
     script.update(0.0);
     assert_eq!(script.printed(), ["7"]);
+}
+
+#[test]
+fn int_arithmetic_is_whole_and_truncating() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            print(str(7 / 2));
+            print(str(0 - 7 / 2));
+            print(str(7 % 2));
+            print(str(2 * 3 + 1));
+        }
+        "#,
+    );
+    script.update(0.0);
+    // Division truncates toward zero, so -7/2 is -3 rather than -4.
+    assert_eq!(script.printed(), ["3", "-3", "1", "7"]);
+}
+
+#[test]
+fn an_int_prints_whole_where_widening_to_f32_would_have_rounded() {
+    // 16_777_217 is the first integer an f32 cannot represent. Going through
+    // `str(f32)` would print 16777216 - silently, in the one function a
+    // beginner uses to see a value.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            print(str(16777217));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["16777217"]);
+}
+
+#[test]
+fn an_int_widens_where_an_f32_is_wanted() {
+    let mut script = Script::at(
+        r#"
+        func scaled(v: f32) -> f32 { v * 2.0 }
+        func update(dt: f32) {
+            // A bare literal, a mixed expression, an argument, and a property.
+            let half: f32 = 1;
+            print(str(half + 0.5));
+            print(str(scaled(3)));
+            transform.rotation = 2;
+        }
+        "#,
+        0.0,
+        0.0,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["1.5", "6"]);
+    assert_eq!(script.rotation(), 2.0);
+}
+
+#[test]
+fn narrowing_is_explicit_and_truncates_toward_zero() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            print(str(int(3.7)));
+            print(str(int(0.0 - 3.7)));
+            // Already an int: allowed, and a no-op rather than an error.
+            print(str(int(5)));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["3", "-3", "5"]);
+}
+
+#[test]
+fn narrowing_something_unrepresentable_saturates_rather_than_trapping() {
+    // i32.trunc_f32_s traps on NaN and out of range. A script that divides
+    // badly should not take the editor down with it.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            print(str(int(1.0 / 0.0)));
+            print(str(int(0.0 - 1.0 / 0.0)));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["2147483647", "-2147483648"]);
+}
+
+#[test]
+fn a_for_loop_counts_in_whole_numbers() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let total = 0;
+            for i in 0..5 {
+                total = total + i;
+            }
+            print(str(total));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["10"]);
 }

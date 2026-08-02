@@ -130,7 +130,7 @@ one a function-per-property design would have lost.
 
 ---
 
-## 4.3 - The numeric model
+## 4.3 - The numeric model (DONE)
 
 **Builds.** Decisions 4 and 5: an `int` type, two literal kinds, int and float
 variants of every arithmetic and comparison operation, implicit widening from
@@ -155,6 +155,25 @@ rejected as too expensive for a checker whose headline property is speed.
 
 **Proven by.** Every script in the repo compiling unchanged - which is the point
 of the implicit widening, and is why decision 5 exists at all.
+
+**Done** as ADR 0021. Three things worth carrying forward:
+
+- **One coercion point.** `Checker::coerce` is the only place widening happens
+  and every expected-type site routes through it. Scattering it would have meant
+  missing one, and the failure is silent: the checker permits it, codegen emits
+  an i32 where an f32 belongs, and the module fails to validate with no line
+  number. That happened once during the work - the function tail was the site I
+  missed - and it surfaced as `type mismatch: expected f32, found i32` with no
+  source location, exactly as predicted.
+- **The widening is a node, not a permission.** A rule the checker allows but
+  does not record is one codegen cannot act on.
+- **`str` of an int is its own host call.** Widening first would print a rounded
+  number past 2^24, silently, in the one function used to look at a value. The
+  test fails with `16777216` if that path is taken.
+
+Left undone deliberately: the maths builtins stay f32-only, so `abs(-5)` widens
+and returns an f32. Doubling them is a wider surface than this iteration should
+carry, and containers are what will make `min`/`max` on ints actually hurt.
 
 ---
 

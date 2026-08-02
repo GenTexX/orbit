@@ -1,0 +1,25 @@
+// Whole numbers, and the loop that counts with them.
+//
+// `5` is an int; `5.0` is an f32. An int widens to an f32 anywhere one is
+// wanted, so mixing them is fine - but going the other way needs `int(x)`,
+// which truncates toward zero.
+
+func start() {
+    let total = 0;
+    for i in 0..5 {
+        total = total + i;
+    }
+    print("0 + 1 + 2 + 3 + 4 = " + str(total));
+
+    // Integer division is whole, and the remainder comes back exact.
+    print("7 / 2 = " + str(7 / 2) + " remainder " + str(7 % 2));
+
+    // f32 division is not.
+    print("7.0 / 2.0 = " + str(7.0 / 2.0));
+
+    // Narrowing has to be asked for.
+    print("int(3.7) = " + str(int(3.7)));
+}
+
+func update(dt: f32) {
+}

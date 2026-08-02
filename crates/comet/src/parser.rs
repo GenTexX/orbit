@@ -495,6 +495,10 @@ impl Parser {
     fn primary(&mut self) -> Expr {
         let span = self.peek_span();
         match self.peek().clone() {
+            TokenKind::Int(value) => {
+                self.advance();
+                Expr::Int { value, span }
+            }
             TokenKind::Number(value) => {
                 self.advance();
                 Expr::Number { value, span }

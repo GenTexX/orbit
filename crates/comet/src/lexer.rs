@@ -7,6 +7,13 @@ use crate::span::Span;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
+    /// A whole number written without a decimal point: `5`. An `int`.
+    Int(i64),
+    /// A number written with a decimal point: `5.0`. An `f32`.
+    ///
+    /// The two are separate at the token level because the distinction is
+    /// entirely in how it was written, and the parser should not have to
+    /// re-read the source to recover it.
     Number(f64),
     Str(String),
     Ident(String),
@@ -229,8 +236,25 @@ impl<'src> Lexer<'src> {
             }
         }
         let text = &self.source[start..self.pos];
-        let value: f64 = text.parse().expect("lexed only digits and at most one dot");
-        self.push(TokenKind::Number(value), start, self.pos);
+        let kind = if text.contains('.') {
+            let value: f64 = text.parse().expect("lexed only digits and one dot");
+            TokenKind::Number(value)
+        } else {
+            // Out of range is reported here rather than silently wrapping. i64
+            // is the carrier so the checker can say what the limit is; the
+            // language's `int` is 32-bit.
+            match text.parse::<i64>() {
+                Ok(value) => TokenKind::Int(value),
+                Err(_) => {
+                    self.diagnostics.push(Diagnostic::error(
+                        Span::new(start as u32, self.pos as u32),
+                        format!("`{text}` is too large for an int"),
+                    ));
+                    TokenKind::Int(0)
+                }
+            }
+        };
+        self.push(kind, start, self.pos);
     }
 
     fn lex_ident_or_keyword(&mut self, start: usize) {
@@ -342,8 +366,32 @@ mod tests {
     }
 
     #[test]
-    fn bare_integers_are_valid_number_literals() {
-        assert_eq!(kinds("200"), vec![TokenKind::Number(200.0), TokenKind::Eof]);
+    fn a_literal_too_large_to_carry_is_reported_rather_than_wrapped() {
+        let (_, diagnostics) = lex("99999999999999999999999");
+        assert_eq!(
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>(),
+            ["`99999999999999999999999` is too large for an int"]
+        );
+    }
+
+    #[test]
+    fn a_literal_without_a_decimal_point_is_an_int() {
+        assert_eq!(kinds("200"), vec![TokenKind::Int(200), TokenKind::Eof]);
+        assert_eq!(
+            kinds("200.0"),
+            vec![TokenKind::Number(200.0), TokenKind::Eof]
+        );
+        // How it is written is the whole distinction, so `200.` - a dot with no
+        // digit after it - is still an int followed by a field access.
+        assert_eq!(
+            kinds("200.x"),
+            vec![
+                TokenKind::Int(200),
+                TokenKind::Dot,
+                TokenKind::Ident("x".into()),
+                TokenKind::Eof
+            ]
+        );
     }
 
     #[test]
@@ -452,7 +500,7 @@ mod tests {
     #[test]
     fn lexing_continues_past_a_multibyte_character() {
         let (tokens, _) = lex("\u{1f600} 42");
-        assert!(tokens.iter().any(|t| t.kind == TokenKind::Number(42.0)));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Int(42)));
     }
 
     #[test]

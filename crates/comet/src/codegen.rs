@@ -121,18 +121,19 @@ const F_PRINT: u32 = 7;
 /// `str(f32) -> String`. The host formats and allocates: float-to-decimal is a
 /// page of code nobody should emit into every module.
 const F_STR: u32 = 8;
+const F_STR_INT: u32 = 9;
 /// The transcendentals. WebAssembly has no opcodes for these, so they are the
 /// only maths that leaves the module; abs, sqrt, floor, ceil, min and max are
 /// one instruction each and are emitted inline.
-const F_SIN: u32 = 9;
-const F_COS: u32 = 10;
-const F_ATAN2: u32 = 11;
-const F_POW: u32 = 12;
-const F_ALLOC: u32 = 13;
-const F_RETAIN: u32 = 14;
-const F_RELEASE: u32 = 15;
+const F_SIN: u32 = 10;
+const F_COS: u32 = 11;
+const F_ATAN2: u32 = 12;
+const F_POW: u32 = 13;
+const F_ALLOC: u32 = 14;
+const F_RETAIN: u32 = 15;
+const F_RELEASE: u32 = 16;
 /// The first script-defined function's index.
-const USER_BASE: u32 = 16;
+const USER_BASE: u32 = 17;
 
 /// Emit a WebAssembly module for `script`.
 ///
@@ -174,6 +175,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     imports.import(HOST_MODULE, "set_vec2", EntityType::Function(t_set_vec2));
     imports.import(HOST_MODULE, "print", EntityType::Function(t_print));
     imports.import(HOST_MODULE, "str", EntityType::Function(t_str));
+    imports.import(HOST_MODULE, "str_int", EntityType::Function(t_get_bool));
     imports.import(HOST_MODULE, "sin", EntityType::Function(t_unary));
     imports.import(HOST_MODULE, "cos", EntityType::Function(t_unary));
     imports.import(HOST_MODULE, "atan2", EntityType::Function(t_binary));
@@ -261,6 +263,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     names.append(F_SET_VEC2, "orbit::set_vec2");
     names.append(F_PRINT, "orbit::print");
     names.append(F_STR, "orbit::str");
+    names.append(F_STR_INT, "orbit::str_int");
     names.append(F_SIN, "orbit::sin");
     names.append(F_COS, "orbit::cos");
     names.append(F_ATAN2, "orbit::atan2");
@@ -308,6 +311,7 @@ fn align4(value: u32) -> u32 {
 fn val_types(ty: Type) -> &'static [ValType] {
     match ty {
         Type::F32 => &[ValType::F32],
+        Type::Int => &[ValType::I32],
         Type::Bool => &[ValType::I32],
         Type::Vec2 => &[ValType::F32, ValType::F32],
         Type::Str => &[ValType::I32],
@@ -749,7 +753,9 @@ fn expr_depth(expr: &TypedExpr) -> usize {
         K::Field { receiver, .. } => (0, vec![receiver]),
         K::MakeVec2 { x, y } => (0, vec![x, y]),
         K::Call { args, .. } => (0, args.iter().collect()),
+        K::Widen(inner) | K::Narrow(inner) => (0, vec![inner]),
         K::Number(_)
+        | K::Int(_)
         | K::Bool(_)
         | K::Str(_)
         | K::Local(_)
@@ -1103,6 +1109,25 @@ impl<'a> FnGen<'a> {
 
     fn expr(&mut self, expr: &TypedExpr) {
         match &expr.kind {
+            TypedExprKind::Int(value) => {
+                self.ins().i32_const(*value);
+            }
+
+            // An `int` where an `f32` is wanted. Signed, because the language's
+            // int is signed and there is nothing else it could mean.
+            TypedExprKind::Widen(inner) => {
+                self.expr(inner);
+                self.ins().f32_convert_i32_s();
+            }
+
+            // `int(x)`: truncate toward zero. Saturating rather than trapping -
+            // `i32.trunc_f32_s` traps on NaN and out of range, and a script that
+            // divides badly should not take the editor down with it.
+            TypedExprKind::Narrow(inner) => {
+                self.expr(inner);
+                self.ins().i32_trunc_sat_f32_s();
+            }
+
             TypedExprKind::Number(value) => {
                 self.ins().f32_const(Ieee32::from(*value));
             }
@@ -1193,6 +1218,10 @@ impl<'a> FnGen<'a> {
                     self.expr(&args[0]);
                     self.ins().call(F_STR);
                 }
+                Host::StrInt => {
+                    self.expr(&args[0]);
+                    self.ins().call(F_STR_INT);
+                }
                 // The transcendentals are ordinary calls: arguments on the
                 // stack, one import, a result.
                 Host::Sin | Host::Cos | Host::Atan2 | Host::Pow => {
@@ -1221,6 +1250,15 @@ impl<'a> FnGen<'a> {
             TypedExprKind::Unary { op, operand } => {
                 // A Vec2 is two f32s on the stack, so negating one means
                 // reaching under the top of the stack for its x.
+                // wasm has no i32.neg, so negation is a subtraction from zero -
+                // which needs the zero underneath the operand, hence the park.
+                if *op == UnaryOp::NegInt {
+                    let tmp = self.scratch().i32s[0];
+                    self.expr(operand);
+                    self.ins().local_set(tmp);
+                    self.ins().i32_const(0).local_get(tmp).i32_sub();
+                    return;
+                }
                 if *op == UnaryOp::NegVec2 {
                     let y = self.enter_frame().f32s[0];
                     self.expr(operand);
@@ -1234,6 +1272,7 @@ impl<'a> FnGen<'a> {
                 match op {
                     UnaryOp::NegVec2 => unreachable!("handled above"),
                     UnaryOp::Neg => self.ins().f32_neg(),
+                    UnaryOp::NegInt => unreachable!("handled above"),
                     UnaryOp::Not => self.ins().i32_eqz(),
                     UnaryOp::Abs => self.ins().f32_abs(),
                     UnaryOp::Sqrt => self.ins().f32_sqrt(),
@@ -1408,6 +1447,17 @@ impl<'a> FnGen<'a> {
             BinaryOp::SubF32 => i.f32_sub(),
             BinaryOp::MulF32 => i.f32_mul(),
             BinaryOp::DivF32 => i.f32_div(),
+            BinaryOp::AddInt => i.i32_add(),
+            BinaryOp::SubInt => i.i32_sub(),
+            BinaryOp::MulInt => i.i32_mul(),
+            // Signed, and trapping on a zero divisor - the honest answer for
+            // whole numbers, where f32 division quietly gives infinity.
+            BinaryOp::DivInt => i.i32_div_s(),
+            BinaryOp::RemInt => i.i32_rem_s(),
+            BinaryOp::LtInt => i.i32_lt_s(),
+            BinaryOp::GtInt => i.i32_gt_s(),
+            BinaryOp::LeInt => i.i32_le_s(),
+            BinaryOp::GeInt => i.i32_ge_s(),
             BinaryOp::LtF32 => i.f32_lt(),
             BinaryOp::GtF32 => i.f32_gt(),
             BinaryOp::LeF32 => i.f32_le(),
@@ -1553,6 +1603,7 @@ mod tests {
             "set_vec2",
             "print",
             "str",
+            "str_int",
             "sin",
             "cos",
             "atan2",

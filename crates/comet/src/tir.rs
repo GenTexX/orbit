@@ -18,6 +18,9 @@ use crate::span::Span;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Type {
     F32,
+    /// A 32-bit signed integer: indices, counters, anything countable. Widens to
+    /// `f32` implicitly; going the other way needs `int(x)`.
+    Int,
     Bool,
     /// A two-component value type, copied on assignment.
     Vec2,
@@ -38,6 +41,7 @@ impl Type {
     pub fn name(self) -> &'static str {
         match self {
             Type::F32 => "f32",
+            Type::Int => "int",
             Type::Bool => "bool",
             Type::Vec2 => "Vec2",
             Type::Str => "String",
@@ -56,6 +60,7 @@ impl Type {
     pub fn from_name(name: &str) -> Option<Type> {
         Some(match name {
             "f32" => Type::F32,
+            "int" => Type::Int,
             "bool" => Type::Bool,
             "Vec2" => Type::Vec2,
             "String" => Type::Str,
@@ -176,8 +181,15 @@ pub struct TypedExpr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedExprKind {
-    /// All numbers are f32 - there is no integer type to coerce from.
     Number(f32),
+    Int(i32),
+    /// An `int` used where an `f32` is wanted. Inserted by the checker, never
+    /// written - which is what makes the widening implicit without codegen
+    /// having to guess where it belongs.
+    Widen(Box<TypedExpr>),
+    /// `int(x)`: an `f32` truncated toward zero. Saturating rather than
+    /// trapping, so a script cannot crash the editor by dividing badly.
+    Narrow(Box<TypedExpr>),
     Bool(bool),
     /// A string literal, interned by codegen into the module's data segment.
     Str(String),
@@ -228,6 +240,11 @@ pub enum TypedExprKind {
 pub enum Host {
     /// `print(String)` - the debug output call.
     Print,
+    /// `str(int) -> String`. A separate call rather than widening to `f32`
+    /// first: past 2^24 that would print a rounded number, and silently at
+    /// that. `str` is the one function a beginner uses to see a value, so it
+    /// must not be the one that lies.
+    StrInt,
     /// `str(f32) -> String` - number formatting. Done by the host because
     /// float-to-decimal is a page of code nobody should emit into every module.
     Str,
@@ -244,6 +261,8 @@ pub enum Host {
 pub enum UnaryOp {
     /// Negate an f32.
     Neg,
+    /// Negate an int.
+    NegInt,
     /// Invert a bool.
     Not,
     /// Negate both components of a `Vec2`.
@@ -263,6 +282,14 @@ pub enum BinaryOp {
     SubF32,
     MulF32,
     DivF32,
+    /// The same five on `int`. Division truncates toward zero, and both it and
+    /// the remainder trap on a zero divisor - the one place an int is sharper
+    /// than an f32, which quietly gives infinity.
+    AddInt,
+    SubInt,
+    MulInt,
+    DivInt,
+    RemInt,
     /// Remainder. WebAssembly has no f32 rem, so codegen emits
     /// `a - trunc(a / b) * b`.
     RemF32,
@@ -293,6 +320,10 @@ pub enum BinaryOp {
     GtF32,
     LeF32,
     GeF32,
+    LtInt,
+    GtInt,
+    LeInt,
+    GeInt,
     And,
     Or,
 }

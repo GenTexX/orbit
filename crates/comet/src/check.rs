@@ -87,6 +87,59 @@ impl Checker<'_> {
         );
     }
 
+    /// Make `expr` fit `want`, widening an `int` where an `f32` is asked for,
+    /// and reporting a mismatch otherwise.
+    ///
+    /// Everything that checks an expression against an expected type goes
+    /// through here - a `let` with an annotation, an argument, a return, an
+    /// assignment - so the widening rule lives in one place instead of at each
+    /// of them, where one would eventually be missed.
+    fn coerce(&mut self, expr: TypedExpr, want: Type) -> TypedExpr {
+        if want == Type::F32 && expr.ty == Type::Int {
+            let span = expr.span;
+            return TypedExpr {
+                kind: TypedExprKind::Widen(Box::new(expr)),
+                ty: Type::F32,
+                span,
+            };
+        }
+        self.expect_type(want, expr.ty, expr.span);
+        expr
+    }
+
+    /// Widen both sides of a mixed-numeric operation to `f32`, or leave two
+    /// ints alone. Returns the type the operation works in.
+    ///
+    /// The widening is one-directional on purpose: there is no precision-loss
+    /// surprise, and a script written before `int` existed keeps compiling
+    /// because a bare `5` still fits everywhere an `f32` is wanted.
+    fn unify_numeric(&mut self, lhs: &mut TypedExpr, rhs: &mut TypedExpr) -> Type {
+        if lhs.ty == Type::Int && rhs.ty == Type::Int {
+            return Type::Int;
+        }
+        let widen = |expr: &mut TypedExpr| {
+            if expr.ty == Type::Int {
+                let taken = std::mem::replace(
+                    expr,
+                    TypedExpr {
+                        kind: TypedExprKind::Error,
+                        ty: Type::Error,
+                        span: Span::new(0, 0),
+                    },
+                );
+                let span = taken.span;
+                *expr = TypedExpr {
+                    kind: TypedExprKind::Widen(Box::new(taken)),
+                    ty: Type::F32,
+                    span,
+                };
+            }
+        };
+        widen(lhs);
+        widen(rhs);
+        Type::F32
+    }
+
     fn resolve_type(&mut self, name: &ast::TypeName) -> Type {
         match Type::from_name(&name.name) {
             Some(ty) => ty,
@@ -155,11 +208,11 @@ impl Checker<'_> {
         // graph.
         let mut state = Vec::new();
         for decl in &script.state {
-            let init = self.expr(&decl.init);
+            let mut init = self.expr(&decl.init);
             let declared = decl.ty.as_ref().map(|t| self.resolve_type(t));
             let ty = match declared {
                 Some(declared) => {
-                    self.expect_type(declared, init.ty, init.span);
+                    init = self.coerce(init, declared);
                     declared
                 }
                 None => init.ty,
@@ -211,12 +264,19 @@ impl Checker<'_> {
             self.scopes[0].insert(p.name.clone(), i as u32);
         }
 
-        let body = self.block(&f.body);
+        let mut body = self.block(&f.body);
         self.report_unused();
 
-        // The body's tail is the function's value when it has one.
-        if let Some(tail) = &body.tail {
-            self.expect_type(ret, tail.ty, tail.ty_span(f.body.span));
+        // The body's tail is the function's value when it has one, so it is
+        // coerced like any other place a type is expected - `-> f32 { 1 }`
+        // widens rather than being refused.
+        if let Some(mut tail) = body.tail.take() {
+            // A tail from recovered source can have an empty span; blame the
+            // block instead, so the squiggle lands somewhere a reader can see.
+            tail.span = tail.ty_span(f.body.span);
+            let coerced = self.coerce(tail, ret);
+            body.ty = coerced.ty;
+            body.tail = Some(coerced);
         } else if ret != Type::Unit && !ret.is_error() && !always_returns(&body) {
             self.error(
                 f.body.span,
@@ -364,10 +424,13 @@ impl Checker<'_> {
             unreachable!("only called for a `for`");
         };
 
+        // The counter is an `int`, which is the case the type was argued for:
+        // a counted loop over whole numbers, with no fencepost weirdness and no
+        // `for i in 0.0..3.5` to wonder about.
         let start = self.expr(start);
         let end = self.expr(end);
-        self.expect_type(Type::F32, start.ty, start.span);
-        self.expect_type(Type::F32, end.ty, end.span);
+        self.expect_type(Type::Int, start.ty, start.span);
+        self.expect_type(Type::Int, end.ty, end.span);
 
         // The loop variable and the bound live in a scope of their own, so
         // neither is in scope after the loop and neither shadows anything for
@@ -375,10 +438,10 @@ impl Checker<'_> {
         self.scopes.push(HashMap::new());
         // The counter is declared without a span: a `for` that does not use its
         // own variable is an ordinary way to repeat something N times.
-        let slot = self.declare_local(name, Type::F32, None);
+        let slot = self.declare_local(name, Type::Int, None);
         // A name with a space in it: no source text can lex to this, so the
         // bound cannot be read or written by the script that produced it.
-        let end_slot = self.declare_local("for end", Type::F32, None);
+        let end_slot = self.declare_local("for end", Type::Int, None);
         out.push(TypedStmt::Let { slot, init: start });
         out.push(TypedStmt::Let {
             slot: end_slot,
@@ -387,12 +450,12 @@ impl Checker<'_> {
 
         let counter = |kind| TypedExpr {
             kind,
-            ty: Type::F32,
+            ty: Type::Int,
             span: *name_span,
         };
         let cond = TypedExpr {
             kind: TypedExprKind::Binary {
-                op: BinaryOp::LtF32,
+                op: BinaryOp::LtInt,
                 lhs: Box::new(counter(TypedExprKind::Local(slot))),
                 rhs: Box::new(counter(TypedExprKind::Local(end_slot))),
             },
@@ -405,11 +468,11 @@ impl Checker<'_> {
             place: Place::Local(slot),
             value: TypedExpr {
                 kind: TypedExprKind::Binary {
-                    op: BinaryOp::AddF32,
+                    op: BinaryOp::AddInt,
                     lhs: Box::new(counter(TypedExprKind::Local(slot))),
-                    rhs: Box::new(counter(TypedExprKind::Number(1.0))),
+                    rhs: Box::new(counter(TypedExprKind::Int(1))),
                 },
-                ty: Type::F32,
+                ty: Type::Int,
                 span: *name_span,
             },
         });
@@ -448,11 +511,11 @@ impl Checker<'_> {
                 init,
                 span,
             } => {
-                let init = self.expr(init);
+                let mut init = self.expr(init);
                 let declared = ty.as_ref().map(|t| self.resolve_type(t));
                 let ty = match declared {
                     Some(declared) => {
-                        self.expect_type(declared, init.ty, init.span);
+                        init = self.coerce(init, declared);
                         declared
                     }
                     None => init.ty,
@@ -471,7 +534,7 @@ impl Checker<'_> {
                 let value = self.expr(value);
                 match op {
                     ast::AssignOp::Set => {
-                        self.expect_type(target_ty, value.ty, value.span);
+                        let value = self.coerce(value, target_ty);
                         TypedStmt::Assign { place, value }
                     }
                     _ => {
@@ -538,9 +601,9 @@ impl Checker<'_> {
             }
 
             ast::Stmt::Return { value, span } => {
-                let value = value.as_ref().map(|v| self.expr(v));
+                let mut value = value.as_ref().map(|v| self.expr(v));
                 match (&value, self.ret) {
-                    (Some(v), ret) => self.expect_type(ret, v.ty, v.span),
+                    (Some(_), ret) => value = value.map(|v| self.coerce(v, ret)),
                     (None, Type::Unit) | (None, Type::Error) => {}
                     (None, ret) => self.error(
                         *span,
@@ -812,6 +875,13 @@ impl Checker<'_> {
         let span = expr.span();
         let (kind, ty) = match expr {
             ast::Expr::Number { value, .. } => (TypedExprKind::Number(*value as f32), Type::F32),
+            ast::Expr::Int { value, span } => match i32::try_from(*value) {
+                Ok(value) => (TypedExprKind::Int(value), Type::Int),
+                Err(_) => {
+                    self.error(*span, format!("`{value}` does not fit in an int"));
+                    (TypedExprKind::Error, Type::Error)
+                }
+            },
             ast::Expr::Bool { value, .. } => (TypedExprKind::Bool(*value), Type::Bool),
             ast::Expr::Str { value, .. } => (TypedExprKind::Str(value.clone()), Type::Str),
 
@@ -910,6 +980,7 @@ impl Checker<'_> {
                     // operand's type rather than by a second operator, which is
                     // how `-v` stays the thing a reader expects it to be.
                     ast::UnaryOp::Neg if operand.ty == Type::Vec2 => (UnaryOp::NegVec2, Type::Vec2),
+                    ast::UnaryOp::Neg if operand.ty == Type::Int => (UnaryOp::NegInt, Type::Int),
                     ast::UnaryOp::Neg => (UnaryOp::Neg, Type::F32),
                     ast::UnaryOp::Not => (UnaryOp::Not, Type::Bool),
                 };
@@ -946,12 +1017,12 @@ impl Checker<'_> {
         args: &[ast::Expr],
         span: Span,
     ) -> (TypedExprKind, Type) {
-        let args: Vec<TypedExpr> = args.iter().map(|a| self.expr(a)).collect();
+        let mut args: Vec<TypedExpr> = args.iter().map(|a| self.expr(a)).collect();
 
         // `vec2(x, y)` is a constructor rather than a call: it becomes two
         // values on the stack, which is what a Vec2 already is.
         if callee == "vec2" {
-            self.check_args(callee, &args, &[Type::F32, Type::F32], span);
+            self.check_args(callee, &mut args, &[Type::F32, Type::F32], span);
             let ok = args.len() == 2 && args.iter().all(|a| a.ty == Type::F32);
             if !ok {
                 return (TypedExprKind::Error, Type::Error);
@@ -965,8 +1036,35 @@ impl Checker<'_> {
                 Type::Vec2,
             );
         }
+        // `int(x)` truncates toward zero; on something already an int it is a
+        // no-op rather than an error, so a script can be explicit without being
+        // punished for it.
+        if callee == "int" {
+            let mut args = args;
+            self.check_args(callee, &mut args, &[Type::F32], span);
+            let Some(arg) = args.pop() else {
+                return (TypedExprKind::Error, Type::Error);
+            };
+            return match arg.ty {
+                Type::Int => (arg.kind, Type::Int),
+                Type::F32 => (TypedExprKind::Narrow(Box::new(arg)), Type::Int),
+                _ => (TypedExprKind::Error, Type::Error),
+            };
+        }
+        // `str` of a whole number keeps it whole. Widening to f32 first would
+        // print a rounded value past 2^24, which is exactly the case `int`
+        // exists to be honest about.
+        if callee == "str" && args.len() == 1 && args[0].ty == Type::Int {
+            return (
+                TypedExprKind::HostCall {
+                    host: Host::StrInt,
+                    args,
+                },
+                Type::Str,
+            );
+        }
         if let Some((builtin, params, ret)) = builtin(callee) {
-            self.check_args(callee, &args, params, span);
+            self.check_args(callee, &mut args, params, span);
             let ok = args.len() == params.len() && args.iter().zip(params).all(|(a, p)| a.ty == *p);
             if !ok {
                 return (TypedExprKind::Error, Type::Error);
@@ -1025,7 +1123,7 @@ impl Checker<'_> {
         };
         let signature = &self.signatures[index];
         let (params, ret) = (signature.params.clone(), signature.ret);
-        self.check_args(callee, &args, &params, span);
+        self.check_args(callee, &mut args, &params, span);
         let ok = args.len() == params.len() && args.iter().zip(&params).all(|(a, p)| a.ty == *p);
         if ok {
             (TypedExprKind::Call { index, args }, ret)
@@ -1034,7 +1132,10 @@ impl Checker<'_> {
         }
     }
 
-    fn check_args(&mut self, callee: &str, args: &[TypedExpr], params: &[Type], span: Span) {
+    /// Check each argument against its parameter, widening an `int` passed
+    /// where an `f32` is wanted. Takes the arguments by mutable reference
+    /// because the widening has to reach codegen, not merely be permitted.
+    fn check_args(&mut self, callee: &str, args: &mut [TypedExpr], params: &[Type], span: Span) {
         if args.len() != params.len() {
             self.error(
                 span,
@@ -1048,16 +1149,24 @@ impl Checker<'_> {
             );
             return;
         }
-        for (arg, param) in args.iter().zip(params) {
-            self.expect_type(*param, arg.ty, arg.span);
+        for (arg, param) in args.iter_mut().zip(params) {
+            let taken = std::mem::replace(
+                arg,
+                TypedExpr {
+                    kind: TypedExprKind::Error,
+                    ty: Type::Error,
+                    span: Span::new(0, 0),
+                },
+            );
+            *arg = self.coerce(taken, *param);
         }
     }
 
     fn binary(
         &mut self,
         op: ast::BinaryOp,
-        lhs: TypedExpr,
-        rhs: TypedExpr,
+        mut lhs: TypedExpr,
+        mut rhs: TypedExpr,
     ) -> (TypedExprKind, Type) {
         use ast::BinaryOp as B;
 
@@ -1105,13 +1214,16 @@ impl Checker<'_> {
             B::Sub if lhs.ty == Type::Vec2 && rhs.ty == Type::Vec2 => {
                 (BinaryOp::SubVec2, Type::Vec2)
             }
-            B::Mul if lhs.ty == Type::Vec2 && rhs.ty == Type::F32 => {
+            B::Mul if lhs.ty == Type::Vec2 && is_numeric(rhs.ty) => {
+                rhs = self.coerce(rhs, Type::F32);
                 (BinaryOp::MulVec2F32, Type::Vec2)
             }
-            B::Mul if lhs.ty == Type::F32 && rhs.ty == Type::Vec2 => {
+            B::Mul if is_numeric(lhs.ty) && rhs.ty == Type::Vec2 => {
+                lhs = self.coerce(lhs, Type::F32);
                 (BinaryOp::MulF32Vec2, Type::Vec2)
             }
-            B::Div if lhs.ty == Type::Vec2 && rhs.ty == Type::F32 => {
+            B::Div if lhs.ty == Type::Vec2 && is_numeric(rhs.ty) => {
+                rhs = self.coerce(rhs, Type::F32);
                 (BinaryOp::DivVec2F32, Type::Vec2)
             }
             // Any other arithmetic involving a Vec2 is unsupported on purpose,
@@ -1137,39 +1249,66 @@ impl Checker<'_> {
                 return (TypedExprKind::Error, Type::Error);
             }
             B::Add | B::Sub | B::Mul | B::Div | B::Rem => {
-                self.expect_type(Type::F32, lhs.ty, lhs.span);
-                self.expect_type(Type::F32, rhs.ty, rhs.span);
-                if lhs.ty != Type::F32 || rhs.ty != Type::F32 {
+                if !is_numeric(lhs.ty) || !is_numeric(rhs.ty) {
+                    self.expect_type(Type::F32, lhs.ty, lhs.span);
+                    self.expect_type(Type::F32, rhs.ty, rhs.span);
                     return (TypedExprKind::Error, Type::Error);
                 }
-                let op = match op {
-                    B::Add => BinaryOp::AddF32,
-                    B::Sub => BinaryOp::SubF32,
-                    B::Mul => BinaryOp::MulF32,
-                    B::Div => BinaryOp::DivF32,
-                    B::Rem => BinaryOp::RemF32,
+                let ty = self.unify_numeric(&mut lhs, &mut rhs);
+                let op = match (op, ty) {
+                    (B::Add, Type::Int) => BinaryOp::AddInt,
+                    (B::Sub, Type::Int) => BinaryOp::SubInt,
+                    (B::Mul, Type::Int) => BinaryOp::MulInt,
+                    (B::Div, Type::Int) => BinaryOp::DivInt,
+                    (B::Rem, Type::Int) => BinaryOp::RemInt,
+                    (B::Add, _) => BinaryOp::AddF32,
+                    (B::Sub, _) => BinaryOp::SubF32,
+                    (B::Mul, _) => BinaryOp::MulF32,
+                    (B::Div, _) => BinaryOp::DivF32,
+                    (B::Rem, _) => BinaryOp::RemF32,
                     _ => unreachable!("matched on the arithmetic operators"),
                 };
-                (op, Type::F32)
+                (op, ty)
             }
 
             B::Lt | B::Gt | B::Le | B::Ge => {
-                self.expect_type(Type::F32, lhs.ty, lhs.span);
-                self.expect_type(Type::F32, rhs.ty, rhs.span);
-                if lhs.ty != Type::F32 || rhs.ty != Type::F32 {
+                if !is_numeric(lhs.ty) || !is_numeric(rhs.ty) {
+                    self.expect_type(Type::F32, lhs.ty, lhs.span);
+                    self.expect_type(Type::F32, rhs.ty, rhs.span);
                     return (TypedExprKind::Error, Type::Error);
                 }
-                let op = match op {
-                    B::Lt => BinaryOp::LtF32,
-                    B::Gt => BinaryOp::GtF32,
-                    B::Le => BinaryOp::LeF32,
-                    B::Ge => BinaryOp::GeF32,
+                let op = match (op, self.unify_numeric(&mut lhs, &mut rhs)) {
+                    (B::Lt, Type::Int) => BinaryOp::LtInt,
+                    (B::Gt, Type::Int) => BinaryOp::GtInt,
+                    (B::Le, Type::Int) => BinaryOp::LeInt,
+                    (B::Ge, Type::Int) => BinaryOp::GeInt,
+                    (B::Lt, _) => BinaryOp::LtF32,
+                    (B::Gt, _) => BinaryOp::GtF32,
+                    (B::Le, _) => BinaryOp::LeF32,
+                    (B::Ge, _) => BinaryOp::GeF32,
                     _ => unreachable!("matched on the comparison operators"),
                 };
                 (op, Type::Bool)
             }
 
             B::Eq | B::NotEq => {
+                // A mixed comparison widens, the same as arithmetic does.
+                if is_numeric(lhs.ty) && is_numeric(rhs.ty) {
+                    let ty = self.unify_numeric(&mut lhs, &mut rhs);
+                    let op = if op == B::Eq {
+                        BinaryOp::Eq(ty)
+                    } else {
+                        BinaryOp::NotEq(ty)
+                    };
+                    return (
+                        TypedExprKind::Binary {
+                            op,
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        },
+                        Type::Bool,
+                    );
+                }
                 if lhs.ty != rhs.ty {
                     self.expect_type(lhs.ty, rhs.ty, rhs.span);
                     return (TypedExprKind::Error, Type::Error);
@@ -1177,7 +1316,7 @@ impl Checker<'_> {
                 // Comparing strings needs a host call or a memcmp helper, which
                 // v1 does not emit; keep it an error rather than a silent
                 // pointer comparison that would look like it worked.
-                if !matches!(lhs.ty, Type::F32 | Type::Bool) {
+                if !matches!(lhs.ty, Type::Bool) {
                     self.error(
                         lhs.span.to(rhs.span),
                         format!(
@@ -1258,7 +1397,7 @@ enum Builtin {
 /// builds: the host functions, which live in [`builtin`] and `vec2`.
 const BUILTIN_NAMES: &[&str] = &[
     "print", "str", "vec2", "abs", "sqrt", "floor", "ceil", "min", "max", "sin", "cos", "atan2",
-    "pow",
+    "pow", "int",
 ];
 
 /// The candidate closest to `name`, if one is close enough to be worth saying.
@@ -1363,7 +1502,7 @@ fn builtin(name: &str) -> Option<(Builtin, &'static [Type], Type)> {
 }
 
 fn is_host_name(name: &str) -> bool {
-    builtin(name).is_some() || name == "vec2"
+    builtin(name).is_some() || name == "vec2" || name == "int"
 }
 
 /// Names the compiled module already uses for something. Every script function
@@ -1390,6 +1529,12 @@ fn symbol(op: ast::BinaryOp) -> &'static str {
         B::And => "&&",
         B::Or => "||",
     }
+}
+
+/// Whether a type takes part in arithmetic. The two numeric types are the
+/// whole set, and mixing them widens.
+fn is_numeric(ty: Type) -> bool {
+    matches!(ty, Type::F32 | Type::Int)
 }
 
 fn is_reserved_name(name: &str) -> bool {
@@ -1982,10 +2127,10 @@ mod tests {
 
     #[test]
     fn a_for_loop_is_the_while_loop_a_reader_would_have_written() {
-        let typed = check_clean("func f() { for i in 0.0..3.0 { print(str(i)); } }");
+        let typed = check_clean("func f() { for i in 0..3 { print(str(i)); } }");
         let body = &typed.functions[0].body.stmts;
 
-        // let i = 0; let <end> = 3; while i < <end> { ...; i = i + 1 }
+        // let i = 0; let <end> = 3; while i < <end> { ...; i = i + 1 }, all int
         assert_eq!(body.len(), 3, "three statements, not one loop node");
         assert!(matches!(body[0], TypedStmt::Let { slot: 0, .. }));
         assert!(matches!(body[1], TypedStmt::Let { slot: 1, .. }));
@@ -1995,7 +2140,7 @@ mod tests {
         assert!(matches!(
             cond.kind,
             TypedExprKind::Binary {
-                op: BinaryOp::LtF32,
+                op: BinaryOp::LtInt,
                 ..
             }
         ));
@@ -2014,19 +2159,25 @@ mod tests {
     #[test]
     fn the_loop_variable_leaves_scope_with_the_loop() {
         assert_eq!(
-            messages("func f() { for i in 0.0..3.0 { } print(str(i)); }"),
+            messages("func f() { for i in 0..3 { } print(str(i)); }"),
             ["cannot find `i` in this scope"]
         );
         // And the hidden bound is not a name any script can reach, because no
         // source text lexes to it.
-        check_clean("func f() { for i in 0.0..3.0 { } for i in 0.0..3.0 { } }");
+        check_clean("func f() { for i in 0..3 { } for i in 0..3 { } }");
     }
 
     #[test]
-    fn for_bounds_must_be_numbers() {
+    fn for_bounds_must_be_whole_numbers() {
         assert_eq!(
-            messages(r#"func f() { for i in "a"..3.0 { } }"#),
-            ["expected `f32`, found `String`"]
+            messages(r#"func f() { for i in "a"..3 { } }"#),
+            ["expected `int`, found `String`"]
+        );
+        // An f32 bound is refused rather than truncated: `for i in 0.0..3.5`
+        // has no obvious meaning, and the counter is an int.
+        assert_eq!(
+            messages("func f() { for i in 0..3.5 { } }"),
+            ["expected `int`, found `f32`"]
         );
     }
 
@@ -2144,5 +2295,79 @@ mod tests {
             messages("func update(dt: Vector) { }"),
             ["unknown type `Vector`"]
         );
+    }
+
+    #[test]
+    fn how_a_literal_is_written_decides_its_type() {
+        let typed = check_clean("func f() { let whole = 5; let fraction = 5.0; }");
+        let f = typed.function("f").unwrap();
+        assert_eq!(f.locals[0], Type::Int);
+        assert_eq!(f.locals[1], Type::F32);
+    }
+
+    #[test]
+    fn an_int_widens_to_f32_but_never_the_other_way() {
+        // One-directional, so there is no precision-loss surprise and every
+        // script written before `int` existed keeps compiling.
+        check_clean("func f() { let x: f32 = 5; }");
+        check_clean("func f(a: f32) { let x = a + 1; }");
+        check_clean("func f() -> f32 { 1 }");
+        assert_eq!(
+            messages("func f() { let x: int = 5.0; }"),
+            ["expected `int`, found `f32`"]
+        );
+        assert_eq!(
+            messages("func f() -> int { 1.0 }"),
+            ["expected `int`, found `f32`"]
+        );
+    }
+
+    #[test]
+    fn a_mixed_expression_is_an_f32_and_two_ints_stay_an_int() {
+        let typed = check_clean("func f() { let a = 1 + 2; let b = 1 + 2.0; let c = 1 < 2; }");
+        let f = typed.function("f").unwrap();
+        assert_eq!(f.locals[0], Type::Int);
+        assert_eq!(f.locals[1], Type::F32);
+        assert_eq!(f.locals[2], Type::Bool);
+    }
+
+    #[test]
+    fn the_widening_reaches_codegen_rather_than_merely_being_permitted() {
+        // A rule the checker allows but does not record would emit an i32 where
+        // an f32 belongs, and the module would not validate.
+        let typed = check_clean("func f(a: f32) -> f32 { a + 1 }");
+        let tail = typed.function("f").unwrap().body.tail.as_ref().unwrap();
+        let TypedExprKind::Binary { op, rhs, .. } = &tail.kind else {
+            panic!("expected a binary expression");
+        };
+        assert_eq!(*op, BinaryOp::AddF32);
+        assert!(matches!(rhs.kind, TypedExprKind::Widen(_)));
+    }
+
+    #[test]
+    fn narrowing_needs_asking_for() {
+        check_clean("func f() { let x = int(3.7); }");
+        let typed = check_clean("func f() -> int { int(3.7) }");
+        assert_eq!(typed.function("f").unwrap().ret, Type::Int);
+        // And `int` is the engine's, not a name to redefine.
+        assert_eq!(
+            messages("func int(x: f32) -> f32 { x }"),
+            ["`int` is provided by the engine and cannot be redefined"]
+        );
+    }
+
+    #[test]
+    fn a_literal_too_large_for_an_int_is_reported_rather_than_wrapped() {
+        assert_eq!(
+            messages("func f() { let x = 3000000000; }"),
+            ["`3000000000` does not fit in an int"]
+        );
+    }
+
+    #[test]
+    fn vec2_scales_by_a_whole_number_too() {
+        check_clean("func f() { let v = vec2(1.0, 2.0) * 2; }");
+        check_clean("func f() { let v = 2 * vec2(1.0, 2.0); }");
+        check_clean("func f() { let v = vec2(1.0, 2.0) / 2; }");
     }
 }

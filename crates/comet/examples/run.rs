@@ -213,6 +213,27 @@ impl Runner {
             )
             .expect("host binding");
         linker
+            .func_wrap(
+                host,
+                "str_int",
+                |mut c: Caller<'_, Host>, value: i32| -> Result<i32, Error> {
+                    // Whole numbers print whole. Widening to f32 first would round
+                    // past 2^24, silently, in the one function used to see a value.
+                    let text = value.to_string();
+                    let Some(Extern::Func(alloc)) = c.get_export("comet_alloc") else {
+                        return Err(Error::msg("every comet module exports comet_alloc"));
+                    };
+                    let alloc = alloc.typed::<i32, i32>(&c)?;
+                    let ptr = alloc.call(&mut c, text.len() as i32)?;
+                    let Some(Extern::Memory(memory)) = c.get_export("memory") else {
+                        return Err(Error::msg("every comet module exports its memory"));
+                    };
+                    comet::write_str(memory.data_mut(&mut c), ptr, &text);
+                    Ok(ptr)
+                },
+            )
+            .expect("host binding");
+        linker
             .func_wrap(host, "sin", |_: Caller<'_, Host>, x: f32| x.sin())
             .expect("host binding");
         linker

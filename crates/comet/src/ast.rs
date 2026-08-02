@@ -140,6 +140,12 @@ pub enum AssignOp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
+    /// `5` - a whole number written without a decimal point.
+    Int {
+        value: i64,
+        span: Span,
+    },
+    /// `5.0` - written with one.
     Number {
         value: f64,
         span: Span,
@@ -193,7 +199,8 @@ pub enum Expr {
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
-            Expr::Number { span, .. }
+            Expr::Int { span, .. }
+            | Expr::Number { span, .. }
             | Expr::Bool { span, .. }
             | Expr::Str { span, .. }
             | Expr::Ident { span, .. }
