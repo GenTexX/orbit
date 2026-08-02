@@ -95,6 +95,10 @@ impl TypedScript {
 pub struct TypedEnum {
     pub name: String,
     pub variants: Vec<TypedVariant>,
+    /// Whether any variant carries a `String`, directly or through another
+    /// enum. When it does not - the ordinary case - releasing a value of this
+    /// enum is nothing at all, and the tag never has to be read.
+    pub holds_str: bool,
     /// How many payload slots a value needs, beyond the tag: the widest
     /// variant's. Every value of the enum is this size whichever variant is
     /// live, which is what keeps an enum a stack value rather than an

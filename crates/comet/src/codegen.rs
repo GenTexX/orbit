@@ -944,10 +944,17 @@ impl<'a> FnGen<'a> {
             }))
             .collect();
 
+        // Slots whose release does something: a String, or an enum that can
+        // hold one. Working this out here rather than at each release site is
+        // what keeps the common enum - no payload owning anything - free.
         let owned = slot_types
             .iter()
             .enumerate()
-            .filter(|(_, ty)| **ty == Type::Str)
+            .filter(|(_, ty)| match ty {
+                Type::Str => true,
+                Type::Enum(index) => enums[*index as usize].holds_str,
+                _ => false,
+            })
             .map(|(slot, _)| slot as u32)
             .collect();
 
@@ -1025,6 +1032,27 @@ impl<'a> FnGen<'a> {
     fn store_global(&mut self, slot: u32) {
         let base = self.globals.base[slot as usize];
         let ty = self.globals.types[slot as usize];
+        // An enum global that owns something has to have its old value read out
+        // and released, which needs the whole value in locals to reach its tag.
+        if let Type::Enum(index) = ty
+            && self.enums[index as usize].holds_str
+        {
+            let width = 1 + self.enums[index as usize].payload_slots;
+            let frame = self.enter_frame();
+            let (incoming, old) = (frame.enum_base, frame.result_base);
+            for offset in (0..width).rev() {
+                self.ins().local_set(incoming + offset as u32);
+            }
+            for offset in 0..width {
+                self.ins().global_get(base + offset as u32);
+                self.ins().local_set(old + offset as u32);
+            }
+            self.release_enum_slots(old, index);
+            for offset in 0..width {
+                self.ins().local_get(incoming + offset as u32);
+            }
+            self.leave_frame();
+        }
         if ty == Type::Str {
             let tmp = self.scratch().i32s[0];
             self.ins().local_set(tmp);
@@ -1041,8 +1069,126 @@ impl<'a> FnGen<'a> {
     /// parameters, which the caller handed over.
     fn release_owned(&mut self) {
         for i in 0..self.owned.len() {
-            let base = self.slot_base[self.owned[i] as usize];
-            self.ins().local_get(base).call(F_RELEASE);
+            let slot = self.owned[i];
+            let ty = self.slot_types[slot as usize];
+            let base = self.slot_base[slot as usize];
+            match ty {
+                Type::Str => {
+                    self.ins().local_get(base).call(F_RELEASE);
+                }
+                Type::Enum(index) => self.release_enum_slots(base, index),
+                _ => {}
+            }
+        }
+    }
+
+    /// Release whatever the enum value starting at wasm local `base` holds.
+    ///
+    /// This is the invariant sum types change: what to release stops being a
+    /// property of a value's static type. The tag has to be read first, because
+    /// which payload is live - and whether there is one at all - depends on it.
+    /// The dispatch is emitted only for enums that can hold a `String`; for
+    /// every other one, releasing is nothing and there is no tag read.
+    fn release_enum_slots(&mut self, base: u32, index: u32) {
+        if !self.enums[index as usize].holds_str {
+            return;
+        }
+        let variants = self.enums[index as usize].variants.clone();
+        for (tag, variant) in variants.iter().enumerate() {
+            // Where each payload starts, and which of them own something.
+            let mut at = 1u32;
+            let mut owned = Vec::new();
+            for ty in &variant.payload {
+                let width = val_types(*ty, self.enums).len() as u32;
+                if self.owns_str(*ty) {
+                    owned.push((at, *ty));
+                }
+                at += width;
+            }
+            if owned.is_empty() {
+                continue;
+            }
+            self.ins().local_get(base).i32_const(tag as i32).i32_eq();
+            self.ins().if_(BlockType::Empty);
+            for (offset, ty) in owned {
+                match ty {
+                    Type::Str => {
+                        self.ins().local_get(base + offset).call(F_RELEASE);
+                    }
+                    Type::Enum(inner) => self.release_enum_slots(base + offset, inner),
+                    _ => {}
+                }
+            }
+            self.ins().end();
+        }
+    }
+
+    /// Take a reference to whatever the value on the stack owns, leaving it
+    /// there.
+    ///
+    /// Binding a variant's payload in a `match` makes a second owner of it, and
+    /// without this the enum and the binding would both release, one of them
+    /// into a freed block.
+    fn retain_value(&mut self, ty: Type) {
+        match ty {
+            Type::Str => self.retain_top(),
+            Type::Enum(index) if self.enums[index as usize].holds_str => {
+                let width = 1 + self.enums[index as usize].payload_slots;
+                let base = self.enter_frame().enum_base;
+                for slot in (0..width).rev() {
+                    self.ins().local_set(base + slot as u32);
+                }
+                self.retain_enum_slots(base, index);
+                for slot in 0..width {
+                    self.ins().local_get(base + slot as u32);
+                }
+                self.leave_frame();
+            }
+            _ => {}
+        }
+    }
+
+    /// The retain counterpart of [`release_enum_slots`](Self::release_enum_slots),
+    /// with the same tag dispatch and the same skip when nothing is owned.
+    fn retain_enum_slots(&mut self, base: u32, index: u32) {
+        if !self.enums[index as usize].holds_str {
+            return;
+        }
+        let variants = self.enums[index as usize].variants.clone();
+        for (tag, variant) in variants.iter().enumerate() {
+            let mut at = 1u32;
+            let mut owned = Vec::new();
+            for ty in &variant.payload {
+                let width = val_types(*ty, self.enums).len() as u32;
+                if self.owns_str(*ty) {
+                    owned.push((at, *ty));
+                }
+                at += width;
+            }
+            if owned.is_empty() {
+                continue;
+            }
+            self.ins().local_get(base).i32_const(tag as i32).i32_eq();
+            self.ins().if_(BlockType::Empty);
+            for (offset, ty) in owned {
+                match ty {
+                    Type::Str => {
+                        self.ins().local_get(base + offset).call(F_RETAIN);
+                    }
+                    Type::Enum(inner) => self.retain_enum_slots(base + offset, inner),
+                    _ => {}
+                }
+            }
+            self.ins().end();
+        }
+    }
+
+    /// Whether releasing a value of this type has anything to do.
+    fn owns_str(&self, ty: Type) -> bool {
+        match ty {
+            Type::Str => true,
+            Type::Enum(index) => self.enums[index as usize].holds_str,
+            _ => false,
         }
     }
 
@@ -1061,6 +1207,17 @@ impl<'a> FnGen<'a> {
                 self.ins().call(F_RELEASE);
             }
             Type::Unit | Type::Error => {}
+            // An enum that owns something has to be parked to read its tag,
+            // because the payload is under it on the stack.
+            Type::Enum(index) if self.enums[index as usize].holds_str => {
+                let width = 1 + self.enums[index as usize].payload_slots;
+                let base = self.enter_frame().enum_base;
+                for slot in (0..width).rev() {
+                    self.ins().local_set(base + slot as u32);
+                }
+                self.release_enum_slots(base, index);
+                self.leave_frame();
+            }
             other => {
                 for _ in val_types(other, self.enums) {
                     self.ins().drop();
@@ -1142,6 +1299,28 @@ impl<'a> FnGen<'a> {
             Place::Local(slot) => {
                 let ty = self.slot_types[*slot as usize];
                 self.expr(value);
+                if let Type::Enum(index) = ty
+                    && self.enums[index as usize].holds_str
+                {
+                    // The same order as a String: park the new value, release
+                    // the old, then put the new one back.
+                    let width = 1 + self.enums[index as usize].payload_slots;
+                    let frame = self.enter_frame();
+                    let (incoming, old) = (frame.enum_base, frame.result_base);
+                    for offset in (0..width).rev() {
+                        self.ins().local_set(incoming + offset as u32);
+                    }
+                    let base = self.slot_base[*slot as usize];
+                    for offset in 0..width {
+                        self.ins().local_get(base + offset as u32);
+                        self.ins().local_set(old + offset as u32);
+                    }
+                    self.release_enum_slots(old, index);
+                    for offset in 0..width {
+                        self.ins().local_get(incoming + offset as u32);
+                    }
+                    self.leave_frame();
+                }
                 if ty == Type::Str {
                     // Park the new reference before dropping the old one, so
                     // `s = s` cannot free the object between the two.
@@ -1259,15 +1438,14 @@ impl<'a> FnGen<'a> {
 
             TypedExprKind::Local(slot) => {
                 self.load_slot(*slot);
-                if self.slot_types[*slot as usize] == Type::Str {
-                    self.retain_top();
-                }
+                // Reading a value that owns something makes the copy on the
+                // stack a second owner. `retain_value` covers both a String and
+                // an enum holding one, which the Str-only check did not.
+                self.retain_value(self.slot_types[*slot as usize]);
             }
             TypedExprKind::Global(slot) => {
                 self.load_global(*slot);
-                if self.globals.types[*slot as usize] == Type::Str {
-                    self.retain_top();
-                }
+                self.retain_value(self.globals.types[*slot as usize]);
             }
 
             TypedExprKind::HostField { field, ty } => {
@@ -1495,6 +1673,10 @@ impl<'a> FnGen<'a> {
         let result_width = val_types(result_ty, self.enums).len() as u32;
         let result_base = frame.result_base;
         self.emit_arms(base, result_base, enum_index, arms, 0);
+        // The subject was a value like any other, and this expression consumed
+        // it. Its bindings retained whatever they took, so this frees only what
+        // no arm kept. Done after the arms and before the result is loaded.
+        self.release_enum_slots(base, enum_index);
         for slot in 0..result_width {
             self.ins().local_get(result_base + slot);
         }
@@ -1543,6 +1725,8 @@ impl<'a> FnGen<'a> {
                 self.ins().local_get(base + at + offset);
             }
             self.unpack(*ty);
+            // The binding is a second owner of whatever the payload holds.
+            self.retain_value(*ty);
             self.store_slot(*slot);
             at += width;
         }

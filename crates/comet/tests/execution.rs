@@ -1435,3 +1435,101 @@ fn a_match_is_an_expression_and_can_be_a_whole_function_body() {
     script.update(0.0);
     assert_eq!(script.position(), (10.0, 0.0));
 }
+
+#[test]
+fn a_variant_holding_a_string_frees_it_and_one_holding_a_number_does_not() {
+    // The invariant sum types change: what to release stops being a property of
+    // a value's static type. Dropping an enum means reading its tag first, and
+    // getting that wrong leaks or double-frees rather than reporting anything.
+    let mut script = Script::new(
+        r#"
+        enum Event { Tick(f32), Said(String) }
+        func describe(e: Event) -> String {
+            match e {
+                Tick(n) => "tick " + str(n),
+                Said(what) => what,
+            }
+        }
+        func update(dt: f32) {
+            print(describe(Event::Tick(1.0)));
+            // str() allocates, so this payload is a real heap block rather than
+            // an immortal data-segment literal - which is the only version of
+            // this test that exercises release at all.
+            print(describe(Event::Said("said " + str(dt))));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["tick 1", "said 0"]);
+
+    // And doing it repeatedly does not grow the heap: a leak shows up here,
+    // and a double free would have trapped or corrupted the free list above.
+    // Enough rounds that a leaked string crosses a 64KB page: a few hundred
+    // would fit inside one and the growth would never show.
+    let before = script.memory_bytes();
+    for _ in 0..20_000 {
+        script.update(0.0);
+    }
+    assert_eq!(script.memory_bytes(), before, "no leak across 20000 rounds");
+}
+
+#[test]
+fn a_string_taken_out_of_a_variant_outlives_the_value_it_came_from() {
+    // The binding is a second owner. Without a retain the enum's release would
+    // free the block the binding still points at.
+    let mut script = Script::new(
+        r#"
+        enum Slot { Empty, Full(String) }
+        let held = Slot::Empty;
+        func update(dt: f32) {
+            held = Slot::Full("kept " + str(dt));
+            let taken = match held {
+                Empty => "nothing",
+                Full(text) => text,
+            };
+            held = Slot::Empty;
+            print(taken);
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["kept 0"]);
+
+    let before = script.memory_bytes();
+    for _ in 0..20_000 {
+        script.update(0.0);
+    }
+    assert_eq!(script.memory_bytes(), before, "still balanced");
+}
+
+#[test]
+fn an_enum_inside_an_enum_releases_through_both_tags() {
+    let mut script = Script::new(
+        r#"
+        enum Inner { Nothing, Text(String) }
+        enum Outer { Empty, Wrapped(Inner) }
+        func update(dt: f32) {
+            let o = Outer::Wrapped(Inner::Text("deep " + str(dt)));
+            let s = match o {
+                Empty => "empty",
+                Wrapped(i) => match i {
+                    Nothing => "nothing",
+                    Text(t) => t,
+                },
+            };
+            print(s);
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["deep 0"]);
+    let before = script.memory_bytes();
+    for _ in 0..20_000 {
+        script.update(0.0);
+    }
+    assert_eq!(
+        script.memory_bytes(),
+        before,
+        "nested release is balanced too"
+    );
+}

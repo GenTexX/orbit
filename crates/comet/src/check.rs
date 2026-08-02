@@ -297,6 +297,15 @@ impl Checker<'_> {
         )
     }
 
+    /// Whether releasing a value of this type has anything to do.
+    fn owns_str(&self, ty: Type) -> bool {
+        match ty {
+            Type::Str => true,
+            Type::Enum(index) => self.enums[index as usize].holds_str,
+            _ => false,
+        }
+    }
+
     /// Whether a value of this type can be stored on the component and written
     /// back into a running module.
     ///
@@ -507,6 +516,7 @@ impl Checker<'_> {
             self.enums.push(TypedEnum {
                 name: decl.name.clone(),
                 variants: Vec::new(),
+                holds_str: false,
                 payload_slots: 0,
             });
             let _ = index;
@@ -542,6 +552,29 @@ impl Checker<'_> {
             }
             self.enums[index].variants = variants;
             self.enums[index].payload_slots = widest;
+        }
+        // Whether an enum can hold a String is a property of the whole graph -
+        // one enum's payload may be another - so it settles by repetition
+        // rather than in one pass. The set only grows, so this terminates.
+        loop {
+            let mut changed = false;
+            for index in 0..self.enums.len() {
+                if self.enums[index].holds_str {
+                    continue;
+                }
+                let holds = self.enums[index]
+                    .variants
+                    .iter()
+                    .flat_map(|v| &v.payload)
+                    .any(|ty| self.owns_str(*ty));
+                if holds {
+                    self.enums[index].holds_str = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
         }
 
         // Signatures first, so a function can call one defined later and a
