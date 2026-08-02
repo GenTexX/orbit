@@ -1830,3 +1830,120 @@ fn an_array_that_goes_out_of_scope_takes_its_storage_with_it() {
     }
     assert_eq!(script.memory_bytes(), before, "no leak across 2000 rounds");
 }
+
+#[test]
+fn get_gives_the_element_or_nothing_rather_than_trapping() {
+    // The safe half of indexing: `a[i]` traps, `get(a, i)` says so in a type
+    // the checker makes you handle.
+    let mut script = Script::new(
+        r#"
+        func show(o: Option<f32>) -> String {
+            match o {
+                None => "-",
+                Some(v) => str(v),
+            }
+        }
+        func update(dt: f32) {
+            let a = [10.0, 20.0];
+            print(show(get(a, 0)));
+            print(show(get(a, 1)));
+            print(show(get(a, 2)));
+            print(show(get(a, 0 - 1)));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["10", "20", "-", "-"]);
+}
+
+#[test]
+fn get_works_for_an_element_wider_than_one_slot() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let p = [vec2(1.0, 2.0), vec2(3.0, 4.0)];
+            let found = get(p, 1);
+            print(match found {
+                None => "-",
+                Some(v) => str(v.x) + "," + str(v.y),
+            });
+            let missing = get(p, 9);
+            print(match missing {
+                None => "-",
+                Some(v) => str(v.x),
+            });
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["3,4", "-"]);
+}
+
+#[test]
+fn an_array_cannot_hold_something_that_owns_a_reference_yet() {
+    // Releasing an array frees its storage but does not walk its elements, so
+    // an element that owns anything would leak. Refused rather than leaked.
+    for source in [
+        "func update(dt: f32) { let a: Array<String> = []; }",
+        "func update(dt: f32) { let a: Array<Array<f32>> = []; }",
+        "struct S { t: String }\nfunc update(dt: f32) { let a: Array<S> = []; }",
+        "enum E { A, B(String) }\nfunc update(dt: f32) { let a: Array<E> = []; }",
+        "func update(dt: f32) { let a: Array<Option<String>> = []; }",
+    ] {
+        let found = comet::compile(source, &comet::example_schema())
+            .expect_err("an owning element type must be refused");
+        assert!(
+            found
+                .iter()
+                .any(|d| d.message.contains("an array cannot hold")),
+            "{source}: {found:?}"
+        );
+    }
+    // A payload-free enum owns nothing, so it is allowed.
+    let source =
+        "enum E { A, B }\nfunc update(dt: f32) { let a: Array<E> = []; print(str(len(a))); }";
+    assert!(comet::compile(source, &comet::example_schema()).is_ok());
+}
+
+#[test]
+fn nested_array_work_gets_the_frames_it_needs() {
+    // Building an array parks the handle and writing each element parks again,
+    // so an element that is itself array work needs several levels. Getting the
+    // count wrong panics the compiler rather than emitting anything.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let a = [1.0, 2.0, 3.0];
+            let b = [a[0] + a[1], a[2] * 2.0];
+            push(b, a[0] + b[1]);
+            b[0] = a[1] + b[1];
+            print(str(b[0]) + "," + str(b[1]) + "," + str(b[2]));
+            print("len " + str(len(b)));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["8,6,7", "len 3"]);
+}
+
+#[test]
+fn a_string_inside_a_place_reaches_the_data_segment() {
+    // `collect_literals` walks statements, and an assignment's place holds
+    // expressions too - `a[i] = v` has two. Missing them panicked emission with
+    // "every literal was interned", the same way a match arm once did.
+    let mut script = Script::new(
+        r#"
+        func announce(tag: String) -> int {
+            print(tag);
+            1
+        }
+        func update(dt: f32) {
+            let a = [0.0, 0.0];
+            a[announce("choosing")] = 5.0;
+            print(str(a[1]));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["choosing", "5"]);
+}

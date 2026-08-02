@@ -1,0 +1,46 @@
+// An array is a reference, and the only one in the language.
+//
+// Two names are one array: change it through either and both see it. That is
+// deliberate - it is what lets a function add to a list you pass it - and
+// `copy` is how you say you meant a second array instead.
+
+let history: Array<f32> = [];
+
+func remember(value: f32) {
+    // `history` is not passed and not returned; push reaches the same array.
+    push(history, value);
+}
+
+func start() {
+    let scores = [10.0, 20.0, 30.0];
+
+    // Indexing is one character and traps if the position is not there.
+    print("second is " + str(scores[1]));
+    print("there are " + str(len(scores)));
+
+    // `get` is the version that cannot trap: it gives an Option, and the
+    // compiler makes you say what happens when there is nothing.
+    print(describe(get(scores, 1)));
+    print(describe(get(scores, 99)));
+
+    // Two names, one array.
+    let same = scores;
+    same[0] = 99.0;
+    print("through the other name: " + str(scores[0]));
+
+    // Unless you ask for a copy.
+    let separate = copy(scores);
+    separate[0] = 1.0;
+    print("after copying: " + str(scores[0]));
+}
+
+func describe(found: Option<f32>) -> String {
+    match found {
+        None => "nothing there",
+        Some(value) => "found " + str(value),
+    }
+}
+
+func update(dt: f32) {
+    remember(dt);
+}

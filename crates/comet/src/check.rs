@@ -443,6 +443,24 @@ impl Checker<'_> {
         }
     }
 
+    /// Whether a value of this type owns a counted reference - so dropping it
+    /// has to do something.
+    ///
+    /// An array's release frees its storage but does not walk its elements, so
+    /// an element that owns anything would leak. Refusing is what keeps that
+    /// from being silent.
+    fn owns_reference(&self, ty: Type) -> bool {
+        match ty {
+            Type::Str | Type::Array(_) => true,
+            Type::Enum(index) => self.enums[index as usize].holds_str,
+            Type::Struct(index) => self.structs[index as usize]
+                .fields
+                .iter()
+                .any(|f| self.owns_reference(f.ty)),
+            _ => false,
+        }
+    }
+
     /// Whether releasing a value of this type has anything to do.
     fn owns_str(&self, ty: Type) -> bool {
         match ty {
@@ -738,11 +756,20 @@ impl Checker<'_> {
             let listed: Vec<&str> = args.iter().map(|t| t.name()).collect();
             format!("{}<{}>", decl.name, listed.join(", "))
         };
+        // Settled here rather than only at the end: whether an enum owns
+        // anything decides whether an array may hold it, and that is asked
+        // while types are being resolved. Everything this one's payload can
+        // name is either already built or is this one, which the guard above
+        // has ruled out.
+        let holds_str = variants
+            .iter()
+            .flat_map(|v| &v.payload)
+            .any(|ty| self.owns_str(*ty));
         let index = self.enums.len() as u32;
         self.enums.push(TypedEnum {
             name,
             variants,
-            holds_str: false,
+            holds_str,
             payload_slots: widest,
         });
         self.instances.insert(key, index);
@@ -781,6 +808,17 @@ impl Checker<'_> {
             }
             if element == Type::Unit {
                 self.error(name.span, "an array cannot hold `()`");
+                return Type::Error;
+            }
+            if self.owns_reference(element) {
+                let held = self.name_of(element);
+                self.error(
+                    name.span,
+                    format!(
+                        "an array cannot hold `{held}` yet - releasing one would have to walk \
+                         its elements, and that is not built"
+                    ),
+                );
                 return Type::Error;
             }
             return self.array_of(element);
@@ -2139,6 +2177,61 @@ impl Checker<'_> {
                 Type::Vec2,
             );
         }
+        // `get(a, i)`: the element, or nothing. Built here rather than in the
+        // table because its result type depends on the array's.
+        if callee == "get" {
+            if args.len() != 2 {
+                self.error(
+                    span,
+                    format!(
+                        "`get` takes 2 arguments, but {} {} given",
+                        args.len(),
+                        if args.len() == 1 { "was" } else { "were" }
+                    ),
+                );
+                return (TypedExprKind::Error, Type::Error);
+            }
+            let mut args = args.into_iter();
+            let array = args.next().expect("arity checked");
+            let index = args.next().expect("arity checked");
+            let index = self.coerce(index, Type::Int);
+            let Type::Array(which) = array.ty else {
+                if !array.ty.is_error() {
+                    let name = self.name_of(array.ty);
+                    self.error(
+                        array.span,
+                        format!("`get` works on an array, not on {name}"),
+                    );
+                }
+                return (TypedExprKind::Error, Type::Error);
+            };
+            let element = self.arrays[which as usize];
+            let Some(template) = self.template("Option") else {
+                return (TypedExprKind::Error, Type::Error);
+            };
+            let Some(option) = self.instantiate(template, &[element], span) else {
+                return (TypedExprKind::Error, Type::Error);
+            };
+            let variant = |name: &str| {
+                self.enums[option as usize]
+                    .variants
+                    .iter()
+                    .position(|v| v.name == name)
+                    .expect("Option has None and Some") as u32
+            };
+            let (none, some) = (variant("None"), variant("Some"));
+            return (
+                TypedExprKind::ArrayGet {
+                    array: Box::new(array),
+                    index: Box::new(index),
+                    element,
+                    option,
+                    none,
+                    some,
+                },
+                Type::Enum(option),
+            );
+        }
         // The array builtins. Generic over the element type, which the builtin
         // table cannot express, so they are resolved here like `vec2` is.
         if let Some(op) = match callee {
@@ -2558,7 +2651,7 @@ enum Builtin {
 /// builds: the host functions, which live in [`builtin`] and `vec2`.
 const BUILTIN_NAMES: &[&str] = &[
     "print", "str", "vec2", "abs", "sqrt", "floor", "ceil", "min", "max", "sin", "cos", "atan2",
-    "pow", "int", "len", "push", "copy",
+    "pow", "int", "len", "push", "copy", "get",
 ];
 
 /// The candidate closest to `name`, if one is close enough to be worth saying.

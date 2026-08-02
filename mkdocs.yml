@@ -47,3 +47,4 @@ nav:
           - adr/0021-two-numeric-types-widening-one-way.md
           - adr/0022-exported-variables-the-inspector-owns.md
           - adr/0023-sum-types-generics-and-what-release-means.md
+          - adr/0024-containers-arrays-are-references-structs-are-values.md

@@ -546,7 +546,14 @@ fn collect_block(block: &TypedBlock, out: &mut Literals) {
     for stmt in &block.stmts {
         match stmt {
             TypedStmt::Let { init, .. } => collect_expr(init, out),
-            TypedStmt::Assign { value, .. } => collect_expr(value, out),
+            TypedStmt::Assign { place, value } => {
+                // A place can hold expressions too: `a[i] = v` has both.
+                if let Place::Element { array, index, .. } = place {
+                    collect_expr(array, out);
+                    collect_expr(index, out);
+                }
+                collect_expr(value, out);
+            }
             TypedStmt::If {
                 cond,
                 then,
@@ -612,6 +619,10 @@ fn collect_expr(expr: &TypedExpr, out: &mut Literals) {
             }
         }
         TypedExprKind::Index { array, index, .. } => {
+            collect_expr(array, out);
+            collect_expr(index, out);
+        }
+        TypedExprKind::ArrayGet { array, index, .. } => {
             collect_expr(array, out);
             collect_expr(index, out);
         }
@@ -1080,7 +1091,9 @@ fn block_depth(block: &TypedBlock) -> usize {
 fn stmt_depth(stmt: &TypedStmt) -> usize {
     match stmt {
         TypedStmt::Let { init, .. } => expr_depth(init),
-        TypedStmt::Assign { value, .. } => expr_depth(value),
+        // An assignment's depth is its value's, and also its place's: writing
+        // an element parks the handle, the address and the value.
+        TypedStmt::Assign { place, value } => expr_depth(value).max(place_depth(place)),
         TypedStmt::If {
             cond,
             then,
@@ -1091,6 +1104,14 @@ fn stmt_depth(stmt: &TypedStmt) -> usize {
         TypedStmt::While { cond, body } => expr_depth(cond).max(block_depth(body)),
         TypedStmt::Return { value } => value.as_ref().map_or(0, expr_depth),
         TypedStmt::Expr(e) => expr_depth(e),
+    }
+}
+
+/// How many frames writing to `place` needs.
+fn place_depth(place: &Place) -> usize {
+    match place {
+        Place::Element { array, index, .. } => 2 + expr_depth(array).max(expr_depth(index)),
+        _ => 0,
     }
 }
 
@@ -1123,13 +1144,18 @@ fn expr_depth(expr: &TypedExpr) -> usize {
         K::Widen(inner) | K::Narrow(inner) => (0, vec![inner]),
         K::MakeVariant { args, .. } => (0, args.iter().collect()),
         K::MakeStruct { fields, .. } => (0, fields.iter().collect()),
-        // Building an array parks the handle while each element is written in.
-        K::MakeArray { elements, .. } => (1, elements.iter().collect()),
+        // Building an array parks the handle, and writing each element parks
+        // the address and the value - two levels, not one.
+        K::MakeArray { elements, .. } => (2, elements.iter().collect()),
         // Indexing parks the address while the element is read out of it.
         K::Index { array, index, .. } => (1, vec![array, index]),
-        // `push` parks the address it is given before writing into it.
+        // `get` parks the handle, the index and the result it is building.
+        K::ArrayGet { array, index, .. } => (1, vec![array, index]),
+        // `push` parks the handle and then writes an element, which parks
+        // again. `len` and `copy` need one, and taking the larger costs a
+        // couple of locals the JIT drops.
         K::ArrayOp { array, value, .. } => (
-            1,
+            2,
             std::iter::once(array.as_ref())
                 .chain(value.as_deref())
                 .collect(),
@@ -1993,6 +2019,60 @@ impl<'a> FnGen<'a> {
                         self.ins().local_get(fresh);
                     }
                 }
+            }
+
+            // `get(a, i)`: an `Option<T>`, built without a trap. The element
+            // and the option's payload are both packed i32 words, so an
+            // in-range read is a straight copy - no unpacking on the way.
+            TypedExprKind::ArrayGet {
+                array,
+                index,
+                element,
+                option,
+                none,
+                some,
+            } => {
+                let width = val_types(*element, self.enums, self.structs).len() as u32;
+                let payload_slots = self.enums[*option as usize].payload_slots as u32;
+                let frame = self.enter_frame();
+                let (handle, idx, at) = (frame.i32s[0], frame.i32s[1], frame.i32s[2]);
+                let res = frame.result_base;
+
+                self.expr(array);
+                self.ins().local_set(handle);
+                self.expr(index);
+                self.ins().local_set(idx);
+
+                // 0 <= index < len. Both halves, because a negative index is
+                // just as much a miss as one past the end.
+                self.ins().local_get(idx).i32_const(0).i32_ge_s();
+                self.ins().local_get(idx);
+                self.ins().local_get(handle).i32_load(mem(OFF_ARRAY_LEN));
+                self.ins().i32_lt_s();
+                self.ins().i32_and();
+                self.ins().if_(BlockType::Empty);
+                self.ins().i32_const(*some as i32).local_set(res);
+                self.ins().local_get(handle);
+                self.ins().local_get(idx);
+                self.ins().i32_const(width as i32);
+                self.ins().call(F_ARRAY_AT).local_set(at);
+                for slot in 0..width {
+                    self.ins().local_get(at).i32_load(mem(u64::from(slot) * 4));
+                    self.ins().local_set(res + 1 + slot);
+                }
+                self.ins().else_();
+                self.ins().i32_const(*none as i32).local_set(res);
+                self.ins().end();
+                // Whatever the live variant did not fill: wasm has no undefined
+                // value, and a `match` on the result never reads these.
+                for slot in width..payload_slots {
+                    self.ins().i32_const(0).local_set(res + 1 + slot);
+                }
+                self.ins().local_get(handle).call(F_ARRAY_RELEASE);
+                for slot in 0..=payload_slots {
+                    self.ins().local_get(res + slot);
+                }
+                self.leave_frame();
             }
 
             // `a[i]`: the address, then the slots at it. Out of bounds traps

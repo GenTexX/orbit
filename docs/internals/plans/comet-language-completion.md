@@ -324,7 +324,7 @@ string fails to compile instead.
 
 ---
 
-## 4.6 - Containers: arrays and structs (4.6a DONE, 4.6b next)
+## 4.6 - Containers: arrays and structs (DONE)
 
 **Builds.** `Array<T>` as an ordinary generic declaration rather than a builtin,
 indexing, and user-defined structs.
@@ -380,6 +380,28 @@ array's element access will want.
 Generic structs are not built. The template machinery from 4.5 would carry them,
 but nothing needs one yet - `Array<T>` is a builtin, not a user struct - and it
 is the same "build ahead of the user" call made twice before.
+
+**4.6b done**, as ADR 0024. An array is two blocks - a handle and its elements -
+which is what makes growth invisible to an alias. `a[i]` traps, `get(a, i)`
+gives an `Option<T>`, and `copy` is the way out of the aliasing.
+
+**One thing is deliberately refused rather than built**: an array cannot hold
+anything that owns a reference. Releasing an array frees its storage but does
+not walk its elements, so `Array<String>` would leak. It is a diagnostic rather
+than a leak, and the walk - a per-element-type drop, the same tag-consulting
+problem 4.5b solved one level further out - is the follow-up.
+
+Three bugs, all found by writing the demo or by disabling a fix:
+
+- `comet_array_at` computed `data + index * width * 4` where `data` is the block
+  pointer, so element zero sat on the allocator's own size field and writing it
+  corrupted the free list. It read as a leak, not as a failure.
+- `pack`/`unpack` handled `f32` and `Vec2` by name, so an array of structs stored
+  raw floats into i32 slots. They walk the layout now.
+- Frame depth has to count what a *place* needs, not only an expression, and
+  `collect_literals` has to walk places too - a string inside `a[f("x")] = v`
+  was never interned. Both are the same omission in two passes, and the second
+  is the third time a wildcard or a missed arm has caused exactly this.
 
 ---
 

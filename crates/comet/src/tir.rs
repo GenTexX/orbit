@@ -331,6 +331,19 @@ pub enum TypedExprKind {
         value: Option<Box<TypedExpr>>,
         element: Type,
     },
+    /// `get(a, i)`: the element as `Option<T>`, or `None` if `i` is not a
+    /// position in `a`. The safe half of indexing - `a[i]` traps instead.
+    ArrayGet {
+        array: Box<TypedExpr>,
+        index: Box<TypedExpr>,
+        element: Type,
+        /// The `Option<T>` this yields, and where its two variants sit. Passed
+        /// rather than looked up, so codegen needs to know nothing about
+        /// `Option` beyond that it is an enum like any other.
+        option: u32,
+        none: u32,
+        some: u32,
+    },
     /// `a[i]`, which traps if `i` is not a position in `a`.
     Index {
         array: Box<TypedExpr>,
