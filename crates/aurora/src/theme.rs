@@ -55,6 +55,10 @@ pub struct Theme {
     /// Slider track (unfilled) and its filled portion / thumb.
     pub slider_track: Color,
     pub slider_fill: Color,
+    /// The knob you drag. Deliberately not `slider_fill`: drawn in the same
+    /// colour as the filled part of the track it vanishes into it, and the
+    /// whole control reads as a progress bar with nothing to grab.
+    pub slider_handle: Color,
     /// Splitter bar fill (when its style sets no background).
     pub splitter: Color,
     /// Scrollbar thumb fill (drawn only while content overflows).
@@ -134,6 +138,7 @@ impl Theme {
             find_match: Color::rgba(0.95, 0.70, 0.25, 0.45),
             slider_track: Color::rgb(0.14, 0.15, 0.19),
             slider_fill: Color::rgb(0.30, 0.55, 0.90),
+            slider_handle: Color::rgb(0.88, 0.91, 0.96),
             splitter: Color::rgb(0.12, 0.13, 0.16),
             scrollbar_thumb: Color::rgba(0.75, 0.78, 0.85, 0.45),
             disabled_fade: 0.38,
@@ -180,6 +185,7 @@ impl Theme {
             find_match: Color::rgba(0.90, 0.62, 0.10, 0.40),
             slider_track: Color::rgb(0.80, 0.81, 0.85),
             slider_fill: Color::rgb(0.20, 0.50, 0.90),
+            slider_handle: Color::rgb(1.0, 1.0, 1.0),
             splitter: Color::rgb(0.78, 0.79, 0.83),
             scrollbar_thumb: Color::rgba(0.20, 0.22, 0.28, 0.45),
             disabled_fade: 0.45,

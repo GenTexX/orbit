@@ -230,6 +230,12 @@ pub const TOKENS: &[Token] = &[
     ),
     t("slider_track", C, "Widgets", "Slider track (unfilled)"),
     t(
+        "slider_handle",
+        C,
+        "Widgets",
+        "The knob you drag on a slider",
+    ),
+    t(
         "slider_fill",
         C,
         "Widgets",

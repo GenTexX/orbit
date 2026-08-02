@@ -44,20 +44,24 @@ pub fn spawn_sprite(
 ///
 /// The source path starts empty. Picking the `.cmt` file is the inspector's job,
 /// through the same asset field a sprite's texture uses.
-pub fn attach_script(scene: &mut Scene, history: &mut History, node: NodeId) -> Option<usize> {
-    if script_index(scene, node).is_some() {
-        return None;
-    }
-    Some(history.add_component(scene, node, Component::Script(ScriptComponent::default())))
+/// A node may run several scripts: one for movement, one for what it collides
+/// with, one for what it says. They are separate files with separate exported
+/// values, and nothing about the component or the host needs them to be one.
+pub fn attach_script(scene: &mut Scene, history: &mut History, node: NodeId) -> usize {
+    history.add_component(scene, node, Component::Script(ScriptComponent::default()))
 }
 
-/// Which of `node`'s components is its script, if it has one.
-pub fn script_index(scene: &Scene, node: NodeId) -> Option<usize> {
+/// The first of `node`'s script components with no file picked yet.
+///
+/// What a dropped `.cmt` fills: adding a script and then dropping one on the
+/// node should put it in the empty slot rather than leaving that behind and
+/// making a second.
+pub fn empty_script_index(scene: &Scene, node: NodeId) -> Option<usize> {
     scene
         .node(node)
         .components
         .iter()
-        .position(|c| matches!(c, Component::Script(_)))
+        .position(|c| matches!(c, Component::Script(s) if s.source.is_empty()))
 }
 
 /// Deep-clone the subtree rooted at `src` as a new sibling right after it,
@@ -256,7 +260,7 @@ mod tests {
 
         assert_eq!(
             attach_script(&mut scene, &mut history, node),
-            Some(1),
+            1,
             "the script lands after the sprite already there"
         );
         assert!(matches!(
@@ -264,8 +268,16 @@ mod tests {
             Component::Script(_)
         ));
 
-        // A node runs one script, so asking again changes nothing.
-        assert_eq!(attach_script(&mut scene, &mut history, node), None);
+        // A node may run several: one for movement, one for what it says.
+        assert_eq!(attach_script(&mut scene, &mut history, node), 2);
+        assert_eq!(scene.node(node).components.len(), 3);
+
+        // A dropped file fills the first slot with no file picked yet, rather
+        // than leaving it empty and making a fourth.
+        assert_eq!(empty_script_index(&scene, node), Some(1));
+
+        // One undo takes the second one back off.
+        assert!(history.undo(&mut scene));
         assert_eq!(scene.node(node).components.len(), 2);
 
         // One undo takes it back off.
@@ -274,12 +286,12 @@ mod tests {
     }
 
     #[test]
-    fn script_index_finds_the_script_wherever_it_sits() {
+    fn an_empty_script_slot_is_found_wherever_it_sits() {
         let mut scene = Scene::new("Root");
         let mut history = History::new();
         let root = scene.root();
         let bare = history.add_node(&mut scene, root, Node::new("Bare"));
-        assert_eq!(script_index(&scene, bare), None);
+        assert_eq!(empty_script_index(&scene, bare), None);
 
         // Behind a sprite, not at index 0 - which is exactly the case that
         // would break a lookup written as "the first component".
@@ -291,7 +303,7 @@ mod tests {
             Vec2::splat(64.0),
         );
         attach_script(&mut scene, &mut history, node);
-        assert_eq!(script_index(&scene, node), Some(1));
+        assert_eq!(empty_script_index(&scene, node), Some(1));
     }
 
     #[test]

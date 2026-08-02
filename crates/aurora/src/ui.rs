@@ -1981,8 +1981,13 @@ impl Ui {
         let (Some(cursor), Some(rect)) = (self.cursor, self.rect(id)) else {
             return;
         };
-        let t = if rect.size.x > 0.0 {
-            ((cursor.x - rect.pos.x) / rect.size.x).clamp(0.0, 1.0)
+        // Measured between the knob's extreme centres, not across the whole
+        // rect - the same span the knob is drawn along, so grabbing it does not
+        // make it jump.
+        let size = (rect.size.y - 4.0).max(10.0);
+        let span = (rect.size.x - size).max(0.0);
+        let t = if span > 0.0 {
+            ((cursor.x - rect.pos.x - size * 0.5) / span).clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -3398,21 +3403,31 @@ impl Ui {
             rect: Rect::new(track.pos, Vec2::new(track.size.x * t, track_h)),
             color: self.theme.slider_fill,
         });
-        // The thumb: a small square centered on the value position.
-        let half = rect.size.y * 0.5;
-        let cx = rect.pos.x + track.size.x * t;
-        let base = self.theme.slider_fill;
+        // The knob. A round, light disc with a rim, inset from the row's full
+        // height so it reads as something sitting on the track rather than as
+        // the end of the filled part - which is what a square in `slider_fill`
+        // looked like, and why the whole control read as a progress bar.
+        let size = (rect.size.y - 4.0).max(10.0);
+        let half = size * 0.5;
+        // The centre stays inside the track, so the knob never hangs off the
+        // end at 0 or 1.
+        let cx = rect.pos.x + half + (track.size.x - size).max(0.0) * t;
+        let base = self.theme.slider_handle;
         let color = match self.interaction(id) {
             Interaction::Idle => base,
             Interaction::Hovered => base.lighten(0.10),
             Interaction::Pressed => base.darken(0.10),
         };
-        list.commands.push(DrawCommand::FillRect {
+        list.commands.push(DrawCommand::RoundedRect {
             rect: Rect::new(
-                Vec2::new(cx - half, rect.pos.y),
-                Vec2::new(half * 2.0, rect.size.y),
+                Vec2::new(cx - half, rect.pos.y + (rect.size.y - size) * 0.5),
+                Vec2::new(size, size),
             ),
             color,
+            radius: [half; 4],
+            border_width: 1.0,
+            border_color: self.theme.slider_fill,
+            border_sides: [true; 4],
         });
     }
 
@@ -5561,20 +5576,30 @@ mod tests {
         let s = ui.slider(root, 0.0, 0.0, 100.0, Style::new().size(100.0, 20.0));
         ui.layout(Vec2::new(200.0, 40.0)).unwrap();
 
-        // The slider spans x 0..100; a press at x=25 sets the value to 25.
-        ui.handle_input(InputEvent::PointerMoved(Vec2::new(25.0, 10.0)));
+        // The knob's centre follows the cursor rather than its left edge, so
+        // the value is measured between the knob's extreme centres - grabbing
+        // it must not make it jump. The slider is 100 wide and 20 tall, so the
+        // knob is 16 across and its centre travels x 8..92.
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(50.0, 10.0)));
         ui.handle_input(InputEvent::PointerPressed);
-        assert!((ui.slider_value(s) - 25.0).abs() < 1e-3);
+        assert!((ui.slider_value(s) - 50.0).abs() < 1e-3, "the middle");
         assert_eq!(
             ui.drain_events(),
-            vec![Event::SliderChanged { id: s, value: 25.0 }]
+            vec![Event::SliderChanged { id: s, value: 50.0 }]
         );
 
-        // Dragging updates it; past the end clamps to the max.
-        ui.handle_input(InputEvent::PointerMoved(Vec2::new(90.0, 10.0)));
-        assert!((ui.slider_value(s) - 90.0).abs() < 1e-3);
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(8.0, 10.0)));
+        assert!((ui.slider_value(s) - 0.0).abs() < 1e-3, "the left extreme");
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(92.0, 10.0)));
+        assert!(
+            (ui.slider_value(s) - 100.0).abs() < 1e-3,
+            "the right extreme"
+        );
+        // And past either end clamps rather than running on.
         ui.handle_input(InputEvent::PointerMoved(Vec2::new(500.0, 10.0)));
         assert!((ui.slider_value(s) - 100.0).abs() < 1e-3);
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(0.0 - 500.0, 10.0)));
+        assert!((ui.slider_value(s) - 0.0).abs() < 1e-3);
         ui.handle_input(InputEvent::PointerReleased);
     }
 

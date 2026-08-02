@@ -405,11 +405,9 @@ pub struct EditorRows {
     /// The Code pane's editor and its Save button.
     pub code_editor: Option<WidgetId>,
     pub code_save: Option<WidgetId>,
-    /// The toolbar actions.
-    pub add_sprite: Option<WidgetId>,
-    pub add_script: Option<WidgetId>,
-    pub save: Option<WidgetId>,
-    pub load: Option<WidgetId>,
+    /// The toolbar actions. Adding a sprite or a script, saving and loading all
+    /// live in the menus and on shortcuts; the toolbar is what the pointer is
+    /// doing and what the viewport shows.
     /// The toolbar's view toggles (grid, world axes, snapping): highlighted when
     /// active, flipped on click.
     pub grid: Option<WidgetId>,
@@ -1137,41 +1135,19 @@ fn build_toolbar(
             .border_bottom(theme.aurora.border_width, theme.aurora.panel_border),
     );
     let icon = |id: Icon| icons.map(|i| i.get(id));
-    rows.add_sprite = Some(toolbar_button(
-        ui,
-        bar,
-        "Add Sprite",
-        icon(Icon::Add),
-        false,
-        theme,
-    ));
-    rows.add_script = Some(toolbar_button(
-        ui,
-        bar,
-        "Add Script",
-        icon(Icon::Add),
-        false,
-        theme,
-    ));
-    rows.save = Some(toolbar_button(
-        ui,
-        bar,
-        "Save",
-        icon(Icon::Save),
-        false,
-        theme,
-    ));
-    rows.load = Some(toolbar_button(
-        ui,
-        bar,
-        "Load",
-        icon(Icon::Load),
-        false,
-        theme,
-    ));
 
-    // View toggles: highlighted (mode_active) when on, so their state reads at a
-    // glance, like the gizmo-mode buttons.
+    // What the pointer is doing: select, then the three transforms. First
+    // because it is what a hand reaches for most, and the active one is
+    // highlighted so the current mode reads at a glance.
+    for m in GizmoMode::ALL {
+        let button = toolbar_button(ui, bar, m.label(), icon(mode_icon(m)), m == mode, theme);
+        rows.mode_buttons.push((button, m));
+    }
+
+    toolbar_separator(ui, bar, theme);
+
+    // What the viewport shows, and whether a drag snaps. Highlighted when on,
+    // the same way the mode buttons are - these are states rather than actions.
     rows.grid = Some(toolbar_button(
         ui,
         bar,
@@ -1197,13 +1173,9 @@ fn build_toolbar(
         theme,
     ));
 
-    // A spacer pushes the mode switches to the right edge of the bar.
+    // Everything above is about the viewport; settings is about the editor, so
+    // it sits alone at the far end rather than in the run.
     ui.panel(bar, Style::new().grow(1.0));
-    for m in GizmoMode::ALL {
-        let button = toolbar_button(ui, bar, m.label(), icon(mode_icon(m)), m == mode, theme);
-        rows.mode_buttons.push((button, m));
-    }
-    // The settings gear sits at the far right.
     rows.settings_button = Some(toolbar_button(
         ui,
         bar,
@@ -1212,6 +1184,19 @@ fn build_toolbar(
         false,
         theme,
     ));
+}
+
+/// A thin vertical rule between groups of toolbar buttons, so "what the pointer
+/// does" and "what the viewport shows" read as two runs rather than one row of
+/// seven.
+fn toolbar_separator(ui: &mut Ui, bar: WidgetId, theme: &EditorTheme) {
+    ui.panel(
+        bar,
+        Style::new()
+            .size(1.0, TOOLBAR_ICON)
+            .margin_x(3.0)
+            .background(theme.aurora.panel_border),
+    );
 }
 
 /// A toolbar button: an icon inside a fixed square when an icon is given, else

@@ -2951,7 +2951,7 @@ fn is_host_name(name: &str) -> bool {
 const PRELUDE: &str = "enum Option<T> { None, Some(T) }";
 
 /// The prelude's enums, parsed once.
-fn prelude_enums() -> &'static [ast::EnumDecl] {
+pub(crate) fn prelude_enums() -> &'static [ast::EnumDecl] {
     static PARSED: std::sync::OnceLock<Vec<ast::EnumDecl>> = std::sync::OnceLock::new();
     PARSED.get_or_init(|| {
         let (script, diagnostics) = crate::parser::parse(PRELUDE);

@@ -97,6 +97,7 @@ theme_tokens! {
     "icon_hover": Color => aurora.icon_hover,
     "icon_active": Color => aurora.icon_active,
     "selection": Color => aurora.selection,
+    "slider_handle": Color => aurora.slider_handle,
     "selection_inactive": Color => aurora.selection_inactive,
     "find_match": Color => aurora.find_match,
     "slider_track": Color => aurora.slider_track,
@@ -155,6 +156,28 @@ theme_tokens! {
 /// shared) or to a literal otherwise. This is what is written to a fresh
 /// settings file - a complete, editable starting point.
 pub fn default_doc() -> ThemeDoc {
+    // The authored document is the theme the editor actually ships with,
+    // exported from a real settings file rather than derived from the built-in
+    // colours - so what a fresh install looks like is what someone chose, and
+    // changing it is editing a file rather than editing Rust.
+    //
+    // Anything it lacks is backfilled from the built-in dark theme below, so a
+    // token added after the file was written still resolves and still appears
+    // in a theming tool.
+    if let Ok(mut authored) = ron::from_str::<ThemeDoc>(DEFAULT_THEME) {
+        backfill_from(&mut authored, &built_in_doc());
+        return authored;
+    }
+    built_in_doc()
+}
+
+/// The shipped theme, as a document.
+const DEFAULT_THEME: &str = include_str!("../assets/default_theme.ron");
+
+/// The theme derived from [`EditorTheme::dark`]: every token bound to a
+/// variable when its value matches one, and to a literal otherwise. The
+/// fallback, and the source of anything the authored document is missing.
+fn built_in_doc() -> ThemeDoc {
     let d = EditorTheme::dark();
     // The palette. A token whose default equals one of these binds to it.
     let variables = BTreeMap::from([
@@ -189,7 +212,12 @@ pub fn default_doc() -> ThemeDoc {
 /// When a missing token's default is a variable the document also lacks, that
 /// variable is re-added too, so the binding still resolves.
 pub fn backfill_missing_tokens(doc: &mut ThemeDoc) -> bool {
-    let dflt = default_doc();
+    backfill_from(doc, &default_doc())
+}
+
+/// Add to `doc` every token `from` has and it lacks, with the variable each
+/// binding needs.
+fn backfill_from(doc: &mut ThemeDoc, dflt: &ThemeDoc) -> bool {
     let mut added = false;
     for (name, bind) in &dflt.tokens {
         if doc.tokens.contains_key(name) {
@@ -213,11 +241,28 @@ mod tests {
     use spectrum::theme::{Kind, TOKENS};
 
     #[test]
-    fn the_default_document_resolves_to_the_built_in_dark_theme() {
-        // The authored dark doc (palette + per-token binds) must resolve back to
-        // exactly EditorTheme::dark() - keeping resolve, snapshot, and the palette
-        // in agreement.
-        assert_eq!(resolve(&default_doc()), EditorTheme::dark());
+    fn the_built_in_document_resolves_to_the_built_in_dark_theme() {
+        // The derived doc (palette + per-token binds) must resolve back to
+        // exactly EditorTheme::dark() - keeping resolve, snapshot, and the
+        // palette in agreement. This is the fallback, not what ships.
+        assert_eq!(resolve(&built_in_doc()), EditorTheme::dark());
+    }
+
+    #[test]
+    fn the_shipped_default_is_the_authored_document() {
+        // What a fresh install looks like is a file someone chose, not the
+        // built-in colours - so this is deliberately NOT dark().
+        let doc = default_doc();
+        assert_ne!(resolve(&doc), EditorTheme::dark());
+        // But it is still complete: every token the registry knows resolves,
+        // because anything the file lacks is backfilled from the built-in one.
+        for token in TOKENS {
+            assert!(
+                doc.resolved(token.name).is_some(),
+                "the shipped default is missing {}",
+                token.name
+            );
+        }
     }
 
     #[test]
@@ -268,6 +313,25 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_default_binds_every_token_to_the_right_kind() {
+        // A colour bound where a scalar belongs resolves to the built-in value
+        // and looks like nothing is wrong - which is how the exported file
+        // arrived with `disabled_fade` bound to a Color.
+        let doc = default_doc();
+        for token in TOKENS {
+            let Some(value) = doc.resolved(token.name) else {
+                continue;
+            };
+            assert_eq!(
+                value.is_color(),
+                token.kind == Kind::Color,
+                "{} is bound to the wrong kind of value",
+                token.name
+            );
+        }
+    }
+
+    #[test]
     fn the_registry_and_the_field_mapping_agree() {
         // spectrum's registry (what a tool enumerates) and atlas's field mapping
         // (what resolve reads) must cover the same tokens with the same kinds.
@@ -293,7 +357,7 @@ mod tests {
         let text = ron::ser::to_string_pretty(&doc, ron::ser::PrettyConfig::default()).unwrap();
         let back: ThemeDoc = ron::from_str(&text).unwrap();
         assert_eq!(back, doc);
-        assert_eq!(resolve(&back), EditorTheme::dark());
+        assert_eq!(resolve(&back), resolve(&doc));
     }
 
     #[test]
@@ -305,8 +369,8 @@ mod tests {
         assert!(backfill_missing_tokens(&mut doc), "a token was added back");
         assert_eq!(
             resolve(&doc).aurora.tab_radius,
-            EditorTheme::dark().aurora.tab_radius,
-            "backfilled token resolves to its default"
+            resolve(&default_doc()).aurora.tab_radius,
+            "backfilled token resolves to what the default says"
         );
         assert_eq!(doc, default_doc(), "backfill restores the full default doc");
         assert!(

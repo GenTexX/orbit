@@ -705,7 +705,7 @@ fn completion_colors(
     use comet::service::CompletionKind as K;
     match kind {
         K::Keyword => (Some(theme.code_keyword), None),
-        K::Type => (Some(theme.code_type), None),
+        K::Type | K::GenericType => (Some(theme.code_type), None),
         K::Function => (Some(theme.code_function), Some(theme.code_function)),
         // An identifier is plain in the editor, and its note is its type.
         K::Variable | K::Field => (None, Some(theme.code_type)),
@@ -3025,6 +3025,24 @@ impl State {
             }
             return true;
         }
+        // The three actions that used to be toolbar buttons. The toolbar is now
+        // what the pointer is doing and what the viewport shows, so these live
+        // on the keyboard - and none of them was reachable any other way, which
+        // is why they are here rather than simply deleted.
+        if c.eq_ignore_ascii_case("o") && !self.code_context_focused() {
+            self.load_project();
+            return true;
+        }
+        if self.modifiers.shift_key() && !self.code_context_focused() {
+            if c.eq_ignore_ascii_case("n") {
+                self.add_sprite_action();
+                return true;
+            }
+            if c.eq_ignore_ascii_case("m") {
+                self.add_script_action();
+                return true;
+            }
+        }
         // Only when the code editor or the find bar itself has focus. It used
         // to fire whenever a Code pane existed at all, so ctrl+f while renaming
         // a node or filtering the scene tree opened a find bar over the editor.
@@ -3440,9 +3458,10 @@ impl State {
     /// undoes in one press rather than leaving an empty component behind.
     fn set_node_script(&mut self, node: NodeId, path: String) {
         self.history.begin_group();
-        let index = actions::script_index(&self.project.scene, node).unwrap_or_else(|| {
+        // An empty script component is a slot waiting for a file; anything else
+        // gets its own, because a node may run several.
+        let index = actions::empty_script_index(&self.project.scene, node).unwrap_or_else(|| {
             actions::attach_script(&mut self.project.scene, &mut self.history, node)
-                .expect("no script found above, so attaching one cannot be refused")
         });
         self.history.set_field(
             &mut self.project.scene,
@@ -3452,6 +3471,10 @@ impl State {
             Value::Asset(path),
         );
         self.history.end_group(&mut self.project.scene);
+        // The script's exported variables are what the inspector shows for it,
+        // and they come from the file that was just pointed at. Without this
+        // the fields appeared only after the script was next saved.
+        self.reconcile_script_exports();
         self.selection.select_one(node);
         self.explorer_focused = false;
         self.dirty = true;
@@ -3490,9 +3513,8 @@ impl State {
         let Some(node) = self.selection.primary() else {
             return;
         };
-        if actions::attach_script(&mut self.project.scene, &mut self.history, node).is_some() {
-            self.dirty = true;
-        }
+        actions::attach_script(&mut self.project.scene, &mut self.history, node);
+        self.dirty = true;
     }
 
     /// Whether the project has edits since the last save or load.
@@ -5326,16 +5348,24 @@ impl State {
         // kind comes from asking the service rather than from state kept beside
         // the popup, which is one fewer thing that can drift - and it costs one
         // pipeline run per acceptance, not per keystroke.
-        let is_call =
+        let kind =
             comet::service::completions_at(&self.script_text, helios::script_schema(), range.start)
-                .iter()
+                .into_iter()
                 .find(|item| item.label == label)
-                .is_some_and(|item| item.kind == comet::service::CompletionKind::Function);
+                .map(|item| item.kind);
+        let is_call = kind == Some(comet::service::CompletionKind::Function);
+        // A generic type is never written without its argument, so accepting one
+        // brings the brackets and leaves the caret between them - the same
+        // reasoning as a function's call parens.
+        let is_generic = kind == Some(comet::service::CompletionKind::GenericType);
         // Unless there is already one there, in which case adding another is
         // how you end up with `print(())`.
         let has_parens = self.script_text[range.end..].trim_start().starts_with('(');
+        let has_args = self.script_text[range.end..].trim_start().starts_with('<');
         let insertion = if is_call && !has_parens {
             format!("{label}()")
+        } else if is_generic && !has_args {
+            format!("{label}<>")
         } else {
             label.to_string()
         };
@@ -6271,9 +6301,6 @@ impl State {
                     );
                     self.dirty = true;
                 }
-                AuroraEvent::Clicked(id) if Some(id) == self.rows.add_sprite => {
-                    self.add_sprite_action();
-                }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.code_save => {
                     self.save_script();
                 }
@@ -6325,11 +6352,6 @@ impl State {
                         self.reveal_find_match();
                     }
                 }
-                AuroraEvent::Clicked(id) if Some(id) == self.rows.add_script => {
-                    self.add_script_action();
-                }
-                AuroraEvent::Clicked(id) if Some(id) == self.rows.save => self.save_project(),
-                AuroraEvent::Clicked(id) if Some(id) == self.rows.load => self.load_project(),
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.settings_button => {
                     self.open_settings_modal();
                 }

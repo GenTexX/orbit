@@ -279,6 +279,10 @@ pub enum CompletionKind {
     Function,
     /// A type name.
     Type,
+    /// A type name that takes arguments - `Array`, `Option`, or a script's own
+    /// generic enum. Told apart from a plain type so an editor can insert the
+    /// angle brackets and leave the caret between them.
+    GenericType,
     Keyword,
 }
 
@@ -343,8 +347,17 @@ fn in_comment_or_string(source: &str, offset: usize) -> bool {
 
 /// The keywords a script can start a statement with.
 const KEYWORDS: &[&str] = &[
-    "func", "let", "if", "else", "while", "for", "in", "enum", "match", "return", "true", "false",
+    "func", "let", "const", "if", "else", "while", "for", "in", "enum", "struct", "match",
+    "return", "true", "false",
 ];
+/// Whether a built-in type name takes arguments.
+fn kind_of_type(name: &str) -> CompletionKind {
+    match name {
+        "Array" | "Option" => CompletionKind::GenericType,
+        _ => CompletionKind::Type,
+    }
+}
+
 /// The type names a script can write.
 const TYPES: &[&str] = &["f32", "int", "bool", "Vec2", "String", "Option", "Array"];
 /// The engine-provided functions, with what each one is, for completion detail
@@ -388,6 +401,34 @@ pub fn completions_at(source: &str, schema: &HostSchema, offset: usize) -> Vec<C
         return Vec::new();
     }
     let (script, _) = parse(source);
+
+    // `State::` offers that enum's variants, and nothing else - the same
+    // reasoning as a dot on a Vec2. Read from the source rather than the tree,
+    // because `State::` does not parse.
+    if let Some(enum_name) = variant_receiver(source, offset) {
+        let (script, _) = parse(source);
+        if let Some(decl) = script
+            .enums
+            .iter()
+            .chain(crate::check::prelude_enums())
+            .find(|e| e.name == enum_name)
+        {
+            return decl
+                .variants
+                .iter()
+                .map(|v| {
+                    let detail = if v.payload.is_empty() {
+                        String::new()
+                    } else {
+                        let types: Vec<&str> = v.payload.iter().map(|t| t.name.as_str()).collect();
+                        format!("({})", types.join(", "))
+                    };
+                    detailed(&v.name, CompletionKind::Field, detail)
+                })
+                .collect();
+        }
+        return Vec::new();
+    }
 
     if let Some(receiver) = field_receiver(source, offset) {
         // A host object offers its own properties. This is the completion that
@@ -460,8 +501,31 @@ pub fn completions_at(source: &str, schema: &HostSchema, offset: usize) -> Vec<C
             signature.to_string(),
         ));
     }
+    // The built-in types, then whatever the script declares - a struct or an
+    // enum is a type name like any other, and not offering them meant a script
+    // could not complete its own vocabulary.
     for name in TYPES {
-        items.push(item(name, CompletionKind::Type));
+        items.push(item(name, kind_of_type(name)));
+    }
+    for decl in &script.enums {
+        if decl.name.is_empty() {
+            continue;
+        }
+        let kind = if decl.params.is_empty() {
+            CompletionKind::Type
+        } else {
+            CompletionKind::GenericType
+        };
+        items.push(detailed(&decl.name, kind, "enum".to_string()));
+    }
+    for decl in &script.structs {
+        if !decl.name.is_empty() {
+            items.push(detailed(
+                &decl.name,
+                CompletionKind::Type,
+                "struct".to_string(),
+            ));
+        }
     }
     for name in KEYWORDS {
         items.push(detailed(
@@ -1155,6 +1219,22 @@ fn word_span(source: &str, offset: usize) -> Option<(usize, usize)> {
         .last()
         .map_or(offset, |(i, c)| offset + i + c.len_utf8());
     (start < end).then_some((start, end))
+}
+
+/// The enum name before the `::` immediately left of `offset`, if the caret is
+/// where a variant goes.
+fn variant_receiver(source: &str, offset: usize) -> Option<&str> {
+    let before = &source[..offset];
+    let name_start = before
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map_or(0, |at| at + 1);
+    let before = &before[..name_start];
+    let colons = before.strip_suffix("::")?;
+    let start = colons
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map_or(0, |at| at + 1);
+    let receiver = &colons[start..];
+    (!receiver.is_empty()).then_some(receiver)
 }
 
 /// The dotted path before the `.` immediately left of `offset`, if the caret is
@@ -2108,5 +2188,47 @@ func f() {
         let help = signature_at(source, third).expect("inside a call");
         assert_eq!(help.active, 2);
         assert_eq!(help.params.len(), 2, "one more argument than it takes");
+    }
+
+    #[test]
+    fn the_completion_vocabulary_keeps_up_with_the_language() {
+        // Every keyword the lexer knows should be offerable. `struct` and
+        // `const` were missing for exactly as long as nothing checked.
+        let offered = at_caret("func update(dt: f32) { | }");
+        for want in ["struct", "const", "enum", "match", "for", "while"] {
+            assert!(offered.contains(&want.to_string()), "missing {want}");
+        }
+        // And the types, including the ones a script declares itself.
+        let offered = at_caret("enum Mood { Calm }\nstruct Body { hp: f32 }\nfunc f(x: |) { }");
+        for want in [
+            "f32", "int", "Vec2", "String", "Option", "Array", "Mood", "Body",
+        ] {
+            assert!(offered.contains(&want.to_string()), "missing {want}");
+        }
+    }
+
+    #[test]
+    fn a_generic_type_is_told_apart_so_an_editor_can_bring_its_brackets() {
+        let items = completions_at("func f(x: A) { }", 10);
+        let kind = |name: &str| items.iter().find(|i| i.label == name).map(|i| i.kind);
+        assert_eq!(kind("Array"), Some(CompletionKind::GenericType));
+        assert_eq!(kind("Option"), Some(CompletionKind::GenericType));
+        assert_eq!(kind("f32"), Some(CompletionKind::Type));
+    }
+
+    #[test]
+    fn after_a_double_colon_only_that_enums_variants_are_offered() {
+        let offered = at_caret("enum Mood { Calm, Angry(f32) }\nfunc f() { let m = Mood::| }");
+        assert_eq!(offered, vec!["Calm", "Angry"]);
+
+        // Option comes from the prelude, and completes the same way.
+        let offered = at_caret("func f() { let o = Option::| }");
+        assert_eq!(offered, vec!["None", "Some"]);
+
+        // A payload is shown, so it is clear what a variant needs.
+        let source = "enum Mood { Calm, Angry(f32) }\nfunc f() { let m = Mood:: }";
+        let at = source.find("Mood::").unwrap() + "Mood::".len();
+        let items = completions_at(source, at);
+        assert_eq!(items[1].detail, "(f32)");
     }
 }
