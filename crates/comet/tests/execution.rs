@@ -1715,3 +1715,118 @@ fn a_struct_can_live_in_script_state_and_be_passed_around() {
     script.update(0.5);
     assert_eq!(script.position(), (5.0, 0.0));
 }
+
+#[test]
+fn an_array_holds_its_elements_in_order() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let a = [10.0, 20.0, 30.0];
+            print(str(len(a)));
+            print(str(a[0]) + "," + str(a[1]) + "," + str(a[2]));
+            a[1] = 99.0;
+            print(str(a[0]) + "," + str(a[1]) + "," + str(a[2]));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["3", "10,20,30", "10,99,30"]);
+}
+
+#[test]
+fn an_array_is_a_reference_so_two_names_are_one_array() {
+    // The decision, and the thing that separates an array from a struct.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let a = [1.0, 2.0];
+            let b = a;
+            b[0] = 99.0;
+            print(str(a[0]));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["99"], "b and a are the same array");
+}
+
+#[test]
+fn copy_is_how_you_say_you_meant_a_second_array() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let a = [1.0, 2.0];
+            let b = copy(a);
+            b[0] = 99.0;
+            print(str(a[0]) + " " + str(b[0]));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["1 99"]);
+}
+
+#[test]
+fn pushing_past_capacity_moves_the_storage_and_every_name_still_sees_it() {
+    // The reason an array is two blocks. Growth replaces the element block, and
+    // an alias taken before the growth must see the new one - which it does
+    // because they share the handle, not the storage.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let a: Array<int> = [];
+            let alias = a;
+            for i in 0..40 {
+                push(a, i);
+            }
+            print(str(len(alias)));
+            print(str(alias[0]) + "," + str(alias[39]));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["40", "0,39"]);
+}
+
+#[test]
+fn an_array_can_hold_a_vec2_or_a_struct() {
+    // An element is as many slots as its type needs, so this is the same
+    // addressing with a wider stride - and getting the stride wrong reads
+    // halfway into the next element.
+    let mut script = Script::new(
+        r#"
+        struct Row { a: f32, b: f32 }
+        func update(dt: f32) {
+            let points = [vec2(1.0, 2.0), vec2(3.0, 4.0)];
+            print(str(points[1].x) + "," + str(points[1].y));
+            let rows = [Row { a: 5.0, b: 6.0 }, Row { a: 7.0, b: 8.0 }];
+            print(str(rows[0].b) + "," + str(rows[1].a));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["3,4", "6,7"]);
+}
+
+#[test]
+fn an_array_that_goes_out_of_scope_takes_its_storage_with_it() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let a: Array<f32> = [];
+            for i in 0..50 {
+                push(a, 1.0);
+            }
+            print(str(len(a)));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["50"]);
+
+    let before = script.memory_bytes();
+    for _ in 0..2_000 {
+        script.update(0.0);
+    }
+    assert_eq!(script.memory_bytes(), before, "no leak across 2000 rounds");
+}

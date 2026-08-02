@@ -32,6 +32,8 @@ pub enum TokenKind {
     True,
     False,
 
+    LBracket,
+    RBracket,
     LBrace,
     RBrace,
     LParen,
@@ -297,6 +299,8 @@ impl<'src> Lexer<'src> {
         let two = self.peek_at(1);
         let (kind, len) = match (self.peek(), two) {
             (Some(b':'), Some(b':')) => (TokenKind::ColonColon, 2),
+            (Some(b'['), _) => (TokenKind::LBracket, 1),
+            (Some(b']'), _) => (TokenKind::RBracket, 1),
             (Some(b'@'), _) => (TokenKind::At, 1),
             (Some(b'.'), Some(b'.')) => (TokenKind::DotDot, 2),
             (Some(b'='), Some(b'>')) => (TokenKind::FatArrow, 2),

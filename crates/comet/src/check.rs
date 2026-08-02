@@ -24,6 +24,7 @@ pub fn check(script: &ast::Script, schema: &HostSchema) -> (TypedScript, Vec<Dia
     let mut checker = Checker {
         templates: Vec::new(),
         structs: Vec::new(),
+        arrays: Vec::new(),
         enums: Vec::new(),
         instances: HashMap::new(),
         building: Vec::new(),
@@ -56,6 +57,9 @@ struct Checker<'a> {
     templates: Vec<ast::EnumDecl>,
     /// The script's structs, in declaration order. `Type::Struct` indexes this.
     structs: Vec<TypedStruct>,
+    /// The element type of each distinct `Array<T>` used. `Type::Array` indexes
+    /// this, so two mentions of `Array<f32>` are one type.
+    arrays: Vec<Type>,
     /// Concrete enums, in the order they were first needed. `Type::Enum`
     /// indexes this, and it is what reaches codegen.
     enums: Vec<TypedEnum>,
@@ -112,6 +116,7 @@ impl Checker<'_> {
         match ty {
             Type::Enum(index) => self.enums[index as usize].name.clone(),
             Type::Struct(index) => self.structs[index as usize].name.clone(),
+            Type::Array(index) => format!("Array<{}>", self.name_of(self.arrays[index as usize])),
             other => other.name().to_string(),
         }
     }
@@ -465,6 +470,71 @@ impl Checker<'_> {
         }
     }
 
+    /// `[a, b, c]`, or `[]`.
+    ///
+    /// The element type comes from the first element, and everything after is
+    /// checked against it. `[]` has no first element, so it takes its type from
+    /// the context - the same hint `Option::None` uses, for the same reason.
+    fn array_lit(
+        &mut self,
+        elements: &[ast::Expr],
+        expected: Option<Type>,
+        span: Span,
+    ) -> (TypedExprKind, Type) {
+        let wanted = match expected {
+            Some(Type::Array(which)) => Some(self.arrays[which as usize]),
+            _ => None,
+        };
+        let Some((first, rest)) = elements.split_first() else {
+            let Some(element) = wanted else {
+                self.error(
+                    span,
+                    "cannot tell what this empty array holds - give the declaration a type, as \
+                     in `let a: Array<f32> = [];`",
+                );
+                return (TypedExprKind::Error, Type::Error);
+            };
+            let Type::Array(which) = self.array_of(element) else {
+                unreachable!("array_of yields an array");
+            };
+            return (
+                TypedExprKind::MakeArray {
+                    array: which,
+                    elements: Vec::new(),
+                },
+                Type::Array(which),
+            );
+        };
+
+        // The first element decides, unless the context already has.
+        let first = match wanted {
+            Some(want) => self.checked_against(first, want),
+            None => self.expr(first),
+        };
+        let element = wanted.unwrap_or(first.ty);
+        if element.is_error() {
+            return (TypedExprKind::Error, Type::Error);
+        }
+        if element == Type::Unit {
+            self.error(span, "an array cannot hold `()`");
+            return (TypedExprKind::Error, Type::Error);
+        }
+        let mut checked = vec![first];
+        for value in rest {
+            checked.push(self.checked_against(value, element));
+        }
+        let Type::Array(which) = self.array_of(element) else {
+            unreachable!("array_of yields an array");
+        };
+        (
+            TypedExprKind::MakeArray {
+                array: which,
+                elements: checked,
+            },
+            Type::Array(which),
+        )
+    }
+
     /// `Enemy { health: 10.0, position: p }`.
     ///
     /// Every field, exactly once, in any order - the value is built in
@@ -520,6 +590,16 @@ impl Checker<'_> {
             },
             Type::Struct(index),
         )
+    }
+
+    /// The `Array<T>` type for element type `element`, reusing the entry if
+    /// this element type has been seen.
+    fn array_of(&mut self, element: Type) -> Type {
+        if let Some(index) = self.arrays.iter().position(|t| *t == element) {
+            return Type::Array(index as u32);
+        }
+        self.arrays.push(element);
+        Type::Array(self.arrays.len() as u32 - 1)
     }
 
     /// The index of the struct called `name`, if the script declares one.
@@ -684,6 +764,27 @@ impl Checker<'_> {
             }
             return *bound;
         }
+        if name.name == "Array" {
+            let [element] = name.args.as_slice() else {
+                self.error(
+                    name.span,
+                    format!(
+                        "`Array` takes 1 type argument, but {} were given",
+                        name.args.len()
+                    ),
+                );
+                return Type::Error;
+            };
+            let element = self.resolve_type_with(element, bindings);
+            if element.is_error() {
+                return Type::Error;
+            }
+            if element == Type::Unit {
+                self.error(name.span, "an array cannot hold `()`");
+                return Type::Error;
+            }
+            return self.array_of(element);
+        }
         if let Some(index) = self.struct_index(&name.name) {
             if !name.args.is_empty() {
                 self.error(
@@ -732,6 +833,8 @@ impl Checker<'_> {
             // The tag plus the widest payload. An enum inside an enum is
             // flattened rather than boxed, so it stays a stack value.
             Type::Enum(index) => 1 + self.enums[index as usize].payload_slots,
+            // A reference: one slot holding a pointer, whatever it holds.
+            Type::Array(_) => 1,
             // A struct is exactly its fields, one after another.
             Type::Struct(index) => self.structs[index as usize]
                 .fields
@@ -799,6 +902,12 @@ impl Checker<'_> {
                 }),
             },
             Type::Str => TypedExprKind::Str(String::new()),
+            // An empty array, which is a real allocation - the default of a
+            // reference type cannot be "no array", because there is no null.
+            Type::Array(index) => TypedExprKind::MakeArray {
+                array: index,
+                elements: Vec::new(),
+            },
             // Every field at its own default, which is what a struct being
             // exactly its fields means.
             Type::Struct(index) => {
@@ -1136,6 +1245,7 @@ impl Checker<'_> {
         TypedScript {
             enums: std::mem::take(&mut self.enums),
             structs: std::mem::take(&mut self.structs),
+            arrays: std::mem::take(&mut self.arrays),
             state,
             functions,
         }
@@ -1568,6 +1678,37 @@ impl Checker<'_> {
         }
         path.reverse();
 
+        // `a[i] = v`, possibly after a path: `world.rows[2] = r`.
+        if let ast::Expr::Index { array, index, .. } = root {
+            if !path.is_empty() {
+                self.error(
+                    target.span(),
+                    "assigning to a field of an element is not supported yet - read it into a \
+                     variable, change that, and put it back",
+                );
+                return (Place::Error, Type::Error);
+            }
+            let array = self.expr(array);
+            let index = self.expr(index);
+            let index = self.coerce(index, Type::Int);
+            let Type::Array(which) = array.ty else {
+                if !array.ty.is_error() {
+                    let name = self.name_of(array.ty);
+                    self.error(array.span, format!("`{name}` cannot be indexed"));
+                }
+                return (Place::Error, Type::Error);
+            };
+            let element = self.arrays[which as usize];
+            return (
+                Place::Element {
+                    array: Box::new(array),
+                    index: Box::new(index),
+                    ty: element,
+                },
+                element,
+            );
+        }
+
         let ast::Expr::Ident { name, span } = root else {
             self.error(
                 target.span(),
@@ -1715,6 +1856,11 @@ impl Checker<'_> {
                     None => read,
                 }
             }
+            Place::Element { array, index, ty } => TypedExprKind::Index {
+                array: array.clone(),
+                index: index.clone(),
+                ty: *ty,
+            },
             Place::Error => TypedExprKind::Error,
         };
         TypedExpr { kind, ty, span }
@@ -1860,6 +2006,34 @@ impl Checker<'_> {
                 ..
             } => self.struct_lit(name, *name_span, fields, span),
 
+            ast::Expr::ArrayLit { elements, .. } => self.array_lit(elements, expected, span),
+
+            ast::Expr::Index { array, index, .. } => {
+                let array = self.expr(array);
+                let index = self.expr(index);
+                let index = self.coerce(index, Type::Int);
+                let Type::Array(which) = array.ty else {
+                    if !array.ty.is_error() {
+                        let name = self.name_of(array.ty);
+                        self.error(array.span, format!("`{name}` cannot be indexed"));
+                    }
+                    return TypedExpr {
+                        kind: TypedExprKind::Error,
+                        ty: Type::Error,
+                        span,
+                    };
+                };
+                let element = self.arrays[which as usize];
+                (
+                    TypedExprKind::Index {
+                        array: Box::new(array),
+                        index: Box::new(index),
+                        ty: element,
+                    },
+                    element,
+                )
+            }
+
             ast::Expr::Call {
                 callee,
                 callee_span,
@@ -1963,6 +2137,56 @@ impl Checker<'_> {
                     y: Box::new(args.next().expect("arity checked")),
                 },
                 Type::Vec2,
+            );
+        }
+        // The array builtins. Generic over the element type, which the builtin
+        // table cannot express, so they are resolved here like `vec2` is.
+        if let Some(op) = match callee {
+            "len" => Some(ArrayOp::Len),
+            "push" => Some(ArrayOp::Push),
+            "copy" => Some(ArrayOp::Copy),
+            _ => None,
+        } {
+            let wanted = if op == ArrayOp::Push { 2 } else { 1 };
+            if args.len() != wanted {
+                self.error(
+                    span,
+                    format!(
+                        "`{callee}` takes {wanted} argument{}, but {} {} given",
+                        if wanted == 1 { "" } else { "s" },
+                        args.len(),
+                        if args.len() == 1 { "was" } else { "were" }
+                    ),
+                );
+                return (TypedExprKind::Error, Type::Error);
+            }
+            let mut args = args.into_iter();
+            let array = args.next().expect("arity checked");
+            let Type::Array(which) = array.ty else {
+                if !array.ty.is_error() {
+                    let name = self.name_of(array.ty);
+                    self.error(
+                        array.span,
+                        format!("`{callee}` works on an array, not on {name}"),
+                    );
+                }
+                return (TypedExprKind::Error, Type::Error);
+            };
+            let element = self.arrays[which as usize];
+            let value = args.next().map(|v| Box::new(self.coerce(v, element)));
+            let ret = match op {
+                ArrayOp::Len => Type::Int,
+                ArrayOp::Push => Type::Unit,
+                ArrayOp::Copy => Type::Array(which),
+            };
+            return (
+                TypedExprKind::ArrayOp {
+                    op,
+                    array: Box::new(array),
+                    value,
+                    element,
+                },
+                ret,
             );
         }
         // `int(x)` truncates toward zero; on something already an int it is a
@@ -2334,7 +2558,7 @@ enum Builtin {
 /// builds: the host functions, which live in [`builtin`] and `vec2`.
 const BUILTIN_NAMES: &[&str] = &[
     "print", "str", "vec2", "abs", "sqrt", "floor", "ceil", "min", "max", "sin", "cos", "atan2",
-    "pow", "int",
+    "pow", "int", "len", "push", "copy",
 ];
 
 /// The candidate closest to `name`, if one is close enough to be worth saying.
@@ -2439,7 +2663,7 @@ fn builtin(name: &str) -> Option<(Builtin, &'static [Type], Type)> {
 }
 
 fn is_host_name(name: &str) -> bool {
-    builtin(name).is_some() || name == "vec2" || name == "int"
+    builtin(name).is_some() || matches!(name, "vec2" | "int" | "len" | "push" | "copy")
 }
 
 /// Names the compiled module already uses for something. Every script function

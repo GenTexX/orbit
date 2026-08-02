@@ -50,8 +50,8 @@ use wasm_encoder::{
 };
 
 use crate::tir::{
-    Axis, BinaryOp, Host, Place, Type, TypedArm, TypedBlock, TypedEnum, TypedExpr, TypedExprKind,
-    TypedFn, TypedScript, TypedStmt, TypedStruct, UnaryOp,
+    ArrayOp, Axis, BinaryOp, Host, Place, Type, TypedArm, TypedBlock, TypedEnum, TypedExpr,
+    TypedExprKind, TypedFn, TypedScript, TypedStmt, TypedStruct, UnaryOp,
 };
 
 /// The module the host must satisfy every import from.
@@ -96,6 +96,19 @@ const OFF_SIZE: u64 = 0;
 const OFF_RC: u64 = 4;
 const OFF_LEN: u64 = 8;
 
+/// An array's handle, in the payload of an ordinary refcounted block:
+/// how many elements it holds, how many it has room for, and where they are.
+///
+/// Two blocks rather than one, because growing must be invisible to every other
+/// name for the same array. Elements inline would mean `push` moving the block,
+/// and an alias would still be pointing at the old one - which is exactly what
+/// reference semantics promise will not happen.
+const OFF_ARRAY_LEN: u64 = 12;
+const OFF_ARRAY_CAP: u64 = 16;
+const OFF_ARRAY_DATA: u64 = 20;
+/// How big an array handle's payload is.
+const ARRAY_HANDLE: i32 = 12;
+
 /// The first 16 bytes are reserved and left zero, so a null `String` pointer
 /// reads a length of 0 instead of the first literal's bytes.
 const DATA_BASE: u32 = 16;
@@ -132,8 +145,15 @@ const F_POW: u32 = 13;
 const F_ALLOC: u32 = 14;
 const F_RETAIN: u32 = 15;
 const F_RELEASE: u32 = 16;
+/// The array runtime. Two blocks per array - a handle and its elements - so
+/// growing is invisible to every other name for the same array.
+const F_ARRAY_NEW: u32 = 17;
+const F_ARRAY_AT: u32 = 18;
+const F_ARRAY_PUSH: u32 = 19;
+const F_ARRAY_RELEASE: u32 = 20;
+const F_ARRAY_COPY: u32 = 21;
 /// The first script-defined function's index.
-const USER_BASE: u32 = 17;
+const USER_BASE: u32 = 22;
 
 /// Emit a WebAssembly module for `script`.
 ///
@@ -181,10 +201,21 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     imports.import(HOST_MODULE, "atan2", EntityType::Function(t_binary));
     imports.import(HOST_MODULE, "pow", EntityType::Function(t_binary));
 
+    let t_array_new = types.get(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
+    let t_array_at = types.get(
+        vec![ValType::I32, ValType::I32, ValType::I32],
+        vec![ValType::I32],
+    );
+
     let mut functions = FunctionSection::new();
     functions.function(t_alloc);
     functions.function(t_rc);
     functions.function(t_rc);
+    functions.function(t_array_new);
+    functions.function(t_array_at);
+    functions.function(t_array_new);
+    functions.function(t_rc);
+    functions.function(t_array_new);
     for f in &script.functions {
         let ty = types.get(
             param_types(f, &script.enums, &script.structs),
@@ -201,14 +232,13 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     code.function(&emit_alloc(&globals));
     code.function(&emit_retain());
     code.function(&emit_release(&globals));
+    code.function(&emit_array_new());
+    code.function(&emit_array_at());
+    code.function(&emit_array_push());
+    code.function(&emit_array_release());
+    code.function(&emit_array_copy());
     for f in &script.functions {
-        code.function(&emit_function(
-            f,
-            &script.enums,
-            &script.structs,
-            &globals,
-            &literals,
-        ));
+        code.function(&emit_function(f, layouts(script), &globals, &literals));
     }
     if has_state {
         code.function(&emit_init(script, &globals, &literals));
@@ -293,6 +323,11 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     names.append(F_COS, "orbit::cos");
     names.append(F_ATAN2, "orbit::atan2");
     names.append(F_POW, "orbit::pow");
+    names.append(F_ARRAY_NEW, "comet_array_new");
+    names.append(F_ARRAY_AT, "comet_array_at");
+    names.append(F_ARRAY_PUSH, "comet_array_push");
+    names.append(F_ARRAY_RELEASE, "comet_array_release");
+    names.append(F_ARRAY_COPY, "comet_array_copy");
     names.append(F_ALLOC, "comet_alloc");
     names.append(F_RETAIN, "comet_retain");
     names.append(F_RELEASE, "comet_release");
@@ -318,7 +353,6 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
 }
 
 // --- module-level layout ---
-
 
 fn align4(value: u32) -> u32 {
     value.div_ceil(4) * 4
@@ -366,6 +400,8 @@ fn scalar_types(ty: Type) -> &'static [ValType] {
         Type::Vec2 => &[ValType::F32, ValType::F32],
         Type::Str => &[ValType::I32],
         Type::Unit | Type::Error => &[],
+        // A reference: one slot holding the handle's address.
+        Type::Array(_) => &[ValType::I32],
         Type::Enum(_) | Type::Struct(_) => {
             unreachable!("handled by val_types, which knows the layouts")
         }
@@ -570,6 +606,21 @@ fn collect_expr(expr: &TypedExpr, out: &mut Literals) {
                 collect_expr(field, out);
             }
         }
+        TypedExprKind::MakeArray { elements, .. } => {
+            for element in elements {
+                collect_expr(element, out);
+            }
+        }
+        TypedExprKind::Index { array, index, .. } => {
+            collect_expr(array, out);
+            collect_expr(index, out);
+        }
+        TypedExprKind::ArrayOp { array, value, .. } => {
+            collect_expr(array, out);
+            if let Some(value) = value {
+                collect_expr(value, out);
+            }
+        }
         TypedExprKind::Match {
             scrutinee, arms, ..
         } => {
@@ -670,6 +721,174 @@ fn emit_alloc(globals: &Globals) -> Function {
     f
 }
 
+/// `comet_array_new(count, width) -> handle`.
+///
+/// Two allocations: a handle holding `[len, capacity, data]`, and a block for
+/// the elements. `width` is how many 4-byte slots one element takes.
+fn emit_array_new() -> Function {
+    // 0: count, 1: width, 2: handle, 3: data
+    let mut f = Function::new_with_locals_types([ValType::I32; 2]);
+    let mut i = f.instructions();
+    i.i32_const(ARRAY_HANDLE).call(F_ALLOC).local_set(2);
+    // Room for what was asked for, and never zero bytes - a zero-size block
+    // would make two empty arrays share an address.
+    i.local_get(0)
+        .local_get(1)
+        .i32_mul()
+        .i32_const(4)
+        .i32_mul()
+        .i32_const(4)
+        .i32_add()
+        .call(F_ALLOC)
+        .local_set(3);
+    i.local_get(2).local_get(0).i32_store(mem(OFF_ARRAY_LEN));
+    i.local_get(2).local_get(0).i32_store(mem(OFF_ARRAY_CAP));
+    i.local_get(2).local_get(3).i32_store(mem(OFF_ARRAY_DATA));
+    i.local_get(2);
+    i.end();
+    f
+}
+
+/// `comet_array_at(handle, index, width) -> address`.
+///
+/// Traps if `index` is not a position in the array. That is the decision: the
+/// common case stays one character, and a script that wants to handle a miss
+/// asks for an `Option` instead.
+fn emit_array_at() -> Function {
+    let mut f = Function::new_with_locals_types(Vec::<ValType>::new());
+    let mut i = f.instructions();
+    i.local_get(1).i32_const(0).i32_lt_s();
+    i.if_(BlockType::Empty).unreachable().end();
+    i.local_get(1)
+        .local_get(0)
+        .i32_load(mem(OFF_ARRAY_LEN))
+        .i32_ge_s();
+    i.if_(BlockType::Empty).unreachable().end();
+    // The elements start after the block's own header, like a String's bytes
+    // do: data + HEADER + index * width * 4. Leaving the header out puts
+    // element zero on top of the allocator's size field, which corrupts the
+    // free list rather than failing.
+    i.local_get(0)
+        .i32_load(mem(OFF_ARRAY_DATA))
+        .i32_const(HEADER)
+        .i32_add();
+    i.local_get(1)
+        .local_get(2)
+        .i32_mul()
+        .i32_const(4)
+        .i32_mul()
+        .i32_add();
+    i.end();
+    f
+}
+
+/// `comet_array_push(handle, width) -> address of the new last element`.
+///
+/// Grows by doubling when full: a new element block, the old contents copied
+/// in, the old block freed, and the handle updated - so every other name for
+/// this array sees the new storage without knowing anything happened.
+fn emit_array_push() -> Function {
+    // 0: handle, 1: width, 2: len, 3: cap, 4: data, 5: bigger
+    let mut f = Function::new_with_locals_types([ValType::I32; 4]);
+    let mut i = f.instructions();
+    i.local_get(0).i32_load(mem(OFF_ARRAY_LEN)).local_set(2);
+    i.local_get(0).i32_load(mem(OFF_ARRAY_CAP)).local_set(3);
+    i.local_get(2).local_get(3).i32_ge_s();
+    i.if_(BlockType::Empty);
+    // Double, or start at four.
+    i.local_get(3).i32_const(0).i32_eq();
+    i.if_(BlockType::Result(ValType::I32))
+        .i32_const(4)
+        .else_()
+        .local_get(3)
+        .i32_const(2)
+        .i32_mul()
+        .end();
+    i.local_set(3);
+    i.local_get(3)
+        .local_get(1)
+        .i32_mul()
+        .i32_const(4)
+        .i32_mul()
+        .i32_const(4)
+        .i32_add()
+        .call(F_ALLOC)
+        .local_set(5);
+    i.local_get(5).i32_const(HEADER).i32_add();
+    i.local_get(0)
+        .i32_load(mem(OFF_ARRAY_DATA))
+        .i32_const(HEADER)
+        .i32_add();
+    i.local_get(2).local_get(1).i32_mul().i32_const(4).i32_mul();
+    i.memory_copy(0, 0);
+    i.local_get(0).i32_load(mem(OFF_ARRAY_DATA)).local_set(4);
+    i.local_get(0).local_get(5).i32_store(mem(OFF_ARRAY_DATA));
+    i.local_get(0).local_get(3).i32_store(mem(OFF_ARRAY_CAP));
+    // The old element block was owned by the handle alone.
+    i.local_get(4).call(F_RELEASE);
+    i.end();
+    i.local_get(0)
+        .local_get(2)
+        .i32_const(1)
+        .i32_add()
+        .i32_store(mem(OFF_ARRAY_LEN));
+    i.local_get(0)
+        .i32_load(mem(OFF_ARRAY_DATA))
+        .i32_const(HEADER)
+        .i32_add();
+    i.local_get(2).local_get(1).i32_mul().i32_const(4).i32_mul();
+    i.i32_add();
+    i.end();
+    f
+}
+
+/// `comet_array_release(handle)`: one fewer owner, and the elements go with the
+/// last one.
+///
+/// The element block is reachable only through the handle, so it is freed here
+/// rather than by the general release, which knows nothing about arrays.
+fn emit_array_release() -> Function {
+    let mut f = Function::new_with_locals_types(Vec::<ValType>::new());
+    let mut i = f.instructions();
+    i.local_get(0).i32_eqz();
+    i.if_(BlockType::Empty).return_().end();
+    // A refcount of one means this release is the last, so the storage goes
+    // before the handle does - after, the handle is on the free list and its
+    // data pointer is whatever the allocator wrote there.
+    i.local_get(0).i32_load(mem(OFF_RC)).i32_const(1).i32_eq();
+    i.if_(BlockType::Empty);
+    i.local_get(0).i32_load(mem(OFF_ARRAY_DATA)).call(F_RELEASE);
+    i.end();
+    i.local_get(0).call(F_RELEASE);
+    i.end();
+    f
+}
+
+/// `comet_array_copy(handle, width) -> a new array with the same elements`.
+///
+/// What makes reference semantics workable: `let b = a;` gives two names for
+/// one array, and this is how you say you meant a second one.
+fn emit_array_copy() -> Function {
+    // 0: handle, 1: width, 2: len, 3: fresh
+    let mut f = Function::new_with_locals_types([ValType::I32; 2]);
+    let mut i = f.instructions();
+    i.local_get(0).i32_load(mem(OFF_ARRAY_LEN)).local_set(2);
+    i.local_get(2).local_get(1).call(F_ARRAY_NEW).local_set(3);
+    i.local_get(3)
+        .i32_load(mem(OFF_ARRAY_DATA))
+        .i32_const(HEADER)
+        .i32_add();
+    i.local_get(0)
+        .i32_load(mem(OFF_ARRAY_DATA))
+        .i32_const(HEADER)
+        .i32_add();
+    i.local_get(2).local_get(1).i32_mul().i32_const(4).i32_mul();
+    i.memory_copy(0, 0);
+    i.local_get(3);
+    i.end();
+    f
+}
+
 /// `comet_retain(ptr)`: one more owner.
 fn emit_retain() -> Function {
     let mut f = Function::new_with_locals_types(Vec::<ValType>::new());
@@ -726,21 +945,12 @@ fn emit_release(globals: &Globals) -> Function {
 
 fn emit_function(
     f: &TypedFn,
-    enums: &[TypedEnum],
-    structs: &[TypedStruct],
+    layouts: Layouts<'_>,
     globals: &Globals,
     literals: &Literals,
 ) -> Function {
     let depth = block_depth(&f.body);
-    let mut out = FnGen::new(
-        &f.locals,
-        f.param_count,
-        depth,
-        enums,
-        structs,
-        globals,
-        literals,
-    );
+    let mut out = FnGen::new(&f.locals, f.param_count, depth, layouts, globals, literals);
     // A tail expression is the return value. It stays on the stack while the
     // locals it may have been read from are released - it already holds its own
     // reference, so releasing theirs cannot free it.
@@ -756,18 +966,19 @@ fn emit_function(
 }
 
 /// The start function: run each state initializer once, at instantiation.
+/// The layout tables a script's own types produce.
+fn layouts(script: &TypedScript) -> Layouts<'_> {
+    Layouts {
+        enums: &script.enums,
+        structs: &script.structs,
+        arrays: &script.arrays,
+    }
+}
+
 fn emit_init(script: &TypedScript, globals: &Globals, literals: &Literals) -> Function {
-    let (enums, structs) = (&script.enums, &script.structs);
+    let layouts = layouts(script);
     let depth = script.state.iter().map(|s| expr_depth(&s.init)).max();
-    let mut out = FnGen::new(
-        &[],
-        0,
-        depth.unwrap_or(0),
-        enums,
-        structs,
-        globals,
-        literals,
-    );
+    let mut out = FnGen::new(&[], 0, depth.unwrap_or(0), layouts, globals, literals);
     for state in &script.state {
         out.expr(&state.init);
         out.store_global(state.slot);
@@ -798,6 +1009,16 @@ impl Vec2Op {
             _ => return None,
         })
     }
+}
+
+/// The three tables that decide how wide a value is. Passed together because
+/// they are always needed together, and because a function taking each of them
+/// separately alongside everything else grows past what anyone can read.
+#[derive(Clone, Copy)]
+struct Layouts<'a> {
+    enums: &'a [TypedEnum],
+    structs: &'a [TypedStruct],
+    arrays: &'a [Type],
 }
 
 /// The scratch locals available at one level of nesting.
@@ -902,6 +1123,17 @@ fn expr_depth(expr: &TypedExpr) -> usize {
         K::Widen(inner) | K::Narrow(inner) => (0, vec![inner]),
         K::MakeVariant { args, .. } => (0, args.iter().collect()),
         K::MakeStruct { fields, .. } => (0, fields.iter().collect()),
+        // Building an array parks the handle while each element is written in.
+        K::MakeArray { elements, .. } => (1, elements.iter().collect()),
+        // Indexing parks the address while the element is read out of it.
+        K::Index { array, index, .. } => (1, vec![array, index]),
+        // `push` parks the address it is given before writing into it.
+        K::ArrayOp { array, value, .. } => (
+            1,
+            std::iter::once(array.as_ref())
+                .chain(value.as_deref())
+                .collect(),
+        ),
         // Picking a field out of a value parks the whole of it first.
         K::Field { receiver, .. } => (1, vec![receiver]),
         // A match parks its scrutinee to read the tag and then unpack from it.
@@ -936,6 +1168,8 @@ struct FnGen<'a> {
     enums: &'a [TypedEnum],
     /// The script's struct layouts, likewise.
     structs: &'a [TypedStruct],
+    /// The element type of each array type the script uses.
+    arrays: &'a [Type],
     /// One set of scratch locals per level of nesting that needs them, and a
     /// cursor into it. See [`FnGen::enter_frame`].
     frames: Vec<Frame>,
@@ -949,11 +1183,15 @@ impl<'a> FnGen<'a> {
         slot_types: &'a [Type],
         param_count: usize,
         depth: usize,
-        enums: &'a [TypedEnum],
-        structs: &'a [TypedStruct],
+        layouts: Layouts<'a>,
         globals: &'a Globals,
         literals: &'a Literals,
     ) -> Self {
+        let Layouts {
+            enums,
+            structs,
+            arrays,
+        } = layouts;
         let mut slot_base = Vec::with_capacity(slot_types.len());
         let mut next = 0;
         for ty in slot_types {
@@ -1005,7 +1243,7 @@ impl<'a> FnGen<'a> {
             .iter()
             .enumerate()
             .filter(|(_, ty)| match ty {
-                Type::Str => true,
+                Type::Str | Type::Array(_) => true,
                 Type::Enum(index) => enums[*index as usize].holds_str,
                 _ => false,
             })
@@ -1019,6 +1257,7 @@ impl<'a> FnGen<'a> {
             owned,
             enums,
             structs,
+            arrays,
             frames,
             frame: 0,
             globals,
@@ -1111,10 +1350,14 @@ impl<'a> FnGen<'a> {
             }
             self.leave_frame();
         }
-        if ty == Type::Str {
+        if matches!(ty, Type::Str | Type::Array(_)) {
             let tmp = self.scratch().i32s[0];
             self.ins().local_set(tmp);
-            self.ins().global_get(base).call(F_RELEASE);
+            self.ins().global_get(base).call(if ty == Type::Str {
+                F_RELEASE
+            } else {
+                F_ARRAY_RELEASE
+            });
             self.ins().local_get(tmp);
         }
         let width = val_types(ty, self.enums, self.structs).len() as u32;
@@ -1133,6 +1376,12 @@ impl<'a> FnGen<'a> {
             match ty {
                 Type::Str => {
                     self.ins().local_get(base).call(F_RELEASE);
+                }
+                // An array's elements are reachable only through its handle, so
+                // its release is its own - the general one knows nothing about
+                // the second block.
+                Type::Array(_) => {
+                    self.ins().local_get(base).call(F_ARRAY_RELEASE);
                 }
                 Type::Enum(index) => self.release_enum_slots(base, index),
                 _ => {}
@@ -1189,7 +1438,7 @@ impl<'a> FnGen<'a> {
     /// into a freed block.
     fn retain_value(&mut self, ty: Type) {
         match ty {
-            Type::Str => self.retain_top(),
+            Type::Str | Type::Array(_) => self.retain_top(),
             Type::Enum(index) if self.enums[index as usize].holds_str => {
                 let width = 1 + self.enums[index as usize].payload_slots;
                 let base = self.enter_frame().enum_base;
@@ -1263,6 +1512,9 @@ impl<'a> FnGen<'a> {
             // `release` consumes the pointer, so there is nothing left to drop.
             Type::Str => {
                 self.ins().call(F_RELEASE);
+            }
+            Type::Array(_) => {
+                self.ins().call(F_ARRAY_RELEASE);
             }
             Type::Unit | Type::Error => {}
             // An enum that owns something has to be parked to read its tag,
@@ -1379,13 +1631,17 @@ impl<'a> FnGen<'a> {
                     }
                     self.leave_frame();
                 }
-                if ty == Type::Str {
+                if matches!(ty, Type::Str | Type::Array(_)) {
                     // Park the new reference before dropping the old one, so
-                    // `s = s` cannot free the object between the two.
+                    // `a = a` cannot free the object between the two.
                     let tmp = self.scratch().i32s[0];
                     self.ins().local_set(tmp);
                     self.load_slot(*slot);
-                    self.ins().call(F_RELEASE);
+                    self.ins().call(if ty == Type::Str {
+                        F_RELEASE
+                    } else {
+                        F_ARRAY_RELEASE
+                    });
                     self.ins().local_get(tmp);
                 }
                 self.store_slot(*slot);
@@ -1458,6 +1714,22 @@ impl<'a> FnGen<'a> {
                         self.ins().call(F_SET_F32);
                     }
                 }
+            }
+
+            // `a[i] = v`, which traps on a bad index like a read does.
+            Place::Element { array, index, ty } => {
+                let width = val_types(*ty, self.enums, self.structs).len() as u32;
+                let frame = self.enter_frame();
+                let (at, handle) = (frame.i32s[2], frame.i32s[3]);
+                self.expr(array);
+                self.ins().local_tee(handle);
+                self.expr(index);
+                self.ins().i32_const(width as i32);
+                self.ins().call(F_ARRAY_AT).local_set(at);
+                self.ins().local_get(handle).call(F_ARRAY_RELEASE);
+                self.ins().local_get(at);
+                self.store_element(value, *ty, width);
+                self.leave_frame();
             }
 
             Place::Error => {
@@ -1657,6 +1929,96 @@ impl<'a> FnGen<'a> {
             // An enum value is its tag, then its payload, then whatever slots
             // the widest variant needs and this one does not - zeroed, because
             // wasm has no undefined value and a match never reads them.
+            // `[a, b, c]`: one array of the right size, then each element
+            // written into it. The handle is parked because every write needs
+            // it and an element can be any expression.
+            TypedExprKind::MakeArray { array, elements } => {
+                let element_ty = self.arrays[*array as usize];
+                let width = val_types(element_ty, self.enums, self.structs).len() as u32;
+                let handle = self.enter_frame().i32s[0];
+                self.ins().i32_const(elements.len() as i32);
+                self.ins().i32_const(width as i32);
+                self.ins().call(F_ARRAY_NEW).local_set(handle);
+                for (at, element) in elements.iter().enumerate() {
+                    self.ins().local_get(handle);
+                    self.ins().i32_const(at as i32);
+                    self.ins().i32_const(width as i32);
+                    self.ins().call(F_ARRAY_AT);
+                    self.store_element(element, element_ty, width);
+                }
+                self.ins().local_get(handle);
+                self.leave_frame();
+            }
+
+            TypedExprKind::ArrayOp {
+                op,
+                array,
+                value,
+                element,
+            } => {
+                let width = val_types(*element, self.enums, self.structs).len() as u32;
+                match op {
+                    ArrayOp::Len => {
+                        self.expr(array);
+                        // The handle is an owned reference the moment it is on
+                        // the stack, so reading its length consumes it.
+                        let tmp = self.scratch().i32s[0];
+                        self.ins().local_tee(tmp);
+                        self.ins().i32_load(mem(OFF_ARRAY_LEN));
+                        let kept = self.scratch().i32s[1];
+                        self.ins().local_set(kept);
+                        self.ins().local_get(tmp).call(F_ARRAY_RELEASE);
+                        self.ins().local_get(kept);
+                    }
+                    ArrayOp::Push => {
+                        let handle = self.enter_frame().i32s[0];
+                        self.expr(array);
+                        self.ins().local_tee(handle);
+                        self.ins().i32_const(width as i32);
+                        self.ins().call(F_ARRAY_PUSH);
+                        let value = value.as_deref().expect("push checked its arity");
+                        self.store_element(value, *element, width);
+                        self.ins().local_get(handle).call(F_ARRAY_RELEASE);
+                        self.leave_frame();
+                    }
+                    ArrayOp::Copy => {
+                        let handle = self.scratch().i32s[0];
+                        self.expr(array);
+                        self.ins().local_tee(handle);
+                        self.ins().i32_const(width as i32);
+                        self.ins().call(F_ARRAY_COPY);
+                        let fresh = self.scratch().i32s[1];
+                        self.ins().local_set(fresh);
+                        self.ins().local_get(handle).call(F_ARRAY_RELEASE);
+                        self.ins().local_get(fresh);
+                    }
+                }
+            }
+
+            // `a[i]`: the address, then the slots at it. Out of bounds traps
+            // inside comet_array_at rather than reading whatever is there.
+            TypedExprKind::Index { array, index, ty } => {
+                let width = val_types(*ty, self.enums, self.structs).len() as u32;
+                let frame = self.enter_frame();
+                let (at, handle) = (frame.i32s[0], frame.i32s[1]);
+                self.expr(array);
+                // The handle arrived owned - reading it took a reference - and
+                // this expression is done with it once it has the address.
+                self.ins().local_tee(handle);
+                self.expr(index);
+                self.ins().i32_const(width as i32);
+                self.ins().call(F_ARRAY_AT).local_set(at);
+                self.ins().local_get(handle).call(F_ARRAY_RELEASE);
+                for slot in 0..width {
+                    self.ins().local_get(at).i32_load(mem(u64::from(slot) * 4));
+                }
+                self.unpack(*ty);
+                // A value read out of an array is a second owner of whatever it
+                // holds, the same as reading one out of a local.
+                self.retain_value(*ty);
+                self.leave_frame();
+            }
+
             // A struct is exactly its fields, in order: building one is
             // evaluating each of them, and there is no header.
             TypedExprKind::MakeStruct { fields, .. } => {
@@ -1720,46 +2082,74 @@ impl<'a> FnGen<'a> {
         frame.enum_base
     }
 
+    /// Evaluate `value` and write it into the element address on the stack.
+    ///
+    /// Elements are stored as `i32` words with floats reinterpreted, the same
+    /// packing an enum payload uses - so one addressing rule covers every
+    /// element type.
+    fn store_element(&mut self, value: &TypedExpr, ty: Type, width: u32) {
+        let frame = self.enter_frame();
+        let (address, slots) = (frame.i32s[1], frame.enum_base);
+        self.ins().local_set(address);
+        self.expr(value);
+        self.pack(ty);
+        for slot in (0..width).rev() {
+            self.ins().local_set(slots + slot);
+        }
+        for slot in 0..width {
+            self.ins().local_get(address);
+            self.ins().local_get(slots + slot);
+            self.ins().i32_store(mem(u64::from(slot) * 4));
+        }
+        self.leave_frame();
+    }
+
     /// Turn the value on the stack into `n` payload slots, all `i32`.
     ///
     /// A uniform slot type is what lets one layout serve every variant, and
     /// reinterpreting an f32 is one instruction that changes no bits. Returns
     /// how many slots it took.
     fn pack(&mut self, ty: Type) -> usize {
-        match ty {
-            Type::F32 => {
-                self.ins().i32_reinterpret_f32();
-                1
-            }
-            // Two f32s, and only the top of the stack can be reinterpreted, so
-            // the lower one is parked to reach it.
-            Type::Vec2 => {
-                let tmp = self.scratch().f32s[0];
-                self.ins().local_set(tmp);
-                self.ins().i32_reinterpret_f32();
-                self.ins().local_get(tmp).i32_reinterpret_f32();
-                2
-            }
-            Type::Unit | Type::Error => 0,
-            // int, bool, String and a nested enum are already i32 slots.
-            _ => val_types(ty, self.enums, self.structs).len(),
+        let layout = val_types(ty, self.enums, self.structs);
+        // Already all i32 - an int, a bool, a String, an enum, or a struct made
+        // only of those. Nothing to do.
+        if layout.iter().all(|slot| *slot == ValType::I32) {
+            return layout.len();
         }
+        let frame = self.enter_frame();
+        for slot in (0..layout.len() as u32).rev() {
+            self.ins().local_set(Self::park_slot(&frame, &layout, slot));
+        }
+        for slot in 0..layout.len() as u32 {
+            self.ins().local_get(Self::park_slot(&frame, &layout, slot));
+            if layout[slot as usize] == ValType::F32 {
+                self.ins().i32_reinterpret_f32();
+            }
+        }
+        self.leave_frame();
+        layout.len()
     }
 
     /// The reverse: `n` i32 slots back into a value of `ty`.
     fn unpack(&mut self, ty: Type) {
-        match ty {
-            Type::F32 => {
-                self.ins().f32_reinterpret_i32();
-            }
-            Type::Vec2 => {
-                let tmp = self.scratch().i32s[0];
-                self.ins().local_set(tmp);
-                self.ins().f32_reinterpret_i32();
-                self.ins().local_get(tmp).f32_reinterpret_i32();
-            }
-            _ => {}
+        let layout = val_types(ty, self.enums, self.structs);
+        if layout.iter().all(|slot| *slot == ValType::I32) {
+            return;
         }
+        // Everything arrives as i32, so the parking region is the i32 one
+        // whatever the value's own layout says.
+        let frame = self.enter_frame();
+        let base = frame.enum_base;
+        for slot in (0..layout.len() as u32).rev() {
+            self.ins().local_set(base + slot);
+        }
+        for slot in 0..layout.len() as u32 {
+            self.ins().local_get(base + slot);
+            if layout[slot as usize] == ValType::F32 {
+                self.ins().f32_reinterpret_i32();
+            }
+        }
+        self.leave_frame();
     }
 
     /// `match`: park the whole value, then a chain of tag comparisons.

@@ -34,6 +34,12 @@ pub enum Type {
     /// index rather than a name keeps `Type` `Copy` and keeps every comparison
     /// a integer one.
     Enum(u32),
+    /// `Array<T>`, by its element type's index in [`TypedScript::arrays`].
+    ///
+    /// A reference: two values of this type can name one array, and changing it
+    /// through either is visible through both. The one type in the language
+    /// that behaves that way, which is why `copy` exists.
+    Array(u32),
     /// A user-defined struct, by its index in [`TypedScript::structs`]. A value
     /// type: flattened into slots, never allocated, copied on assignment.
     Struct(u32),
@@ -54,6 +60,7 @@ impl Type {
             Type::Str => "String",
             Type::Enum(_) => "enum",
             Type::Struct(_) => "struct",
+            Type::Array(_) => "Array",
             Type::Unit => "()",
             Type::Error => "<error>",
         }
@@ -83,6 +90,9 @@ impl Type {
 pub struct TypedScript {
     pub enums: Vec<TypedEnum>,
     pub structs: Vec<TypedStruct>,
+    /// The element type of each `Array<T>` the script uses, one entry per
+    /// distinct `T`. `Type::Array` indexes this.
+    pub arrays: Vec<Type>,
     pub state: Vec<TypedState>,
     pub functions: Vec<TypedFn>,
 }
@@ -199,7 +209,7 @@ pub enum TypedStmt {
 }
 
 /// Somewhere a value can be stored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Place {
     Local(u32),
     /// Part of a local: one axis of a `Vec2`, or a struct's field, or a field
@@ -214,6 +224,13 @@ pub enum Place {
         ty: Type,
     },
     Global(u32),
+    /// `a[i] = v`. The array is an expression rather than a slot, because it
+    /// may be any expression that yields one.
+    Element {
+        array: Box<TypedExpr>,
+        index: Box<TypedExpr>,
+        ty: Type,
+    },
     GlobalAt {
         slot: u32,
         offset: u32,
@@ -300,6 +317,26 @@ pub enum TypedExprKind {
         lhs: Box<TypedExpr>,
         rhs: Box<TypedExpr>,
     },
+    /// `[a, b, c]` - a new array holding these elements, in order.
+    MakeArray {
+        array: u32,
+        elements: Vec<TypedExpr>,
+    },
+    /// `len(a)`, `push(a, v)` and `copy(a)` - the operations that need to know
+    /// an element's width, which only codegen does.
+    ArrayOp {
+        op: ArrayOp,
+        array: Box<TypedExpr>,
+        /// The value for `push`, and nothing for the rest.
+        value: Option<Box<TypedExpr>>,
+        element: Type,
+    },
+    /// `a[i]`, which traps if `i` is not a position in `a`.
+    Index {
+        array: Box<TypedExpr>,
+        index: Box<TypedExpr>,
+        ty: Type,
+    },
     /// Build a struct value: every field, in declaration order.
     MakeStruct {
         struct_index: u32,
@@ -324,6 +361,14 @@ pub enum TypedExprKind {
     },
     /// Something that did not check. Always paired with [`Type::Error`].
     Error,
+}
+
+/// The array operations that are builtins rather than syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayOp {
+    Len,
+    Push,
+    Copy,
 }
 
 /// One arm: where its payload bindings live, and what it evaluates to.

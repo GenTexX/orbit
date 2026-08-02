@@ -242,6 +242,18 @@ pub enum Expr {
         value: String,
         span: Span,
     },
+    /// `[a, b, c]`, or `[]` - a new array. An empty one has no element type of
+    /// its own, so it takes one from the context.
+    ArrayLit {
+        elements: Vec<Expr>,
+        span: Span,
+    },
+    /// `a[i]`.
+    Index {
+        array: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
     /// `Enemy { health: 10.0, position: p }` - every field, in any order.
     StructLit {
         name: String,
@@ -311,6 +323,8 @@ impl Expr {
             | Expr::Number { span, .. }
             | Expr::Variant { span, .. }
             | Expr::StructLit { span, .. }
+            | Expr::ArrayLit { span, .. }
+            | Expr::Index { span, .. }
             | Expr::Match { span, .. }
             | Expr::Bool { span, .. }
             | Expr::Str { span, .. }

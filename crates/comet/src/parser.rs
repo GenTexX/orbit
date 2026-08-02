@@ -705,23 +705,54 @@ impl Parser {
 
     fn postfix(&mut self) -> Expr {
         let mut expr = self.primary();
-        while self.eat(&TokenKind::Dot) {
-            let (field, field_span) = self.ident("a field name");
-            let span = expr.span().to(field_span);
-            expr = Expr::Field {
-                receiver: Box::new(expr),
-                field,
-                field_span,
-                span,
-            };
+        // `.field` and `[index]` chain in either order and any depth, so
+        // `a[0].health` and `world.rows[2]` both read left to right.
+        loop {
+            if self.eat(&TokenKind::Dot) {
+                let (field, field_span) = self.ident("a field name");
+                let span = expr.span().to(field_span);
+                expr = Expr::Field {
+                    receiver: Box::new(expr),
+                    field,
+                    field_span,
+                    span,
+                };
+            } else if self.eat(&TokenKind::LBracket) {
+                let index = self.expr();
+                let end = self.peek_span();
+                self.expect(&TokenKind::RBracket, "`]` after an index");
+                let span = expr.span().to(end);
+                expr = Expr::Index {
+                    array: Box::new(expr),
+                    index: Box::new(index),
+                    span,
+                };
+            } else {
+                return expr;
+            }
         }
-        expr
     }
 
     fn primary(&mut self) -> Expr {
         let span = self.peek_span();
         match self.peek().clone() {
             TokenKind::Match => self.match_expr(),
+            TokenKind::LBracket => {
+                self.advance();
+                let mut elements = Vec::new();
+                while !self.at_end() && !matches!(self.peek(), TokenKind::RBracket) {
+                    elements.push(self.expr());
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                let end = self.peek_span();
+                self.expect(&TokenKind::RBracket, "`]` after an array's elements");
+                Expr::ArrayLit {
+                    elements,
+                    span: span.to(end),
+                }
+            }
             TokenKind::Int(value) => {
                 self.advance();
                 Expr::Int { value, span }
