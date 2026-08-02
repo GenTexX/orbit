@@ -130,6 +130,7 @@ theme_tokens! {
     "code_comment": Color => code_comment,
     "code_function": Color => code_function,
     "code_type": Color => code_type,
+    "code_annotation": Color => code_annotation,
     "code_error": Color => code_error,
     "code_warning": Color => code_warning,
     "code_occurrence": Color => code_occurrence,

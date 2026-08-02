@@ -58,6 +58,9 @@ pub struct EditorTheme {
     pub code_comment: Color,
     pub code_function: Color,
     pub code_type: Color,
+    /// `@export` and friends: metadata about a declaration rather than part of
+    /// what runs, so it gets a color of its own.
+    pub code_annotation: Color,
     /// The squiggle under an error and under a warning.
     pub code_error: Color,
     pub code_warning: Color,
@@ -96,6 +99,7 @@ impl EditorTheme {
             code_comment: Color::rgb(0.45, 0.50, 0.48),
             code_function: Color::rgb(0.45, 0.72, 0.95),
             code_type: Color::rgb(0.40, 0.80, 0.78),
+            code_annotation: Color::rgb(0.86, 0.58, 0.72),
             code_error: Color::rgb(0.92, 0.36, 0.36),
             code_warning: Color::rgb(0.90, 0.72, 0.32),
             code_occurrence: Color::rgba(0.55, 0.60, 0.70, 0.28),
@@ -125,6 +129,7 @@ impl EditorTheme {
             code_comment: Color::rgb(0.48, 0.53, 0.50),
             code_function: Color::rgb(0.12, 0.38, 0.70),
             code_type: Color::rgb(0.05, 0.48, 0.46),
+            code_annotation: Color::rgb(0.62, 0.20, 0.42),
             code_error: Color::rgb(0.78, 0.16, 0.16),
             code_warning: Color::rgb(0.70, 0.50, 0.10),
             code_occurrence: Color::rgba(0.45, 0.50, 0.60, 0.22),

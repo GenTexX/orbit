@@ -128,6 +128,12 @@ pub const TOKENS: &[Token] = &[
     t("code_comment", C, "Code", "Script comments"),
     t("code_function", C, "Code", "Script function names"),
     t("code_type", C, "Code", "Script type names"),
+    t(
+        "code_annotation",
+        C,
+        "Code",
+        "Script annotations (@export, @range)",
+    ),
     t("code_error", C, "Code", "The squiggle under an error"),
     t("code_warning", C, "Code", "The squiggle under a warning"),
     t(

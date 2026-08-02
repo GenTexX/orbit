@@ -86,6 +86,9 @@ pub enum TokenClass {
     Function,
     /// A type name, in an annotation or a return type.
     Type,
+    /// `@export`, or the `@range` of `@range(0, 100)` - the `@` and the name
+    /// together.
+    Annotation,
     /// Any other identifier: a local, a parameter, script state, `transform`.
     Identifier,
     Operator,
@@ -143,8 +146,14 @@ fn classify(tokens: &[crate::lexer::Token]) -> Vec<TokenSpan> {
             | TokenKind::Return
             | TokenKind::True
             | TokenKind::False => TokenClass::Keyword,
+            TokenKind::At => TokenClass::Annotation,
             TokenKind::Ident(_) => {
-                if matches!(previous, Some(TokenKind::Colon | TokenKind::Arrow)) {
+                // `@range(0, 100)` is an annotation that takes arguments, not a
+                // call: its parens would otherwise read as a function, which is
+                // the one thing the script is certainly not doing there.
+                if matches!(previous, Some(TokenKind::At)) {
+                    TokenClass::Annotation
+                } else if matches!(previous, Some(TokenKind::Colon | TokenKind::Arrow)) {
                     TokenClass::Type
                 } else if matches!(next, Some(TokenKind::LParen))
                     || matches!(previous, Some(TokenKind::Func))
@@ -1486,6 +1495,37 @@ func third(c: f32) { let x = nope; }
             .into_iter()
             .map(|t| (t.span.text(source), t.class))
             .collect()
+    }
+
+    #[test]
+    fn an_annotation_is_not_a_function_call() {
+        // `@range(0, 100)` looks exactly like a call, and coloring it as one
+        // says the script calls something named `range` - which it does not.
+        assert_eq!(
+            classes("@range(0.0, 500.0)"),
+            vec![
+                ("@", TokenClass::Annotation),
+                ("range", TokenClass::Annotation),
+                ("(", TokenClass::Punctuation),
+                ("0.0", TokenClass::Number),
+                (",", TokenClass::Punctuation),
+                ("500.0", TokenClass::Number),
+                (")", TokenClass::Punctuation),
+            ]
+        );
+        // And one with no arguments is the same thing.
+        assert_eq!(
+            classes("@export"),
+            vec![
+                ("@", TokenClass::Annotation),
+                ("export", TokenClass::Annotation),
+            ]
+        );
+        // The name still colors as a call where it really is one.
+        assert_eq!(
+            classes("range(1.0)").first(),
+            Some(&("range", TokenClass::Function))
+        );
     }
 
     #[test]

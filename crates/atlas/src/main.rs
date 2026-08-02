@@ -5457,6 +5457,7 @@ impl State {
                     comet::service::TokenClass::Comment => theme.code_comment,
                     comet::service::TokenClass::Function => theme.code_function,
                     comet::service::TokenClass::Type => theme.code_type,
+                    comet::service::TokenClass::Annotation => theme.code_annotation,
                     // Identifiers, operators and punctuation are the widget's
                     // own color - a span for each would be noise and cost a
                     // draw command apiece.
