@@ -1,0 +1,38 @@
+// An enum is a type that is one of several named variants, and `match` picks a
+// value by which one is live.
+//
+// Every variant needs an arm: there is no wildcard, so the compiler can always
+// tell you which case you forgot. Try deleting one of the arms below.
+
+enum Mood { Calm, Restless, Panicked }
+
+// A variant can carry values, and the pattern gives them names.
+enum Contact { None, Wall(f32), Corner(f32, f32) }
+
+let mood = Mood::Restless;
+
+func wobble(m: Mood) -> f32 {
+    match m {
+        Calm => 0.0,
+        Restless => 20.0,
+        Panicked => 90.0,
+    }
+}
+
+func describe(c: Contact) -> String {
+    match c {
+        None => "nothing",
+        Wall(depth) => "a wall " + str(depth) + " deep",
+        Corner(a, b) => "a corner at " + str(a) + "," + str(b),
+    }
+}
+
+func start() {
+    print(describe(Contact::None));
+    print(describe(Contact::Wall(1.5)));
+    print(describe(Contact::Corner(2.0, 3.0)));
+}
+
+func update(dt: f32) {
+    transform.position.y = wobble(mood) * dt;
+}

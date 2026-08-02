@@ -30,6 +30,10 @@ pub enum Type {
     /// block with no tail expression - which is why it is the default.
     #[default]
     Unit,
+    /// A user-defined enum, by its index in [`TypedScript::enums`]. Carrying an
+    /// index rather than a name keeps `Type` `Copy` and keeps every comparison
+    /// a integer one.
+    Enum(u32),
     /// The poison type: something already reported as wrong. Anything built from
     /// an `Error` is `Error` and reports nothing further, so one mistake yields
     /// one diagnostic rather than a cascade.
@@ -45,6 +49,7 @@ impl Type {
             Type::Bool => "bool",
             Type::Vec2 => "Vec2",
             Type::Str => "String",
+            Type::Enum(_) => "enum",
             Type::Unit => "()",
             Type::Error => "<error>",
         }
@@ -72,6 +77,7 @@ impl Type {
 /// A checked script: persistent state in declaration order, then functions.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TypedScript {
+    pub enums: Vec<TypedEnum>,
     pub state: Vec<TypedState>,
     pub functions: Vec<TypedFn>,
 }
@@ -81,6 +87,25 @@ impl TypedScript {
     pub fn function(&self, name: &str) -> Option<&TypedFn> {
         self.functions.iter().find(|f| f.name == name)
     }
+}
+
+/// A checked enum: its variants in declaration order, and the layout every
+/// value of it occupies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedEnum {
+    pub name: String,
+    pub variants: Vec<TypedVariant>,
+    /// How many payload slots a value needs, beyond the tag: the widest
+    /// variant's. Every value of the enum is this size whichever variant is
+    /// live, which is what keeps an enum a stack value rather than an
+    /// allocation.
+    pub payload_slots: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedVariant {
+    pub name: String,
+    pub payload: Vec<Type>,
 }
 
 /// One piece of persistent script state - a top-level `let`, living in a global
@@ -236,8 +261,33 @@ pub enum TypedExprKind {
         lhs: Box<TypedExpr>,
         rhs: Box<TypedExpr>,
     },
+    /// Build an enum value: its tag, then its payload.
+    MakeVariant {
+        enum_index: u32,
+        variant: u32,
+        args: Vec<TypedExpr>,
+    },
+    /// `match`: evaluate the scrutinee once, then whichever arm's tag matches.
+    /// An expression, so every arm has the same type - which is the type of the
+    /// whole thing.
+    Match {
+        scrutinee: Box<TypedExpr>,
+        enum_index: u32,
+        /// One per variant, in the enum's declaration order. Exhaustiveness is
+        /// checked, so there is always exactly one arm per variant and codegen
+        /// never has to consider a fallthrough.
+        arms: Vec<TypedArm>,
+    },
     /// Something that did not check. Always paired with [`Type::Error`].
     Error,
+}
+
+/// One arm: where its payload bindings live, and what it evaluates to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedArm {
+    /// The local slots the variant's payload is unpacked into, in order.
+    pub bindings: Vec<u32>,
+    pub body: TypedExpr,
 }
 
 /// The functions the host must supply for a module to run. Kept as a closed enum

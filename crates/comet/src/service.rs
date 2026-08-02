@@ -136,6 +136,8 @@ fn classify(tokens: &[crate::lexer::Token]) -> Vec<TokenSpan> {
             | TokenKind::While
             | TokenKind::For
             | TokenKind::In
+            | TokenKind::Enum
+            | TokenKind::Match
             | TokenKind::Return
             | TokenKind::True
             | TokenKind::False => TokenClass::Keyword,
@@ -339,7 +341,7 @@ fn in_comment_or_string(source: &str, offset: usize) -> bool {
 
 /// The keywords a script can start a statement with.
 const KEYWORDS: &[&str] = &[
-    "func", "let", "if", "else", "while", "for", "in", "return", "true", "false",
+    "func", "let", "if", "else", "while", "for", "in", "enum", "match", "return", "true", "false",
 ];
 /// The type names a script can write.
 const TYPES: &[&str] = &["f32", "int", "bool", "Vec2", "String"];
@@ -493,7 +495,9 @@ fn keyword_detail(word: &str) -> &'static str {
         "if" => "run a block when a condition holds",
         "else" => "run a block when the `if` did not",
         "while" => "repeat a block while a condition holds",
-        "for" => "repeat a block once per number in a range: `for i in 0.0..4.0`",
+        "for" => "repeat a block once per whole number in a range: `for i in 0..4`",
+        "enum" => "declare a type that is one of several named variants",
+        "match" => "pick a value by which variant something is - every variant needs an arm",
         "in" => "separates a `for` loop's variable from its range",
         "return" => "leave a function with a value",
         "true" | "false" => "a bool literal",

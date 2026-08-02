@@ -232,7 +232,7 @@ so it was deleted rather than left dead - the same call made about decision 3 in
 
 ---
 
-## 4.5 - Sum types and generics
+## 4.5 - Sum types and generics (4.5a DONE, 4.5b next)
 
 **Builds.** Decisions 7, 8, 9, 10: user-defined enums carrying payloads,
 exhaustive `match`, `Option<T>` as an ordinary declaration with no compiler
@@ -272,6 +272,40 @@ section.
 **Proven by.** Execution tests that a variant holding a `String` frees it and
 one holding an `int` does not - the tag-consulting release path is the thing
 most likely to be quietly wrong. Exhaustiveness reported on a missing arm.
+
+**Split into two.** 4.5a is enums with payloads and exhaustive `match`; 4.5b is
+generics and `Option<T>`. Same decisions, same order - but the first half is
+complete on its own (state machines are what decision 7 was argued for), and the
+layout work it introduces is what the second builds on. One commit this size
+would have been an unverifiable lump.
+
+**4.5a done.** Decisions taken along the way:
+
+- **An enum is a stack value, not an allocation**: a tag plus the widest
+  variant's payload. Every payload slot is an `i32`, with an `f32` stored
+  reinterpreted - one free instruction each way - because a uniform slot type is
+  what lets one layout serve every variant.
+- **`match` parks its result in locals** rather than using the `if` block's
+  result. A result wider than one slot needs a function type in the type
+  section, which is built long before any instruction is emitted; locals have no
+  such limit.
+- **`val_types` stopped being `&'static`.** An enum's width depends on the
+  script, so the layout spine now threads the enum table through codegen. That
+  was the bulk of the work and 4.5b inherits it.
+- **The predicted refcount problem has not arrived yet.** No variant can hold a
+  `String` and be released correctly - the release path still reads a value's
+  static type. 4.5b is where that has to be faced, and it is the invariant the
+  plan warned about.
+
+Exported enums default to their first variant, per Philip's call, and only
+payload-free enums are exportable: the tag is one number and a payload is not.
+The inspector shows it as a number, which is provisional - a dropdown is 4.7's.
+
+A bug worth recording: `collect_literals` had a `_ => {}` arm, so a string
+inside a `match` was never interned and emission panicked with "every literal
+was interned before emission". Found by the demo script, not by a test. The
+wildcard is gone - every node kind is listed, so the next one that can hold a
+string fails to compile instead.
 
 ---
 

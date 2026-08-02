@@ -723,6 +723,10 @@ fn default_for(ty: comet::Type) -> Option<helios::Value> {
         comet::Type::Int => helios::Value::F32(0.0),
         comet::Type::Bool => helios::Value::Bool(false),
         comet::Type::Vec2 => helios::Value::Vec2(Vec2::ZERO),
+        // A payload-free enum is stored as its tag. The inspector has no
+        // dropdown yet, so it shows as a number - provisional, and the same
+        // wart as an exported int.
+        comet::Type::Enum(_) => helios::Value::F32(0.0),
         _ => return None,
     })
 }

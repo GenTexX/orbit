@@ -1314,3 +1314,124 @@ fn a_variable_without_export_is_not_offered_to_the_inspector() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].name, "tuned");
 }
+
+#[test]
+fn a_match_picks_the_arm_whose_variant_is_live() {
+    let mut script = Script::new(
+        r#"
+        enum State { Idle, Walking, Falling }
+        let state = State::Walking;
+        func speed_of(s: State) -> f32 {
+            match s {
+                Idle => 0.0,
+                Walking => 5.0,
+                Falling => 9.8,
+            }
+        }
+        func update(dt: f32) {
+            print(str(speed_of(State::Idle)));
+            print(str(speed_of(state)));
+            print(str(speed_of(State::Falling)));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["0", "5", "9.8"]);
+}
+
+#[test]
+fn a_variant_carries_its_payload_through_the_match() {
+    // The payload is packed into the value's slots and unpacked into the names
+    // the pattern gives it. Distinct numbers, so crossing them shows.
+    let mut script = Script::new(
+        r#"
+        enum Hit { Miss, Wall(f32), Corner(f32, f32) }
+        func depth(h: Hit) -> f32 {
+            match h {
+                Miss => -1.0,
+                Wall(d) => d,
+                Corner(a, b) => a * 100.0 + b,
+            }
+        }
+        func update(dt: f32) {
+            print(str(depth(Hit::Miss)));
+            print(str(depth(Hit::Wall(7.0))));
+            print(str(depth(Hit::Corner(2.0, 3.0))));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["-1", "7", "203"]);
+}
+
+#[test]
+fn a_payload_survives_being_stored_and_read_back() {
+    // Through script state, so the value goes out to a global and back rather
+    // than staying on the stack.
+    let mut script = Script::new(
+        r#"
+        enum Shot { None, At(Vec2) }
+        let last = Shot::None;
+        func update(dt: f32) {
+            last = Shot::At(vec2(3.0, 4.0));
+            let p = match last {
+                None => vec2(0.0, 0.0),
+                At(where) => where,
+            };
+            print(str(p.x) + "," + str(p.y));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["3,4"]);
+}
+
+#[test]
+fn a_match_inside_a_match_keeps_its_own_subject() {
+    // Four paths through two levels, so a tag chain that fell through to the
+    // wrong arm shows up. This does NOT prove the per-level scrutinee slots are
+    // needed - collapsing them still passes, because an arm's bindings are
+    // unpacked before its body runs. Those slots are defensive; see Frame.
+    let mut script = Script::new(
+        r#"
+        enum Outer { A, B }
+        enum Inner { X, Y }
+        func pick(o: Outer, i: Inner) -> f32 {
+            match o {
+                A => match i { X => 1.0, Y => 2.0 },
+                B => match i { X => 3.0, Y => 4.0 },
+            }
+        }
+        func update(dt: f32) {
+            print(str(pick(Outer::A, Inner::X)));
+            print(str(pick(Outer::A, Inner::Y)));
+            print(str(pick(Outer::B, Inner::X)));
+            print(str(pick(Outer::B, Inner::Y)));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["1", "2", "3", "4"]);
+}
+
+#[test]
+fn a_match_is_an_expression_and_can_be_a_whole_function_body() {
+    let mut script = Script::at(
+        r#"
+        enum Dir { Left, Right }
+        func step(d: Dir) -> Vec2 {
+            match d {
+                Left => vec2(-1.0, 0.0),
+                Right => vec2(1.0, 0.0),
+            }
+        }
+        func update(dt: f32) {
+            transform.position += step(Dir::Right) * 10.0;
+        }
+        "#,
+        0.0,
+        0.0,
+    );
+    script.update(0.0);
+    assert_eq!(script.position(), (10.0, 0.0));
+}

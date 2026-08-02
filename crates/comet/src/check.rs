@@ -22,6 +22,7 @@ use crate::tir::*;
 /// diagnostics still yields a tree - the bad parts are [`Type::Error`].
 pub fn check(script: &ast::Script, schema: &HostSchema) -> (TypedScript, Vec<Diagnostic>) {
     let mut checker = Checker {
+        enums: Vec::new(),
         schema,
         diagnostics: Vec::new(),
         globals: HashMap::new(),
@@ -46,6 +47,8 @@ struct Signature {
 }
 
 struct Checker<'a> {
+    /// The script's enums, in declaration order. `Type::Enum` indexes this.
+    enums: Vec<TypedEnum>,
     /// What this script can reach outside itself. comet has no built-in idea of
     /// what a node is; the engine says.
     schema: &'a HostSchema,
@@ -87,6 +90,252 @@ impl Checker<'_> {
         );
     }
 
+    /// `State::Idle`, or `Hit::Wall(3.0)`.
+    fn make_variant(
+        &mut self,
+        enum_name: &str,
+        enum_span: Span,
+        variant: &str,
+        variant_span: Span,
+        args: &[ast::Expr],
+    ) -> (TypedExprKind, Type) {
+        let Some(index) = self.enum_index(enum_name) else {
+            if !enum_name.is_empty() {
+                let candidates = self.enums.iter().map(|e| e.name.as_str());
+                let message = match nearest(enum_name, candidates) {
+                    Some(suggestion) => {
+                        format!("cannot find enum `{enum_name}` - did you mean `{suggestion}`?")
+                    }
+                    None => format!("cannot find enum `{enum_name}`"),
+                };
+                self.error(enum_span, message);
+            }
+            return (TypedExprKind::Error, Type::Error);
+        };
+        let found = self.enums[index as usize]
+            .variants
+            .iter()
+            .position(|v| v.name == variant);
+        let Some(position) = found else {
+            let candidates = self.enums[index as usize]
+                .variants
+                .iter()
+                .map(|v| v.name.as_str());
+            let message = match nearest(variant, candidates) {
+                Some(suggestion) => format!(
+                    "`{enum_name}` has no variant `{variant}` - did you mean `{suggestion}`?"
+                ),
+                None => format!("`{enum_name}` has no variant `{variant}`"),
+            };
+            self.error(variant_span, message);
+            return (TypedExprKind::Error, Type::Error);
+        };
+
+        let payload = self.enums[index as usize].variants[position]
+            .payload
+            .clone();
+        let mut checked: Vec<TypedExpr> = args.iter().map(|a| self.expr(a)).collect();
+        if checked.len() != payload.len() {
+            self.error(
+                variant_span,
+                format!(
+                    "`{variant}` carries {} value{}, but {} {} given",
+                    payload.len(),
+                    if payload.len() == 1 { "" } else { "s" },
+                    checked.len(),
+                    if checked.len() == 1 { "was" } else { "were" }
+                ),
+            );
+            return (TypedExprKind::Error, Type::Error);
+        }
+        for (arg, want) in checked.iter_mut().zip(&payload) {
+            let taken = std::mem::replace(
+                arg,
+                TypedExpr {
+                    kind: TypedExprKind::Error,
+                    ty: Type::Error,
+                    span: variant_span,
+                },
+            );
+            *arg = self.coerce(taken, *want);
+        }
+        (
+            TypedExprKind::MakeVariant {
+                enum_index: index,
+                variant: position as u32,
+                args: checked,
+            },
+            Type::Enum(index),
+        )
+    }
+
+    /// `match x { ... }`, checked for exhaustiveness.
+    ///
+    /// Every variant must have an arm. There is no wildcard on purpose: a
+    /// compiler that tells a learner they forgot a case is the point of the
+    /// construct, and `_` is how that goes quiet.
+    fn match_expr(
+        &mut self,
+        scrutinee: &ast::Expr,
+        arms: &[ast::MatchArm],
+        span: Span,
+    ) -> (TypedExprKind, Type) {
+        let scrutinee = self.expr(scrutinee);
+        let Type::Enum(index) = scrutinee.ty else {
+            if !scrutinee.ty.is_error() {
+                self.error(
+                    scrutinee.span,
+                    format!(
+                        "`match` works on an enum, and this is a {}",
+                        scrutinee.ty.name()
+                    ),
+                );
+            }
+            return (TypedExprKind::Error, Type::Error);
+        };
+
+        let variants = self.enums[index as usize].variants.clone();
+        let mut checked: Vec<Option<TypedArm>> = vec![None; variants.len()];
+        let mut result = Type::Error;
+        let mut first_span = span;
+        for arm in arms {
+            let Some(position) = variants.iter().position(|v| v.name == arm.variant) else {
+                let message = match nearest(&arm.variant, variants.iter().map(|v| v.name.as_str()))
+                {
+                    Some(suggestion) => format!(
+                        "`{}` has no variant `{}` - did you mean `{suggestion}`?",
+                        self.enums[index as usize].name, arm.variant
+                    ),
+                    None => format!(
+                        "`{}` has no variant `{}`",
+                        self.enums[index as usize].name, arm.variant
+                    ),
+                };
+                self.error(arm.variant_span, message);
+                continue;
+            };
+            if checked[position].is_some() {
+                self.error(
+                    arm.variant_span,
+                    format!("`{}` already has an arm", arm.variant),
+                );
+                continue;
+            }
+
+            // The payload's names are bound for this arm's body only.
+            let payload = variants[position].payload.clone();
+            if arm.bindings.len() != payload.len() {
+                self.error(
+                    arm.variant_span,
+                    format!(
+                        "`{}` carries {} value{}, but this pattern names {}",
+                        arm.variant,
+                        payload.len(),
+                        if payload.len() == 1 { "" } else { "s" },
+                        arm.bindings.len()
+                    ),
+                );
+                continue;
+            }
+            self.scopes.push(HashMap::new());
+            let bindings: Vec<u32> = arm
+                .bindings
+                .iter()
+                .zip(&payload)
+                .map(|((name, name_span), ty)| self.declare_local(name, *ty, Some(*name_span)))
+                .collect();
+            let body = self.expr(&arm.body);
+            self.scopes.pop();
+
+            // Every arm has the same type: it is one expression with one value.
+            if result.is_error() {
+                result = body.ty;
+                first_span = body.span;
+            } else if body.ty != result && !body.ty.is_error() {
+                self.error(
+                    body.span,
+                    format!(
+                        "every arm of a `match` has to produce the same type - this one is {}, \
+                         and the first is {}",
+                        body.ty.name(),
+                        result.name()
+                    ),
+                );
+            }
+            let _ = first_span;
+            checked[position] = Some(TypedArm { bindings, body });
+        }
+
+        let missing: Vec<&str> = checked
+            .iter()
+            .zip(&variants)
+            .filter(|(arm, _)| arm.is_none())
+            .map(|(_, variant)| variant.name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            let list = missing.join("`, `");
+            self.error(
+                span,
+                format!(
+                    "this `match` does not cover `{list}` - every variant needs an arm, and \
+                     there is no wildcard"
+                ),
+            );
+            return (TypedExprKind::Error, Type::Error);
+        }
+
+        (
+            TypedExprKind::Match {
+                scrutinee: Box::new(scrutinee),
+                enum_index: index,
+                arms: checked
+                    .into_iter()
+                    .map(|a| a.expect("all present"))
+                    .collect(),
+            },
+            result,
+        )
+    }
+
+    /// Whether a value of this type can be stored on the component and written
+    /// back into a running module.
+    ///
+    /// A `String` is a pointer into the module's own memory, so handing one
+    /// across needs an ownership rule that is its own decision. An enum is one
+    /// number - its tag - as long as no variant carries anything, which is also
+    /// exactly when it has a default to fall back to.
+    fn is_exportable(&self, ty: Type) -> bool {
+        match ty {
+            Type::F32 | Type::Int | Type::Bool | Type::Vec2 => true,
+            Type::Enum(index) => self.enums[index as usize]
+                .variants
+                .iter()
+                .all(|v| v.payload.is_empty()),
+            _ => false,
+        }
+    }
+
+    /// The index of the enum called `name`, if the script declares one.
+    fn enum_index(&self, name: &str) -> Option<u32> {
+        self.enums
+            .iter()
+            .position(|e| e.name == name)
+            .map(|i| i as u32)
+    }
+
+    /// How many wasm slots a value of this type occupies. The checker needs it
+    /// only to size an enum's payload; codegen has the authoritative version.
+    fn slots(&self, ty: Type) -> usize {
+        match ty {
+            Type::Vec2 => 2,
+            Type::Unit | Type::Error => 0,
+            // The tag plus the widest payload. An enum inside an enum is
+            // flattened rather than boxed, so it stays a stack value.
+            Type::Enum(index) => 1 + self.enums[index as usize].payload_slots,
+            _ => 1,
+        }
+    }
+
     /// Check a declaration's annotations, returning whether it is exported.
     ///
     /// Only `@export` exists in v1. The others - `@range`, `@tooltip` and the
@@ -121,9 +370,11 @@ impl Checker<'_> {
 
     /// The value a declaration with no initializer starts with.
     ///
-    /// Every type in the language has an obvious answer, which is what makes an
-    /// initializer optional at all. A user-defined enum would not, and that is
-    /// exactly why `@export` is being built before enums exist.
+    /// Every built-in type has an obvious answer. A user-defined enum does not,
+    /// so its first variant is it: an arbitrary rule, chosen because the
+    /// alternatives were a warning with an exception in it, or refusing to
+    /// export enums at all. A variant carrying a payload cannot be a default -
+    /// there is nothing to fill the payload with - so that is an error.
     fn default_value(&mut self, ty: Type, span: Span) -> TypedExpr {
         let kind = match ty {
             Type::F32 => TypedExprKind::Number(0.0),
@@ -142,6 +393,29 @@ impl Checker<'_> {
                 }),
             },
             Type::Str => TypedExprKind::Str(String::new()),
+            Type::Enum(index) => {
+                let first = self.enums[index as usize].variants.first();
+                match first {
+                    Some(variant) if variant.payload.is_empty() => TypedExprKind::MakeVariant {
+                        enum_index: index,
+                        variant: 0,
+                        args: Vec::new(),
+                    },
+                    Some(variant) => {
+                        let name = variant.name.clone();
+                        self.error(
+                            span,
+                            format!(
+                                "`{name}` is this enum's first variant and so its default, but it \
+                                 carries a value - give the declaration an initializer, or put a \
+                                 variant with no payload first"
+                            ),
+                        );
+                        TypedExprKind::Error
+                    }
+                    None => TypedExprKind::Error,
+                }
+            }
             Type::Unit | Type::Error => TypedExprKind::Error,
         };
         TypedExpr { kind, ty, span }
@@ -203,6 +477,9 @@ impl Checker<'_> {
     fn resolve_type(&mut self, name: &ast::TypeName) -> Type {
         match Type::from_name(&name.name) {
             Some(ty) => ty,
+            None if self.enum_index(&name.name).is_some() => {
+                Type::Enum(self.enum_index(&name.name).expect("just checked"))
+            }
             None => {
                 // An empty name means the parser already reported a missing
                 // type name; do not pile on.
@@ -217,6 +494,56 @@ impl Checker<'_> {
     // --- top level ---
 
     fn script(&mut self, script: &ast::Script) -> TypedScript {
+        // Enums first: a state initializer, a signature, or another enum's
+        // payload can name one, and none of them can be checked until the set
+        // of type names is known.
+        for (index, decl) in script.enums.iter().enumerate() {
+            if self.enum_index(&decl.name).is_some() && !decl.name.is_empty() {
+                self.error(
+                    decl.name_span,
+                    format!("`{}` is already defined in this script", decl.name),
+                );
+            }
+            self.enums.push(TypedEnum {
+                name: decl.name.clone(),
+                variants: Vec::new(),
+                payload_slots: 0,
+            });
+            let _ = index;
+        }
+        // Then their payloads, in a second pass, so one enum may carry another
+        // regardless of which was written first.
+        for (index, decl) in script.enums.iter().enumerate() {
+            let mut variants = Vec::new();
+            let mut widest = 0;
+            for variant in &decl.variants {
+                if variants
+                    .iter()
+                    .any(|v: &TypedVariant| v.name == variant.name)
+                {
+                    self.error(
+                        variant.name_span,
+                        format!("`{}` is already a variant of this enum", variant.name),
+                    );
+                }
+                let payload: Vec<Type> = variant
+                    .payload
+                    .iter()
+                    .map(|t| self.resolve_type(t))
+                    .collect();
+                widest = widest.max(payload.iter().map(|t| self.slots(*t)).sum::<usize>());
+                variants.push(TypedVariant {
+                    name: variant.name.clone(),
+                    payload,
+                });
+            }
+            if variants.is_empty() && !decl.name.is_empty() {
+                self.error(decl.span, "an enum needs at least one variant");
+            }
+            self.enums[index].variants = variants;
+            self.enums[index].payload_slots = widest;
+        }
+
         // Signatures first, so a function can call one defined later and a
         // global initializer can call any of them.
         for (index, f) in script.functions.iter().enumerate() {
@@ -315,14 +642,18 @@ impl Checker<'_> {
                     ),
                 ));
             }
-            if exported && !is_exportable(ty) && !ty.is_error() {
+            if exported && !self.is_exportable(ty) && !ty.is_error() {
+                let detail = match ty {
+                    // The tag is one number; a payload is not, and there is no
+                    // way to put one in the inspector yet.
+                    Type::Enum(_) => "an enum whose variants carry values cannot be exported yet",
+                    _ => {
+                        "only f32, int, bool, Vec2 and payload-free enums can be stored on the component"
+                    }
+                };
                 self.error(
                     decl.span,
-                    format!(
-                        "a `{}` cannot be exported yet - only f32, int, bool and Vec2 can be \
-                         stored on the component",
-                        ty.name()
-                    ),
+                    format!("a `{}` cannot be exported yet - {detail}", ty.name()),
                 );
             }
             if ty == Type::Unit {
@@ -354,7 +685,11 @@ impl Checker<'_> {
             .enumerate()
             .map(|(index, f)| self.function(index, f))
             .collect();
-        TypedScript { state, functions }
+        TypedScript {
+            enums: std::mem::take(&mut self.enums),
+            state,
+            functions,
+        }
     }
 
     fn function(&mut self, index: usize, f: &ast::Function) -> TypedFn {
@@ -1082,6 +1417,19 @@ impl Checker<'_> {
                 ..
             } => self.call(callee, *callee_span, args, span),
 
+            ast::Expr::Variant {
+                enum_name,
+                enum_span,
+                variant,
+                variant_span,
+                args,
+                ..
+            } => self.make_variant(enum_name, *enum_span, variant, *variant_span, args),
+
+            ast::Expr::Match {
+                scrutinee, arms, ..
+            } => self.match_expr(scrutinee, arms, span),
+
             ast::Expr::Unary { op, operand, .. } => {
                 let operand = self.expr(operand);
                 let (op, want) = match op {
@@ -1644,13 +1992,6 @@ fn symbol(op: ast::BinaryOp) -> &'static str {
 /// whole set, and mixing them widens.
 fn is_numeric(ty: Type) -> bool {
     matches!(ty, Type::F32 | Type::Int)
-}
-
-/// Whether a value of this type can be stored on the component and written back
-/// into a running module. A `String` is a pointer into the module's own memory,
-/// so handing one across needs an ownership rule that is its own decision.
-fn is_exportable(ty: Type) -> bool {
-    matches!(ty, Type::F32 | Type::Int | Type::Bool | Type::Vec2)
 }
 
 fn is_reserved_name(name: &str) -> bool {
@@ -2542,7 +2883,7 @@ mod tests {
                 .filter(|m| m.contains("exported"))
                 .collect::<Vec<_>>(),
             [
-                "a `String` cannot be exported yet - only f32, int, bool and Vec2 can be stored on the component"
+                "a `String` cannot be exported yet - only f32, int, bool, Vec2 and payload-free enums can be stored on the component"
             ]
         );
     }
@@ -2558,6 +2899,134 @@ mod tests {
         assert_eq!(
             messages("@export(1) let speed: f32;"),
             ["`@export` takes no arguments"]
+        );
+    }
+
+    // --- enums and match ---
+
+    #[test]
+    fn a_match_must_cover_every_variant() {
+        // The whole point of the construct: a compiler that tells a learner
+        // they forgot a case. There is no wildcard, so it always can.
+        assert_eq!(
+            messages(
+                "enum S { Idle, Walking, Falling }\n\
+                 func f(s: S) -> f32 { match s { Idle => 0.0 } }"
+            ),
+            [
+                "this `match` does not cover `Walking`, `Falling` - every variant needs an arm, and there is no wildcard"
+            ]
+        );
+    }
+
+    #[test]
+    fn every_arm_of_a_match_produces_the_same_type() {
+        assert_eq!(
+            messages("enum S { A, B }\nfunc f(s: S) -> f32 { match s { A => 1.0, B => true } }"),
+            [
+                "every arm of a `match` has to produce the same type - this one is bool, and the first is f32"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pattern_names_exactly_what_its_variant_carries() {
+        assert_eq!(
+            messages("enum H { Wall(f32) }\nfunc f(h: H) -> f32 { match h { Wall => 1.0 } }"),
+            // The bad arm does not count as covering its variant, so the
+            // coverage error follows - which is the honest reading.
+            [
+                "this `match` does not cover `Wall` - every variant needs an arm, and there is no wildcard",
+                "`Wall` carries 1 value, but this pattern names 0"
+            ]
+        );
+        assert_eq!(
+            messages("enum H { Wall(f32) }\nfunc f() -> H { H::Wall(1.0, 2.0) }"),
+            ["`Wall` carries 1 value, but 2 were given"]
+        );
+    }
+
+    #[test]
+    fn an_unknown_variant_suggests_the_nearest_one() {
+        assert_eq!(
+            messages("enum S { Idle, Walking }\nfunc f() -> S { S::Wlaking }"),
+            ["`S` has no variant `Wlaking` - did you mean `Walking`?"]
+        );
+        assert_eq!(
+            messages("enum State { Idle }\nfunc f() -> State { Stat::Idle }"),
+            ["cannot find enum `Stat` - did you mean `State`?"]
+        );
+    }
+
+    #[test]
+    fn a_repeated_arm_is_reported_and_the_rest_still_checked() {
+        assert_eq!(
+            messages("enum S { A, B }\nfunc f(s: S) -> f32 { match s { A => 1.0, A => 2.0 } }"),
+            // Sorted by span, and the `match` starts before its second arm.
+            [
+                "this `match` does not cover `B` - every variant needs an arm, and there is no wildcard",
+                "`A` already has an arm"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_payload_binding_has_the_type_the_variant_declared() {
+        check_clean(
+            "enum H { Miss, At(Vec2) }\n\
+             func f(h: H) -> f32 { match h { Miss => 0.0, At(p) => p.x } }",
+        );
+        assert_eq!(
+            messages(
+                "enum H { Miss, At(Vec2) }\n\
+                 func f(h: H) -> f32 { match h { Miss => 0.0, At(p) => p } }"
+            ),
+            [
+                "every arm of a `match` has to produce the same type - this one is Vec2, and the first is f32"
+            ]
+        );
+    }
+
+    #[test]
+    fn matching_on_something_that_is_not_an_enum_says_so() {
+        assert_eq!(
+            messages("func f(x: f32) -> f32 { match x { A => 1.0 } }"),
+            ["`match` works on an enum, and this is a f32"]
+        );
+    }
+
+    #[test]
+    fn an_exported_enum_defaults_to_its_first_variant() {
+        let typed = check_clean("enum S { Idle, Walking }\n@export let state: S;");
+        assert!(matches!(
+            typed.state[0].init.kind,
+            TypedExprKind::MakeVariant { variant: 0, .. }
+        ));
+
+        // Unless that variant carries something, in which case there is nothing
+        // to fill the payload with and the author has to say.
+        assert_eq!(
+            messages("enum S { Wall(f32), Idle }\n@export let state: S;")
+                .into_iter()
+                .filter(|m| m.contains("first variant"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_enum_needs_a_name_of_its_own_and_variants_of_their_own() {
+        assert_eq!(
+            messages("enum S { A }\nenum S { B }"),
+            ["`S` is already defined in this script"]
+        );
+        assert_eq!(
+            messages("enum S { A, A }"),
+            ["`A` is already a variant of this enum"]
+        );
+        assert_eq!(
+            messages("enum S { }"),
+            ["an enum needs at least one variant"]
         );
     }
 }

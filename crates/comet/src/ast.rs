@@ -10,7 +10,26 @@ use crate::span::Span;
 /// for now). Top-level `let`s are persistent state that outlives a call, which is
 /// why they are a separate list from anything inside a function body.
 #[derive(Debug, Clone, PartialEq, Default)]
+pub struct EnumDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub variants: Vec<VariantDecl>,
+    pub span: Span,
+}
+
+/// One variant, with the types it carries. An empty payload is the ordinary
+/// case - `Idle` - and is not a special kind of variant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VariantDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub payload: Vec<TypeName>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Script {
+    pub enums: Vec<EnumDecl>,
     pub state: Vec<StateDecl>,
     pub functions: Vec<Function>,
 }
@@ -33,6 +52,17 @@ pub struct StateDecl {
     /// would be a second answer to the same question. A declaration must have a
     /// type or an initializer; with neither there is nothing to infer from.
     pub init: Option<Expr>,
+    pub span: Span,
+}
+
+/// One arm: a variant, the names it binds from the payload, and the value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub variant: String,
+    pub variant_span: Span,
+    /// The names bound to the variant's payload, in order.
+    pub bindings: Vec<(String, Span)>,
+    pub body: Expr,
     pub span: Span,
 }
 
@@ -175,6 +205,23 @@ pub enum Expr {
         value: String,
         span: Span,
     },
+    /// `State::Idle`, or `Hit::Wall(3.0)` - naming a variant, and giving it its
+    /// payload when it has one.
+    Variant {
+        enum_name: String,
+        enum_span: Span,
+        variant: String,
+        variant_span: Span,
+        args: Vec<Expr>,
+        span: Span,
+    },
+    /// `match x { Idle => a, Wall(w) => b }` - an expression, so it can be the
+    /// value of a `let` rather than needing a mutable variable per arm.
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
     /// A bare name: a local, a parameter, a piece of script state, or the
     /// name of a host object like `transform`. Which one it is, is the checker's call.
     Ident {
@@ -218,6 +265,8 @@ impl Expr {
         match self {
             Expr::Int { span, .. }
             | Expr::Number { span, .. }
+            | Expr::Variant { span, .. }
+            | Expr::Match { span, .. }
             | Expr::Bool { span, .. }
             | Expr::Str { span, .. }
             | Expr::Ident { span, .. }

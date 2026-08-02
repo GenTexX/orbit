@@ -50,8 +50,8 @@ use wasm_encoder::{
 };
 
 use crate::tir::{
-    Axis, BinaryOp, Host, Place, Type, TypedBlock, TypedExpr, TypedExprKind, TypedFn, TypedScript,
-    TypedStmt, UnaryOp,
+    Axis, BinaryOp, Host, Place, Type, TypedArm, TypedBlock, TypedEnum, TypedExpr, TypedExprKind,
+    TypedFn, TypedScript, TypedStmt, UnaryOp,
 };
 
 /// The module the host must satisfy every import from.
@@ -186,7 +186,10 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     functions.function(t_rc);
     functions.function(t_rc);
     for f in &script.functions {
-        let ty = types.get(param_types(f), val_types(f.ret).to_vec());
+        let ty = types.get(
+            param_types(f, &script.enums),
+            val_types(f.ret, &script.enums),
+        );
         functions.function(ty);
     }
     let has_state = !script.state.is_empty();
@@ -199,7 +202,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     code.function(&emit_retain());
     code.function(&emit_release(&globals));
     for f in &script.functions {
-        code.function(&emit_function(f, &globals, &literals));
+        code.function(&emit_function(f, &script.enums, &globals, &literals));
     }
     if has_state {
         code.function(&emit_init(script, &globals, &literals));
@@ -207,8 +210,8 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
 
     let mut global_section = GlobalSection::new();
     for state in &script.state {
-        for vt in val_types(state.ty) {
-            global_section.global(mutable(*vt), &zero_of(*vt));
+        for vt in val_types(state.ty, &script.enums) {
+            global_section.global(mutable(vt), &zero_of(vt));
         }
     }
     global_section.global(
@@ -336,7 +339,20 @@ pub fn exported_globals(name: &str, ty: Type) -> Vec<String> {
     }
 }
 
-fn val_types(ty: Type) -> &'static [ValType] {
+/// How a value of `ty` is laid out in wasm slots.
+///
+/// An enum is a tag followed by the widest variant's payload, and every payload
+/// slot is an `i32` - an `f32` payload is stored reinterpreted, which is one
+/// free instruction each way. A uniform slot type is what lets one layout serve
+/// every variant, and keeps an enum a stack value rather than an allocation.
+fn val_types(ty: Type, enums: &[TypedEnum]) -> Vec<ValType> {
+    if let Type::Enum(index) = ty {
+        return vec![ValType::I32; 1 + enums[index as usize].payload_slots];
+    }
+    scalar_types(ty).to_vec()
+}
+
+fn scalar_types(ty: Type) -> &'static [ValType] {
     match ty {
         Type::F32 => &[ValType::F32],
         Type::Int => &[ValType::I32],
@@ -344,14 +360,14 @@ fn val_types(ty: Type) -> &'static [ValType] {
         Type::Vec2 => &[ValType::F32, ValType::F32],
         Type::Str => &[ValType::I32],
         Type::Unit | Type::Error => &[],
+        Type::Enum(_) => unreachable!("handled by val_types, which knows the layouts"),
     }
 }
 
-fn param_types(f: &TypedFn) -> Vec<ValType> {
+fn param_types(f: &TypedFn, enums: &[TypedEnum]) -> Vec<ValType> {
     f.locals[..f.param_count]
         .iter()
-        .flat_map(|ty| val_types(*ty))
-        .copied()
+        .flat_map(|ty| val_types(*ty, enums))
         .collect()
 }
 
@@ -420,13 +436,14 @@ struct Globals {
 
 impl Globals {
     fn new(script: &TypedScript) -> Self {
+        let enums = &script.enums;
         let mut base = Vec::new();
         let mut types = Vec::new();
         let mut next = 0;
         for state in &script.state {
             base.push(next);
             types.push(state.ty);
-            next += val_types(state.ty).len() as u32;
+            next += val_types(state.ty, enums).len() as u32;
         }
         Self {
             base,
@@ -530,7 +547,34 @@ fn collect_expr(expr: &TypedExpr, out: &mut Literals) {
             collect_expr(lhs, out);
             collect_expr(rhs, out);
         }
-        _ => {}
+        TypedExprKind::MakeVec2 { x, y } => {
+            collect_expr(x, out);
+            collect_expr(y, out);
+        }
+        TypedExprKind::Widen(inner) | TypedExprKind::Narrow(inner) => collect_expr(inner, out),
+        TypedExprKind::MakeVariant { args, .. } => {
+            for arg in args {
+                collect_expr(arg, out);
+            }
+        }
+        TypedExprKind::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_expr(scrutinee, out);
+            for arm in arms {
+                collect_expr(&arm.body, out);
+            }
+        }
+        // Listed rather than caught by a wildcard: a new kind that holds a
+        // string must fail to compile here rather than panic at emission with
+        // "every literal was interned", which is how this was found.
+        TypedExprKind::Number(_)
+        | TypedExprKind::Int(_)
+        | TypedExprKind::Bool(_)
+        | TypedExprKind::Local(_)
+        | TypedExprKind::Global(_)
+        | TypedExprKind::HostField { .. }
+        | TypedExprKind::Error => {}
     }
 }
 
@@ -667,9 +711,14 @@ fn emit_release(globals: &Globals) -> Function {
 
 // --- script functions ---
 
-fn emit_function(f: &TypedFn, globals: &Globals, literals: &Literals) -> Function {
+fn emit_function(
+    f: &TypedFn,
+    enums: &[TypedEnum],
+    globals: &Globals,
+    literals: &Literals,
+) -> Function {
     let depth = block_depth(&f.body);
-    let mut out = FnGen::new(&f.locals, f.param_count, depth, globals, literals);
+    let mut out = FnGen::new(&f.locals, f.param_count, depth, enums, globals, literals);
     // A tail expression is the return value. It stays on the stack while the
     // locals it may have been read from are released - it already holds its own
     // reference, so releasing theirs cannot free it.
@@ -686,8 +735,9 @@ fn emit_function(f: &TypedFn, globals: &Globals, literals: &Literals) -> Functio
 
 /// The start function: run each state initializer once, at instantiation.
 fn emit_init(script: &TypedScript, globals: &Globals, literals: &Literals) -> Function {
+    let enums = &script.enums;
     let depth = script.state.iter().map(|s| expr_depth(&s.init)).max();
-    let mut out = FnGen::new(&[], 0, depth.unwrap_or(0), globals, literals);
+    let mut out = FnGen::new(&[], 0, depth.unwrap_or(0), enums, globals, literals);
     for state in &script.state {
         out.expr(&state.init);
         out.store_global(state.slot);
@@ -725,10 +775,37 @@ impl Vec2Op {
 struct Frame {
     f32s: [u32; 3],
     i32s: [u32; 4],
+    /// Where a `match` parks its scrutinee.
+    ///
+    /// Per nesting level rather than shared. With the current emission order a
+    /// shared region would in fact survive - an arm's bindings are unpacked
+    /// before its body runs, and nothing reads the parked value afterwards - so
+    /// this is defensive rather than load-bearing, and deliberately so: it makes
+    /// the reasoning local instead of a property of the order things happen to
+    /// be emitted in. The cost is a handful of locals the JIT drops.
+    enum_base: u32,
+    /// Where each arm leaves its value.
+    ///
+    /// A `match` could have used the `if` block's result instead, but a result
+    /// wider than one slot needs a function type in the type section, which is
+    /// built long before any instruction is emitted. Locals have no such limit
+    /// and cost nothing after the JIT.
+    result_base: u32,
 }
 
-/// How many wasm locals one [`Frame`] occupies.
-const FRAME_WIDTH: u32 = 7;
+/// The fixed part of a [`Frame`]: three f32 and four i32 scratches.
+const FRAME_SCRATCH: u32 = 7;
+
+/// How wide the two variable regions of a frame are. A `Vec2` is the widest
+/// built-in at two slots; an enum can be wider.
+fn spare_width(enums: &[TypedEnum]) -> u32 {
+    enums
+        .iter()
+        .map(|e| 1 + e.payload_slots as u32)
+        .max()
+        .unwrap_or(0)
+        .max(2)
+}
 
 /// The greatest number of [`Frame`]s a block can need at once.
 fn block_depth(block: &TypedBlock) -> usize {
@@ -782,6 +859,16 @@ fn expr_depth(expr: &TypedExpr) -> usize {
         K::MakeVec2 { x, y } => (0, vec![x, y]),
         K::Call { args, .. } => (0, args.iter().collect()),
         K::Widen(inner) | K::Narrow(inner) => (0, vec![inner]),
+        K::MakeVariant { args, .. } => (0, args.iter().collect()),
+        // A match parks its scrutinee to read the tag and then unpack from it.
+        K::Match {
+            scrutinee, arms, ..
+        } => (
+            1,
+            std::iter::once(scrutinee.as_ref())
+                .chain(arms.iter().map(|a| &a.body))
+                .collect(),
+        ),
         K::Number(_)
         | K::Int(_)
         | K::Bool(_)
@@ -801,6 +888,8 @@ struct FnGen<'a> {
     slot_types: &'a [Type],
     /// Slots holding a `String`, released on the way out of the function.
     owned: Vec<u32>,
+    /// The script's enum layouts, for sizing anything that holds one.
+    enums: &'a [TypedEnum],
     /// One set of scratch locals per level of nesting that needs them, and a
     /// cursor into it. See [`FnGen::enter_frame`].
     frames: Vec<Frame>,
@@ -814,6 +903,7 @@ impl<'a> FnGen<'a> {
         slot_types: &'a [Type],
         param_count: usize,
         depth: usize,
+        enums: &'a [TypedEnum],
         globals: &'a Globals,
         literals: &'a Literals,
     ) -> Self {
@@ -821,7 +911,7 @@ impl<'a> FnGen<'a> {
         let mut next = 0;
         for ty in slot_types {
             slot_base.push(next);
-            next += val_types(*ty).len() as u32;
+            next += val_types(*ty, enums).len() as u32;
         }
         // Scratch locals come in frames, one per level of nesting that needs
         // them. A single shared set would be wrong: the outer `%` in
@@ -829,30 +919,28 @@ impl<'a> FnGen<'a> {
         // operand that parks its own - and would overwrite it. wasm-encoder
         // wants the local list before the first instruction, so the depth is
         // measured up front rather than discovered while emitting.
+        let spare = spare_width(enums);
+        let frame_width = FRAME_SCRATCH + spare * 2;
         let frames: Vec<Frame> = (0..depth + 1)
             .map(|i| {
-                let base = next + (i as u32) * FRAME_WIDTH;
+                let base = next + (i as u32) * frame_width;
                 Frame {
                     f32s: [base, base + 1, base + 2],
                     i32s: [base + 3, base + 4, base + 5, base + 6],
+                    enum_base: base + FRAME_SCRATCH,
+                    result_base: base + FRAME_SCRATCH + spare,
                 }
             })
             .collect();
 
         let declared: Vec<ValType> = slot_types[param_count..]
             .iter()
-            .flat_map(|ty| val_types(*ty))
-            .copied()
+            .flat_map(|ty| val_types(*ty, enums))
             .chain(frames.iter().flat_map(|_| {
-                [
-                    ValType::F32,
-                    ValType::F32,
-                    ValType::F32,
+                [ValType::F32; 3].into_iter().chain(std::iter::repeat_n(
                     ValType::I32,
-                    ValType::I32,
-                    ValType::I32,
-                    ValType::I32,
-                ]
+                    (frame_width - 3) as usize,
+                ))
             }))
             .collect();
 
@@ -868,6 +956,7 @@ impl<'a> FnGen<'a> {
             slot_base,
             slot_types,
             owned,
+            enums,
             frames,
             frame: 0,
             globals,
@@ -908,7 +997,7 @@ impl<'a> FnGen<'a> {
 
     fn load_slot(&mut self, slot: u32) {
         let base = self.slot_base[slot as usize];
-        let width = val_types(self.slot_types[slot as usize]).len() as u32;
+        let width = val_types(self.slot_types[slot as usize], self.enums).len() as u32;
         for i in 0..width {
             self.ins().local_get(base + i);
         }
@@ -916,7 +1005,7 @@ impl<'a> FnGen<'a> {
 
     fn store_slot(&mut self, slot: u32) {
         let base = self.slot_base[slot as usize];
-        let width = val_types(self.slot_types[slot as usize]).len() as u32;
+        let width = val_types(self.slot_types[slot as usize], self.enums).len() as u32;
         // The stack has the components in order, so they come off backwards.
         for i in (0..width).rev() {
             self.ins().local_set(base + i);
@@ -925,7 +1014,7 @@ impl<'a> FnGen<'a> {
 
     fn load_global(&mut self, slot: u32) {
         let base = self.globals.base[slot as usize];
-        let width = val_types(self.globals.types[slot as usize]).len() as u32;
+        let width = val_types(self.globals.types[slot as usize], self.enums).len() as u32;
         for i in 0..width {
             self.ins().global_get(base + i);
         }
@@ -942,7 +1031,7 @@ impl<'a> FnGen<'a> {
             self.ins().global_get(base).call(F_RELEASE);
             self.ins().local_get(tmp);
         }
-        let width = val_types(ty).len() as u32;
+        let width = val_types(ty, self.enums).len() as u32;
         for i in (0..width).rev() {
             self.ins().global_set(base + i);
         }
@@ -973,7 +1062,7 @@ impl<'a> FnGen<'a> {
             }
             Type::Unit | Type::Error => {}
             other => {
-                for _ in val_types(other) {
+                for _ in val_types(other, self.enums) {
                     self.ins().drop();
                 }
             }
@@ -1311,9 +1400,151 @@ impl<'a> FnGen<'a> {
 
             TypedExprKind::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs),
 
+            // An enum value is its tag, then its payload, then whatever slots
+            // the widest variant needs and this one does not - zeroed, because
+            // wasm has no undefined value and a match never reads them.
+            TypedExprKind::MakeVariant {
+                enum_index,
+                variant,
+                args,
+            } => {
+                let layout = &self.enums[*enum_index as usize];
+                self.ins().i32_const(*variant as i32);
+                let mut written = 0;
+                for arg in args {
+                    let ty = arg.ty;
+                    self.expr(arg);
+                    written += self.pack(ty);
+                }
+                for _ in written..layout.payload_slots {
+                    self.ins().i32_const(0);
+                }
+            }
+
+            TypedExprKind::Match {
+                scrutinee,
+                enum_index,
+                arms,
+            } => self.match_expr(scrutinee, *enum_index, arms),
+
             TypedExprKind::Error => {
                 self.ins().unreachable();
             }
+        }
+    }
+
+    /// Turn the value on the stack into `n` payload slots, all `i32`.
+    ///
+    /// A uniform slot type is what lets one layout serve every variant, and
+    /// reinterpreting an f32 is one instruction that changes no bits. Returns
+    /// how many slots it took.
+    fn pack(&mut self, ty: Type) -> usize {
+        match ty {
+            Type::F32 => {
+                self.ins().i32_reinterpret_f32();
+                1
+            }
+            // Two f32s, and only the top of the stack can be reinterpreted, so
+            // the lower one is parked to reach it.
+            Type::Vec2 => {
+                let tmp = self.scratch().f32s[0];
+                self.ins().local_set(tmp);
+                self.ins().i32_reinterpret_f32();
+                self.ins().local_get(tmp).i32_reinterpret_f32();
+                2
+            }
+            Type::Unit | Type::Error => 0,
+            // int, bool, String and a nested enum are already i32 slots.
+            _ => val_types(ty, self.enums).len(),
+        }
+    }
+
+    /// The reverse: `n` i32 slots back into a value of `ty`.
+    fn unpack(&mut self, ty: Type) {
+        match ty {
+            Type::F32 => {
+                self.ins().f32_reinterpret_i32();
+            }
+            Type::Vec2 => {
+                let tmp = self.scratch().i32s[0];
+                self.ins().local_set(tmp);
+                self.ins().f32_reinterpret_i32();
+                self.ins().local_get(tmp).f32_reinterpret_i32();
+            }
+            _ => {}
+        }
+    }
+
+    /// `match`: park the whole value, then a chain of tag comparisons.
+    ///
+    /// Exhaustiveness is already checked, so the last arm needs no test - there
+    /// is no path where none matches, and emitting one would be an unreachable
+    /// branch the validator then wants a value from.
+    fn match_expr(&mut self, scrutinee: &TypedExpr, enum_index: u32, arms: &[TypedArm]) {
+        let width = 1 + self.enums[enum_index as usize].payload_slots;
+        let frame = self.enter_frame();
+        // The value's slots go into locals reserved after the frame's own, so a
+        // nested match cannot overwrite an outer one's scrutinee.
+        let base = frame.enum_base;
+        self.expr(scrutinee);
+        for slot in (0..width).rev() {
+            self.ins().local_set(base + slot as u32);
+        }
+
+        let result_ty = arms[0].body.ty;
+        let result_width = val_types(result_ty, self.enums).len() as u32;
+        let result_base = frame.result_base;
+        self.emit_arms(base, result_base, enum_index, arms, 0);
+        for slot in 0..result_width {
+            self.ins().local_get(result_base + slot);
+        }
+        self.unpack(result_ty);
+        self.leave_frame();
+    }
+
+    /// The tag chain, one `if` per arm bar the last.
+    fn emit_arms(
+        &mut self,
+        base: u32,
+        result_base: u32,
+        enum_index: u32,
+        arms: &[TypedArm],
+        at: usize,
+    ) {
+        let last = at + 1 == arms.len();
+        if !last {
+            self.ins().local_get(base).i32_const(at as i32).i32_eq();
+            self.ins().if_(BlockType::Empty);
+        }
+        self.unpack_bindings(base, enum_index, at, &arms[at]);
+        self.expr(&arms[at].body);
+        // Through the same packing the payload uses, so the result region is
+        // one uniform block of i32 slots whatever the arms produce.
+        let width = self.pack(arms[at].body.ty) as u32;
+        for slot in (0..width).rev() {
+            self.ins().local_set(result_base + slot);
+        }
+        if !last {
+            self.ins().else_();
+            self.emit_arms(base, result_base, enum_index, arms, at + 1);
+            self.ins().end();
+        }
+    }
+
+    /// Copy this variant's payload slots into the locals its pattern named.
+    fn unpack_bindings(&mut self, base: u32, enum_index: u32, variant: usize, arm: &TypedArm) {
+        let payload = self.enums[enum_index as usize].variants[variant]
+            .payload
+            .clone();
+        let mut at = 1u32;
+        for (slot, ty) in arm.bindings.iter().zip(&payload) {
+            let width = val_types(*ty, self.enums).len() as u32;
+            for offset in 0..width {
+                self.ins().local_get(base + at + offset);
+            }
+            self.unpack(*ty);
+            self.store_slot(*slot);
+            at += width;
         }
     }
 

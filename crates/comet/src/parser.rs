@@ -131,6 +131,11 @@ impl Parser {
             // Annotations attach to whatever declaration follows them.
             let annotations = self.annotations();
             match self.peek() {
+                TokenKind::Enum => {
+                    if let Some(e) = self.enum_decl() {
+                        script.enums.push(e);
+                    }
+                }
                 TokenKind::Func => {
                     if let Some(f) = self.function() {
                         script.functions.push(f);
@@ -161,6 +166,97 @@ impl Parser {
             )
         {
             self.advance();
+        }
+    }
+
+    /// `enum Name { A, B(f32), C(Vec2, f32) }`.
+    fn enum_decl(&mut self) -> Option<EnumDecl> {
+        let start = self.peek_span();
+        self.advance(); // `enum`
+        let (name, name_span) = self.ident("an enum name");
+        if !self.expect(&TokenKind::LBrace, "`{` after an enum name") {
+            self.recover_to_top_level();
+            return None;
+        }
+        let mut variants = Vec::new();
+        while !self.at_end() && !matches!(self.peek(), TokenKind::RBrace) {
+            let v_start = self.peek_span();
+            let (v_name, v_name_span) = self.ident("a variant name");
+            let mut payload = Vec::new();
+            if self.eat(&TokenKind::LParen) {
+                while !self.at_end() && !matches!(self.peek(), TokenKind::RParen) {
+                    payload.push(self.type_name());
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen, "`)` after a variant's payload");
+            }
+            let v_end = self.peek_span();
+            variants.push(VariantDecl {
+                name: v_name,
+                name_span: v_name_span,
+                payload,
+                span: v_start.to(v_end),
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self.peek_span();
+        self.expect(&TokenKind::RBrace, "`}` after an enum's variants");
+        Some(EnumDecl {
+            name,
+            name_span,
+            variants,
+            span: start.to(end),
+        })
+    }
+
+    /// `match x { Idle => a, Wall(w) => b }`.
+    ///
+    /// A pattern names the variant without its enum: the scrutinee's type
+    /// already says which enum it is, and repeating it on every arm is noise a
+    /// beginner has to read past.
+    fn match_expr(&mut self) -> Expr {
+        let start = self.peek_span();
+        self.advance(); // `match`
+        let scrutinee = self.expr();
+        self.expect(&TokenKind::LBrace, "`{` after a `match` subject");
+        let mut arms = Vec::new();
+        while !self.at_end() && !matches!(self.peek(), TokenKind::RBrace) {
+            let arm_start = self.peek_span();
+            let (variant, variant_span) = self.ident("a variant name");
+            let mut bindings = Vec::new();
+            if self.eat(&TokenKind::LParen) {
+                while !self.at_end() && !matches!(self.peek(), TokenKind::RParen) {
+                    bindings.push(self.ident("a name for the value this variant carries"));
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen, "`)` after a pattern's names");
+            }
+            self.expect(&TokenKind::FatArrow, "`=>` after a pattern");
+            let body = self.expr();
+            let arm_end = self.peek_span();
+            arms.push(MatchArm {
+                variant,
+                variant_span,
+                bindings,
+                body,
+                span: arm_start.to(arm_end),
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self.peek_span();
+        self.expect(&TokenKind::RBrace, "`}` after a `match`'s arms");
+        Expr::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+            span: start.to(end),
         }
     }
 
@@ -536,6 +632,7 @@ impl Parser {
     fn primary(&mut self) -> Expr {
         let span = self.peek_span();
         match self.peek().clone() {
+            TokenKind::Match => self.match_expr(),
             TokenKind::Int(value) => {
                 self.advance();
                 Expr::Int { value, span }
@@ -558,6 +655,30 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
+                // `State::Idle`, or `Hit::Wall(3.0)`.
+                if self.eat(&TokenKind::ColonColon) {
+                    let (variant, variant_span) = self.ident("a variant name");
+                    let mut args = Vec::new();
+                    let mut end = variant_span;
+                    if self.eat(&TokenKind::LParen) {
+                        while !self.at_end() && !matches!(self.peek(), TokenKind::RParen) {
+                            args.push(self.expr());
+                            if !self.eat(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                        end = self.peek_span();
+                        self.expect(&TokenKind::RParen, "`)` after a variant's payload");
+                    }
+                    return Expr::Variant {
+                        enum_name: name,
+                        enum_span: span,
+                        variant,
+                        variant_span,
+                        args,
+                        span: span.to(end),
+                    };
+                }
                 if self.eat(&TokenKind::LParen) {
                     let mut args = Vec::new();
                     while !self.at_end() && !matches!(self.peek(), TokenKind::RParen) {

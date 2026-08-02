@@ -25,6 +25,8 @@ pub enum TokenKind {
     While,
     For,
     In,
+    Enum,
+    Match,
     Return,
     True,
     False,
@@ -41,6 +43,10 @@ pub enum TokenKind {
     DotDot,
     Semicolon,
     Colon,
+    /// `::`, which separates an enum from one of its variants.
+    ColonColon,
+    /// `=>`, which separates a `match` pattern from its value.
+    FatArrow,
     Arrow,
 
     Plus,
@@ -273,6 +279,8 @@ impl<'src> Lexer<'src> {
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "while" => TokenKind::While,
+            "enum" => TokenKind::Enum,
+            "match" => TokenKind::Match,
             "for" => TokenKind::For,
             "in" => TokenKind::In,
             "return" => TokenKind::Return,
@@ -286,8 +294,10 @@ impl<'src> Lexer<'src> {
     fn lex_punct(&mut self, start: usize) {
         let two = self.peek_at(1);
         let (kind, len) = match (self.peek(), two) {
+            (Some(b':'), Some(b':')) => (TokenKind::ColonColon, 2),
             (Some(b'@'), _) => (TokenKind::At, 1),
             (Some(b'.'), Some(b'.')) => (TokenKind::DotDot, 2),
+            (Some(b'='), Some(b'>')) => (TokenKind::FatArrow, 2),
             (Some(b'='), Some(b'=')) => (TokenKind::EqEq, 2),
             (Some(b'!'), Some(b'=')) => (TokenKind::NotEq, 2),
             (Some(b'<'), Some(b'=')) => (TokenKind::Le, 2),
