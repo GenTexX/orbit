@@ -4,9 +4,12 @@
 // wanted, so mixing them is fine - but going the other way needs `int(x)`,
 // which truncates toward zero.
 
+// `const` is state that never changes - nothing can assign to it.
+const rounds = 5;
+
 func start() {
     let total = 0;
-    for i in 0..5 {
+    for i in 0..rounds {
         total = total + i;
     }
     print("0 + 1 + 2 + 3 + 4 = " + str(total));

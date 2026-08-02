@@ -136,6 +136,7 @@ fn classify(tokens: &[crate::lexer::Token]) -> Vec<TokenSpan> {
             | TokenKind::While
             | TokenKind::For
             | TokenKind::In
+            | TokenKind::Const
             | TokenKind::Enum
             | TokenKind::Struct
             | TokenKind::Match
@@ -496,6 +497,7 @@ fn keyword_detail(word: &str) -> &'static str {
     match word {
         "func" => "define a function",
         "let" => "bind a name; at the top level, script state",
+        "const" => "script state that never changes - nothing can assign to it",
         "if" => "run a block when a condition holds",
         "else" => "run a block when the `if` did not",
         "while" => "repeat a block while a condition holds",

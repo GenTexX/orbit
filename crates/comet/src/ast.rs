@@ -72,6 +72,9 @@ pub struct StateDecl {
     pub name_span: Span,
     /// The declared type, when written (`let speed: f32 = ...`). `None` means
     /// infer it from `init`.
+    /// Whether it was written `const` rather than `let`: a value fixed at the
+    /// declaration, which nothing may assign to afterwards.
+    pub constant: bool,
     pub ty: Option<TypeName>,
     /// The value it starts with. Optional, because an exported variable should
     /// not carry one - the inspector owns its value, and a number in the source
@@ -314,6 +317,20 @@ pub enum Expr {
     Error {
         span: Span,
     },
+}
+
+impl Stmt {
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::Let { span, .. }
+            | Stmt::Assign { span, .. }
+            | Stmt::While { span, .. }
+            | Stmt::For { span, .. }
+            | Stmt::Return { span, .. }
+            | Stmt::Expr { span, .. } => *span,
+            Stmt::If(if_stmt) => if_stmt.span,
+        }
+    }
 }
 
 impl Expr {

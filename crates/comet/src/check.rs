@@ -26,6 +26,8 @@ pub fn check(script: &ast::Script, schema: &HostSchema) -> (TypedScript, Vec<Dia
         structs: Vec::new(),
         arrays: Vec::new(),
         enums: Vec::new(),
+        constants: std::collections::HashSet::new(),
+        called: std::collections::HashSet::new(),
         instances: HashMap::new(),
         building: Vec::new(),
         schema,
@@ -60,6 +62,10 @@ struct Checker<'a> {
     /// The element type of each distinct `Array<T>` used. `Type::Array` indexes
     /// this, so two mentions of `Array<f32>` are one type.
     arrays: Vec<Type>,
+    /// State declared `const`, by name. Assigning to one is an error.
+    constants: std::collections::HashSet<String>,
+    /// Which functions something calls, by index.
+    called: std::collections::HashSet<usize>,
     /// Concrete enums, in the order they were first needed. `Type::Enum`
     /// indexes this, and it is what reaches codegen.
     enums: Vec<TypedEnum>,
@@ -1159,6 +1165,22 @@ impl Checker<'_> {
         let mut state = Vec::new();
         for decl in &script.state {
             let exported = self.annotations(decl);
+            if decl.constant {
+                if exported {
+                    self.error(
+                        decl.span,
+                        "a `const` cannot be exported - the inspector would own a value the \
+                         script says never changes",
+                    );
+                }
+                if decl.init.is_none() {
+                    self.error(
+                        decl.span,
+                        format!("`{}` is a `const`, so it needs a value", decl.name),
+                    );
+                }
+                self.constants.insert(decl.name.clone());
+            }
             let declared = decl.ty.as_ref().map(|t| self.resolve_type(t));
             let (init, ty) = match (&decl.init, declared) {
                 (Some(written), Some(declared)) => {
@@ -1247,6 +1269,26 @@ impl Checker<'_> {
             .enumerate()
             .map(|(index, f)| self.function(index, f))
             .collect();
+        // A function nothing calls, and that the engine does not look up
+        // either. Catches a rename whose callers are gone, and a typo that made
+        // a second function instead of calling the first.
+        for (index, f) in script.functions.iter().enumerate() {
+            if f.name.is_empty()
+                || self.called.contains(&index)
+                || HOOKS.iter().any(|hook| hook.name == f.name)
+            {
+                continue;
+            }
+            self.diagnostics.push(Diagnostic::warning(
+                f.name_span,
+                format!(
+                    "`{}` is never called - the engine only looks for `update`, `start` and \
+                     `on_destroy`",
+                    f.name
+                ),
+            ));
+        }
+
         // Last, because instantiation is lazy: a generic enum used only inside
         // a function body does not exist until that body has been checked.
         self.settle_holds_str();
@@ -1400,6 +1442,22 @@ impl Checker<'_> {
     /// wants, so `func f() -> Option<f32> { Option::None }` can say what it is.
     fn block_hinted(&mut self, block: &ast::Block, expected: Option<Type>) -> TypedBlock {
         self.scopes.push(HashMap::new());
+        // Anything after a `return` in the same block never runs. Reported once
+        // per block, at the first statement that cannot be reached, rather than
+        // once per dead statement.
+        if let Some(at) = block
+            .stmts
+            .iter()
+            .position(|s| matches!(s, ast::Stmt::Return { .. }))
+            && at + 1 < block.stmts.len()
+        {
+            let from = block.stmts[at + 1].span();
+            let to = block.stmts.last().expect("at least one follows").span();
+            self.diagnostics.push(Diagnostic::warning(
+                from.to(to),
+                "this cannot be reached - the `return` above always happens first",
+            ));
+        }
         let mut stmts = Vec::with_capacity(block.stmts.len());
         for stmt in &block.stmts {
             // One source statement can become several typed ones: `for` is
@@ -1782,6 +1840,13 @@ impl Checker<'_> {
         let (is_local, slot, mut ty) = if let Some(slot) = self.lookup_local(name) {
             (true, slot, self.locals[slot as usize])
         } else if let Some(&slot) = self.globals.get(name) {
+            if self.constants.contains(name) {
+                self.error(
+                    *span,
+                    format!("`{name}` is a `const`, so nothing can assign to it"),
+                );
+                return (Place::Error, Type::Error);
+            }
             (false, slot, self.global_types[slot as usize])
         } else {
             self.unresolved(*span, name);
@@ -2338,6 +2403,7 @@ impl Checker<'_> {
             }
             return (TypedExprKind::Error, Type::Error);
         };
+        self.called.insert(index);
         let signature = &self.signatures[index];
         let (params, ret) = (signature.params.clone(), signature.ret);
         self.check_args(callee, &mut args, &params, span);
@@ -3461,7 +3527,7 @@ mod tests {
 
     #[test]
     fn a_binding_nothing_reads_is_a_warning_not_an_error() {
-        let source = "func f() { let unused = 1.0; }";
+        let source = "func update(dt: f32) { let unused = 1.0; }";
         assert_eq!(
             warnings(source),
             ["`unused` is never used - prefix it with `_` if that is deliberate"]
@@ -3472,11 +3538,19 @@ mod tests {
     #[test]
     fn writing_to_a_binding_is_not_reading_it() {
         // `x = 2.0` stores; nothing has looked at what is in there.
-        assert_eq!(warnings("func f() { let x = 1.0; x = 2.0; }").len(), 1);
+        assert_eq!(
+            warnings("func update(dt: f32) { let x = 1.0; x = 2.0; }").len(),
+            1
+        );
         // `x += 1.0` reads it first, so it counts.
-        assert!(warnings("func f() { let x = 1.0; x += 1.0; }").is_empty());
+        assert!(warnings("func update(dt: f32) { let x = 1.0; x += 1.0; }").is_empty());
         // And so does reading one field of it.
-        assert!(warnings("func f() { let v = pos; let y = v.x; print(str(y)); }").is_empty());
+        assert!(
+            warnings(
+                "func update(dt: f32) { let v = transform.position; let y = v.x; print(str(y)); }"
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -3485,9 +3559,9 @@ mod tests {
         // it needs it.
         assert!(warnings("func update(dt: f32) { }").is_empty());
         // A `for` that repeats something N times need not name its counter.
-        assert!(warnings(r#"func f() { for i in 0.0..3.0 { print("x"); } }"#).is_empty());
+        assert!(warnings(r#"func update(dt: f32) { for i in 0..3 { print("x"); } }"#).is_empty());
         // And an underscore says "I know".
-        assert!(warnings("func f() { let _spare = 1.0; }").is_empty());
+        assert!(warnings("func update(dt: f32) { let _spare = 1.0; }").is_empty());
     }
 
     #[test]
@@ -3988,6 +4062,63 @@ mod tests {
         assert_eq!(
             messages("struct P { x: f32 }\nfunc f(p: P<f32>) { }"),
             ["`P` takes no type arguments"]
+        );
+    }
+
+    // --- 4.8: const, and the warnings ---
+
+    #[test]
+    fn a_const_is_state_that_nothing_can_assign_to() {
+        check_clean("const gravity = 9.8;\nfunc update(dt: f32) { print(str(gravity)); }");
+        assert_eq!(
+            messages("const gravity = 9.8;\nfunc update(dt: f32) { gravity = 1.0; }"),
+            ["`gravity` is a `const`, so nothing can assign to it"]
+        );
+        // It needs a value: there is nothing to hold constant otherwise.
+        assert_eq!(
+            messages("const gravity: f32;"),
+            ["`gravity` is a `const`, so it needs a value"]
+        );
+        // And it cannot be exported - the inspector would own a value the
+        // script says never changes.
+        assert!(
+            messages("@export const gravity = 9.8;")
+                .iter()
+                .any(|m| m.contains("cannot be exported"))
+        );
+    }
+
+    #[test]
+    fn code_after_a_return_is_a_warning() {
+        assert_eq!(
+            warnings("func update(dt: f32) { return; print(\"never\"); }"),
+            ["this cannot be reached - the `return` above always happens first"]
+        );
+        // One warning per block, not one per dead statement.
+        assert_eq!(
+            warnings("func update(dt: f32) { return; print(\"a\"); print(\"b\"); }").len(),
+            1
+        );
+        // And a `return` at the end of a block is the ordinary case.
+        check_clean("func update(dt: f32) { if dt > 0.0 { return; } print(\"fine\"); }");
+    }
+
+    #[test]
+    fn a_function_nothing_calls_is_a_warning_unless_the_engine_calls_it() {
+        assert_eq!(
+            warnings("func helper(a: f32) -> f32 { a }\nfunc update(dt: f32) { }"),
+            [
+                "`helper` is never called - the engine only looks for `update`, `start` and `on_destroy`"
+            ]
+        );
+        // The three the engine looks up are called by it, not by the script.
+        assert!(
+            warnings("func update(dt: f32) { }\nfunc start() { }\nfunc on_destroy() { }")
+                .is_empty()
+        );
+        // And one that is called is fine wherever the call is.
+        check_clean(
+            "func update(dt: f32) { print(str(helper(dt))); }\nfunc helper(a: f32) -> f32 { a }",
         );
     }
 }

@@ -424,7 +424,7 @@ half-built.
 
 ---
 
-## 4.8 - The small remainder
+## 4.8 - The small remainder (DONE)
 
 **Builds.** Tuples and multiple return values (WASM multi-value makes this
 nearly free and it removes the need for out-parameters). `const` declarations,
@@ -439,6 +439,27 @@ emitting.
 **Risk.** Low, each independently shippable.
 
 **ADR.** Only if the annotations question goes the other way.
+
+**Done.** Philip's answers: annotations stay mandatory, and the warnings are
+unreachable-after-return and never-called - not shadowing, which the language now
+does legitimately in match arms and loop bodies and which would teach people to
+ignore warnings.
+
+- **`const`** is state nothing can assign to. It needs a value, since there is
+  otherwise nothing to hold constant, and it cannot be `@export`ed - the
+  inspector would own a value the script says never changes.
+- **Required annotations stay**, recorded as a decision rather than left as an
+  accident of implementation: they keep the checker one pass, they make a
+  signature readable without reading the body, and being told the types is the
+  point in a language meant to be learned from.
+- **Tuples and multiple return values are deliberately not built.** Structs
+  arrived in 4.6a and cover the need - `func f() -> Pair` returns two things
+  without an out-parameter - so tuples would be sugar for a problem the language
+  no longer has. The plan listed them when structs did not exist yet.
+
+Adding the never-called warning made six existing test fixtures noisy, because
+they used `func f()` for things that were about something else. That is the
+warning working, and the fixtures now say `update`.
 
 ---
 

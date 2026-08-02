@@ -20,6 +20,7 @@ pub enum TokenKind {
 
     Func,
     Let,
+    Const,
     If,
     Else,
     While,
@@ -279,6 +280,7 @@ impl<'src> Lexer<'src> {
         let kind = match text {
             "func" => TokenKind::Func,
             "let" => TokenKind::Let,
+            "const" => TokenKind::Const,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "while" => TokenKind::While,

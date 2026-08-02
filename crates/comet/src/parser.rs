@@ -184,7 +184,7 @@ impl Parser {
                         script.functions.push(f);
                     }
                 }
-                TokenKind::Let => {
+                TokenKind::Let | TokenKind::Const => {
                     if let Some(s) = self.state_decl(annotations) {
                         script.state.push(s);
                     }
@@ -385,7 +385,8 @@ impl Parser {
         let start = annotations
             .first()
             .map_or_else(|| self.peek_span(), |a| a.span);
-        self.advance(); // `let`
+        let constant = matches!(self.peek(), TokenKind::Const);
+        self.advance(); // `let` or `const`
         let (name, name_span) = self.ident("a variable name");
         let ty = self.eat(&TokenKind::Colon).then(|| self.type_name());
         // The initializer is optional, which is what lets an exported variable
@@ -396,6 +397,7 @@ impl Parser {
         self.expect(&TokenKind::Semicolon, "`;` after a `let` declaration");
         Some(StateDecl {
             annotations,
+            constant,
             name,
             name_span,
             ty,

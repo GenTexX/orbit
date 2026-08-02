@@ -1003,7 +1003,7 @@ fn a_warning_does_not_stop_a_script_running() {
     assert_eq!(script.printed(), ["ran"]);
 
     let (_, diagnostics) = comet::check(
-        &comet::parse("func f() { let x = 1.0; }").0,
+        &comet::parse("func update(dt: f32) { let x = 1.0; }").0,
         &comet::example_schema(),
     );
     assert_eq!(diagnostics.len(), 1);
