@@ -46,7 +46,40 @@ pub use ast::{
     TypeName, UnaryOp,
 };
 pub use check::check;
-pub use codegen::{HOST_MODULE, emit, format_f32, write_str};
+pub use codegen::{HOST_MODULE, emit, exported_globals, format_f32, write_str};
+
+/// One `@export`ed variable: what the inspector shows, and which globals hold
+/// it in a compiled module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exported {
+    pub name: String,
+    pub ty: Type,
+    /// The module's export names for the globals behind it - one for a scalar,
+    /// two for a `Vec2`.
+    pub globals: Vec<String>,
+}
+
+/// The variables `source` marks `@export`, in declaration order.
+///
+/// The engine needs this to know what to store on the component and what to
+/// write back into a running module; the editor needs the same list to draw the
+/// fields. Both ask rather than each working it out, so there is one answer.
+/// A source that does not compile still yields what it managed to declare -
+/// the inspector should not empty itself while a line is half-typed.
+pub fn exports(source: &str, schema: &HostSchema) -> Vec<Exported> {
+    let (script, _) = parse(source);
+    let (typed, _) = check(&script, schema);
+    typed
+        .state
+        .iter()
+        .filter(|state| state.exported && !state.ty.is_error())
+        .map(|state| Exported {
+            name: state.name.clone(),
+            ty: state.ty,
+            globals: codegen::exported_globals(&state.name, state.ty),
+        })
+        .collect()
+}
 pub use diagnostic::{Diagnostic, Severity};
 pub use lexer::{Token, TokenKind, lex, lex_with_comments};
 pub use parser::parse;

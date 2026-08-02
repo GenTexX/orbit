@@ -32,8 +32,9 @@ use std::path::{Path, PathBuf};
 
 use glam::Vec2;
 use thiserror::Error;
-use wasmtime::{Caller, Engine, Extern, Linker, Module, Store, TypedFunc};
+use wasmtime::{Caller, Engine, Extern, Instance, Linker, Module, Store, TypedFunc, Val};
 
+use crate::reflect::Value;
 use crate::scene::{NodeId, Scene};
 use crate::transform::Transform;
 
@@ -163,8 +164,22 @@ impl ScriptHost {
         scene: &mut Scene,
         node: NodeId,
     ) -> Result<ScriptInstance, ScriptError> {
+        self.instantiate_with(source, scene, node, &[])
+    }
+
+    /// The same, with the component's stored values for the script's
+    /// `@export`ed variables. Those are written in after instantiation and
+    /// before `start`, because the inspector owns them and the initializer in
+    /// the source is only the default (ADR 0022).
+    pub fn instantiate_with(
+        &mut self,
+        source: &str,
+        scene: &mut Scene,
+        node: NodeId,
+        exports: &[(String, Value)],
+    ) -> Result<ScriptInstance, ScriptError> {
         let module = self.compile(source)?;
-        self.start(&module, scene, node)
+        self.start(&module, scene, node, exports)
     }
 
     /// The same, reading the source from `path`. A path compiled before reuses
@@ -175,6 +190,7 @@ impl ScriptHost {
         path: &Path,
         scene: &mut Scene,
         node: NodeId,
+        exports: &[(String, Value)],
     ) -> Result<ScriptInstance, ScriptError> {
         if !self.modules.contains_key(path) {
             let source = std::fs::read_to_string(path).map_err(|source| ScriptError::Io {
@@ -185,7 +201,7 @@ impl ScriptHost {
             self.modules.insert(path.to_path_buf(), module);
         }
         let module = self.modules[path].clone();
-        let mut instance = self.start(&module, scene, node)?;
+        let mut instance = self.start(&module, scene, node, exports)?;
         instance.set_label(path.display().to_string());
         Ok(instance)
     }
@@ -206,6 +222,7 @@ impl ScriptHost {
         module: &Module,
         scene: &mut Scene,
         node: NodeId,
+        exports: &[(String, Value)],
     ) -> Result<ScriptInstance, ScriptError> {
         let mut store = Store::new(
             &self.engine,
@@ -220,6 +237,11 @@ impl ScriptHost {
             .linker
             .instantiate(&mut store, module)
             .map_err(ScriptError::runtime)?;
+        // The inspector's stored values go in before anything runs. The
+        // script's own initializer has already evaluated during instantiation
+        // and is only the default; the stored value is what wins (ADR 0022),
+        // and `start` below must see it.
+        apply_exports(&mut store, &instance, exports);
         let update = instance.get_typed_func::<f32, ()>(&mut store, UPDATE).ok();
         let on_destroy = instance
             .get_typed_func::<(), ()>(&mut store, ON_DESTROY)
@@ -337,6 +359,35 @@ impl ScriptInstance {
 struct ScriptState {
     transform: Transform,
     printed: Vec<String>,
+}
+
+/// Write the component's stored values into the module's exported globals.
+///
+/// A value that does not line up - the script no longer exports that name, or
+/// exports it at another type - is skipped rather than forced. The component is
+/// reconciled against the script separately; this is the last line of defence
+/// for a module and a component that disagree, and dropping a value is better
+/// than writing a float into a bool.
+fn apply_exports(store: &mut Store<ScriptState>, instance: &Instance, exports: &[(String, Value)]) {
+    for (name, value) in exports {
+        let globals = match value {
+            Value::Vec2(_) => comet::exported_globals(name, comet::Type::Vec2),
+            Value::F32(_) => comet::exported_globals(name, comet::Type::F32),
+            Value::Bool(_) => comet::exported_globals(name, comet::Type::Bool),
+            _ => continue,
+        };
+        let wasm: Vec<Val> = match value {
+            Value::F32(v) => vec![Val::F32(v.to_bits())],
+            Value::Bool(v) => vec![Val::I32(i32::from(*v))],
+            Value::Vec2(v) => vec![Val::F32(v.x.to_bits()), Val::F32(v.y.to_bits())],
+            _ => continue,
+        };
+        for (name, value) in globals.iter().zip(wasm) {
+            if let Some(global) = instance.get_global(&mut *store, name) {
+                let _ = global.set(&mut *store, value);
+            }
+        }
+    }
 }
 
 /// Which property a schema id refers to. The order here is what fixes the ids,
@@ -590,6 +641,7 @@ fn read_string(caller: &mut Caller<'_, ScriptState>, ptr: i32, len: i32) -> Stri
 mod tests {
     use super::*;
     use crate::component::{Component, ScriptComponent};
+    use crate::reflect::Reflect;
     use crate::scene::Node;
     use crate::transform::Transform;
 
@@ -614,6 +666,7 @@ mod tests {
         node.transform = Transform::from_translation(at);
         node.components.push(Component::Script(ScriptComponent {
             source: "scripts/bounce.cmt".into(),
+            ..Default::default()
         }));
         let node = scene.add_child(root, node);
         (scene, node)
@@ -891,7 +944,7 @@ mod tests {
         let mut host = ScriptHost::new().unwrap();
         let (mut scene, node) = scene_with_node(Vec2::ZERO);
         let err = host
-            .instantiate_file(Path::new("/nowhere/missing.cmt"), &mut scene, node)
+            .instantiate_file(Path::new("/nowhere/missing.cmt"), &mut scene, node, &[])
             .expect_err("no such file");
         assert!(matches!(err, ScriptError::Io { .. }));
         assert!(err.to_string().contains("missing.cmt"));
@@ -911,14 +964,14 @@ mod tests {
         let a = scene.add_child(root, Node::new("a"));
         let b = scene.add_child(root, Node::new("b"));
 
-        let mut script_a = host.instantiate_file(&path, &mut scene, a).unwrap();
-        let mut script_b = host.instantiate_file(&path, &mut scene, b).unwrap();
+        let mut script_a = host.instantiate_file(&path, &mut scene, a, &[]).unwrap();
+        let mut script_b = host.instantiate_file(&path, &mut scene, b, &[]).unwrap();
 
         // Deleting the file after the first read proves the second instance came
         // from the cache rather than reading it again.
         std::fs::remove_file(&path).unwrap();
         let mut script_c = host
-            .instantiate_file(&path, &mut scene, a)
+            .instantiate_file(&path, &mut scene, a, &[])
             .expect("the module was cached");
 
         // Each instance keeps its own state: stepping one does not move another.
@@ -932,7 +985,7 @@ mod tests {
         script_c.update(&mut scene, a, 0.0).unwrap();
         host.forget(&path);
         assert!(matches!(
-            host.instantiate_file(&path, &mut scene, a),
+            host.instantiate_file(&path, &mut scene, a, &[]),
             Err(ScriptError::Io { .. })
         ));
     }
@@ -1098,5 +1151,156 @@ mod tests {
             "{:?}",
             diagnostics[0].message
         );
+    }
+
+    // --- exported variables ---
+
+    const TUNABLE: &str = "
+        @export let speed: f32;
+        func update(dt: f32) {
+            transform.position.x += speed * dt;
+        }
+    ";
+
+    #[test]
+    fn two_nodes_run_one_script_at_different_speeds() {
+        // The whole point of decision 12, and the thing M5's hot-reload promise
+        // is measured against: without this, a script has no per-instance
+        // state for reloading to preserve.
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, fast) = scene_with_node(Vec2::ZERO);
+        let slow = scene.add_child(scene.root(), Node::new("slow"));
+
+        let mut a = host
+            .instantiate_with(
+                TUNABLE,
+                &mut scene,
+                fast,
+                &[("speed".into(), Value::F32(100.0))],
+            )
+            .expect("it compiles");
+        let mut b = host
+            .instantiate_with(
+                TUNABLE,
+                &mut scene,
+                slow,
+                &[("speed".into(), Value::F32(10.0))],
+            )
+            .expect("it compiles");
+
+        a.update(&mut scene, fast, 1.0).expect("one frame");
+        b.update(&mut scene, slow, 1.0).expect("one frame");
+        assert_eq!(position(&scene, fast).x, 100.0);
+        assert_eq!(position(&scene, slow).x, 10.0);
+    }
+
+    #[test]
+    fn the_stored_value_beats_the_one_written_in_the_script() {
+        // The initializer is the default used when the field is first created
+        // or explicitly reverted. Anything stored wins.
+        let source = "
+            @export let speed: f32 = 999.0;
+            func update(dt: f32) { transform.position.x += speed * dt; }
+        ";
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate_with(
+                source,
+                &mut scene,
+                node,
+                &[("speed".into(), Value::F32(2.0))],
+            )
+            .expect("it compiles despite the warning");
+        script.update(&mut scene, node, 1.0).expect("one frame");
+        assert_eq!(position(&scene, node).x, 2.0);
+    }
+
+    #[test]
+    fn start_sees_the_stored_value_rather_than_the_default() {
+        // Ordering: instantiate, write the stored values, then call `start`.
+        // A `start` that read the default would be reading a value nobody set.
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        host.instantiate_with(
+            "
+            @export let offset: Vec2;
+            func start() { transform.position = offset; }
+            func update(dt: f32) { }
+            ",
+            &mut scene,
+            node,
+            &[("offset".into(), Value::Vec2(Vec2::new(3.0, 4.0)))],
+        )
+        .expect("it compiles");
+        assert_eq!(position(&scene, node), Vec2::new(3.0, 4.0));
+    }
+
+    #[test]
+    fn a_stored_value_the_script_no_longer_declares_is_dropped() {
+        // The component and the module can disagree while a source is being
+        // edited. Skipping is better than writing a value into the wrong place.
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate_with(
+                TUNABLE,
+                &mut scene,
+                node,
+                &[
+                    ("speed".into(), Value::F32(5.0)),
+                    ("gone".into(), Value::F32(1.0)),
+                    ("speed".into(), Value::Bool(true)),
+                ],
+            )
+            .expect("it compiles");
+        script.update(&mut scene, node, 1.0).expect("one frame");
+        assert_eq!(position(&scene, node).x, 5.0, "the good one still applied");
+    }
+
+    #[test]
+    fn reconcile_keeps_tuning_across_an_edit_to_the_source() {
+        // What ADR 0008's field migration means for a script: a name that is
+        // still declared at the same type keeps its value, one that is gone
+        // goes, and a new one arrives at its default.
+        let mut component = ScriptComponent {
+            source: "s.cmt".into(),
+            exports: vec![
+                ("speed".into(), Value::F32(120.0)),
+                ("removed".into(), Value::F32(1.0)),
+                ("retyped".into(), Value::F32(2.0)),
+            ],
+        };
+        component.reconcile(&[
+            ("speed".into(), Value::F32(0.0)),
+            ("retyped".into(), Value::Bool(false)),
+            ("added".into(), Value::F32(7.0)),
+        ]);
+        assert_eq!(
+            component.exports,
+            vec![
+                ("speed".into(), Value::F32(120.0)),
+                ("retyped".into(), Value::Bool(false)),
+                ("added".into(), Value::F32(7.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_exported_variable_becomes_an_inspector_field_without_anyone_being_told() {
+        // The inspector and the serializer both walk field_names(), so this is
+        // what makes decision 3 load-bearing rather than merely tidy.
+        let component = ScriptComponent {
+            source: "s.cmt".into(),
+            exports: vec![("speed".into(), Value::F32(120.0))],
+        };
+        assert_eq!(component.field_names(), vec!["source", "speed"]);
+        assert_eq!(component.get("speed"), Some(Value::F32(120.0)));
+
+        let mut component = component;
+        assert!(component.set("speed", Value::F32(5.0)));
+        assert_eq!(component.get("speed"), Some(Value::F32(5.0)));
+        // A stale value of the wrong type is refused rather than written.
+        assert!(!component.set("speed", Value::Bool(true)));
     }
 }

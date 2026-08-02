@@ -90,7 +90,13 @@ pub struct TypedState {
     pub name: String,
     pub ty: Type,
     pub slot: u32,
+    /// Always present, even when the source wrote none: the checker fills in
+    /// the type's default, so codegen never learns that an initializer can be
+    /// left out.
     pub init: TypedExpr,
+    /// Whether `@export` marked it inspector-editable, in which case the stored
+    /// value the host writes after instantiation is what actually wins.
+    pub exported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

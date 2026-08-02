@@ -47,6 +47,7 @@ pub fn open_or_create(dir: &Path) -> Result<Project> {
     }));
     sprite.components.push(Component::Script(ScriptComponent {
         source: "scripts/bounce.cmt".to_string(),
+        ..Default::default()
     }));
     scene.add_child(root, sprite);
 

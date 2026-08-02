@@ -1288,3 +1288,29 @@ fn a_for_loop_counts_in_whole_numbers() {
     script.update(0.0);
     assert_eq!(script.printed(), ["10"]);
 }
+
+#[test]
+fn an_exported_variable_reaches_the_module_as_a_writable_global() {
+    // The host writes the inspector's stored value in after instantiation, so
+    // the global has to be exported and mutable. Without the export there is
+    // nothing to write to and the value silently stays at its default.
+    let source = "@export let speed: f32; @export let home: Vec2;\nfunc update(dt: f32) { }";
+    let bytes = comet::compile(source, &comet::example_schema()).expect("compiles");
+    assert!(
+        wasmparser::validate(&bytes).is_ok(),
+        "the module must validate"
+    );
+
+    let listed = comet::exports(source, &comet::example_schema());
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].globals, ["state.speed"]);
+    assert_eq!(listed[1].globals, ["state.home.x", "state.home.y"]);
+}
+
+#[test]
+fn a_variable_without_export_is_not_offered_to_the_inspector() {
+    let source = "let internal = 1.0;\n@export let tuned: f32;\nfunc update(dt: f32) { }";
+    let listed = comet::exports(source, &comet::example_schema());
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "tuned");
+}

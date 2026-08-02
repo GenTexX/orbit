@@ -177,7 +177,7 @@ carry, and containers are what will make `min`/`max` on ints actually hurt.
 
 ---
 
-## 4.4 - Exported variables
+## 4.4 - Exported variables (DONE)
 
 **Builds.** Decision 11: an `@` token and an annotation grammar that generalizes
 to arguments, then `@export`. Decision 14's grammar change: `StateDecl.init`
@@ -209,6 +209,26 @@ correctness, which sets a precedent worth being deliberate about.
 **Proven by.** Two nodes running one script at different speeds. That is the
 thing decision 12 exists for, and it is exactly what M5's hot-reload promise is
 measured against.
+
+**Done** as ADR 0022, including decision 3, which came here from 4.2 as planned.
+
+The sequencing bet paid: with no user-defined enums yet, every type had an
+obvious default, so decision 14 shipped without the open question ever needing
+an answer. It is now the enum iteration's to take, with that work in front of
+it.
+
+The cost landed somewhere the plan did not name. Decision 3 was scoped as "touches
+every `Reflect` impl", and it does - but the expensive part was the *inspector*,
+which assumed `'static` field names all the way down: `FieldRef`, `ColorTarget`,
+`AssetTarget` and four row vectors all held `&'static str` and were `Copy`. That
+assumption is precisely what a dynamic field list breaks, and unpicking it was
+most of the iteration. Worth knowing before 4.7 adds more annotations to the
+same plumbing.
+
+One thing deliberately not built: reading exported values back out of a running
+module. The write half has a user now; the read half does not until Play exists,
+so it was deleted rather than left dead - the same call made about decision 3 in
+4.2.
 
 ---
 

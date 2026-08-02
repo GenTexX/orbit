@@ -87,6 +87,66 @@ impl Checker<'_> {
         );
     }
 
+    /// Check a declaration's annotations, returning whether it is exported.
+    ///
+    /// Only `@export` exists in v1. The others - `@range`, `@tooltip` and the
+    /// rest - are a decision that has not been taken, so an unknown one is
+    /// reported rather than ignored: a typo that silently does nothing is the
+    /// wrong failure mode for a language meant to be learned from, and is the
+    /// reason annotations are grammar rather than a doc-comment convention.
+    fn annotations(&mut self, decl: &ast::StateDecl) -> bool {
+        let mut exported = false;
+        for annotation in &decl.annotations {
+            if annotation.name != "export" {
+                let message = match nearest(&annotation.name, ["export"].into_iter()) {
+                    Some(suggestion) => format!(
+                        "unknown annotation `@{}` - did you mean `@{suggestion}`?",
+                        annotation.name
+                    ),
+                    None => format!("unknown annotation `@{}`", annotation.name),
+                };
+                self.error(annotation.name_span, message);
+                continue;
+            }
+            if !annotation.args.is_empty() {
+                self.error(annotation.span, "`@export` takes no arguments");
+            }
+            if exported {
+                self.error(annotation.span, "`@export` is already on this declaration");
+            }
+            exported = true;
+        }
+        exported
+    }
+
+    /// The value a declaration with no initializer starts with.
+    ///
+    /// Every type in the language has an obvious answer, which is what makes an
+    /// initializer optional at all. A user-defined enum would not, and that is
+    /// exactly why `@export` is being built before enums exist.
+    fn default_value(&mut self, ty: Type, span: Span) -> TypedExpr {
+        let kind = match ty {
+            Type::F32 => TypedExprKind::Number(0.0),
+            Type::Int => TypedExprKind::Int(0),
+            Type::Bool => TypedExprKind::Bool(false),
+            Type::Vec2 => TypedExprKind::MakeVec2 {
+                x: Box::new(TypedExpr {
+                    kind: TypedExprKind::Number(0.0),
+                    ty: Type::F32,
+                    span,
+                }),
+                y: Box::new(TypedExpr {
+                    kind: TypedExprKind::Number(0.0),
+                    ty: Type::F32,
+                    span,
+                }),
+            },
+            Type::Str => TypedExprKind::Str(String::new()),
+            Type::Unit | Type::Error => TypedExprKind::Error,
+        };
+        TypedExpr { kind, ty, span }
+    }
+
     /// Make `expr` fit `want`, widening an `int` where an `f32` is asked for,
     /// and reporting a mismatch otherwise.
     ///
@@ -208,15 +268,63 @@ impl Checker<'_> {
         // graph.
         let mut state = Vec::new();
         for decl in &script.state {
-            let mut init = self.expr(&decl.init);
+            let exported = self.annotations(decl);
             let declared = decl.ty.as_ref().map(|t| self.resolve_type(t));
-            let ty = match declared {
-                Some(declared) => {
-                    init = self.coerce(init, declared);
-                    declared
+            let (init, ty) = match (&decl.init, declared) {
+                (Some(written), Some(declared)) => {
+                    let init = self.expr(written);
+                    (self.coerce(init, declared), declared)
                 }
-                None => init.ty,
+                (Some(written), None) => {
+                    let init = self.expr(written);
+                    let ty = init.ty;
+                    (init, ty)
+                }
+                // No initializer: the type's default. This is what an exported
+                // variable should look like - the inspector owns the value, so
+                // a number in the source would be a second answer to the same
+                // question, and the one a reader sees first is the one that
+                // loses.
+                (None, Some(declared)) => (self.default_value(declared, decl.span), declared),
+                (None, None) => {
+                    self.error(
+                        decl.span,
+                        format!(
+                            "`{}` needs a type or a value - with neither there is nothing to \
+                             work out what it holds",
+                            decl.name
+                        ),
+                    );
+                    (
+                        TypedExpr {
+                            kind: TypedExprKind::Error,
+                            ty: Type::Error,
+                            span: decl.span,
+                        },
+                        Type::Error,
+                    )
+                }
             };
+            if exported && decl.init.is_some() {
+                self.diagnostics.push(Diagnostic::warning(
+                    decl.span,
+                    format!(
+                        "`{}` is exported, so the inspector owns its value - what is written \
+                         here is only the default and is not what runs",
+                        decl.name
+                    ),
+                ));
+            }
+            if exported && !is_exportable(ty) && !ty.is_error() {
+                self.error(
+                    decl.span,
+                    format!(
+                        "a `{}` cannot be exported yet - only f32, int, bool and Vec2 can be \
+                         stored on the component",
+                        ty.name()
+                    ),
+                );
+            }
             if ty == Type::Unit {
                 self.error(
                     decl.span,
@@ -236,6 +344,7 @@ impl Checker<'_> {
                 ty,
                 slot,
                 init,
+                exported,
             });
         }
 
@@ -1537,6 +1646,13 @@ fn is_numeric(ty: Type) -> bool {
     matches!(ty, Type::F32 | Type::Int)
 }
 
+/// Whether a value of this type can be stored on the component and written back
+/// into a running module. A `String` is a pointer into the module's own memory,
+/// so handing one across needs an ownership rule that is its own decision.
+fn is_exportable(ty: Type) -> bool {
+    matches!(ty, Type::F32 | Type::Int | Type::Bool | Type::Vec2)
+}
+
 fn is_reserved_name(name: &str) -> bool {
     name.starts_with("comet_") || name == "memory"
 }
@@ -2369,5 +2485,79 @@ mod tests {
         check_clean("func f() { let v = vec2(1.0, 2.0) * 2; }");
         check_clean("func f() { let v = 2 * vec2(1.0, 2.0); }");
         check_clean("func f() { let v = vec2(1.0, 2.0) / 2; }");
+    }
+
+    // --- exported variables ---
+
+    #[test]
+    fn an_exported_variable_may_carry_only_a_type() {
+        // What a well-written script looks like: the inspector owns the value,
+        // so there is no number in the source to be a second answer.
+        let typed = check_clean("@export let speed: f32;");
+        assert!(typed.state[0].exported);
+        assert_eq!(typed.state[0].ty, Type::F32);
+        // And it starts at the type's default rather than at nothing.
+        assert!(matches!(typed.state[0].init.kind, TypedExprKind::Number(v) if v == 0.0));
+    }
+
+    #[test]
+    fn every_type_that_can_be_exported_has_a_default() {
+        for (source, want) in [
+            ("@export let a: f32;", Type::F32),
+            ("@export let a: int;", Type::Int),
+            ("@export let a: bool;", Type::Bool),
+            ("@export let a: Vec2;", Type::Vec2),
+        ] {
+            let typed = check_clean(source);
+            assert_eq!(typed.state[0].ty, want);
+            assert!(!matches!(typed.state[0].init.kind, TypedExprKind::Error));
+        }
+    }
+
+    #[test]
+    fn an_exported_variable_with_an_initializer_warns_but_still_compiles() {
+        let warnings = warnings("@export let speed: f32 = 120.0;");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("the inspector owns its value"));
+        assert!(messages("@export let speed: f32 = 120.0;").is_empty());
+    }
+
+    #[test]
+    fn a_declaration_with_neither_a_type_nor_a_value_says_so() {
+        assert_eq!(
+            messages("let speed;"),
+            [
+                "`speed` needs a type or a value - with neither there is nothing to work out what it holds"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_what_can_be_stored_on_the_component_can_be_exported() {
+        // A String is a pointer into the module's own memory, so handing one
+        // across needs an ownership rule that is its own decision.
+        assert_eq!(
+            messages(r#"@export let name: String = "hi";"#)
+                .into_iter()
+                .filter(|m| m.contains("exported"))
+                .collect::<Vec<_>>(),
+            [
+                "a `String` cannot be exported yet - only f32, int, bool and Vec2 can be stored on the component"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_annotation_is_reported_rather_than_ignored() {
+        // A typo that silently does nothing is the wrong failure mode, and is
+        // the reason annotations are grammar rather than a comment convention.
+        assert_eq!(
+            messages("@exprot let speed: f32;"),
+            ["unknown annotation `@exprot` - did you mean `@export`?"]
+        );
+        assert_eq!(
+            messages("@export(1) let speed: f32;"),
+            ["`@export` takes no arguments"]
+        );
     }
 }

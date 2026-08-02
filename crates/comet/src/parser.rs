@@ -128,6 +128,8 @@ impl Parser {
     fn script(&mut self) -> Script {
         let mut script = Script::default();
         while !self.at_end() {
+            // Annotations attach to whatever declaration follows them.
+            let annotations = self.annotations();
             match self.peek() {
                 TokenKind::Func => {
                     if let Some(f) = self.function() {
@@ -135,7 +137,7 @@ impl Parser {
                     }
                 }
                 TokenKind::Let => {
-                    if let Some(s) = self.state_decl() {
+                    if let Some(s) = self.state_decl(annotations) {
                         script.state.push(s);
                     }
                 }
@@ -152,24 +154,63 @@ impl Parser {
     /// Skip forward to the next thing that can start a top-level item, so one
     /// piece of garbage costs one diagnostic rather than one per token after it.
     fn recover_to_top_level(&mut self) {
-        while !self.at_end() && !matches!(self.peek(), TokenKind::Func | TokenKind::Let) {
+        while !self.at_end()
+            && !matches!(
+                self.peek(),
+                TokenKind::Func | TokenKind::Let | TokenKind::At
+            )
+        {
             self.advance();
         }
     }
 
-    fn state_decl(&mut self) -> Option<StateDecl> {
-        let start = self.peek_span();
+    /// Any run of `@name` or `@name(a, b)` before a declaration.
+    ///
+    /// Parsed generally even though `@export` is the only one the checker knows:
+    /// the whole reason for the `@` prefix is that the ones taking arguments
+    /// need no second syntax when they arrive.
+    fn annotations(&mut self) -> Vec<Annotation> {
+        let mut found = Vec::new();
+        while matches!(self.peek(), TokenKind::At) {
+            let start = self.peek_span();
+            self.advance();
+            let (name, name_span) = self.ident("an annotation name");
+            let mut args = Vec::new();
+            if self.eat(&TokenKind::LParen) {
+                while !self.at_end() && !matches!(self.peek(), TokenKind::RParen) {
+                    args.push(self.expr());
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen, "`)` after an annotation's arguments");
+            }
+            let end = self.peek_span();
+            found.push(Annotation {
+                name,
+                name_span,
+                args,
+                span: start.to(end),
+            });
+        }
+        found
+    }
+
+    fn state_decl(&mut self, annotations: Vec<Annotation>) -> Option<StateDecl> {
+        let start = annotations
+            .first()
+            .map_or_else(|| self.peek_span(), |a| a.span);
         self.advance(); // `let`
         let (name, name_span) = self.ident("a variable name");
         let ty = self.eat(&TokenKind::Colon).then(|| self.type_name());
-        if !self.expect(&TokenKind::Eq, "`=` after a `let` declaration") {
-            self.recover_to_top_level();
-            return None;
-        }
-        let init = self.expr();
+        // The initializer is optional, which is what lets an exported variable
+        // carry only a type. Whether it may be left out at all is the checker's
+        // call, since it depends on there being a type to default from.
+        let init = self.eat(&TokenKind::Eq).then(|| self.expr());
         let end = self.peek_span();
         self.expect(&TokenKind::Semicolon, "`;` after a `let` declaration");
         Some(StateDecl {
+            annotations,
             name,
             name_span,
             ty,
@@ -718,7 +759,7 @@ mod tests {
     fn unknown_characters_are_dropped_by_the_lexer_before_the_parser_sees_them() {
         // The division of labour: junk characters are the lexer's to report, so
         // the parser is handed a clean stream and stays quiet about them.
-        let (script, diagnostics) = parse("@ @ @\nfunc update(dt: f32) { }");
+        let (script, diagnostics) = parse("# # #\nfunc update(dt: f32) { }");
         assert_eq!(
             diagnostics.len(),
             3,

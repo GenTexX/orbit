@@ -102,8 +102,8 @@ fn component_to_doc(component: &Component) -> ComponentDoc {
     let reflect = component.as_reflect();
     let fields = reflect
         .field_names()
-        .iter()
-        .filter_map(|&name| reflect.get(name).map(|v| (name.to_string(), v)))
+        .into_iter()
+        .filter_map(|name| reflect.get(&name).map(|v| (name, v)))
         .collect();
     ComponentDoc {
         kind: reflect.type_name().to_string(),
@@ -164,6 +164,7 @@ mod tests {
         player.components.push(Component::Sprite(sprite));
         player.components.push(Component::Script(ScriptComponent {
             source: "scripts/player.cmt".into(),
+            ..Default::default()
         }));
         let player = scene.add_child(root, player);
 

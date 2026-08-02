@@ -680,6 +680,7 @@ mod tests {
             node,
             Component::Script(ScriptComponent {
                 source: "scripts/bounce.cmt".into(),
+                ..Default::default()
             }),
         );
         assert_eq!(index, 1, "attached after the sprite that was already there");

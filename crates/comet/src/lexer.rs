@@ -35,6 +35,8 @@ pub enum TokenKind {
     RParen,
     Comma,
     Dot,
+    /// `@`, which starts an annotation.
+    At,
     /// `..`, which only ever appears in a `for` range.
     DotDot,
     Semicolon,
@@ -284,6 +286,7 @@ impl<'src> Lexer<'src> {
     fn lex_punct(&mut self, start: usize) {
         let two = self.peek_at(1);
         let (kind, len) = match (self.peek(), two) {
+            (Some(b'@'), _) => (TokenKind::At, 1),
             (Some(b'.'), Some(b'.')) => (TokenKind::DotDot, 2),
             (Some(b'='), Some(b'=')) => (TokenKind::EqEq, 2),
             (Some(b'!'), Some(b'=')) => (TokenKind::NotEq, 2),
@@ -471,9 +474,9 @@ mod tests {
 
     #[test]
     fn an_unknown_character_is_reported_and_skipped() {
-        let (tokens, diagnostics) = lex("let x = 1.0 @ 2.0;");
+        let (tokens, diagnostics) = lex("let x = 1.0 # 2.0;");
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains('@'));
+        assert!(diagnostics[0].message.contains('#'));
         // Lexing continued past the bad character instead of stopping.
         assert!(tokens.iter().any(|t| t.kind == TokenKind::Number(2.0)));
     }

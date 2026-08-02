@@ -231,6 +231,22 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     exports.export("comet_alloc", ExportKind::Func, F_ALLOC);
     exports.export("comet_retain", ExportKind::Func, F_RETAIN);
     exports.export("comet_release", ExportKind::Func, F_RELEASE);
+    // An exported variable's globals, so the host can write the inspector's
+    // stored value in after instantiation and read it back out. A Vec2 takes
+    // two, which is why the naming is derived rather than assumed - see
+    // `exported_globals`.
+    for state in &script.state {
+        if !state.exported {
+            continue;
+        }
+        let base = globals.base[state.slot as usize];
+        for (offset, name) in exported_globals(&state.name, state.ty)
+            .into_iter()
+            .enumerate()
+        {
+            exports.export(&name, ExportKind::Global, base + offset as u32);
+        }
+    }
     for (i, f) in script.functions.iter().enumerate() {
         exports.export(&f.name, ExportKind::Func, USER_BASE + i as u32);
     }
@@ -308,6 +324,18 @@ fn align4(value: u32) -> u32 {
 
 /// How a comet type is represented on the wasm stack. `Vec2` is two f32s - it is
 /// a value type, so it never touches the heap; `String` is a pointer.
+/// The names a module exports the globals of `name` under.
+///
+/// One for a scalar, two for a `Vec2`. The host never builds these itself: it
+/// asks, so the convention has one definition rather than two that agree until
+/// somebody changes one.
+pub fn exported_globals(name: &str, ty: Type) -> Vec<String> {
+    match ty {
+        Type::Vec2 => vec![format!("state.{name}.x"), format!("state.{name}.y")],
+        _ => vec![format!("state.{name}")],
+    }
+}
+
 fn val_types(ty: Type) -> &'static [ValType] {
     match ty {
         Type::F32 => &[ValType::F32],

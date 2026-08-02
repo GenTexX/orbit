@@ -56,11 +56,11 @@ pub enum Pending {
 }
 
 /// Which reflected component field an asset chooser writes to.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AssetTarget {
     pub node: NodeId,
     pub component: usize,
-    pub field: &'static str,
+    pub field: String,
 }
 
 /// The state behind the asset chooser: the field being set and the assets to
@@ -202,7 +202,7 @@ impl Modal {
     /// The asset chooser's target field, if this is an asset chooser.
     pub fn asset_target(&self) -> Option<AssetTarget> {
         match &self.body {
-            ModalBody::AssetChooser(c) => Some(c.target),
+            ModalBody::AssetChooser(c) => Some(c.target.clone()),
             _ => None,
         }
     }

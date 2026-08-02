@@ -167,7 +167,7 @@ impl Selection {
 
 /// An in-progress inspector label drag-scrub: adjusting one component of a
 /// Vec2 field by the horizontal cursor motion since the press.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ScrubDrag {
     field: FieldRef,
     axis: Axis,
@@ -710,6 +710,21 @@ fn completion_colors(
         // An identifier is plain in the editor, and its note is its type.
         K::Variable | K::Field => (None, Some(theme.code_type)),
     }
+}
+
+/// The value an exported variable of this type starts at, as the inspector's
+/// `Value`. `None` for a type that cannot be stored on a component - the
+/// checker refuses those, so this is the same rule seen from the other side.
+fn default_for(ty: comet::Type) -> Option<helios::Value> {
+    Some(match ty {
+        comet::Type::F32 => helios::Value::F32(0.0),
+        // The inspector has no int field yet, so an exported int is shown and
+        // stored as an f32. Narrowing back happens at the wasm boundary.
+        comet::Type::Int => helios::Value::F32(0.0),
+        comet::Type::Bool => helios::Value::Bool(false),
+        comet::Type::Vec2 => helios::Value::Vec2(Vec2::ZERO),
+        _ => return None,
+    })
 }
 
 /// Which way [`State::change_case`] is going.
@@ -1456,12 +1471,12 @@ impl State {
             .rows
             .vec_inputs
             .iter()
-            .filter(|&&(_, field, _)| {
-                matches!(field, FieldRef::Position(n) | FieldRef::Scale(n) if n == node)
+            .filter(|(_, field, _)| {
+                matches!(field, FieldRef::Position(n) | FieldRef::Scale(n) if *n == node)
             })
-            .map(|&(widget, field, axis)| {
-                let value = axis_of(field_vec2(scene, field), axis);
-                (widget, value_to_text(&Value::F32(value)))
+            .map(|(widget, field, axis)| {
+                let value = axis_of(field_vec2(scene, field), *axis);
+                (*widget, value_to_text(&Value::F32(value)))
             })
             .collect();
         let rotation = scene.node(node).transform.rotation.to_degrees();
@@ -1480,15 +1495,15 @@ impl State {
     /// Update one Vec2 field component's inspector input in place (no rebuild) -
     /// used during an inspector label drag-scrub, the same way a viewport drag
     /// updates the transform inputs.
-    fn sync_vec_input(&mut self, field: FieldRef, axis: Axis) {
+    fn sync_vec_input(&mut self, field: &FieldRef, axis: Axis) {
         let value = axis_of(field_vec2(&self.project.scene, field), axis);
         let text = value_to_text(&Value::F32(value));
         let widget = self
             .rows
             .vec_inputs
             .iter()
-            .find(|&&(_, f, a)| f == field && a == axis)
-            .map(|&(w, ..)| w);
+            .find(|(_, f, a)| f == field && *a == axis)
+            .map(|(w, ..)| *w);
         if let Some(widget) = widget {
             self.ui.set_text_input(widget, text);
         }
@@ -2109,13 +2124,7 @@ impl State {
     /// through history (one undo step). Marks dirty so the field's preview and
     /// the sprite both refresh. A no-op if the value is unchanged or the field is
     /// not an asset.
-    fn commit_asset_field(
-        &mut self,
-        node: NodeId,
-        component: usize,
-        field: &'static str,
-        path: String,
-    ) {
+    fn commit_asset_field(&mut self, node: NodeId, component: usize, field: &str, path: String) {
         let old = self
             .project
             .scene
@@ -2133,6 +2142,9 @@ impl State {
                 field,
                 Value::Asset(path),
             );
+            // A different script exports different variables, so the fields
+            // the inspector shows change with it.
+            self.reconcile_script_exports();
         }
         self.dirty = true;
     }
@@ -2141,7 +2153,7 @@ impl State {
     /// can actually hold, in a grid. Which kind comes from the component that
     /// owns the field, not from the field's name - a Script's source takes a
     /// `.cmt`, and offering it the project's textures would be a dead end.
-    fn open_asset_chooser(&mut self, node: NodeId, component: usize, field: &'static str) {
+    fn open_asset_chooser(&mut self, node: NodeId, component: usize, field: &str) {
         let kind = self.asset_kind_of(node, component);
         let assets = match kind {
             modal::AssetKind::Image => self.explorer.all_images(),
@@ -2150,7 +2162,7 @@ impl State {
         let target = modal::AssetTarget {
             node,
             component,
-            field,
+            field: field.to_string(),
         };
         self.open_modal(modal::Modal::asset_chooser(target, assets, kind));
     }
@@ -2325,15 +2337,17 @@ impl State {
     /// Returns whether it did (so the caller can consume the press).
     fn begin_scrub(&mut self) -> bool {
         let hit = self.ui.hit_test(self.cursor);
-        let Some(&(_, field, axis)) =
+        let Some((_, field, axis)) =
             hit.and_then(|id| self.rows.scrub_labels.iter().find(|(w, ..)| *w == id))
         else {
             return false;
         };
+        let (field, axis) = (field.clone(), *axis);
+        let original = field_vec2(&self.project.scene, &field);
         self.scrub = Some(ScrubDrag {
             field,
             axis,
-            original: field_vec2(&self.project.scene, field),
+            original,
             start_x: self.cursor.x,
         });
         true
@@ -2341,7 +2355,7 @@ impl State {
 
     /// The scrub sensitivity (value change per horizontal pixel) for a field:
     /// scale is fine-grained, positions and sizes move a pixel per pixel.
-    fn scrub_step(field: FieldRef) -> f32 {
+    fn scrub_step(field: &FieldRef) -> f32 {
         match field {
             FieldRef::Scale(_) => 0.01,
             _ => 1.0,
@@ -2351,16 +2365,16 @@ impl State {
     /// Apply the live scrub value for the current cursor (called on move):
     /// the pressed axis component moves by the horizontal drag since the press.
     fn apply_scrub(&mut self) {
-        let Some(scrub) = self.scrub else {
+        let Some(scrub) = self.scrub.clone() else {
             return;
         };
-        let delta = (self.cursor.x - scrub.start_x) * Self::scrub_step(scrub.field);
+        let delta = (self.cursor.x - scrub.start_x) * Self::scrub_step(&scrub.field);
         let base = crate::ui::axis_of(scrub.original, scrub.axis);
         let value = with_axis(scrub.original, scrub.axis, base + delta);
-        set_field_vec2(&mut self.project.scene, scrub.field, value);
+        set_field_vec2(&mut self.project.scene, &scrub.field, value);
         // Update the scrubbed input in place rather than rebuilding every move
         // (the scene re-renders live regardless); see sync_inspector_transform.
-        self.sync_vec_input(scrub.field, scrub.axis);
+        self.sync_vec_input(&scrub.field, scrub.axis);
     }
 
     /// Finish a scrub: rewind to the press-time value and commit the final one
@@ -2369,9 +2383,9 @@ impl State {
         let Some(scrub) = self.scrub.take() else {
             return;
         };
-        let current = field_vec2(&self.project.scene, scrub.field);
+        let current = field_vec2(&self.project.scene, &scrub.field);
         if current != scrub.original {
-            set_field_vec2(&mut self.project.scene, scrub.field, scrub.original);
+            set_field_vec2(&mut self.project.scene, &scrub.field, scrub.original);
             self.commit_field_vec2(scrub.field, current);
             self.dirty = true;
         }
@@ -2397,7 +2411,7 @@ impl State {
             }
             FieldRef::Component { node, index, field } => {
                 self.history
-                    .set_field(scene, node, index, field, Value::Vec2(v));
+                    .set_field(scene, node, index, &field, Value::Vec2(v));
             }
         }
     }
@@ -2844,7 +2858,7 @@ impl State {
         if self.modal.is_some() {
             return;
         }
-        let original = field_color(&self.project.scene, target);
+        let original = field_color(&self.project.scene, &target);
         self.picker = Some(ColorPicker {
             target,
             original,
@@ -2862,12 +2876,12 @@ impl State {
         };
         let final_rgba = picker.picker.rgba();
         if final_rgba != picker.original {
-            set_field_color(&mut self.project.scene, picker.target, picker.original);
+            set_field_color(&mut self.project.scene, &picker.target, picker.original);
             self.history.set_field(
                 &mut self.project.scene,
                 picker.target.node,
                 picker.target.index,
-                picker.target.field,
+                &picker.target.field,
                 Value::Color(final_rgba),
             );
         }
@@ -2912,8 +2926,8 @@ impl State {
         if !open.picker.drag_to(ui, &rows, cursor) {
             return;
         }
-        let (target, rgba) = (open.target, open.picker.rgba());
-        set_field_color(&mut self.project.scene, target, rgba);
+        let (target, rgba) = (open.target.clone(), open.picker.rgba());
+        set_field_color(&mut self.project.scene, &target, rgba);
         self.refresh_picker_images();
         self.dirty = true;
     }
@@ -2939,8 +2953,8 @@ impl State {
         if !picker.picker.commit_hex(text.as_str()) {
             return;
         }
-        let (target, rgba) = (picker.target, picker.picker.rgba());
-        set_field_color(&mut self.project.scene, target, rgba);
+        let (target, rgba) = (picker.target.clone(), picker.picker.rgba());
+        set_field_color(&mut self.project.scene, &target, rgba);
         self.refresh_picker_images();
         self.dirty = true;
     }
@@ -3329,7 +3343,7 @@ impl State {
         }
         if let Some((node, component, field)) = self.asset_field_at(target, modal::AssetKind::Image)
         {
-            self.commit_asset_field(node, component, field, path);
+            self.commit_asset_field(node, component, &field, path);
         }
     }
 
@@ -3341,7 +3355,7 @@ impl State {
         if let Some((node, component, field)) =
             self.asset_field_at(target, modal::AssetKind::Script)
         {
-            self.commit_asset_field(node, component, field, path);
+            self.commit_asset_field(node, component, &field, path);
             return;
         }
         // The scene tree runs its own reparent drag rather than aurora drop
@@ -3392,11 +3406,12 @@ impl State {
         &self,
         target: Option<aurora::WidgetId>,
         want: modal::AssetKind,
-    ) -> Option<(NodeId, usize, &'static str)> {
+    ) -> Option<(NodeId, usize, String)> {
         let target = target?;
-        let &(_, node, component, field) =
+        let (_, node, component, field) =
             self.rows.asset_fields.iter().find(|(w, ..)| *w == target)?;
-        (self.asset_kind_of(node, component) == want).then_some((node, component, field))
+        let (node, component) = (*node, *component);
+        (self.asset_kind_of(node, component) == want).then_some((node, component, field.clone()))
     }
 
     /// Which kind of asset a component's fields hold. Asked of the component
@@ -3561,6 +3576,9 @@ impl State {
         match Project::load(&self.project_dir) {
             Ok(project) => {
                 self.project = project;
+                // A scene saved before a script's exports changed still holds
+                // the old set; bring them into line before anything is drawn.
+                self.reconcile_script_exports();
                 self.history = History::new();
                 self.saved_revision = 0;
                 self.selection.clear();
@@ -3623,8 +3641,8 @@ impl State {
         if let Some(node) = self.selection.primary() {
             for comp in &self.project.scene.node(node).components {
                 let reflect = comp.as_reflect();
-                for &field in reflect.field_names() {
-                    if let Some(Value::Asset(rel)) = reflect.get(field)
+                for field in reflect.field_names() {
+                    if let Some(Value::Asset(rel)) = reflect.get(&field)
                         && !rel.is_empty()
                     {
                         paths.push(self.explorer.resolve_relative(&rel));
@@ -3807,6 +3825,56 @@ impl State {
         self.analyze_script();
     }
 
+    /// Bring every Script component's stored values into line with what its
+    /// source now exports: keep what is still declared at the same type, drop
+    /// what is gone, add what is new at its default.
+    ///
+    /// Called when a script's path changes and when a script is saved, rather
+    /// than watched continuously - a live file watcher is M5's, along with the
+    /// reload it would drive. Returns whether anything changed, so a caller can
+    /// decide whether the shell needs rebuilding.
+    fn reconcile_script_exports(&mut self) -> bool {
+        fn collect(
+            scene: &helios::Scene,
+            node: helios::NodeId,
+            out: &mut Vec<(helios::NodeId, usize, String)>,
+        ) {
+            for (index, component) in scene.node(node).components.iter().enumerate() {
+                if let helios::Component::Script(script) = component
+                    && !script.source.is_empty()
+                {
+                    out.push((node, index, script.source.clone()));
+                }
+            }
+            for child in scene.children(node) {
+                collect(scene, *child, out);
+            }
+        }
+        let mut sources = Vec::new();
+        collect(&self.project.scene, self.project.scene.root(), &mut sources);
+
+        let mut changed = false;
+        for (node, index, source) in sources {
+            let Ok(text) = std::fs::read_to_string(self.project_dir.join(&source)) else {
+                continue;
+            };
+            let declared: Vec<(String, helios::Value)> =
+                comet::exports(&text, helios::script_schema())
+                    .into_iter()
+                    .filter_map(|e| Some((e.name, default_for(e.ty)?)))
+                    .collect();
+            let helios::Component::Script(script) =
+                &mut self.project.scene.node_mut(node).components[index]
+            else {
+                continue;
+            };
+            let before = script.exports.clone();
+            script.reconcile(&declared);
+            changed |= script.exports != before;
+        }
+        changed
+    }
+
     /// Write the Code pane's buffer back to its file, in the encoding it came
     /// in: the line endings it had, and its byte-order mark if it had one.
     fn save_script(&mut self) {
@@ -3821,6 +3889,8 @@ impl State {
         match write_atomic(&path, body.as_bytes()) {
             Ok(()) => {
                 self.script_modified = false;
+                // The file just changed, so what it exports may have too.
+                self.reconcile_script_exports();
                 self.dirty = true;
             }
             Err(err) => self.open_modal(modal::Modal::error("Cannot save script", &err)),
@@ -6371,7 +6441,7 @@ impl State {
                         .color_swatches
                         .iter()
                         .find(|(w, _)| *w == id)
-                        .map(|(_, t)| *t)
+                        .map(|(_, t)| t.clone())
                         .expect("guarded by the match arm");
                     self.open_color_picker(target);
                 }
@@ -6383,9 +6453,9 @@ impl State {
                         .asset_browse
                         .iter()
                         .find(|(w, ..)| *w == id)
-                        .map(|&(_, n, c, f)| (n, c, f))
+                        .map(|(_, n, c, f)| (*n, *c, f.clone()))
                         .expect("guarded by the match arm");
-                    self.open_asset_chooser(node, component, field);
+                    self.open_asset_chooser(node, component, &field);
                 }
                 AuroraEvent::Clicked(id)
                     if self.rows.asset_clear.iter().any(|(w, ..)| *w == id) =>
@@ -6395,9 +6465,9 @@ impl State {
                         .asset_clear
                         .iter()
                         .find(|(w, ..)| *w == id)
-                        .map(|&(_, n, c, f)| (n, c, f))
+                        .map(|(_, n, c, f)| (*n, *c, f.clone()))
                         .expect("guarded by the match arm");
-                    self.commit_asset_field(node, component, field, String::new());
+                    self.commit_asset_field(node, component, &field, String::new());
                 }
                 AuroraEvent::Clicked(id)
                     if self.rows.asset_choices.iter().any(|(w, _)| *w == id) =>
@@ -6410,7 +6480,7 @@ impl State {
                         .map(|(_, p)| p.clone())
                         .expect("guarded by the match arm");
                     if let Some(t) = self.modal.as_ref().and_then(|m| m.asset_target()) {
-                        self.commit_asset_field(t.node, t.component, t.field, rel);
+                        self.commit_asset_field(t.node, t.component, &t.field, rel);
                     }
                     self.close_modal();
                 }
@@ -6517,16 +6587,17 @@ impl State {
     /// component and commit the whole Vec2 through the history. A no-op for
     /// other widgets or unparseable text.
     fn commit_vec_input(&mut self, id: aurora::WidgetId) {
-        let Some(&(_, field, axis)) = self.rows.vec_inputs.iter().find(|(w, ..)| *w == id) else {
+        let Some((_, field, axis)) = self.rows.vec_inputs.iter().find(|(w, ..)| *w == id) else {
             return;
         };
+        let (field, axis) = (field.clone(), *axis);
         let WidgetKind::TextInput(text) = self.ui.kind(id) else {
             return;
         };
         let Ok(parsed) = text.trim().parse::<f32>() else {
             return;
         };
-        let current = field_vec2(&self.project.scene, field);
+        let current = field_vec2(&self.project.scene, &field);
         let updated = with_axis(current, axis, parsed);
         if updated != current {
             // No shell rebuild: the field already shows the typed value and the
@@ -6585,7 +6656,7 @@ impl State {
     }
 
     fn commit_field(&mut self, id: aurora::WidgetId) {
-        let Some(&(_, node, component, field)) = self
+        let Some((_, node, component, field)) = self
             .rows
             .field_rows
             .iter()
@@ -6593,6 +6664,7 @@ impl State {
         else {
             return;
         };
+        let (node, component, field) = (*node, *component, field.clone());
         let WidgetKind::TextInput(text) = self.ui.kind(id) else {
             return;
         };
@@ -6603,7 +6675,7 @@ impl State {
             .node(node)
             .components
             .get(component)
-            .and_then(|c| c.as_reflect().get(field))
+            .and_then(|c| c.as_reflect().get(&field))
         else {
             return;
         };
@@ -6615,7 +6687,7 @@ impl State {
         {
             // No rebuild - see commit_vec_input's note on keeping focus.
             self.history
-                .set_field(&mut self.project.scene, node, component, field, new);
+                .set_field(&mut self.project.scene, node, component, &field, new);
         }
     }
 }

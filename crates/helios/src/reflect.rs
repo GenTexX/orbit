@@ -33,7 +33,13 @@ pub trait Reflect {
     fn type_name(&self) -> &'static str;
 
     /// This component's field names, in a stable order.
-    fn field_names(&self) -> &'static [&'static str];
+    ///
+    /// Owned rather than `&'static`, because a component's fields can depend on
+    /// something outside the type: a `Script`'s are the variables its source
+    /// file marks `@export`. Special-casing that in the inspector and the
+    /// serializer would make ADR 0016's actual claim - that one contract serves
+    /// all three consumers with no component hardcoded - untrue.
+    fn field_names(&self) -> Vec<String>;
 
     /// The current value of `field`, or `None` if the name is unknown.
     fn get(&self, field: &str) -> Option<Value>;

@@ -19,12 +19,29 @@ pub struct Script {
 /// across calls, as opposed to a `let` inside a body, which is an ordinary local.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateDecl {
+    /// `@export` and anything else written with `@` before the `let`. Kept as
+    /// written rather than as flags, so the grammar covers the annotations that
+    /// take arguments - `@range(0, 100)` - without a second syntax for them.
+    pub annotations: Vec<Annotation>,
     pub name: String,
     pub name_span: Span,
     /// The declared type, when written (`let speed: f32 = ...`). `None` means
     /// infer it from `init`.
     pub ty: Option<TypeName>,
-    pub init: Expr,
+    /// The value it starts with. Optional, because an exported variable should
+    /// not carry one - the inspector owns its value, and a number in the source
+    /// would be a second answer to the same question. A declaration must have a
+    /// type or an initializer; with neither there is nothing to infer from.
+    pub init: Option<Expr>,
+    pub span: Span,
+}
+
+/// An `@name` or `@name(args)` written before a declaration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annotation {
+    pub name: String,
+    pub name_span: Span,
+    pub args: Vec<Expr>,
     pub span: Span,
 }
 

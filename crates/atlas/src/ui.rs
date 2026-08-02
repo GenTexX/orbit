@@ -153,7 +153,9 @@ pub enum Axis {
 
 /// A reference to a `Vec2`-valued field the inspector edits, resolved against
 /// the scene to read or write it (for both typed commits and label drag-scrub).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Not `Copy`: a component's field names are owned now, because a `Script`'s
+/// are whatever its source exports rather than a fixed list.
+#[derive(Debug, Clone, PartialEq)]
 pub enum FieldRef {
     /// The node's transform translation.
     Position(NodeId),
@@ -163,7 +165,7 @@ pub enum FieldRef {
     Component {
         node: NodeId,
         index: usize,
-        field: &'static str,
+        field: String,
     },
 }
 
@@ -184,12 +186,12 @@ pub fn with_axis(v: Vec2, axis: Axis, val: f32) -> Vec2 {
 }
 
 /// The current value of a `Vec2` field.
-pub fn field_vec2(scene: &Scene, r: FieldRef) -> Vec2 {
+pub fn field_vec2(scene: &Scene, r: &FieldRef) -> Vec2 {
     match r {
-        FieldRef::Position(n) => scene.node(n).transform.translation,
-        FieldRef::Scale(n) => scene.node(n).transform.scale,
+        FieldRef::Position(n) => scene.node(*n).transform.translation,
+        FieldRef::Scale(n) => scene.node(*n).transform.scale,
         FieldRef::Component { node, index, field } => {
-            match scene.node(node).components[index].as_reflect().get(field) {
+            match scene.node(*node).components[*index].as_reflect().get(field) {
                 Some(Value::Vec2(v)) => v,
                 _ => Vec2::ZERO,
             }
@@ -199,12 +201,12 @@ pub fn field_vec2(scene: &Scene, r: FieldRef) -> Vec2 {
 
 /// Write a `Vec2` field directly (no undo step) - used for live drag-scrub;
 /// the caller commits the final value through the history on release.
-pub fn set_field_vec2(scene: &mut Scene, r: FieldRef, v: Vec2) {
+pub fn set_field_vec2(scene: &mut Scene, r: &FieldRef, v: Vec2) {
     match r {
-        FieldRef::Position(n) => scene.node_mut(n).transform.translation = v,
-        FieldRef::Scale(n) => scene.node_mut(n).transform.scale = v,
+        FieldRef::Position(n) => scene.node_mut(*n).transform.translation = v,
+        FieldRef::Scale(n) => scene.node_mut(*n).transform.scale = v,
         FieldRef::Component { node, index, field } => {
-            scene.node_mut(node).components[index]
+            scene.node_mut(*node).components[*index]
                 .as_reflect_mut()
                 .set(field, Value::Vec2(v));
         }
@@ -212,18 +214,18 @@ pub fn set_field_vec2(scene: &mut Scene, r: FieldRef, v: Vec2) {
 }
 
 /// A `Color`-valued component field the color picker edits.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColorTarget {
     pub node: NodeId,
     pub index: usize,
-    pub field: &'static str,
+    pub field: String,
 }
 
 /// The current value of a color field (opaque black if it is not a `Color`).
-pub fn field_color(scene: &Scene, t: ColorTarget) -> [f32; 4] {
+pub fn field_color(scene: &Scene, t: &ColorTarget) -> [f32; 4] {
     match scene.node(t.node).components[t.index]
         .as_reflect()
-        .get(t.field)
+        .get(&t.field)
     {
         Some(Value::Color(c)) => c,
         _ => [0.0, 0.0, 0.0, 1.0],
@@ -232,10 +234,10 @@ pub fn field_color(scene: &Scene, t: ColorTarget) -> [f32; 4] {
 
 /// Write a color field directly (no undo step) - the picker commits the final
 /// value through the history when it closes.
-pub fn set_field_color(scene: &mut Scene, t: ColorTarget, rgba: [f32; 4]) {
+pub fn set_field_color(scene: &mut Scene, t: &ColorTarget, rgba: [f32; 4]) {
     scene.node_mut(t.node).components[t.index]
         .as_reflect_mut()
-        .set(t.field, Value::Color(rgba));
+        .set(&t.field, Value::Color(rgba));
 }
 
 /// Where a dragged tree row will drop, relative to the row under the cursor:
@@ -330,13 +332,13 @@ pub struct EditorRows {
     pub section_toggles: Vec<(WidgetId, InspectorSection)>,
     /// A submitted field row commits its current text to
     /// `(node, component index, field name)`.
-    pub field_rows: Vec<(WidgetId, NodeId, usize, &'static str)>,
+    pub field_rows: Vec<(WidgetId, NodeId, usize, String)>,
     /// Inspector asset (`Value::Asset`) fields: each is a drop target that,
     /// when an explorer image is dropped on it, sets `(node, component, field)`.
-    pub asset_fields: Vec<(WidgetId, NodeId, usize, &'static str)>,
+    pub asset_fields: Vec<(WidgetId, NodeId, usize, String)>,
     /// The "browse" (open chooser) and "clear" buttons of each asset field.
-    pub asset_browse: Vec<(WidgetId, NodeId, usize, &'static str)>,
-    pub asset_clear: Vec<(WidgetId, NodeId, usize, &'static str)>,
+    pub asset_browse: Vec<(WidgetId, NodeId, usize, String)>,
+    pub asset_clear: Vec<(WidgetId, NodeId, usize, String)>,
     /// The asset chooser's grid cells, each mapped to the project-relative image
     /// path it selects.
     pub asset_choices: Vec<(WidgetId, String)>,
@@ -2043,10 +2045,11 @@ fn build_inspector(
         ) else {
             continue;
         };
-        for &field in reflect.field_names() {
-            let Some(value) = reflect.get(field) else {
+        for name in reflect.field_names() {
+            let Some(value) = reflect.get(&name) else {
                 continue;
             };
+            let field = name.as_str();
             // A Vec2 field gets the two-axis treatment, a Color field a swatch
             // that opens the picker; everything else a plain (numeric where it
             // makes sense) row.
@@ -2055,7 +2058,7 @@ fn build_inspector(
                     let r = FieldRef::Component {
                         node,
                         index: i,
-                        field,
+                        field: field.to_string(),
                     };
                     add_vec2_field(ui, card, field, v, r, theme, rows);
                 }
@@ -2080,7 +2083,7 @@ fn build_inspector(
                         ColorTarget {
                             node,
                             index: i,
-                            field,
+                            field: field.to_string(),
                         },
                     ));
                 }
@@ -2093,7 +2096,7 @@ fn build_inspector(
                 _ => {
                     let numeric = matches!(value, Value::F32(_));
                     let input = add_value_row(ui, card, field, &value, numeric, None, theme);
-                    rows.field_rows.push((input, node, i, field));
+                    rows.field_rows.push((input, node, i, field.to_string()));
                 }
             }
         }
@@ -2324,7 +2327,7 @@ const ASSET_THUMB: f32 = 30.0;
 fn add_asset_field(
     ui: &mut Ui,
     card: WidgetId,
-    field: &'static str,
+    field: &str,
     path: &str,
     kind: AssetKind,
     node: NodeId,
@@ -2347,7 +2350,8 @@ fn add_asset_field(
                 AssetKind::Script => DRAG_SCRIPT,
             }),
     );
-    rows.asset_fields.push((row, node, component, field));
+    rows.asset_fields
+        .push((row, node, component, field.to_string()));
 
     // The field name, left, so the asset row reads label <-> value like the rest.
     ui.label(
@@ -2385,13 +2389,16 @@ fn add_asset_field(
             .foreground(theme.aurora.heading)
             .corner_radius(theme.aurora.control_radius),
     );
-    rows.field_rows.push((input, node, component, field));
+    rows.field_rows
+        .push((input, node, component, field.to_string()));
 
     // Browse (opens the image chooser) and Clear (empties the field).
     let browse = asset_icon_button(ui, row, icons, Icon::Load, "...", theme);
-    rows.asset_browse.push((browse, node, component, field));
+    rows.asset_browse
+        .push((browse, node, component, field.to_string()));
     let clear = asset_icon_button(ui, row, icons, Icon::Close, "x", theme);
-    rows.asset_clear.push((clear, node, component, field));
+    rows.asset_clear
+        .push((clear, node, component, field.to_string()));
 }
 
 /// A small icon button for an asset field (falls back to a text caption when
@@ -2563,7 +2570,7 @@ fn add_vec2_field(
                 .text_center()
                 .corner_radius(theme.aurora.control_radius),
         );
-        rows.scrub_labels.push((label, field, axis));
+        rows.scrub_labels.push((label, field.clone(), axis));
         let input = ui.numeric_input(
             row,
             value_to_text(&Value::F32(axis_of(v, axis))),
@@ -2573,7 +2580,7 @@ fn add_vec2_field(
                 .foreground(theme.aurora.heading)
                 .corner_radius(theme.aurora.control_radius),
         );
-        rows.vec_inputs.push((input, field, axis));
+        rows.vec_inputs.push((input, field.clone(), axis));
     }
 }
 
@@ -3170,7 +3177,7 @@ mod tests {
         let target = crate::modal::AssetTarget {
             node: scene.root(),
             component: 0,
-            field: "texture",
+            field: "texture".to_string(),
         };
         let images = vec![
             crate::explorer::AssetRef {
@@ -3650,13 +3657,13 @@ mod tests {
         let (mut scene, _) = demo_scene();
         let node = scene.children(scene.root())[0];
         let field = FieldRef::Position(node);
-        assert_eq!(field_vec2(&scene, field), Vec2::new(10.0, 10.0));
+        assert_eq!(field_vec2(&scene, &field), Vec2::new(10.0, 10.0));
 
         // Scrub the X component and read it back; Y is untouched.
-        let moved = with_axis(field_vec2(&scene, field), Axis::X, 42.0);
-        set_field_vec2(&mut scene, field, moved);
-        assert_eq!(field_vec2(&scene, field), Vec2::new(42.0, 10.0));
-        assert_eq!(axis_of(field_vec2(&scene, field), Axis::Y), 10.0);
+        let moved = with_axis(field_vec2(&scene, &field), Axis::X, 42.0);
+        set_field_vec2(&mut scene, &field, moved);
+        assert_eq!(field_vec2(&scene, &field), Vec2::new(42.0, 10.0));
+        assert_eq!(axis_of(field_vec2(&scene, &field), Axis::Y), 10.0);
     }
 
     /// The widget of the tab group currently showing `pane` (its content area).
@@ -4154,18 +4161,18 @@ mod tests {
         let tint = ColorTarget {
             node: id,
             index: 0,
-            field: "tint",
+            field: "tint".to_string(),
         };
-        set_field_color(&mut scene, tint, [0.2, 0.4, 0.6, 0.8]);
-        assert_eq!(field_color(&scene, tint), [0.2, 0.4, 0.6, 0.8]);
+        set_field_color(&mut scene, &tint, [0.2, 0.4, 0.6, 0.8]);
+        assert_eq!(field_color(&scene, &tint), [0.2, 0.4, 0.6, 0.8]);
 
         // A non-color field falls back to opaque black rather than panicking.
         let size = ColorTarget {
             node: id,
             index: 0,
-            field: "size",
+            field: "size".to_string(),
         };
-        assert_eq!(field_color(&scene, size), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(field_color(&scene, &size), [0.0, 0.0, 0.0, 1.0]);
     }
 
     #[test]

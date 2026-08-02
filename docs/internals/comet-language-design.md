@@ -19,8 +19,8 @@ alongside the enum work. A further set, listed under "Still to decide", has not
 been put yet.
 
 **Implemented so far:** decisions 6 and 13 (iteration 4.1), decisions 1 and 2
-(iteration 4.2, ADR 0020), and decisions 4 and 5 (iteration 4.3, ADR 0021). Decision 3 has moved to iteration 4.4, where
-`ScriptComponent` first needs a field list that is not static.
+(iteration 4.2, ADR 0020), decisions 4 and 5 (iteration 4.3, ADR 0021), and decisions 3, 11, 12 and 14
+(iteration 4.4, ADR 0022). 
 
 ## Where the language actually stands
 

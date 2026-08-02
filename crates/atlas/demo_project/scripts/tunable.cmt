@@ -1,0 +1,20 @@
+// An exported variable is edited in the inspector, not in the script.
+//
+// `@export` marks a variable as one the inspector owns. Two nodes running this
+// same file can move at different speeds, because the value lives on each
+// node's Script component rather than in the source.
+//
+// Note there is no number here: an exported variable carries only its type.
+// Writing one would be a second answer to the same question, and the compiler
+// says so if you do.
+
+@export let speed: f32;
+@export let direction: Vec2;
+
+func start() {
+    print("starting at speed " + str(speed));
+}
+
+func update(dt: f32) {
+    transform.position += direction * speed * dt;
+}

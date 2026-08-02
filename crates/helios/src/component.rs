@@ -72,8 +72,11 @@ impl Reflect for SpriteComponent {
         "Sprite"
     }
 
-    fn field_names(&self) -> &'static [&'static str] {
-        &["texture", "tint", "size"]
+    fn field_names(&self) -> Vec<String> {
+        ["texture", "tint", "size"]
+            .into_iter()
+            .map(String::from)
+            .collect()
     }
 
     fn get(&self, field: &str) -> Option<Value> {
@@ -116,6 +119,41 @@ pub struct ScriptComponent {
     /// component exists but has no script yet, which is what "Add Script" leaves
     /// behind until a file is picked.
     pub source: String,
+    /// The script's `@export`ed variables and what this instance holds for
+    /// each, in the order the script declares them.
+    ///
+    /// This is what makes two nodes running one script behave differently, and
+    /// it is the value that wins: the script's own initializer is only the
+    /// default used when the field is first created or explicitly reverted.
+    ///
+    /// A `Vec` rather than a map so the inspector shows them in the order they
+    /// were written, which is the order the author chose.
+    pub exports: Vec<(String, Value)>,
+}
+
+impl ScriptComponent {
+    /// Bring the stored values into line with what `exports` says the script
+    /// now declares: keep what is still there and still the right type, drop
+    /// what is gone, and add what is new at its default.
+    ///
+    /// Keeping by name and type is what makes an edit to the source preserve
+    /// tuning - the migration ADR 0008 describes, in the one place a script's
+    /// fields can change without the component being touched.
+    pub fn reconcile(&mut self, declared: &[(String, Value)]) {
+        let mut next = Vec::with_capacity(declared.len());
+        for (name, default) in declared {
+            let kept = self
+                .exports
+                .iter()
+                .find(|(existing, value)| {
+                    existing == name
+                        && std::mem::discriminant(value) == std::mem::discriminant(default)
+                })
+                .map(|(_, value)| value.clone());
+            next.push((name.clone(), kept.unwrap_or_else(|| default.clone())));
+        }
+        self.exports = next;
+    }
 }
 
 impl Reflect for ScriptComponent {
@@ -123,8 +161,13 @@ impl Reflect for ScriptComponent {
         "Script"
     }
 
-    fn field_names(&self) -> &'static [&'static str] {
-        &["source"]
+    fn field_names(&self) -> Vec<String> {
+        // The path, then whatever the script exports. The inspector and the
+        // serializer both walk this, so an exported variable becomes an
+        // editable, saved field without either of them being told.
+        std::iter::once("source".to_string())
+            .chain(self.exports.iter().map(|(name, _)| name.clone()))
+            .collect()
     }
 
     fn get(&self, field: &str) -> Option<Value> {
@@ -133,18 +176,29 @@ impl Reflect for ScriptComponent {
             // texture is, so the inspector gives it the same path field and the
             // same drop target for free.
             "source" => Some(Value::Asset(self.source.clone())),
-            _ => None,
+            _ => self
+                .exports
+                .iter()
+                .find(|(name, _)| name == field)
+                .map(|(_, value)| value.clone()),
         }
     }
 
     fn set(&mut self, field: &str, value: Value) -> bool {
-        match (field, value) {
-            ("source", Value::Asset(s)) => {
-                self.source = s;
-                true
-            }
-            _ => false,
+        if let ("source", Value::Asset(s)) = (field, &value) {
+            self.source = s.clone();
+            return true;
         }
+        // An exported value, and only if the type still matches - a stale
+        // stored value from an older version of the script must not be written
+        // back into a field that has since changed type.
+        for (name, held) in &mut self.exports {
+            if name == field && std::mem::discriminant(held) == std::mem::discriminant(&value) {
+                *held = value;
+                return true;
+            }
+        }
+        false
     }
 }
 
