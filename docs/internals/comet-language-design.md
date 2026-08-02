@@ -7,9 +7,11 @@ without context, and the result of a real trade-off. Several of them will be
 promoted to numbered ADRs once the set is complete - which one, and how many,
 is itself still open (see "Still to decide").
 
-**Status: incomplete.** Thirteen decisions are settled and two questions are
-open, neither of which blocks the others. A further set, listed under "Still to
-decide", has not been put yet. Nothing here is implemented.
+**Status: incomplete.** Fourteen decisions are settled and two questions are
+open. One of those - default values for a bare export - is part of decision 14
+rather than independent of it, so decision 14 should not be built before it is
+answered. A further set, listed under "Still to decide", has not been put yet.
+Nothing here is implemented.
 
 ## Where the language actually stands
 
@@ -239,14 +241,40 @@ runtime and a decided ordering against `update`, which is M5 runtime design
 rather than language design, and it should be settled there with the game loop
 in front of us.
 
+### 14. An exported variable carrying an initializer is a warning
+
+`@export let speed = 120.0;` warns. Decision 12's idiom becomes something the
+compiler says rather than something the documentation asks for, which is the
+only version of it that a reader encounters at the moment it matters.
+
+**This forces a grammar change, and the two must ship together.** A state
+declaration's initializer is not optional today - `StateDecl.init` is an `Expr`,
+while `ty` is the `Option` - so on its own this warning would fire on every
+exported variable with no way to act on it, and a warning nobody can silence is
+worse than no warning at all. `@export let speed: f32;` therefore has to become
+writable, which inverts the current optionality: a state declaration needs a
+type or an initializer, and an exported one should carry only the type.
+
+Note: the warning is on *any* initializer, not only a non-default one, because
+"is this value the type's default" is a question about the value rather than
+about the code, and the answer changes what the compiler says about identical
+source. Simpler to state and simpler to act on.
+
+Two things this needs that are not yet settled, recorded below rather than
+guessed: what each type's default is, and what happens for a type that has no
+natural default.
+
 ## Open
 
-- **How hard to push the "no value in an exported variable" idiom** (from
-  decision 12): documentation only, a warning when an exported variable has a
-  non-trivial initializer, or a grammar change letting `@export let speed: f32;`
-  stand without an initializer. The last one is the only one that needs the
-  parser and a defaulting rule per type, and it is the only one that makes the
-  idiom the path of least resistance rather than advice.
+- **Default values for a bare `@export let x: T;`** (from decision 14). Most
+  types answer easily - `f32` is `0.0`, `int` is `0`, `bool` is `false`, `Vec2`
+  is the origin, `String` is empty, `Option<T>` is `None`. **A user-defined enum
+  has no natural default**, which is the real question: either its first variant
+  is it (cheap, and an arbitrary rule the author may not have thought about),
+  or an exported enum keeps its initializer and is exempt from decision 14's
+  warning (honest, but it makes the warning conditional on type), or enums are
+  simply not exportable in v1 (smallest, and it defers the question to when
+  someone wants it).
 - **Arrays: reference or value semantics.** Deliberately deferred to when arrays
   are actually scheduled, rather than decided ahead of the work. The tension is
   recorded so it is not rediscovered: reference semantics match ADR 0006's "GC
@@ -328,3 +356,13 @@ Collected so they are not rediscovered during implementation:
 - `ScriptComponent` grows from a single `source: String` into source plus stored
   exported values (decisions 11 and 12), which is what makes decision 3's
   dynamic `Reflect` load-bearing rather than merely tidy.
+- `StateDecl`'s optionality inverts (decision 14): `init` becomes optional and
+  a declaration must carry a type or an initializer. Type inference for state
+  therefore stops being unconditional, since there is nothing to infer from
+  when only the type is written - which is the point, but it is a checker
+  change and not only a parser one.
+- Decision 14 makes comet emit a warning about a declaration that is otherwise
+  perfectly legal, which is a first: every existing warning is about code that
+  does nothing (an unused local), not about a style the project prefers. Worth
+  being deliberate about, because it sets the precedent for whether comet's
+  diagnostics police idiom at all.
