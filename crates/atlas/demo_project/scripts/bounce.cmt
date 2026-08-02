@@ -1,12 +1,16 @@
 // A bouncing node, and a tour of what Comet can do today.
 //
-// A top-level `let` is script state: it runs once, when the script starts, and
-// keeps its value between frames. `pos` is this node's position - read it, or
-// assign to it, to move the node.
+// A top-level `let` is script state: it keeps its value between frames.
+// `start()` runs once, before the first frame. `pos` is this node's position -
+// read it, or assign to it, to move the node.
 
 let home = pos;
-let speed = 120.0;
-let direction = 1.0;
+let velocity = vec2(0.0, 0.0);
+
+func start() {
+    velocity = vec2(120.0, 0.0);
+    print("off we go from " + str(home.x) + "," + str(home.y));
+}
 
 // Functions declare their types. The last expression in a body, written with
 // no semicolon, is what the function gives back.
@@ -15,10 +19,12 @@ func past_edge(x: f32, edge: f32) -> bool {
 }
 
 func update(dt: f32) {
-    pos.x += speed * direction * dt;
+    // Vectors add, subtract, and scale by a number, so a whole frame of
+    // movement is one line rather than one line per axis.
+    pos += velocity * dt;
 
     if past_edge(pos.x, 200.0) {
-        direction = -direction;
+        velocity = -velocity;
         print("turned around");
     }
 

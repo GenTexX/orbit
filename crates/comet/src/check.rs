@@ -455,36 +455,48 @@ impl Checker {
                         TypedStmt::Assign { place, value }
                     }
                     _ => {
-                        // Compound assignment is arithmetic, so both sides must
-                        // be f32; desugar to a plain store of the operation.
+                        // Desugar to a plain store of the operation, and check
+                        // it the way the operator itself is checked - so
+                        // `pos += vel * dt` works exactly when `pos + vel * dt`
+                        // does, and there is one definition of what `+` means
+                        // rather than a second one that has to be kept in step.
                         let op = match op {
-                            ast::AssignOp::Add => BinaryOp::AddF32,
-                            ast::AssignOp::Sub => BinaryOp::SubF32,
-                            ast::AssignOp::Mul => BinaryOp::MulF32,
-                            ast::AssignOp::Div => BinaryOp::DivF32,
-                            ast::AssignOp::Rem => BinaryOp::RemF32,
+                            ast::AssignOp::Add => ast::BinaryOp::Add,
+                            ast::AssignOp::Sub => ast::BinaryOp::Sub,
+                            ast::AssignOp::Mul => ast::BinaryOp::Mul,
+                            ast::AssignOp::Div => ast::BinaryOp::Div,
+                            ast::AssignOp::Rem => ast::BinaryOp::Rem,
                             ast::AssignOp::Set => unreachable!("handled above"),
                         };
-                        self.expect_type(Type::F32, target_ty, target.span());
-                        self.expect_type(Type::F32, value.ty, value.span);
-                        let ok = target_ty == Type::F32 && value.ty == Type::F32;
                         let span = value.span;
                         let read = self.place_read(&place, target_ty, target.span());
+                        let (kind, ty) = self.binary(op, read, value);
+                        // The result has to fit back where it came from. Every
+                        // operator reachable here returns one of its operand
+                        // types, so this only fires on a mismatch the operator
+                        // itself was happy with.
+                        if !ty.is_error() && !target_ty.is_error() && ty != target_ty {
+                            self.error(
+                                span,
+                                format!(
+                                    "`{}=` on {} produces {}, which cannot be stored back",
+                                    symbol(op),
+                                    target_ty.name(),
+                                    ty.name()
+                                ),
+                            );
+                            return TypedStmt::Assign {
+                                place,
+                                value: TypedExpr {
+                                    kind: TypedExprKind::Error,
+                                    ty: Type::Error,
+                                    span,
+                                },
+                            };
+                        }
                         TypedStmt::Assign {
                             place,
-                            value: TypedExpr {
-                                ty: if ok { Type::F32 } else { Type::Error },
-                                kind: if ok {
-                                    TypedExprKind::Binary {
-                                        op,
-                                        lhs: Box::new(read),
-                                        rhs: Box::new(value),
-                                    }
-                                } else {
-                                    TypedExprKind::Error
-                                },
-                                span,
-                            },
+                            value: TypedExpr { kind, ty, span },
                         }
                     }
                 }
@@ -779,6 +791,10 @@ impl Checker {
             ast::Expr::Unary { op, operand, .. } => {
                 let operand = self.expr(operand);
                 let (op, want) = match op {
+                    // Negating a Vec2 negates both components. Chosen by the
+                    // operand's type rather than by a second operator, which is
+                    // how `-v` stays the thing a reader expects it to be.
+                    ast::UnaryOp::Neg if operand.ty == Type::Vec2 => (UnaryOp::NegVec2, Type::Vec2),
                     ast::UnaryOp::Neg => (UnaryOp::Neg, Type::F32),
                     ast::UnaryOp::Not => (UnaryOp::Not, Type::Bool),
                 };
@@ -965,6 +981,46 @@ impl Checker {
                 self.error(span, format!("cannot join a String and {a} {name}{hint}"));
                 return (TypedExprKind::Error, Type::Error);
             }
+            // The additive core of Vec2 plus scaling, which is exactly enough
+            // to make `pos += vel * dt` compile. Geometry - dot, length,
+            // normalize, distance - is a small further step and is not here.
+            B::Add if lhs.ty == Type::Vec2 && rhs.ty == Type::Vec2 => {
+                (BinaryOp::AddVec2, Type::Vec2)
+            }
+            B::Sub if lhs.ty == Type::Vec2 && rhs.ty == Type::Vec2 => {
+                (BinaryOp::SubVec2, Type::Vec2)
+            }
+            B::Mul if lhs.ty == Type::Vec2 && rhs.ty == Type::F32 => {
+                (BinaryOp::MulVec2F32, Type::Vec2)
+            }
+            B::Mul if lhs.ty == Type::F32 && rhs.ty == Type::Vec2 => {
+                (BinaryOp::MulF32Vec2, Type::Vec2)
+            }
+            B::Div if lhs.ty == Type::Vec2 && rhs.ty == Type::F32 => {
+                (BinaryOp::DivVec2F32, Type::Vec2)
+            }
+            // Any other arithmetic involving a Vec2 is unsupported on purpose,
+            // and says so rather than reporting "expected f32" once per side.
+            B::Add | B::Sub | B::Mul | B::Div | B::Rem
+                if lhs.ty == Type::Vec2 || rhs.ty == Type::Vec2 =>
+            {
+                let message = if op == B::Mul && lhs.ty == rhs.ty {
+                    "`*` on two Vec2 values is not defined: it reads as a dot \
+                     product to some people and as componentwise to others. \
+                     Multiply by a number, or write the components you want"
+                        .to_string()
+                } else {
+                    format!(
+                        "cannot apply `{}` to {} and {} - a Vec2 supports `+`, `-`, \
+                         unary `-`, and `*` or `/` by a number",
+                        symbol(op),
+                        lhs.ty.name(),
+                        rhs.ty.name()
+                    )
+                };
+                self.error(lhs.span.to(rhs.span), message);
+                return (TypedExprKind::Error, Type::Error);
+            }
             B::Add | B::Sub | B::Mul | B::Div | B::Rem => {
                 self.expect_type(Type::F32, lhs.ty, lhs.span);
                 self.expect_type(Type::F32, rhs.ty, rhs.span);
@@ -1141,15 +1197,29 @@ struct Hook {
     written: &'static str,
 }
 
-/// Only `update`. `start` and `on_destroy` are decided but not yet called by
-/// helios, and rejecting a signature nothing looks up would be inventing a
+/// The three names helios looks up. A name is listed here only once the engine
+/// actually calls it - rejecting a signature nothing looks up would invent a
 /// contract the engine does not have.
-const HOOKS: &[Hook] = &[Hook {
-    name: "update",
-    params: &[Type::F32],
-    ret: Type::Unit,
-    written: "func update(dt: f32)",
-}];
+const HOOKS: &[Hook] = &[
+    Hook {
+        name: "update",
+        params: &[Type::F32],
+        ret: Type::Unit,
+        written: "func update(dt: f32)",
+    },
+    Hook {
+        name: "start",
+        params: &[],
+        ret: Type::Unit,
+        written: "func start()",
+    },
+    Hook {
+        name: "on_destroy",
+        params: &[],
+        ret: Type::Unit,
+        written: "func on_destroy()",
+    },
+];
 
 /// A `let` the checker is watching, so it can say when nothing ever read it.
 struct Binding {
@@ -1186,6 +1256,26 @@ fn is_host_name(name: &str) -> bool {
 /// a script calling a function `memory` would emit an invalid module. Reserving
 /// the `comet_` prefix and `memory` up front turns that into a diagnostic with a
 /// span, which is the only form of it a person can act on.
+/// How an operator is written, for a diagnostic that has to name it.
+fn symbol(op: ast::BinaryOp) -> &'static str {
+    use ast::BinaryOp as B;
+    match op {
+        B::Add => "+",
+        B::Sub => "-",
+        B::Mul => "*",
+        B::Div => "/",
+        B::Rem => "%",
+        B::Eq => "==",
+        B::NotEq => "!=",
+        B::Lt => "<",
+        B::Gt => ">",
+        B::Le => "<=",
+        B::Ge => ">=",
+        B::And => "&&",
+        B::Or => "||",
+    }
+}
+
 fn is_reserved_name(name: &str) -> bool {
     name.starts_with("comet_") || name == "memory"
 }
@@ -1876,6 +1966,20 @@ mod tests {
             messages("func update(a: f32, b: f32) { }"),
             expected,
             "too many parameters"
+        );
+    }
+
+    #[test]
+    fn the_other_two_hooks_are_checked_the_same_way() {
+        check_clean("func start() { }");
+        check_clean("func on_destroy() { }");
+        assert_eq!(
+            messages("func start(dt: f32) { }"),
+            ["`start` is called by the engine and must be written `func start()`"]
+        );
+        assert_eq!(
+            messages("func on_destroy() -> f32 { 1.0 }"),
+            ["`on_destroy` is called by the engine and must be written `func on_destroy()`"]
         );
     }
 

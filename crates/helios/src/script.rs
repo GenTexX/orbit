@@ -37,6 +37,12 @@ use crate::scene::{NodeId, Scene};
 
 /// The function the host calls once per frame, if a script defines one.
 const UPDATE: &str = "update";
+/// Run once before the first `update`, after state initializers. It is also
+/// what stops a top-level `let` doing double duty as init code.
+const START: &str = "start";
+/// Run when the node or the script goes away. Cheap to add now and awkward to
+/// retrofit once instances have real lifetimes (M5).
+const ON_DESTROY: &str = "on_destroy";
 
 /// How many printed lines an instance keeps before dropping the oldest. A script
 /// printing in a loop must not grow memory without bound just because nobody
@@ -213,10 +219,18 @@ impl ScriptHost {
             .instantiate(&mut store, module)
             .map_err(ScriptError::runtime)?;
         let update = instance.get_typed_func::<f32, ()>(&mut store, UPDATE).ok();
+        let on_destroy = instance
+            .get_typed_func::<(), ()>(&mut store, ON_DESTROY)
+            .ok();
+        // Before the write-back, so a `start` that moves the node is seen.
+        if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, START) {
+            start.call(&mut store, ()).map_err(ScriptError::trap)?;
+        }
         scene.node_mut(node).transform.translation = store.data().position;
         Ok(ScriptInstance {
             store,
             update,
+            on_destroy,
             label: scene.node(node).name.clone(),
         })
     }
@@ -228,6 +242,7 @@ impl ScriptHost {
 pub struct ScriptInstance {
     store: Store<ScriptState>,
     update: Option<TypedFunc<f32, ()>>,
+    on_destroy: Option<TypedFunc<(), ()>>,
     /// What this instance's printed output is tagged with.
     label: String,
 }
@@ -262,6 +277,26 @@ impl ScriptInstance {
         self.store.data_mut().position = scene.node(node).transform.translation;
         update
             .call(&mut self.store, dt)
+            .map_err(ScriptError::trap)?;
+        scene.node_mut(node).transform.translation = self.store.data().position;
+        Ok(())
+    }
+
+    /// Run `on_destroy()`, if the script defines one, because the node or the
+    /// script is going away.
+    ///
+    /// Called by whoever owns the instance rather than from `Drop`: the hook can
+    /// trap, and a `Drop` has nowhere to report that to. Nothing calls this on a
+    /// real lifecycle yet - instances do not have one until Play exists - which
+    /// is exactly why the mechanism goes in now rather than being retrofitted
+    /// around it later.
+    pub fn destroy(&mut self, scene: &mut Scene, node: NodeId) -> Result<(), ScriptError> {
+        let Some(on_destroy) = self.on_destroy.take() else {
+            return Ok(());
+        };
+        self.store.data_mut().position = scene.node(node).transform.translation;
+        on_destroy
+            .call(&mut self.store, ())
             .map_err(ScriptError::trap)?;
         scene.node_mut(node).transform.translation = self.store.data().position;
         Ok(())
@@ -754,5 +789,99 @@ mod tests {
             host.instantiate_file(&path, &mut scene, a),
             Err(ScriptError::Io { .. })
         ));
+    }
+
+    #[test]
+    fn start_runs_once_before_the_first_update() {
+        // What `start` is for: a top-level `let` was doing double duty as init
+        // code, and the demo script needed a comment to explain it.
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::new(5.0, 5.0));
+        let mut script = host
+            .instantiate(
+                "
+                let ticks = 0.0;
+                func start() {
+                    pos = vec2(100.0, 200.0);
+                }
+                func update(dt: f32) {
+                    ticks += 1.0;
+                }
+                ",
+                &mut scene,
+                node,
+            )
+            .expect("it compiles");
+
+        // Before any update at all.
+        assert_eq!(position(&scene, node), Vec2::new(100.0, 200.0));
+
+        script.update(&mut scene, node, 0.5).expect("one frame");
+        script.update(&mut scene, node, 0.5).expect("another");
+        assert_eq!(
+            position(&scene, node),
+            Vec2::new(100.0, 200.0),
+            "start does not run again"
+        );
+    }
+
+    #[test]
+    fn start_sees_the_state_its_initializers_produced() {
+        // Instantiation runs the module's own start function, where state
+        // initializers evaluate, so the hook must run after that and not
+        // instead of it.
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        host.instantiate(
+            "
+            let home: Vec2 = vec2(7.0, 9.0);
+            func start() { pos = home; }
+            func update(dt: f32) { }
+            ",
+            &mut scene,
+            node,
+        )
+        .expect("it compiles");
+        assert_eq!(position(&scene, node), Vec2::new(7.0, 9.0));
+    }
+
+    #[test]
+    fn on_destroy_runs_when_the_owner_says_the_script_is_going_away() {
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate(
+                r#"
+                func update(dt: f32) { }
+                func on_destroy() { print("goodbye"); }
+                "#,
+                &mut scene,
+                node,
+            )
+            .expect("it compiles");
+
+        assert!(
+            script.take_printed().is_empty(),
+            "not until it is destroyed"
+        );
+        script.destroy(&mut scene, node).expect("the hook runs");
+        assert_eq!(script.take_printed(), ["goodbye"]);
+
+        // Destroying twice does not run it twice.
+        script.destroy(&mut scene, node).expect("no hook left");
+        assert!(script.take_printed().is_empty());
+    }
+
+    #[test]
+    fn a_script_with_neither_hook_is_not_broken() {
+        // Both are optional. A script that is a library of functions defines
+        // none of them and must still instantiate and tick.
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate("func helper(a: f32) -> f32 { a }", &mut scene, node)
+            .expect("it compiles");
+        script.update(&mut scene, node, 0.5).expect("a no-op frame");
+        script.destroy(&mut scene, node).expect("a no-op destroy");
     }
 }

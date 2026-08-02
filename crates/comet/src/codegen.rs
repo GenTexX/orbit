@@ -641,15 +641,40 @@ fn emit_init(script: &TypedScript, globals: &Globals, literals: &Literals) -> Fu
     out.finish()
 }
 
+/// The three shapes Vec2 arithmetic takes on the stack. Grouped because the
+/// stack juggling, not the arithmetic, is what differs between them.
+#[derive(Debug, Clone, Copy)]
+enum Vec2Op {
+    /// Two vectors, componentwise. `true` adds, `false` subtracts.
+    Componentwise(bool),
+    /// A vector then a number. `true` multiplies, `false` divides.
+    ScaleRight(bool),
+    /// A number then a vector, which only multiplication allows.
+    ScaleLeft,
+}
+
+impl Vec2Op {
+    fn of(op: BinaryOp) -> Option<Self> {
+        Some(match op {
+            BinaryOp::AddVec2 => Vec2Op::Componentwise(true),
+            BinaryOp::SubVec2 => Vec2Op::Componentwise(false),
+            BinaryOp::MulVec2F32 => Vec2Op::ScaleRight(true),
+            BinaryOp::DivVec2F32 => Vec2Op::ScaleRight(false),
+            BinaryOp::MulF32Vec2 => Vec2Op::ScaleLeft,
+            _ => return None,
+        })
+    }
+}
+
 /// The scratch locals available at one level of nesting.
 #[derive(Debug, Clone, Copy)]
 struct Frame {
-    f32s: [u32; 2],
+    f32s: [u32; 3],
     i32s: [u32; 4],
 }
 
 /// How many wasm locals one [`Frame`] occupies.
-const FRAME_WIDTH: u32 = 6;
+const FRAME_WIDTH: u32 = 7;
 
 /// The greatest number of [`Frame`]s a block can need at once.
 fn block_depth(block: &TypedBlock) -> usize {
@@ -681,15 +706,24 @@ fn expr_depth(expr: &TypedExpr) -> usize {
     use TypedExprKind as K;
     let (mine, children): (usize, Vec<&TypedExpr>) = match &expr.kind {
         K::Binary { op, lhs, rhs } => {
-            let mine = usize::from(matches!(op, BinaryOp::RemF32 | BinaryOp::ConcatStr));
-            (mine, vec![lhs, rhs])
+            let parks = matches!(
+                op,
+                BinaryOp::RemF32
+                    | BinaryOp::ConcatStr
+                    | BinaryOp::AddVec2
+                    | BinaryOp::SubVec2
+                    | BinaryOp::MulVec2F32
+                    | BinaryOp::MulF32Vec2
+                    | BinaryOp::DivVec2F32
+            );
+            (usize::from(parks), vec![lhs, rhs])
         }
         // Print parks the string to release it after the call.
         K::HostCall { host, args } => (
             usize::from(*host == Host::Print),
             args.iter().collect::<Vec<_>>(),
         ),
-        K::Unary { operand, .. } => (0, vec![operand]),
+        K::Unary { op, operand } => (usize::from(*op == UnaryOp::NegVec2), vec![operand]),
         K::Field { receiver, .. } => (0, vec![receiver]),
         K::MakeVec2 { x, y } => (0, vec![x, y]),
         K::Call { args, .. } => (0, args.iter().collect()),
@@ -739,8 +773,8 @@ impl<'a> FnGen<'a> {
             .map(|i| {
                 let base = next + (i as u32) * FRAME_WIDTH;
                 Frame {
-                    f32s: [base, base + 1],
-                    i32s: [base + 2, base + 3, base + 4, base + 5],
+                    f32s: [base, base + 1, base + 2],
+                    i32s: [base + 3, base + 4, base + 5, base + 6],
                 }
             })
             .collect();
@@ -751,6 +785,7 @@ impl<'a> FnGen<'a> {
             .copied()
             .chain(frames.iter().flat_map(|_| {
                 [
+                    ValType::F32,
                     ValType::F32,
                     ValType::F32,
                     ValType::I32,
@@ -1119,8 +1154,20 @@ impl<'a> FnGen<'a> {
             },
 
             TypedExprKind::Unary { op, operand } => {
+                // A Vec2 is two f32s on the stack, so negating one means
+                // reaching under the top of the stack for its x.
+                if *op == UnaryOp::NegVec2 {
+                    let y = self.enter_frame().f32s[0];
+                    self.expr(operand);
+                    self.ins().local_set(y);
+                    self.ins().f32_neg();
+                    self.ins().local_get(y).f32_neg();
+                    self.leave_frame();
+                    return;
+                }
                 self.expr(operand);
                 match op {
+                    UnaryOp::NegVec2 => unreachable!("handled above"),
                     UnaryOp::Neg => self.ins().f32_neg(),
                     UnaryOp::Not => self.ins().i32_eqz(),
                     UnaryOp::Abs => self.ins().f32_abs(),
@@ -1159,6 +1206,62 @@ impl<'a> FnGen<'a> {
                 return;
             }
             _ => {}
+        }
+
+        // Vec2 arithmetic. A Vec2 occupies two stack slots, so every one of
+        // these has to park the values it cannot reach past - x always sits
+        // under y, and under the whole right operand as well.
+        if let Some(vec_op) = Vec2Op::of(op) {
+            let [a, b, c] = self.enter_frame().f32s;
+            self.expr(lhs);
+            self.expr(rhs);
+            match vec_op {
+                // [ax, ay, bx, by] -> [ax op bx, ay op by]
+                Vec2Op::Componentwise(add) => {
+                    self.ins().local_set(a); // by
+                    self.ins().local_set(b); // bx
+                    self.ins().local_set(c); // ay
+                    self.ins().local_get(b);
+                    if add {
+                        self.ins().f32_add();
+                    } else {
+                        self.ins().f32_sub();
+                    }
+                    self.ins().local_get(c).local_get(a);
+                    if add {
+                        self.ins().f32_add();
+                    } else {
+                        self.ins().f32_sub();
+                    }
+                }
+                // [vx, vy, s] -> [vx op s, vy op s]
+                Vec2Op::ScaleRight(mul) => {
+                    self.ins().local_set(a); // s
+                    self.ins().local_set(b); // vy
+                    self.ins().local_get(a);
+                    if mul {
+                        self.ins().f32_mul();
+                    } else {
+                        self.ins().f32_div();
+                    }
+                    self.ins().local_get(b).local_get(a);
+                    if mul {
+                        self.ins().f32_mul();
+                    } else {
+                        self.ins().f32_div();
+                    }
+                }
+                // [s, vx, vy] -> [s * vx, s * vy]
+                Vec2Op::ScaleLeft => {
+                    self.ins().local_set(a); // vy
+                    self.ins().local_set(b); // vx
+                    self.ins().local_set(c); // s
+                    self.ins().local_get(c).local_get(b).f32_mul();
+                    self.ins().local_get(c).local_get(a).f32_mul();
+                }
+            }
+            self.leave_frame();
+            return;
         }
 
         // Concatenation is the first thing in the language that allocates, and
@@ -1210,7 +1313,7 @@ impl<'a> FnGen<'a> {
         // operand can be a call - evaluating one twice would run its effects
         // twice.
         if op == BinaryOp::RemF32 {
-            let [a, b] = self.enter_frame().f32s;
+            let [a, b, _] = self.enter_frame().f32s;
             self.expr(lhs);
             self.ins().local_set(a);
             self.expr(rhs);
@@ -1228,7 +1331,13 @@ impl<'a> FnGen<'a> {
         let mut i = self.func.instructions();
         match op {
             BinaryOp::AddF32 => i.f32_add(),
-            BinaryOp::RemF32 | BinaryOp::ConcatStr => unreachable!("handled above"),
+            BinaryOp::RemF32
+            | BinaryOp::ConcatStr
+            | BinaryOp::AddVec2
+            | BinaryOp::SubVec2
+            | BinaryOp::MulVec2F32
+            | BinaryOp::MulF32Vec2
+            | BinaryOp::DivVec2F32 => unreachable!("handled above"),
             BinaryOp::MinF32 => i.f32_min(),
             BinaryOp::MaxF32 => i.f32_max(),
             BinaryOp::SubF32 => i.f32_sub(),

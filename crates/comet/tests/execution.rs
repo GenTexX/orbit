@@ -917,3 +917,110 @@ fn a_warning_does_not_stop_a_script_running() {
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(diagnostics[0].severity, comet::Severity::Warning);
 }
+
+#[test]
+fn vector_addition_and_subtraction_work_on_both_components() {
+    // A Vec2 is two stack slots, so every one of these has to reach under the
+    // top of the stack. Distinct numbers everywhere: reading the same lane
+    // twice, or crossing x with y, has to change the answer.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let a = vec2(1.0, 2.0);
+            let b = vec2(10.0, 20.0);
+            let sum = a + b;
+            let difference = b - a;
+            print(str(sum.x) + "," + str(sum.y));
+            print(str(difference.x) + "," + str(difference.y));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["11,22", "9,18"]);
+}
+
+#[test]
+fn subtraction_keeps_its_operands_the_right_way_round() {
+    // The operand order is the thing a stack juggle is most likely to lose.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let d = vec2(1.0, 2.0) - vec2(10.0, 20.0);
+            print(str(d.x) + "," + str(d.y));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["-9,-18"]);
+}
+
+#[test]
+fn scaling_works_with_the_number_on_either_side() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let v = vec2(3.0, 5.0);
+            let right = v * 2.0;
+            let left = 2.0 * v;
+            let divided = v / 2.0;
+            print(str(right.x) + "," + str(right.y));
+            print(str(left.x) + "," + str(left.y));
+            print(str(divided.x) + "," + str(divided.y));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["6,10", "6,10", "1.5,2.5"]);
+}
+
+#[test]
+fn negating_a_vector_negates_both_components() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let v = -vec2(3.0, -5.0);
+            print(str(v.x) + "," + str(v.y));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["-3,5"]);
+}
+
+#[test]
+fn nested_vector_arithmetic_does_not_lose_an_operand() {
+    // The same trap `%` and string concatenation had: each level of nesting
+    // parks operands, and a shared set of scratch locals would let the inner
+    // expression overwrite the outer one's.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let v = (vec2(1.0, 2.0) + vec2(10.0, 20.0)) - (vec2(100.0, 200.0) - vec2(1000.0, 2000.0));
+            print(str(v.x) + "," + str(v.y));
+        }
+        "#,
+    );
+    script.update(0.0);
+    // (11, 22) - (-900, -1800)
+    assert_eq!(script.printed(), ["911,1822"]);
+}
+
+#[test]
+fn a_node_moves_by_a_velocity_vector() {
+    // The line decision 6 exists for. `pos += vel * dt` is a compound
+    // assignment on a Vec2 place, which is the whole path end to end.
+    let mut script = Script::at(
+        r#"
+        let velocity: Vec2 = vec2(30.0, -10.0);
+        func update(dt: f32) {
+            pos += velocity * dt;
+        }
+        "#,
+        100.0,
+        50.0,
+    );
+    script.update(0.5);
+    assert_eq!(script.position(), (115.0, 45.0));
+    script.update(0.5);
+    assert_eq!(script.position(), (130.0, 40.0));
+}

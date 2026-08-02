@@ -6985,4 +6985,37 @@ mod tests {
         // Surrounded by whitespace, there is no word.
         assert_eq!(word_before_or_around("a  b", 2).1, "");
     }
+
+    #[test]
+    fn every_demo_script_still_compiles() {
+        // The scripts shipped with the demo project are the first Comet anyone
+        // reads, and nothing else compiles them - so a language change could
+        // break them silently. squiggles.cmt is wrong on purpose and is the one
+        // that must NOT compile.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("demo_project/scripts");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("the demo project has a scripts folder") {
+            let path = entry.expect("a readable entry").path();
+            if path.extension().is_none_or(|e| e != "cmt") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("readable");
+            let name = path
+                .file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .to_string();
+            let result = comet::compile(&source);
+            if name == "squiggles.cmt" {
+                assert!(result.is_err(), "squiggles.cmt is wrong on purpose");
+            } else {
+                assert!(result.is_ok(), "{name} should compile: {:?}", result.err());
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "expected to find the demo scripts, found {checked}"
+        );
+    }
 }

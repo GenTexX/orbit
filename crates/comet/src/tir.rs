@@ -236,6 +236,8 @@ pub enum UnaryOp {
     Neg,
     /// Invert a bool.
     Not,
+    /// Negate both components of a `Vec2`.
+    NegVec2,
     /// The f32 instructions that happen to be unary.
     Abs,
     Sqrt,
@@ -260,6 +262,20 @@ pub enum BinaryOp {
     /// String concatenation. Allocates - the first thing in the language that
     /// does - and yields an owned reference like any other String expression.
     ConcatStr,
+    /// The additive core of `Vec2`, plus scaling by a number. Exactly enough to
+    /// make `pos += vel * dt` compile.
+    ///
+    /// Componentwise `Vec2 * Vec2` is deliberately absent: `a * b` on two
+    /// vectors reads as a dot product to enough people that it is a hazard in a
+    /// language meant to be learned from.
+    AddVec2,
+    SubVec2,
+    /// Scaling. Both orders are kept rather than normalized to one, because
+    /// swapping the operands would swap the order they are evaluated in, and an
+    /// operand can be a call.
+    MulVec2F32,
+    MulF32Vec2,
+    DivVec2F32,
     /// Equality on f32 or bool; the operand type decides the instruction.
     Eq(Type),
     NotEq(Type),

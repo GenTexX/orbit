@@ -36,7 +36,7 @@ than at the end.
 
 ---
 
-## 4.1 - Vectors and lifecycle
+## 4.1 - Vectors and lifecycle (DONE)
 
 **Builds.** Decision 6: `+`, `-`, unary `-`, `Vec2 * f32`, `f32 * Vec2`,
 `Vec2 / f32`. Deliberately not `dot`, `length`, `normalize`, `distance`, or
@@ -62,6 +62,19 @@ consequences list predicted it would have to.
 seeds the velocity. Execution tests that a Vec2 operation emits both lanes
 rather than reading one twice - the same class of test that caught operand
 swaps in M4.
+
+**Done.** Six execution tests for the arithmetic, four for the hooks, all
+verified to fail by exactly the wrong value when the lane pairing is crossed.
+Two things worth carrying forward:
+
+- Compound assignment now routes through `binary()` rather than hardcoding f32
+  on both sides, so `pos += vel * dt` works exactly when `pos + vel * dt` does
+  and there is one definition of each operator instead of two. It gave
+  `s += "text"` for free, which is right and was not planned.
+- The frame machinery built for `%` and string concatenation covered Vec2
+  arithmetic with one change - a third f32 per frame, because `a + b` on two
+  vectors parks three values. Nesting was correct on the first try because of
+  it, and there is a test that proves it.
 
 ---
 
