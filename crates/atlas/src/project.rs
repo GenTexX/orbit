@@ -70,15 +70,15 @@ mod tests {
 
         let bounce = std::fs::read_to_string(dir.path().join("scripts/bounce.cmt")).unwrap();
         assert!(
-            comet::compile(&bounce).is_ok(),
+            comet::compile(&bounce, helios::script_schema()).is_ok(),
             "the demo script must compile: {:?}",
-            comet::compile(&bounce).err()
+            comet::compile(&bounce, helios::script_schema()).err()
         );
 
         // The broken one is broken on purpose, and its errors are the three it
         // has comments about - a squiggle each, not one that stops the rest.
         let squiggles = std::fs::read_to_string(dir.path().join("scripts/squiggles.cmt")).unwrap();
-        let diagnostics = comet::service::diagnostics(&squiggles);
+        let diagnostics = comet::service::diagnostics(&squiggles, helios::script_schema());
         assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
         assert!(diagnostics.iter().all(|d| d.span.end > d.span.start));
 

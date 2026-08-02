@@ -78,7 +78,7 @@ Two things worth carrying forward:
 
 ---
 
-## 4.2 - The host surface generalizes
+## 4.2 - The host surface generalizes (DONE)
 
 **Builds.** Decision 1: `Place` becomes a resolved path, and
 `TypedExprKind::Pos`, `Place::Pos` and `Place::PosField` disappear into it.
@@ -107,6 +107,26 @@ the record lists under "still to decide".
 **Proven by.** A script reading `transform.rotation` and writing a `Sprite`
 field. comet's tests run against a fake schema, consistent with how the crate
 already runs against a fake host.
+
+**Done** as ADR 0020, with two deliberate changes to the plan:
+
+- **`pos` is gone rather than kept as sugar.** Philip's call, and the more
+  honest one - sugar would have left a second way to say the same thing forever.
+  It broke every script in the repo: both demo files, four fixtures and around
+  forty test sources. That was the cheapest this will ever be, which is the
+  argument for having done it second rather than eighth.
+- **Decision 3 moved to 4.4, and components are not in the schema yet.**
+  Dynamic `Reflect` fields have no consumer until `ScriptComponent` carries
+  exported values, so building it here would have been building ahead of its
+  user. Component properties were left out because "what does a script see when
+  the node has no Sprite" is a runtime-semantics question worth answering
+  deliberately; the mechanism does not care, and adding them later is a data
+  change. ADR 0016 is therefore untouched.
+
+The shape that made it work: properties are **numbered**, and codegen passes the
+number to a fixed set of accessors. The import list stays fixed however large
+the schema grows, which is the property the old fixed-import design had and the
+one a function-per-property design would have lost.
 
 ---
 

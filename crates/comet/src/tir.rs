@@ -146,10 +146,17 @@ pub enum Place {
     LocalField(u32, Axis),
     Global(u32),
     GlobalField(u32, Axis),
-    /// The owning node's position, written back through the host.
-    Pos,
-    /// One axis of the owning node's position.
-    PosField(Axis),
+    /// A host property, by its schema id. One variant for every property the
+    /// engine exposes, rather than one variant per property - which is the
+    /// whole point: adding `transform.rotation` costs nothing here.
+    ///
+    /// `axis` writes one component of a `Vec2` property and leaves the other as
+    /// it was, which is what makes `transform.position.x = 1.0` a partial write.
+    Host {
+        field: u32,
+        ty: Type,
+        axis: Option<Axis>,
+    },
     /// An assignment whose target did not check. Codegen never sees this.
     Error,
 }
@@ -176,8 +183,11 @@ pub enum TypedExprKind {
     Str(String),
     Local(u32),
     Global(u32),
-    /// The owning node's position, read through the host.
-    Pos,
+    /// A host property, read through the host by its schema id.
+    HostField {
+        field: u32,
+        ty: Type,
+    },
     /// One component of a `Vec2` value.
     Field {
         receiver: Box<TypedExpr>,

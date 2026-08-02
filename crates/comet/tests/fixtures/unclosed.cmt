@@ -1,7 +1,7 @@
 func update(dt: f32) {
     let speed = 100.0;
-    pos.x += speed * dt;
+    transform.position.x += speed * dt;
 
-    if pos.x > 200.0 {
-        pos.x = -200.0;
+    if transform.position.x > 200.0 {
+        transform.position.x = -200.0;
     // missing closing brace, twice over

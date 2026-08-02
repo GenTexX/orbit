@@ -3,12 +3,12 @@ let speed = 120.0;
 let direction = 1.0;
 
 func update(dt: f32) {
-    pos.x += speed * direction * dt;
+    transform.position.x += speed * direction * dt;
 
-    if pos.x > 200.0 {
+    if transform.position.x > 200.0 {
         direction = -1.0;
     }
-    if pos.x < -200.0 {
+    if transform.position.x < -200.0 {
         direction = 1.0;
     }
 }

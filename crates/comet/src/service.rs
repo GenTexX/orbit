@@ -18,6 +18,7 @@ use crate::ast::{Block, Else, Function, Script, Stmt};
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind, lex_with_comments};
 use crate::parser::parse;
+use crate::schema::HostSchema;
 use crate::span::Span;
 use crate::tir::Type;
 
@@ -36,10 +37,10 @@ pub struct Analysis {
 
 impl Analysis {
     /// Run the whole frontend over `source` once.
-    pub fn new(source: &str) -> Self {
+    pub fn new(source: &str, schema: &HostSchema) -> Self {
         let (with_comments, _) = lex_with_comments(source);
         let (script, mut diagnostics) = parse(source);
-        let (_, checked) = crate::check::check(&script);
+        let (_, checked) = crate::check::check(&script, schema);
         diagnostics.extend(checked);
         diagnostics.sort_by_key(|d| (d.span.start, d.span.end));
         Self {
@@ -63,9 +64,9 @@ impl Analysis {
 /// Never fails and never stops early: a typo on line 3 does not blank out the
 /// diagnostics for line 30, which is what makes live squiggles worth having at
 /// all - a file being typed is malformed most of the time it is looked at.
-pub fn diagnostics(source: &str) -> Vec<Diagnostic> {
+pub fn diagnostics(source: &str, schema: &HostSchema) -> Vec<Diagnostic> {
     let (script, mut found) = parse(source);
-    let (_, checked) = crate::check::check(&script);
+    let (_, checked) = crate::check::check(&script, schema);
     found.extend(checked);
     found.sort_by_key(|d| (d.span.start, d.span.end));
     found
@@ -85,7 +86,7 @@ pub enum TokenClass {
     Function,
     /// A type name, in an annotation or a return type.
     Type,
-    /// Any other identifier: a local, a parameter, script state, `pos`.
+    /// Any other identifier: a local, a parameter, script state, `transform`.
     Identifier,
     Operator,
     Punctuation,
@@ -284,13 +285,13 @@ pub struct CompletionItem {
     pub kind: CompletionKind,
     /// A short line about what it is - a type, a signature, a sentence. Shown
     /// beside the name, because a list of bare names does not teach anyone what
-    /// `pos` or `print` actually are.
+    /// `transform` or `print` actually are.
     pub detail: String,
 }
 
 /// Every occurrence of the identifier `offset` sits in, including that one.
 ///
-/// Token-based rather than textual: `pos` does not light up inside `position`,
+/// Token-based rather than textual: `speed` does not light up inside `speeds`,
 /// inside a comment, or inside a string. It is also deliberately not
 /// scope-aware - two locals called `i` in different functions both highlight -
 /// because the point is "show me this word", answered instantly on every caret
@@ -360,7 +361,6 @@ const BUILTINS: &[(&str, &str)] = &[
     ("pow", "func pow(a: f32, b: f32) -> f32"),
 ];
 /// The magic name bound to the owning node's position.
-const POS_NAME: &str = "pos";
 /// `Vec2`'s whole member set.
 const VEC2_FIELDS: &[&str] = &["x", "y"];
 
@@ -371,7 +371,7 @@ const VEC2_FIELDS: &[&str] = &["x", "y"];
 /// functions, the builtins, the types, and the keywords.
 ///
 /// Resolution is single-file, because a v1 script is (there is no `import`).
-pub fn completions_at(source: &str, offset: usize) -> Vec<CompletionItem> {
+pub fn completions_at(source: &str, schema: &HostSchema, offset: usize) -> Vec<CompletionItem> {
     let offset = offset.min(source.len());
     // Inside a comment or a string literal there is no code to complete, and a
     // list popping up over prose is pure noise. The lexer already knows which
@@ -382,7 +382,35 @@ pub fn completions_at(source: &str, offset: usize) -> Vec<CompletionItem> {
     let (script, _) = parse(source);
 
     if let Some(receiver) = field_receiver(source, offset) {
-        return match receiver_type(&script, offset, receiver) {
+        // A host object offers its own properties. This is the completion that
+        // makes a schema-driven surface discoverable at all: nobody remembers
+        // whether it is `position` or `translation` without being shown.
+        // `transform.position.` - a property's own type decides what follows.
+        if let Some((object, property)) = receiver.split_once('.')
+            && let Some(found) = schema.resolve(object, property)
+        {
+            return match found.ty.ty() {
+                Type::Vec2 => VEC2_FIELDS
+                    .iter()
+                    .map(|name| detailed(name, CompletionKind::Field, "f32".to_string()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+        }
+        if schema.has_object(receiver) {
+            return schema
+                .fields_of(receiver)
+                .iter()
+                .map(|field| {
+                    detailed(
+                        &field.name,
+                        CompletionKind::Field,
+                        field.ty.ty().name().to_string(),
+                    )
+                })
+                .collect();
+        }
+        return match receiver_type(&script, schema, offset, receiver) {
             Some(Type::Vec2) => VEC2_FIELDS
                 .iter()
                 .map(|name| detailed(name, CompletionKind::Field, "f32".to_string()))
@@ -395,8 +423,15 @@ pub fn completions_at(source: &str, offset: usize) -> Vec<CompletionItem> {
     }
 
     let mut items = Vec::new();
+    for name in schema.object_names() {
+        items.push(detailed(
+            name,
+            CompletionKind::Variable,
+            "engine properties".to_string(),
+        ));
+    }
     for name in names_in_scope(&script, offset) {
-        let detail = type_of_name(&script, offset, &name)
+        let detail = type_of_name(&script, schema, offset, &name)
             .map(|ty| ty.name().to_string())
             .unwrap_or_default();
         items.push(detailed(&name, CompletionKind::Variable, detail));
@@ -472,12 +507,9 @@ fn keyword_detail(word: &str) -> &'static str {
 /// worked on annotated ones would almost never fire. A local inside a function
 /// still needs its annotation: the checker resolves those to slots, and nothing
 /// maps a slot back to the name it came from yet.
-fn type_of_name(script: &Script, offset: usize, name: &str) -> Option<Type> {
-    if name == POS_NAME {
-        return Some(Type::Vec2);
-    }
+fn type_of_name(script: &Script, schema: &HostSchema, offset: usize, name: &str) -> Option<Type> {
     if script.state.iter().any(|s| s.name == name) {
-        let (typed, _) = crate::check::check(script);
+        let (typed, _) = crate::check::check(script, schema);
         return typed
             .state
             .iter()
@@ -610,7 +642,7 @@ fn signature_of(function: &Function) -> String {
 /// Hovering a name is how you find out what `dt` is without reading the
 /// signature again - and in a teaching language that is most of what a person
 /// needs while writing.
-pub fn hover_at(source: &str, offset: usize) -> Option<String> {
+pub fn hover_at(source: &str, schema: &HostSchema, offset: usize) -> Option<String> {
     let offset = offset.min(source.len());
     let (script, _) = parse(source);
     let (start, end) = word_span(source, offset)?;
@@ -628,7 +660,15 @@ pub fn hover_at(source: &str, offset: usize) -> Option<String> {
     if !keyword_detail(name).is_empty() {
         return Some(format!("{name} - {}", keyword_detail(name)));
     }
-    let ty = type_of_name(&script, offset, name)?;
+    if schema.has_object(name) {
+        let properties: Vec<String> = schema
+            .fields_of(name)
+            .iter()
+            .map(|f| format!("{}: {}", f.name, f.ty.ty().name()))
+            .collect();
+        return Some(format!("{name} - {}", properties.join(", ")));
+    }
+    let ty = type_of_name(&script, schema, offset, name)?;
     Some(format!("{name}: {}", ty.name()))
 }
 
@@ -703,7 +743,7 @@ pub struct Definition {
 /// [`completions_at`], which deliberately over-offers - a name it suggests that
 /// turns out not to compile is a small annoyance, but a *jump* to the wrong
 /// declaration teaches something false.
-pub fn definition_at(source: &str, offset: usize) -> Option<Definition> {
+pub fn definition_at(source: &str, schema: &HostSchema, offset: usize) -> Option<Definition> {
     let (start, end) = word_span(source, offset)?;
     let name = &source[start..end];
     if name.is_empty() {
@@ -714,6 +754,7 @@ pub fn definition_at(source: &str, offset: usize) -> Option<Definition> {
     let called = source[end..].trim_start().starts_with('(');
     resolve(
         source,
+        schema,
         offset,
         name,
         called,
@@ -724,8 +765,13 @@ pub fn definition_at(source: &str, offset: usize) -> Option<Definition> {
 /// What `name` would refer to if it were written at `offset` - which is how a
 /// rename learns whether the name it is about to introduce already means
 /// something there.
-pub fn declaration_visible_at(source: &str, offset: usize, name: &str) -> Option<Definition> {
-    resolve(source, offset, name, false, Span::new(0, 0))
+pub fn declaration_visible_at(
+    source: &str,
+    schema: &HostSchema,
+    offset: usize,
+    name: &str,
+) -> Option<Definition> {
+    resolve(source, schema, offset, name, false, Span::new(0, 0))
 }
 
 /// The shared scope walk behind [`definition_at`] and
@@ -733,6 +779,7 @@ pub fn declaration_visible_at(source: &str, offset: usize, name: &str) -> Option
 /// as the span of an engine-provided name, which is declared nowhere.
 fn resolve(
     source: &str,
+    schema: &HostSchema,
     offset: usize,
     name: &str,
     called: bool,
@@ -797,7 +844,7 @@ fn resolve(
     }
     let engine = if BUILTINS.iter().any(|(builtin, _)| *builtin == name) {
         DefinitionKind::Builtin
-    } else if TYPES.contains(&name) || name == "pos" {
+    } else if TYPES.contains(&name) || schema.has_object(name) {
         DefinitionKind::Type
     } else {
         return None;
@@ -814,21 +861,21 @@ fn resolve(
 ///
 /// Each candidate occurrence is resolved on its own and kept only if it lands
 /// on the same declaration, so a shadowed inner `x` is left alone and a field
-/// `pos.x` is never touched. That is one resolution per occurrence, which is
+/// `transform.position.x` is never touched. That is one resolution per occurrence, which is
 /// more work than a textual sweep and is the entire point: renaming is the one
 /// operation where being nearly right corrupts the file.
 ///
 /// `None` when `offset` is not on a renameable name - a builtin or a type has
 /// no declaration in this file to rename.
-pub fn rename_spans(source: &str, offset: usize) -> Option<Vec<Span>> {
-    let target = definition_at(source, offset)?;
+pub fn rename_spans(source: &str, schema: &HostSchema, offset: usize) -> Option<Vec<Span>> {
+    let target = definition_at(source, schema, offset)?;
     if !target.kind.is_in_source() {
         return None;
     }
     let mut spans: Vec<Span> = occurrences_at(source, target.span.start as usize)
         .into_iter()
         .filter(|span| {
-            definition_at(source, span.start as usize)
+            definition_at(source, schema, span.start as usize)
                 .is_some_and(|found| found.span == target.span)
         })
         .collect();
@@ -850,8 +897,8 @@ pub fn rename_spans(source: &str, offset: usize) -> Option<Vec<Span>> {
 /// in a language whose only feedback would be `cannot find X in this scope`,
 /// quietly changing which declaration a name resolves to is the worst outcome
 /// available.
-pub fn rename_is_safe(source: &str, offset: usize, name: &str) -> bool {
-    is_identifier(name) && declaration_visible_at(source, offset, name).is_none()
+pub fn rename_is_safe(source: &str, schema: &HostSchema, offset: usize, name: &str) -> bool {
+    is_identifier(name) && declaration_visible_at(source, schema, offset, name).is_none()
 }
 
 /// Whether `text` is a single identifier - what a rename is allowed to produce.
@@ -1098,10 +1145,13 @@ fn word_span(source: &str, offset: usize) -> Option<(usize, usize)> {
     (start < end).then_some((start, end))
 }
 
-/// The identifier before the `.` immediately left of `offset`, if the caret is
-/// in a field position. Reads the source rather than the tree: `pos.` does not
-/// parse as a field access, and that half-typed state is exactly when
-/// completions are asked for.
+/// The dotted path before the `.` immediately left of `offset`, if the caret is
+/// in a field position - `transform`, or `transform.position`.
+///
+/// Reads the source rather than the tree: `transform.` does not parse as a field
+/// access, and that half-typed state is exactly when completions are asked for.
+/// The whole path is returned rather than the last segment, because
+/// `transform.position.` and a local called `position` mean different things.
 fn field_receiver(source: &str, offset: usize) -> Option<&str> {
     let before = &source[..offset];
     // Skip the partial field name already typed.
@@ -1111,18 +1161,22 @@ fn field_receiver(source: &str, offset: usize) -> Option<&str> {
     let before = &before[..name_start];
     let dot = before.strip_suffix('.')?;
     let start = dot
-        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
         .map_or(0, |at| at + 1);
-    let receiver = &dot[start..];
+    let receiver = dot[start..].trim_end_matches('.');
     (!receiver.is_empty()).then_some(receiver)
 }
 
-/// The type of `receiver` as seen from `offset`: the magic `pos`, a declared
-/// local, or a piece of script state.
-fn receiver_type(script: &Script, offset: usize, receiver: &str) -> Option<Type> {
-    if receiver == POS_NAME {
-        return Some(Type::Vec2);
-    }
+/// The type of `receiver` as seen from `offset`: a declared local, a parameter,
+/// or a piece of script state. Host objects are handled by the caller, since
+/// they complete to property names rather than to a type's fields.
+fn receiver_type(
+    script: &Script,
+    schema: &HostSchema,
+    offset: usize,
+    receiver: &str,
+) -> Option<Type> {
+    let _ = schema;
     // A `let` with an explicit type says what it is; one without needs the
     // checker, which cannot run on a half-typed file - so an annotated binding
     // completes and an inferred one does not, which is a limit worth having
@@ -1156,9 +1210,6 @@ fn names_in_scope(script: &Script, offset: usize) -> Vec<String> {
         .filter(|state| !state.name.is_empty())
         .map(|state| state.name.clone())
         .collect();
-    // `pos` is always there, and is the name a script reaches for first.
-    names.insert(0, POS_NAME.to_string());
-
     if let Some(function) = enclosing_function(script, offset) {
         for param in &function.params {
             if !param.name.is_empty() {
@@ -1242,6 +1293,31 @@ fn visit_lets(block: &Block, offset: usize, out: &mut impl FnMut(&str, Option<&s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The service's public functions all take the host schema now. These
+    /// shadow them with the example one, so a test about completions is not
+    /// three quarters schema-passing noise.
+    fn schema() -> HostSchema {
+        crate::schema::example_schema()
+    }
+    fn diagnostics(source: &str) -> Vec<Diagnostic> {
+        super::diagnostics(source, &schema())
+    }
+    fn completions_at(source: &str, offset: usize) -> Vec<CompletionItem> {
+        super::completions_at(source, &schema(), offset)
+    }
+    fn hover_at(source: &str, offset: usize) -> Option<String> {
+        super::hover_at(source, &schema(), offset)
+    }
+    fn definition_at(source: &str, offset: usize) -> Option<Definition> {
+        super::definition_at(source, &schema(), offset)
+    }
+    fn rename_spans(source: &str, offset: usize) -> Option<Vec<Span>> {
+        super::rename_spans(source, &schema(), offset)
+    }
+    fn rename_is_safe(source: &str, offset: usize, name: &str) -> bool {
+        super::rename_is_safe(source, &schema(), offset, name)
+    }
 
     // --- diagnostics ---
 
@@ -1365,7 +1441,7 @@ func third(c: f32) { let x = nope; }
     #[test]
     fn highlighting_survives_a_file_that_does_not_parse() {
         // It runs on every keystroke, so most of what it sees is half-written.
-        let classes = classes("func update(dt: f32) { if pos.x > { ");
+        let classes = classes("func update(dt: f32) { if transform.position.x > { ");
         assert!(
             classes
                 .iter()
@@ -1387,7 +1463,7 @@ func third(c: f32) { let x = nope; }
         // lexing and parsing the same text three or four times to learn the
         // same things.
         let source = include_str!("../tests/fixtures/type_error.cmt");
-        let analysis = Analysis::new(source);
+        let analysis = Analysis::new(source, &schema());
         assert_eq!(analysis.diagnostics, diagnostics(source));
         assert_eq!(analysis.tokens, highlight(source));
         assert_eq!(analysis.brackets, brackets(source));
@@ -1396,7 +1472,7 @@ func third(c: f32) { let x = nope; }
     #[test]
     fn an_analysis_finds_a_bracket_the_same_way_the_standalone_call_does() {
         let source = "func f() { }";
-        let analysis = Analysis::new(source);
+        let analysis = Analysis::new(source, &schema());
         assert_eq!(analysis.bracket_at(9), bracket_at(source, 9));
         assert_eq!(analysis.bracket_at(5), None);
     }
@@ -1532,7 +1608,7 @@ func third(c: f32) { let x = nope; }
                  |
              }",
         );
-        for want in ["pos", "speed", "dt", "step"] {
+        for want in ["transform", "speed", "dt", "step"] {
             assert!(offered.contains(&want.to_string()), "missing {want}");
         }
     }
@@ -1564,7 +1640,7 @@ func third(c: f32) { let x = nope; }
 
     #[test]
     fn a_completion_says_what_it_is() {
-        // A list of bare names does not teach anyone what `pos` or `print` are.
+        // A list of bare names does not teach anyone what `transform` or `print` are.
         let source =
             "let speed = 1.0;\nfunc helper(a: f32) -> f32 { a }\nfunc update(dt: f32) {  }";
         let at = source.len() - 2;
@@ -1577,7 +1653,7 @@ func third(c: f32) { let x = nope; }
                 .unwrap_or("<missing>")
         };
         assert_eq!(detail("dt"), "f32", "a parameter shows its type");
-        assert_eq!(detail("pos"), "Vec2");
+        assert_eq!(detail("transform"), "engine properties");
         assert_eq!(detail("helper"), "func helper(a: f32) -> f32");
         assert_eq!(detail("print"), "func print(s: String)");
         assert_eq!(detail("while"), "repeat a block while a condition holds");
@@ -1586,23 +1662,43 @@ func third(c: f32) { let x = nope; }
     #[test]
     fn a_field_completion_says_its_type_too() {
         // Just after the dot, which is where the caret is when you type one.
-        let items = completions_at("func update(dt: f32) { pos. }", 27);
+        let source = "func update(dt: f32) { transform.position. }";
+        let at = source.find("position.").unwrap() + "position.".len();
+        let items = completions_at(source, at);
         assert_eq!(items[0].label, "x");
         assert_eq!(items[0].detail, "f32");
+    }
+
+    #[test]
+    fn a_dot_on_a_host_object_offers_its_properties_with_their_types() {
+        // The completion that makes a schema-driven surface discoverable at
+        // all: nobody remembers whether it is `position` or `translation`.
+        let offered = at_caret("func update(dt: f32) { transform.| }");
+        assert_eq!(offered, vec!["position", "rotation", "scale"]);
+
+        let source = "func update(dt: f32) { transform. }";
+        let at = source.find("transform.").unwrap() + "transform.".len();
+        let items = completions_at(source, at);
+        assert_eq!(items[0].detail, "Vec2");
+        assert_eq!(items[1].detail, "f32");
     }
 
     // --- hover ---
 
     #[test]
     fn hovering_a_name_says_what_it_is() {
-        let source = "let speed = 1.0;\nfunc helper(a: f32) -> f32 { a }\nfunc update(dt: f32) { pos.x += dt; }";
+        let source = "let speed = 1.0;\nfunc helper(a: f32) -> f32 { a }\nfunc update(dt: f32) { transform.position.x += dt; }";
         let at = |needle: &str| source.find(needle).unwrap() + 1;
         assert_eq!(hover_at(source, at("dt: f32")), Some("dt: f32".to_string()));
         assert_eq!(
             hover_at(source, at("helper")),
             Some("func helper(a: f32) -> f32".to_string())
         );
-        assert_eq!(hover_at(source, at("pos.x")), Some("pos: Vec2".to_string()));
+        assert_eq!(
+            hover_at(source, at("transform.position.x")),
+            Some("transform - position: Vec2, rotation: f32, scale: Vec2".to_string()),
+            "a host object lists what it holds, since that is the thing nobody remembers"
+        );
         assert_eq!(
             hover_at(source, at("speed")),
             Some("speed: f32".to_string()),
@@ -1637,7 +1733,7 @@ func third(c: f32) { let x = nope; }
     #[test]
     fn hover_survives_a_file_that_does_not_parse() {
         assert_eq!(
-            hover_at("func update(dt: f32) { pos.x += dt", 32),
+            hover_at("func update(dt: f32) { transform.position.x += dt", 47),
             Some("dt: f32".to_string())
         );
     }
@@ -1650,15 +1746,15 @@ func third(c: f32) { let x = nope; }
     }
 
     #[test]
-    fn after_a_dot_on_pos_only_its_fields_are_offered() {
-        let offered = at_caret("func update(dt: f32) { pos.| }");
+    fn after_a_dot_on_a_vec2_property_only_its_axes_are_offered() {
+        let offered = at_caret("func update(dt: f32) { transform.position.| }");
         assert_eq!(offered, vec!["x", "y"], "and no keywords: {offered:?}");
     }
 
     #[test]
     fn a_partly_typed_field_still_offers_the_whole_set() {
         // The editor filters as you type; the service reports what exists.
-        let offered = at_caret("func update(dt: f32) { pos.x| }");
+        let offered = at_caret("func update(dt: f32) { transform.position.x| }");
         assert_eq!(offered, vec!["x", "y"]);
     }
 
@@ -1685,7 +1781,7 @@ func third(c: f32) { let x = nope; }
         let offered = at_caret(
             "func update(dt: f32) {
                  let speed = 2.0;
-                 pos.x += sp|",
+                 transform.position.x += sp|",
         );
         assert!(offered.contains(&"speed".to_string()), "{offered:?}");
     }

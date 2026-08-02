@@ -4129,7 +4129,7 @@ impl State {
         if let Some(d) = self.diagnostic_at(offset) {
             return Some(d.message.clone());
         }
-        comet::service::hover_at(&self.script_text, offset)
+        comet::service::hover_at(&self.script_text, helios::script_schema(), offset)
     }
 
     /// Move the caret to the next problem after it, or the previous one before
@@ -4300,7 +4300,7 @@ impl State {
             return;
         };
         let at = self.editor_caret();
-        match comet::service::definition_at(&self.script_text, at) {
+        match comet::service::definition_at(&self.script_text, helios::script_schema(), at) {
             Some(found) if found.kind.is_in_source() => {
                 self.ui
                     .select_range(editor, found.span.start as usize, found.span.end as usize);
@@ -4329,7 +4329,9 @@ impl State {
     /// Start renaming the symbol at the caret, if it is one this file declares.
     fn start_symbol_rename(&mut self) {
         let at = self.editor_caret();
-        let Some(found) = comet::service::definition_at(&self.script_text, at) else {
+        let Some(found) =
+            comet::service::definition_at(&self.script_text, helios::script_schema(), at)
+        else {
             self.note("put the caret on a name to rename it");
             return;
         };
@@ -4366,11 +4368,18 @@ impl State {
             self.set_rename_error("that is not a name");
             return;
         }
-        if !comet::service::rename_is_safe(&self.script_text, rename.offset, &name) {
+        if !comet::service::rename_is_safe(
+            &self.script_text,
+            helios::script_schema(),
+            rename.offset,
+            &name,
+        ) {
             self.set_rename_error(format!("`{name}` already means something here"));
             return;
         }
-        let Some(mut spans) = comet::service::rename_spans(&self.script_text, rename.offset) else {
+        let Some(mut spans) =
+            comet::service::rename_spans(&self.script_text, helios::script_schema(), rename.offset)
+        else {
             self.set_rename_error("nothing to rename");
             return;
         };
@@ -5104,7 +5113,7 @@ impl State {
         let (_, prefix) = word_before(&self.script_text, caret);
         let theme = &self.theme;
         let items: Vec<aurora::list::ListItem> =
-            comet::service::completions_at(&self.script_text, caret)
+            comet::service::completions_at(&self.script_text, helios::script_schema(), caret)
                 .into_iter()
                 .map(|item| {
                     let (label, detail) = completion_colors(item.kind, theme);
@@ -5237,10 +5246,11 @@ impl State {
         // kind comes from asking the service rather than from state kept beside
         // the popup, which is one fewer thing that can drift - and it costs one
         // pipeline run per acceptance, not per keystroke.
-        let is_call = comet::service::completions_at(&self.script_text, range.start)
-            .iter()
-            .find(|item| item.label == label)
-            .is_some_and(|item| item.kind == comet::service::CompletionKind::Function);
+        let is_call =
+            comet::service::completions_at(&self.script_text, helios::script_schema(), range.start)
+                .iter()
+                .find(|item| item.label == label)
+                .is_some_and(|item| item.kind == comet::service::CompletionKind::Function);
         // Unless there is already one there, in which case adding another is
         // how you end up with `print(())`.
         let has_parens = self.script_text[range.end..].trim_start().starts_with('(');
@@ -5276,7 +5286,7 @@ impl State {
         }
         // One pass for everything: diagnostics, syntax classes and brackets all
         // come out of the same lex and parse rather than three of each.
-        self.analysis = comet::service::Analysis::new(&self.script_text);
+        self.analysis = comet::service::Analysis::new(&self.script_text, helios::script_schema());
         let theme = &self.theme;
         self.script_spans = self
             .analysis
@@ -7005,7 +7015,7 @@ mod tests {
                 .expect("a name")
                 .to_string_lossy()
                 .to_string();
-            let result = comet::compile(&source);
+            let result = comet::compile(&source, helios::script_schema());
             if name == "squiggles.cmt" {
                 assert!(result.is_err(), "squiggles.cmt is wrong on purpose");
             } else {

@@ -25,5 +25,5 @@ pub use project::{Manifest, Project};
 pub use reflect::{Reflect, Value};
 pub use render::SpriteDraw;
 pub use scene::{Node, NodeId, Scene};
-pub use script::{ScriptError, ScriptHost, ScriptInstance};
+pub use script::{ScriptError, ScriptHost, ScriptInstance, schema as script_schema};
 pub use transform::Transform;

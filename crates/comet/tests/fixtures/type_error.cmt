@@ -1,4 +1,4 @@
 func update(dt: f32) {
     let ready = true;
-    pos.x += ready;
+    transform.position.x += ready;
 }

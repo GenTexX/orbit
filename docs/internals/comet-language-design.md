@@ -16,7 +16,11 @@ decision 14 rather than independent of it. The plan dissolves rather than answer
 it, by scheduling `@export` before user-defined enums exist: every type in the
 language until then has an obvious default, and the enum case is answered
 alongside the enum work. A further set, listed under "Still to decide", has not
-been put yet. Nothing here is implemented.
+been put yet.
+
+**Implemented so far:** decisions 6 and 13 (iteration 4.1), and decisions 1 and 2
+(iteration 4.2, ADR 0020). Decision 3 has moved to iteration 4.4, where
+`ScriptComponent` first needs a field list that is not static.
 
 ## Where the language actually stands
 
@@ -35,12 +39,13 @@ block's tail expression as its value. The builtins are `print`, `str`, `vec2`,
 
 Two things are worth stating plainly because they drove several decisions:
 
-- **The host surface is `pos`, and nothing else.** A script can read and write
-  its own node's local translation. It cannot see rotation, scale, its own
-  components, any other node, input, or time.
-- **`Vec2` has no arithmetic.** `pos + vel`, `pos * dt` and `-v` are all type
-  errors today; only construction, field access and equality exist. This is why
-  `bounce.cmt` is written one axis at a time.
+- ~~**The host surface is `pos`, and nothing else.**~~ Fixed in 4.2. A script
+  reaches `transform.position`, `transform.rotation` and `transform.scale`
+  through a schema the engine supplies; `pos` no longer exists. Components,
+  other nodes, input and time are still out of reach.
+- ~~**`Vec2` has no arithmetic.**~~ Fixed in 4.1. `+`, `-`, unary `-`, and
+  scaling by a number all work, so `transform.position += vel * dt` compiles.
+  Geometry - dot, length, normalize, distance - is still absent.
 
 ## Decided
 

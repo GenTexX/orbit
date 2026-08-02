@@ -1,10 +1,10 @@
 // A bouncing node, and a tour of what Comet can do today.
 //
 // A top-level `let` is script state: it keeps its value between frames.
-// `start()` runs once, before the first frame. `pos` is this node's position -
+// `start()` runs once, before the first frame. `transform.position` is this node's position -
 // read it, or assign to it, to move the node.
 
-let home = pos;
+let home = transform.position;
 let velocity = vec2(0.0, 0.0);
 
 func start() {
@@ -21,14 +21,14 @@ func past_edge(x: f32, edge: f32) -> bool {
 func update(dt: f32) {
     // Vectors add, subtract, and scale by a number, so a whole frame of
     // movement is one line rather than one line per axis.
-    pos += velocity * dt;
+    transform.position += velocity * dt;
 
-    if past_edge(pos.x, 200.0) {
+    if past_edge(transform.position.x, 200.0) {
         velocity = -velocity;
         print("turned around");
     }
 
     // Vec2 is a value, not a reference: `home` still holds where the node
     // started, however far the line above has moved it since.
-    pos.y = home.y;
+    transform.position.y = home.y;
 }

@@ -44,7 +44,7 @@ fn main() {
         }
     };
 
-    let bytes = match comet::compile(&source) {
+    let bytes = match comet::compile(&source, &comet::example_schema()) {
         Ok(bytes) => bytes,
         Err(diagnostics) => {
             for diagnostic in &diagnostics {

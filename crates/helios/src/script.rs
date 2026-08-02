@@ -10,13 +10,14 @@
 //!
 //! Its own node's position, and nothing else. The store holds an owned copy,
 //! handed in before each call and read back after, rather than borrowing the
-//! `Scene`: v1's whole surface is `pos`, so there is nothing else to look at,
+//! `Scene`: v1's whole surface is the node's own transform, so there is
+//! nothing else to look at,
 //! and a store that borrowed the scene would put its lifetime into every type
 //! that touches a script. Copying in every frame also means an edit between
 //! frames - dragging the node in the editor - is what the script sees next,
 //! rather than the script fighting the editor from a stale position.
 //!
-//! `pos` is the node's **local** translation, the same value the inspector
+//! `transform.position` is the node's **local** translation, the same value the inspector
 //! shows. A script on a child moves it relative to its parent.
 //!
 //! # What this does not do
@@ -34,6 +35,7 @@ use thiserror::Error;
 use wasmtime::{Caller, Engine, Extern, Linker, Module, Store, TypedFunc};
 
 use crate::scene::{NodeId, Scene};
+use crate::transform::Transform;
 
 /// The function the host calls once per frame, if a script defines one.
 const UPDATE: &str = "update";
@@ -195,7 +197,7 @@ impl ScriptHost {
     }
 
     fn compile(&self, source: &str) -> Result<Module, ScriptError> {
-        let bytes = comet::compile(source).map_err(ScriptError::Compile)?;
+        let bytes = comet::compile(source, schema()).map_err(ScriptError::Compile)?;
         Module::new(&self.engine, &bytes).map_err(ScriptError::runtime)
     }
 
@@ -208,7 +210,7 @@ impl ScriptHost {
         let mut store = Store::new(
             &self.engine,
             ScriptState {
-                position: scene.node(node).transform.translation,
+                transform: scene.node(node).transform,
                 printed: Vec::new(),
             },
         );
@@ -226,7 +228,7 @@ impl ScriptHost {
         if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, START) {
             start.call(&mut store, ()).map_err(ScriptError::trap)?;
         }
-        scene.node_mut(node).transform.translation = store.data().position;
+        scene.node_mut(node).transform = store.data().transform;
         Ok(ScriptInstance {
             store,
             update,
@@ -274,11 +276,11 @@ impl ScriptInstance {
         let Some(update) = self.update.clone() else {
             return Ok(());
         };
-        self.store.data_mut().position = scene.node(node).transform.translation;
+        self.store.data_mut().transform = scene.node(node).transform;
         update
             .call(&mut self.store, dt)
             .map_err(ScriptError::trap)?;
-        scene.node_mut(node).transform.translation = self.store.data().position;
+        scene.node_mut(node).transform = self.store.data().transform;
         Ok(())
     }
 
@@ -294,11 +296,11 @@ impl ScriptInstance {
         let Some(on_destroy) = self.on_destroy.take() else {
             return Ok(());
         };
-        self.store.data_mut().position = scene.node(node).transform.translation;
+        self.store.data_mut().transform = scene.node(node).transform;
         on_destroy
             .call(&mut self.store, ())
             .map_err(ScriptError::trap)?;
-        scene.node_mut(node).transform.translation = self.store.data().position;
+        scene.node_mut(node).transform = self.store.data().transform;
         Ok(())
     }
 
@@ -333,30 +335,149 @@ impl ScriptInstance {
 /// What a running script can see and touch.
 #[derive(Debug)]
 struct ScriptState {
-    position: Vec2,
+    transform: Transform,
     printed: Vec<String>,
+}
+
+/// Which property a schema id refers to. The order here is what fixes the ids,
+/// and [`schema`] is built from the same list, so the two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Property {
+    Position,
+    Rotation,
+    Scale,
+}
+
+/// Everything a script can reach outside itself, and what each thing is.
+///
+/// comet compiles against the schema this produces and never learns what a
+/// `Transform` is. Adding a property here makes it scriptable - with
+/// completions and hover - without touching the compiler.
+const PROPERTIES: &[(&str, &str, comet::HostType, Property)] = &[
+    (
+        "transform",
+        "position",
+        comet::HostType::Vec2,
+        Property::Position,
+    ),
+    (
+        "transform",
+        "rotation",
+        comet::HostType::F32,
+        Property::Rotation,
+    ),
+    ("transform", "scale", comet::HostType::Vec2, Property::Scale),
+];
+
+/// The host surface every script in this engine is compiled against.
+///
+/// The editor asks for this too, so its squiggles and completions describe the
+/// same surface the compiler enforces - one definition, not two.
+pub fn schema() -> &'static comet::HostSchema {
+    static SCHEMA: std::sync::OnceLock<comet::HostSchema> = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(build_schema)
+}
+
+fn build_schema() -> comet::HostSchema {
+    let mut schema = comet::HostSchema::new();
+    let mut at = 0;
+    while at < PROPERTIES.len() {
+        let object = PROPERTIES[at].0;
+        let fields: Vec<(&'static str, comet::HostType)> = PROPERTIES[at..]
+            .iter()
+            .take_while(|(o, ..)| *o == object)
+            .map(|(_, field, ty, _)| (*field, *ty))
+            .collect();
+        at += fields.len();
+        schema = schema.object(object, fields);
+    }
+    schema
+}
+
+/// What property `id` names, or `None` if a module asked for one that is not in
+/// the schema it was compiled against - which can only happen if a module and
+/// the engine disagree, so it reads as a default rather than a panic.
+fn property(id: i32) -> Option<Property> {
+    usize::try_from(id)
+        .ok()
+        .and_then(|id| PROPERTIES.get(id))
+        .map(|(.., property)| *property)
 }
 
 /// Bind the functions every comet module imports (see `comet::HOST_MODULE`
 /// - the import list is fixed, so one binding table serves every script).
 fn bind_host(linker: &mut Linker<ScriptState>) -> Result<(), ScriptError> {
     let host = comet::HOST_MODULE;
+    // The property accessors. Each takes the property's schema id, so this
+    // table stays the same size however many properties the engine exposes.
     linker
-        .func_wrap(host, "get_position_x", |c: Caller<'_, ScriptState>| {
-            c.data().position.x
-        })
+        .func_wrap(
+            host,
+            "get_f32",
+            |c: Caller<'_, ScriptState>, id: i32| match property(id) {
+                Some(Property::Rotation) => c.data().transform.rotation,
+                _ => 0.0,
+            },
+        )
         .map_err(ScriptError::runtime)?;
     linker
-        .func_wrap(host, "get_position_y", |c: Caller<'_, ScriptState>| {
-            c.data().position.y
+        .func_wrap(
+            host,
+            "set_f32",
+            |mut c: Caller<'_, ScriptState>, id: i32, value: f32| {
+                if let Some(Property::Rotation) = property(id) {
+                    c.data_mut().transform.rotation = value;
+                }
+            },
+        )
+        .map_err(ScriptError::runtime)?;
+    // No property is a bool yet. The accessors exist so that adding one is a
+    // change to PROPERTIES rather than to the ABI.
+    linker
+        .func_wrap(host, "get_bool", |_: Caller<'_, ScriptState>, _id: i32| {
+            0i32
         })
         .map_err(ScriptError::runtime)?;
     linker
         .func_wrap(
             host,
-            "set_position",
-            |mut c: Caller<'_, ScriptState>, x: f32, y: f32| {
-                c.data_mut().position = Vec2::new(x, y);
+            "set_bool",
+            |_: Caller<'_, ScriptState>, _id: i32, _value: i32| {},
+        )
+        .map_err(ScriptError::runtime)?;
+    linker
+        .func_wrap(
+            host,
+            "get_vec2_x",
+            |c: Caller<'_, ScriptState>, id: i32| match property(id) {
+                Some(Property::Position) => c.data().transform.translation.x,
+                Some(Property::Scale) => c.data().transform.scale.x,
+                _ => 0.0,
+            },
+        )
+        .map_err(ScriptError::runtime)?;
+    linker
+        .func_wrap(
+            host,
+            "get_vec2_y",
+            |c: Caller<'_, ScriptState>, id: i32| match property(id) {
+                Some(Property::Position) => c.data().transform.translation.y,
+                Some(Property::Scale) => c.data().transform.scale.y,
+                _ => 0.0,
+            },
+        )
+        .map_err(ScriptError::runtime)?;
+    linker
+        .func_wrap(
+            host,
+            "set_vec2",
+            |mut c: Caller<'_, ScriptState>, id: i32, x: f32, y: f32| {
+                let value = Vec2::new(x, y);
+                match property(id) {
+                    Some(Property::Position) => c.data_mut().transform.translation = value,
+                    Some(Property::Scale) => c.data_mut().transform.scale = value,
+                    _ => {}
+                }
             },
         )
         .map_err(ScriptError::runtime)?;
@@ -454,9 +575,9 @@ mod tests {
         let direction = 1.0;
 
         func update(dt: f32) {
-            pos.x += speed * direction * dt;
-            if pos.x > 200.0 { direction = -1.0; }
-            if pos.x < -200.0 { direction = 1.0; }
+            transform.position.x += speed * direction * dt;
+            if transform.position.x > 200.0 { direction = -1.0; }
+            if transform.position.x < -200.0 { direction = 1.0; }
         }
     ";
 
@@ -535,7 +656,7 @@ mod tests {
 
     #[test]
     fn writing_one_axis_leaves_the_other_where_the_scene_had_it() {
-        // The script only ever assigns pos.x, so y must survive the round trip
+        // The script only ever assigns transform.position.x, so y must survive the round trip
         // out to the script and back.
         let mut host = ScriptHost::new().unwrap();
         let (mut scene, node) = scene_with_node(Vec2::new(0.0, 42.0));
@@ -575,8 +696,8 @@ mod tests {
         let mut script = host
             .instantiate(
                 "
-                let home = pos;
-                func update(dt: f32) { pos = home; }
+                let home = transform.position;
+                func update(dt: f32) { transform.position = home; }
                 ",
                 &mut scene,
                 node,
@@ -601,7 +722,7 @@ mod tests {
         host.instantiate(
             "
             func jump() -> f32 {
-                pos.y = 77.0;
+                transform.position.y = 77.0;
                 1.0
             }
             let started = jump();
@@ -651,7 +772,7 @@ mod tests {
         let (mut scene, node) = scene_with_node(Vec2::ZERO);
         let err = host
             .instantiate(
-                "func update(dt: f32) { let ready = true; pos.x += ready; }",
+                "func update(dt: f32) { let ready = true; transform.position.x += ready; }",
                 &mut scene,
                 node,
             )
@@ -682,7 +803,7 @@ mod tests {
             .instantiate(
                 "
                 func forever(n: f32) -> f32 { forever(n) }
-                func update(dt: f32) { pos.x = forever(dt); }
+                func update(dt: f32) { transform.position.x = forever(dt); }
                 ",
                 &mut scene,
                 node,
@@ -802,7 +923,7 @@ mod tests {
                 "
                 let ticks = 0.0;
                 func start() {
-                    pos = vec2(100.0, 200.0);
+                    transform.position = vec2(100.0, 200.0);
                 }
                 func update(dt: f32) {
                     ticks += 1.0;
@@ -835,7 +956,7 @@ mod tests {
         host.instantiate(
             "
             let home: Vec2 = vec2(7.0, 9.0);
-            func start() { pos = home; }
+            func start() { transform.position = home; }
             func update(dt: f32) { }
             ",
             &mut scene,
@@ -883,5 +1004,74 @@ mod tests {
             .expect("it compiles");
         script.update(&mut scene, node, 0.5).expect("a no-op frame");
         script.destroy(&mut scene, node).expect("a no-op destroy");
+    }
+
+    #[test]
+    fn a_script_rotates_and_scales_its_node_through_the_schema() {
+        // Nothing but `pos` could be reached before. These two properties cost
+        // a row each in PROPERTIES - no new IR, no new import, no compiler
+        // change - which is the whole claim decision 2 makes.
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::new(5.0, 5.0));
+        let mut script = host
+            .instantiate(
+                "func update(dt: f32) {
+                     transform.rotation = 1.5;
+                     transform.scale = vec2(2.0, 4.0);
+                 }",
+                &mut scene,
+                node,
+            )
+            .expect("it compiles");
+        script.update(&mut scene, node, 0.0).expect("one frame");
+
+        let transform = scene.node(node).transform;
+        assert_eq!(transform.rotation, 1.5);
+        assert_eq!(transform.scale, Vec2::new(2.0, 4.0));
+        assert_eq!(
+            transform.translation,
+            Vec2::new(5.0, 5.0),
+            "the property it did not touch is where the scene had it"
+        );
+    }
+
+    #[test]
+    fn the_schema_and_the_property_table_cannot_disagree() {
+        // The ids codegen emits are positions in PROPERTIES, and the schema is
+        // built from the same list. If the two ever drift, every accessor reads
+        // the wrong field - so this checks they are still derived from one
+        // another rather than maintained in parallel.
+        let schema = schema();
+        for (id, (object, field, ty, _)) in PROPERTIES.iter().enumerate() {
+            let found = schema
+                .resolve(object, field)
+                .unwrap_or_else(|| panic!("{object}.{field} is missing from the schema"));
+            assert_eq!(found.id as usize, id, "{object}.{field} is numbered wrong");
+            assert_eq!(found.ty, *ty);
+            assert_eq!(property(id as i32), Some(PROPERTIES[id].3));
+        }
+        assert_eq!(schema.properties().count(), PROPERTIES.len());
+        assert_eq!(property(PROPERTIES.len() as i32), None, "and no further");
+    }
+
+    #[test]
+    fn a_script_reaching_for_something_the_engine_does_not_expose_is_refused() {
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let error = host
+            .instantiate(
+                "func update(dt: f32) { transform.mass = 1.0; }",
+                &mut scene,
+                node,
+            )
+            .expect_err("there is no such property");
+        let ScriptError::Compile(diagnostics) = error else {
+            panic!("expected a compile error, got {error:?}");
+        };
+        assert!(
+            diagnostics[0].message.contains("has no property `mass`"),
+            "{:?}",
+            diagnostics[0].message
+        );
     }
 }

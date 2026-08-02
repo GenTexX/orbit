@@ -14,16 +14,15 @@ use std::collections::HashMap;
 
 use crate::ast;
 use crate::diagnostic::Diagnostic;
+use crate::schema::HostSchema;
 use crate::span::Span;
 use crate::tir::*;
 
-/// The magic identifier bound to the owning node's position.
-const POS: &str = "pos";
-
 /// Check `script`, returning the typed IR and any diagnostics. A script with
 /// diagnostics still yields a tree - the bad parts are [`Type::Error`].
-pub fn check(script: &ast::Script) -> (TypedScript, Vec<Diagnostic>) {
+pub fn check(script: &ast::Script, schema: &HostSchema) -> (TypedScript, Vec<Diagnostic>) {
     let mut checker = Checker {
+        schema,
         diagnostics: Vec::new(),
         globals: HashMap::new(),
         global_types: Vec::new(),
@@ -46,7 +45,10 @@ struct Signature {
     ret: Type,
 }
 
-struct Checker {
+struct Checker<'a> {
+    /// What this script can reach outside itself. comet has no built-in idea of
+    /// what a node is; the engine says.
+    schema: &'a HostSchema,
     diagnostics: Vec<Diagnostic>,
     /// Script state by name -> global slot.
     globals: HashMap<String, u32>,
@@ -69,7 +71,7 @@ struct Checker {
     ret: Type,
 }
 
-impl Checker {
+impl Checker<'_> {
     fn error(&mut self, span: Span, message: impl Into<String>) {
         self.diagnostics.push(Diagnostic::error(span, message));
     }
@@ -289,6 +291,24 @@ impl Checker {
                 format!("`{name}` is never used - prefix it with `_` if that is deliberate"),
             ));
         }
+    }
+
+    /// Report a property the host schema does not have, suggesting the nearest
+    /// one it does - the engine's property names are exactly the kind of thing
+    /// nobody remembers exactly.
+    fn unknown_property(&mut self, object: &str, field: &str, span: Span) {
+        let names = self
+            .schema
+            .fields_of(object)
+            .iter()
+            .map(|f| f.name.as_str());
+        let message = match nearest(field, names) {
+            Some(suggestion) => {
+                format!("`{object}` has no property `{field}` - did you mean `{suggestion}`?")
+            }
+            None => format!("`{object}` has no property `{field}`"),
+        };
+        self.error(span, message);
     }
 
     /// Note that something read the local in `slot`.
@@ -567,9 +587,6 @@ impl Checker {
     fn place(&mut self, target: &ast::Expr) -> (Place, Type) {
         match target {
             ast::Expr::Ident { name, span } => {
-                if name == POS {
-                    return (Place::Pos, Type::Vec2);
-                }
                 if let Some(slot) = self.lookup_local(name) {
                     return (Place::Local(slot), self.locals[slot as usize]);
                 }
@@ -585,16 +602,63 @@ impl Checker {
                 field_span,
                 ..
             } => {
+                // `transform.position = v`, or one axis of it.
                 if let ast::Expr::Ident { name, .. } = receiver.as_ref()
-                    && name == POS
+                    && self.lookup_local(name).is_none()
+                    && !self.globals.contains_key(name)
+                    && self.schema.has_object(name)
                 {
-                    return match axis(field) {
-                        Some(axis) => (Place::PosField(axis), Type::F32),
+                    return match self.schema.resolve(name, field) {
+                        Some(found) => (
+                            Place::Host {
+                                field: found.id,
+                                ty: found.ty.ty(),
+                                axis: None,
+                            },
+                            found.ty.ty(),
+                        ),
                         None => {
-                            self.error(*field_span, format!("`Vec2` has no field `{field}`"));
+                            self.unknown_property(name, field, *field_span);
                             (Place::Error, Type::Error)
                         }
                     };
+                }
+                // `transform.position.x = v`: one axis of a Vec2 property,
+                // leaving the other as it was.
+                if let ast::Expr::Field {
+                    receiver: outer,
+                    field: property,
+                    field_span: property_span,
+                    ..
+                } = receiver.as_ref()
+                    && let ast::Expr::Ident { name, .. } = outer.as_ref()
+                    && self.lookup_local(name).is_none()
+                    && !self.globals.contains_key(name)
+                    && self.schema.has_object(name)
+                {
+                    let Some(found) = self.schema.resolve(name, property) else {
+                        self.unknown_property(name, property, *property_span);
+                        return (Place::Error, Type::Error);
+                    };
+                    if found.ty.ty() != Type::Vec2 {
+                        self.error(
+                            *field_span,
+                            format!("`{}` has no fields", found.ty.ty().name()),
+                        );
+                        return (Place::Error, Type::Error);
+                    }
+                    let Some(axis) = axis(field) else {
+                        self.error(*field_span, format!("`Vec2` has no field `{field}`"));
+                        return (Place::Error, Type::Error);
+                    };
+                    return (
+                        Place::Host {
+                            field: found.id,
+                            ty: Type::Vec2,
+                            axis: Some(axis),
+                        },
+                        Type::F32,
+                    );
                 }
                 // A named `Vec2` - a local, a parameter, or script state - can
                 // have one axis written. Anything else cannot: there is nowhere
@@ -680,15 +744,31 @@ impl Checker {
                 }),
                 axis: *axis,
             },
-            Place::Pos => TypedExprKind::Pos,
-            Place::PosField(axis) => TypedExprKind::Field {
-                receiver: Box::new(TypedExpr {
-                    kind: TypedExprKind::Pos,
-                    ty: Type::Vec2,
-                    span,
-                }),
-                axis: *axis,
-            },
+            // Reading a host property back for a compound assignment. With an
+            // axis, that means reading the whole Vec2 and taking one component -
+            // the property has no per-axis accessor, and inventing one here
+            // would be codegen's decision rather than the checker's.
+            Place::Host {
+                field,
+                ty: field_ty,
+                axis,
+            } => {
+                let read = TypedExprKind::HostField {
+                    field: *field,
+                    ty: *field_ty,
+                };
+                match axis {
+                    Some(axis) => TypedExprKind::Field {
+                        receiver: Box::new(TypedExpr {
+                            kind: read,
+                            ty: *field_ty,
+                            span,
+                        }),
+                        axis: *axis,
+                    },
+                    None => read,
+                }
+            }
             Place::Error => TypedExprKind::Error,
         };
         TypedExpr { kind, ty, span }
@@ -736,9 +816,7 @@ impl Checker {
             ast::Expr::Str { value, .. } => (TypedExprKind::Str(value.clone()), Type::Str),
 
             ast::Expr::Ident { name, .. } => {
-                if name == POS {
-                    (TypedExprKind::Pos, Type::Vec2)
-                } else if let Some(slot) = self.lookup_local(name) {
+                if let Some(slot) = self.lookup_local(name) {
                     self.mark_used(slot);
                     (TypedExprKind::Local(slot), self.locals[slot as usize])
                 } else if let Some(&slot) = self.globals.get(name) {
@@ -746,6 +824,20 @@ impl Checker {
                         TypedExprKind::Global(slot),
                         self.global_types[slot as usize],
                     )
+                } else if self.schema.has_object(name) {
+                    // A group of properties is not a value. Saying which one to
+                    // reach for is more use than "expected a value".
+                    let example = self
+                        .schema
+                        .fields_of(name)
+                        .first()
+                        .map(|f| format!(" - write `{name}.{}`", f.name))
+                        .unwrap_or_default();
+                    self.error(
+                        span,
+                        format!("`{name}` is a group of properties, not a value{example}"),
+                    );
+                    (TypedExprKind::Error, Type::Error)
                 } else {
                     self.unresolved(span, name);
                     (TypedExprKind::Error, Type::Error)
@@ -758,6 +850,29 @@ impl Checker {
                 field_span,
                 ..
             } => {
+                // A host property, if the receiver names an object nothing else
+                // has shadowed. Checked before the receiver is evaluated as an
+                // expression, because as an expression it is an error.
+                if let ast::Expr::Ident { name, .. } = receiver.as_ref()
+                    && self.lookup_local(name).is_none()
+                    && !self.globals.contains_key(name)
+                    && self.schema.has_object(name)
+                {
+                    let (kind, ty) = match self.schema.resolve(name, field) {
+                        Some(found) => (
+                            TypedExprKind::HostField {
+                                field: found.id,
+                                ty: found.ty.ty(),
+                            },
+                            found.ty.ty(),
+                        ),
+                        None => {
+                            self.unknown_property(name, field, *field_span);
+                            (TypedExprKind::Error, Type::Error)
+                        }
+                    };
+                    return TypedExpr { kind, ty, span };
+                }
                 let receiver = self.expr(receiver);
                 match receiver.ty {
                     Type::Vec2 => match axis(field) {
@@ -1143,7 +1258,7 @@ enum Builtin {
 /// builds: the host functions, which live in [`builtin`] and `vec2`.
 const BUILTIN_NAMES: &[&str] = &[
     "print", "str", "vec2", "abs", "sqrt", "floor", "ceil", "min", "max", "sin", "cos", "atan2",
-    "pow", "pos",
+    "pow",
 ];
 
 /// The candidate closest to `name`, if one is close enough to be worth saying.
@@ -1257,6 +1372,7 @@ fn is_host_name(name: &str) -> bool {
 /// the `comet_` prefix and `memory` up front turns that into a diagnostic with a
 /// span, which is the only form of it a person can act on.
 /// How an operator is written, for a diagnostic that has to name it.
+///
 fn symbol(op: ast::BinaryOp) -> &'static str {
     use ast::BinaryOp as B;
     match op {
@@ -1312,7 +1428,7 @@ mod tests {
             parse_diagnostics.is_empty(),
             "fixture should parse clean: {parse_diagnostics:?}"
         );
-        check(&script)
+        check(&script, &crate::schema::example_schema())
     }
 
     /// The error messages a script produces. Warnings are advisory and have
@@ -1499,7 +1615,7 @@ mod tests {
     #[test]
     fn script_state_is_visible_to_a_function_defined_before_it() {
         // clamp.cmt relies on this: `let speed` sits between the two functions.
-        check_clean("func update(dt: f32) { pos.x += speed; }\nlet speed = 1.0;");
+        check_clean("func update(dt: f32) { transform.position.x += speed; }\nlet speed = 1.0;");
     }
 
     #[test]
@@ -1510,33 +1626,62 @@ mod tests {
         );
     }
 
-    // --- the magic `pos` binding ---
+    // --- host properties ---
 
     #[test]
-    fn pos_is_a_vec2_and_its_axes_are_f32() {
-        let typed = check_clean("func update(dt: f32) { let p = pos; let x = pos.x; }");
+    fn a_host_property_has_the_type_the_schema_gave_it() {
+        let typed = check_clean(
+            "func update(dt: f32) { let p = transform.position; let x = transform.position.x; }",
+        );
         let update = typed.function("update").unwrap();
         assert_eq!(update.locals[1], Type::Vec2);
         assert_eq!(update.locals[2], Type::F32);
     }
 
     #[test]
-    fn assigning_a_pos_axis_resolves_to_a_pos_field_place() {
-        let typed = check_clean("func update(dt: f32) { pos.y = 3.0; }");
+    fn assigning_one_axis_of_a_property_is_a_partial_write() {
+        let typed = check_clean("func update(dt: f32) { transform.position.y = 3.0; }");
         let update = typed.function("update").unwrap();
         assert!(matches!(
             update.body.stmts[0],
             TypedStmt::Assign {
-                place: Place::PosField(Axis::Y),
+                place: Place::Host {
+                    ty: Type::Vec2,
+                    axis: Some(Axis::Y),
+                    ..
+                },
                 ..
             }
         ));
     }
 
     #[test]
+    fn an_object_is_not_a_value_and_says_what_to_write_instead() {
+        assert_eq!(
+            messages("func update(dt: f32) { let p = transform; }"),
+            ["`transform` is a group of properties, not a value - write `transform.position`"]
+        );
+    }
+
+    #[test]
+    fn an_unknown_property_suggests_the_nearest_one() {
+        assert_eq!(
+            messages("func update(dt: f32) { let r = transform.rotaton; }"),
+            ["`transform` has no property `rotaton` - did you mean `rotation`?"]
+        );
+    }
+
+    #[test]
+    fn a_local_may_shadow_an_object_name_because_nothing_is_magic_now() {
+        // `transform` is not a keyword. A local wins, which is ordinary lexical
+        // scoping - and the reason a script can still call something `pos`.
+        check_clean("func update(dt: f32) { let pos = 1.0; print(str(pos)); }");
+    }
+
+    #[test]
     fn vec2_has_only_x_and_y() {
         assert_eq!(
-            messages("func update(dt: f32) { let z = pos.z; }"),
+            messages("func update(dt: f32) { let z = transform.position.z; }"),
             vec!["`Vec2` has no field `z`"]
         );
     }
@@ -1623,7 +1768,7 @@ mod tests {
     #[test]
     fn a_function_may_call_one_defined_later() {
         check_clean(
-            "func update(dt: f32) { pos.x = later(dt); }\n\
+            "func update(dt: f32) { transform.position.x = later(dt); }\n\
              func later(v: f32) -> f32 { v }",
         );
     }
@@ -1773,7 +1918,7 @@ mod tests {
         let messages = messages(
             "func f(a: f32) -> f32 { a }\n\
              func f() -> f32 { 1.0 }\n\
-             func update(dt: f32) { pos.x = f(dt); }",
+             func update(dt: f32) { transform.position.x = f(dt); }",
         );
         assert_eq!(messages.len(), 1, "the call is fine: {messages:?}");
         assert!(messages[0].contains("already defined"), "got: {messages:?}");
@@ -1797,7 +1942,7 @@ mod tests {
         assert!(!parse_diagnostics.is_empty());
         // The point: this does not panic, and the statements that did parse are
         // still typed - which is what keeps squiggles alive while you type.
-        let (typed, _) = check(&script);
+        let (typed, _) = check(&script, &crate::schema::example_schema());
         let update = typed.function("update").expect("update still parsed");
         assert_eq!(update.locals[1], Type::F32, "`let speed` was still typed");
     }
@@ -1987,7 +2132,7 @@ mod tests {
     fn the_parameter_name_of_update_is_the_authors_to_choose() {
         check_clean("func update(elapsed: f32) { }");
         // And a function that is not a hook can have any shape at all.
-        check_clean("func tick() -> Vec2 { pos }");
+        check_clean("func tick() -> Vec2 { transform.position }");
     }
 
     #[test]

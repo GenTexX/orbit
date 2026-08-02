@@ -6,12 +6,12 @@ func update(dt: f32) {
     
     print("Hello Comet!");
     
-    pos.x += speed * direction * dt;
+    transform.position.x += speed * direction * dt;
 
-    if pos.x > 200.0 {
+    if transform.position.x > 200.0 {
         direction = -1.0;
     }
-    if pos.x < -200.0 {
+    if transform.position.x < -200.0 {
         direction = 1.0;
     }
 }

@@ -103,25 +103,36 @@ const PAGE: u32 = 65536;
 
 // Function indices. Imports come first in wasm's index space, then everything
 // the module defines, so these are fixed for every module comet emits.
-const F_GET_X: u32 = 0;
-const F_GET_Y: u32 = 1;
-const F_SET_POS: u32 = 2;
-const F_PRINT: u32 = 3;
+/// The host property accessors. Every one takes the property's schema id, so
+/// the import list stays fixed no matter how many properties the engine
+/// exposes - a host that can run one comet module can run all of them, and
+/// there is one binding table to write rather than one per script.
+///
+/// A `Vec2` is read a component at a time and written whole, which is what the
+/// dedicated position accessors did before the schema generalized them.
+const F_GET_F32: u32 = 0;
+const F_SET_F32: u32 = 1;
+const F_GET_BOOL: u32 = 2;
+const F_SET_BOOL: u32 = 3;
+const F_GET_VEC2_X: u32 = 4;
+const F_GET_VEC2_Y: u32 = 5;
+const F_SET_VEC2: u32 = 6;
+const F_PRINT: u32 = 7;
 /// `str(f32) -> String`. The host formats and allocates: float-to-decimal is a
 /// page of code nobody should emit into every module.
-const F_STR: u32 = 4;
+const F_STR: u32 = 8;
 /// The transcendentals. WebAssembly has no opcodes for these, so they are the
 /// only maths that leaves the module; abs, sqrt, floor, ceil, min and max are
 /// one instruction each and are emitted inline.
-const F_SIN: u32 = 5;
-const F_COS: u32 = 6;
-const F_ATAN2: u32 = 7;
-const F_POW: u32 = 8;
-const F_ALLOC: u32 = 9;
-const F_RETAIN: u32 = 10;
-const F_RELEASE: u32 = 11;
+const F_SIN: u32 = 9;
+const F_COS: u32 = 10;
+const F_ATAN2: u32 = 11;
+const F_POW: u32 = 12;
+const F_ALLOC: u32 = 13;
+const F_RETAIN: u32 = 14;
+const F_RELEASE: u32 = 15;
 /// The first script-defined function's index.
-const USER_BASE: u32 = 12;
+const USER_BASE: u32 = 16;
 
 /// Emit a WebAssembly module for `script`.
 ///
@@ -140,8 +151,11 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
 
     let mut types = Types::default();
     // The host ABI, in import order.
-    let t_get = types.get(vec![], vec![ValType::F32]);
-    let t_set = types.get(vec![ValType::F32, ValType::F32], vec![]);
+    let t_get_f32 = types.get(vec![ValType::I32], vec![ValType::F32]);
+    let t_set_f32 = types.get(vec![ValType::I32, ValType::F32], vec![]);
+    let t_get_bool = types.get(vec![ValType::I32], vec![ValType::I32]);
+    let t_set_bool = types.get(vec![ValType::I32, ValType::I32], vec![]);
+    let t_set_vec2 = types.get(vec![ValType::I32, ValType::F32, ValType::F32], vec![]);
     let t_print = types.get(vec![ValType::I32, ValType::I32], vec![]);
     let t_str = types.get(vec![ValType::F32], vec![ValType::I32]);
     let t_unary = types.get(vec![ValType::F32], vec![ValType::F32]);
@@ -151,9 +165,13 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     let t_init = types.get(vec![], vec![]);
 
     let mut imports = ImportSection::new();
-    imports.import(HOST_MODULE, "get_position_x", EntityType::Function(t_get));
-    imports.import(HOST_MODULE, "get_position_y", EntityType::Function(t_get));
-    imports.import(HOST_MODULE, "set_position", EntityType::Function(t_set));
+    imports.import(HOST_MODULE, "get_f32", EntityType::Function(t_get_f32));
+    imports.import(HOST_MODULE, "set_f32", EntityType::Function(t_set_f32));
+    imports.import(HOST_MODULE, "get_bool", EntityType::Function(t_get_bool));
+    imports.import(HOST_MODULE, "set_bool", EntityType::Function(t_set_bool));
+    imports.import(HOST_MODULE, "get_vec2_x", EntityType::Function(t_get_f32));
+    imports.import(HOST_MODULE, "get_vec2_y", EntityType::Function(t_get_f32));
+    imports.import(HOST_MODULE, "set_vec2", EntityType::Function(t_set_vec2));
     imports.import(HOST_MODULE, "print", EntityType::Function(t_print));
     imports.import(HOST_MODULE, "str", EntityType::Function(t_str));
     imports.import(HOST_MODULE, "sin", EntityType::Function(t_unary));
@@ -234,9 +252,13 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     // `wasm-function[7]`. It costs a few dozen bytes and is the difference
     // between a runtime error naming something and naming nothing.
     let mut names = NameMap::new();
-    names.append(F_GET_X, "orbit::get_position_x");
-    names.append(F_GET_Y, "orbit::get_position_y");
-    names.append(F_SET_POS, "orbit::set_position");
+    names.append(F_GET_F32, "orbit::get_f32");
+    names.append(F_SET_F32, "orbit::set_f32");
+    names.append(F_GET_BOOL, "orbit::get_bool");
+    names.append(F_SET_BOOL, "orbit::set_bool");
+    names.append(F_GET_VEC2_X, "orbit::get_vec2_x");
+    names.append(F_GET_VEC2_Y, "orbit::get_vec2_y");
+    names.append(F_SET_VEC2, "orbit::set_vec2");
     names.append(F_PRINT, "orbit::print");
     names.append(F_STR, "orbit::str");
     names.append(F_SIN, "orbit::sin");
@@ -727,9 +749,13 @@ fn expr_depth(expr: &TypedExpr) -> usize {
         K::Field { receiver, .. } => (0, vec![receiver]),
         K::MakeVec2 { x, y } => (0, vec![x, y]),
         K::Call { args, .. } => (0, args.iter().collect()),
-        K::Number(_) | K::Bool(_) | K::Str(_) | K::Local(_) | K::Global(_) | K::Pos | K::Error => {
-            (0, Vec::new())
-        }
+        K::Number(_)
+        | K::Bool(_)
+        | K::Str(_)
+        | K::Local(_)
+        | K::Global(_)
+        | K::HostField { .. }
+        | K::Error => (0, Vec::new()),
     };
     mine + children.into_iter().map(expr_depth).max().unwrap_or(0)
 }
@@ -1010,11 +1036,6 @@ impl<'a> FnGen<'a> {
                 self.store_global(*slot);
             }
 
-            Place::Pos => {
-                self.expr(value);
-                self.ins().call(F_SET_POS);
-            }
-
             // One axis of a named Vec2. A Vec2 is two adjacent slots, so
             // writing one component is a store into one of them and the other
             // is simply left alone - no read-modify-write needed.
@@ -1029,18 +1050,45 @@ impl<'a> FnGen<'a> {
                 self.ins().global_set(base + axis_offset(*axis));
             }
 
-            Place::PosField(axis) => {
-                // Position is written whole, so the other axis has to be read
-                // back and passed through untouched.
-                self.expr(value);
-                let tmp = self.scratch().f32s[0];
-                self.ins().local_set(tmp);
-                match axis {
-                    Axis::X => {
-                        self.ins().local_get(tmp).call(F_GET_Y).call(F_SET_POS);
+            // A host property. The id goes on the stack first, because every
+            // accessor takes it as its first argument.
+            Place::Host { field, ty, axis } => {
+                let id = *field as i32;
+                match (ty, axis) {
+                    // One axis of a Vec2 property. It is written whole, so the
+                    // other component has to be read back and passed through
+                    // untouched.
+                    (Type::Vec2, Some(axis)) => {
+                        let tmp = self.scratch().f32s[0];
+                        self.expr(value);
+                        self.ins().local_set(tmp);
+                        self.ins().i32_const(id);
+                        match axis {
+                            Axis::X => {
+                                self.ins().local_get(tmp);
+                                self.ins().i32_const(id).call(F_GET_VEC2_Y);
+                            }
+                            Axis::Y => {
+                                self.ins().i32_const(id).call(F_GET_VEC2_X);
+                                self.ins().local_get(tmp);
+                            }
+                        }
+                        self.ins().call(F_SET_VEC2);
                     }
-                    Axis::Y => {
-                        self.ins().call(F_GET_X).local_get(tmp).call(F_SET_POS);
+                    (Type::Vec2, None) => {
+                        self.ins().i32_const(id);
+                        self.expr(value);
+                        self.ins().call(F_SET_VEC2);
+                    }
+                    (Type::Bool, _) => {
+                        self.ins().i32_const(id);
+                        self.expr(value);
+                        self.ins().call(F_SET_BOOL);
+                    }
+                    _ => {
+                        self.ins().i32_const(id);
+                        self.expr(value);
+                        self.ins().call(F_SET_F32);
                     }
                 }
             }
@@ -1080,8 +1128,21 @@ impl<'a> FnGen<'a> {
                 }
             }
 
-            TypedExprKind::Pos => {
-                self.ins().call(F_GET_X).call(F_GET_Y);
+            TypedExprKind::HostField { field, ty } => {
+                let id = *field as i32;
+                match ty {
+                    // A Vec2 is two stack slots, so it takes two calls.
+                    Type::Vec2 => {
+                        self.ins().i32_const(id).call(F_GET_VEC2_X);
+                        self.ins().i32_const(id).call(F_GET_VEC2_Y);
+                    }
+                    Type::Bool => {
+                        self.ins().i32_const(id).call(F_GET_BOOL);
+                    }
+                    _ => {
+                        self.ins().i32_const(id).call(F_GET_F32);
+                    }
+                }
             }
 
             // A Vec2 is two f32s on the stack, so constructing one is just
@@ -1092,13 +1153,17 @@ impl<'a> FnGen<'a> {
             }
 
             TypedExprKind::Field { receiver, axis } => {
-                // `pos.x` fetches only the axis it wants. Going through the
-                // general path would call the host twice and throw one result
-                // away, on the single most common line in a script.
-                if matches!(receiver.kind, TypedExprKind::Pos) {
-                    self.ins().call(match axis {
-                        Axis::X => F_GET_X,
-                        Axis::Y => F_GET_Y,
+                // `transform.position.x` fetches only the axis it wants. Going
+                // through the general path would call the host twice and throw
+                // one result away, on the single most common line in a script.
+                if let TypedExprKind::HostField {
+                    field,
+                    ty: Type::Vec2,
+                } = receiver.kind
+                {
+                    self.ins().i32_const(field as i32).call(match axis {
+                        Axis::X => F_GET_VEC2_X,
+                        Axis::Y => F_GET_VEC2_Y,
                     });
                     return;
                 }
@@ -1365,20 +1430,22 @@ mod tests {
     /// Every emitted module in these tests goes through the real validator -
     /// "it compiled" is not evidence that wasmtime will accept it.
     fn compile_valid(source: &str) -> Vec<u8> {
-        let bytes = compile(source).expect("fixture should compile clean");
+        let bytes = compile(source, &crate::schema::example_schema())
+            .expect("fixture should compile clean");
         wasmparser::validate(&bytes).expect("emitted module must validate");
         bytes
     }
 
     /// A script touching every emission path: all four arithmetic ops, all six
     /// comparisons, both logical ops, unary minus and not, if/else, while, a
-    /// user call, a Vec2 return, Vec2 field reads off a local, both `pos` axis
-    /// writes, a whole-`pos` write, String state, assignment, and print.
+    /// user call, a Vec2 return, Vec2 field reads off a local, both axis writes
+    /// of a host property, a whole-property write, String state, assignment, and
+    /// print.
     const KITCHEN_SINK: &str = r#"
         let counter = 0.0;
         let flag = true;
         let label = "tick";
-        let home = pos;
+        let home = transform.position;
 
         func mix(a: f32, b: f32) -> f32 {
             let sum = a + b;
@@ -1395,16 +1462,16 @@ mod tests {
         }
 
         func whole() -> Vec2 {
-            pos
+            transform.position
         }
 
         func update(dt: f32) {
             let p = whole();
             let x = p.x;
             let y = p.y;
-            pos.x = mix(x, dt);
-            pos.y = y + 1.0;
-            pos = home;
+            transform.position.x = mix(x, dt);
+            transform.position.y = y + 1.0;
+            transform.position = home;
             let msg = label;
             msg = "other";
             print(msg);
@@ -1436,7 +1503,8 @@ mod tests {
     #[test]
     fn a_script_that_does_not_check_does_not_compile() {
         let source = include_str!("../tests/fixtures/type_error.cmt");
-        let diagnostics = compile(source).expect_err("a type error must not produce a module");
+        let diagnostics = compile(source, &crate::schema::example_schema())
+            .expect_err("a type error must not produce a module");
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].message, "expected `f32`, found `bool`");
     }
@@ -1444,7 +1512,7 @@ mod tests {
     #[test]
     fn a_script_that_does_not_parse_does_not_compile() {
         let source = include_str!("../tests/fixtures/unclosed.cmt");
-        assert!(compile(source).is_err());
+        assert!(compile(source, &crate::schema::example_schema()).is_err());
     }
 
     // --- the host ABI, pinned ---
@@ -1468,15 +1536,21 @@ mod tests {
 
     #[test]
     fn every_module_asks_the_host_for_the_same_functions() {
-        // The import list is fixed rather than per-script: a host that can run
-        // one comet module can run all of them, and there is one binding table
-        // to write rather than one per script. Only the transcendentals are
-        // imported - the rest of the maths is one instruction each and never
-        // leaves the module.
+        // The import list is fixed rather than per-script, and now also fixed
+        // rather than per-schema: a property accessor takes the property's id,
+        // so exposing a hundred more of them adds no imports. A host that can
+        // run one comet module can run all of them, and there is one binding
+        // table to write rather than one per script. Only the transcendentals
+        // are imported - the rest of the maths is one instruction each and
+        // never leaves the module.
         let expected: Vec<(String, String)> = [
-            "get_position_x",
-            "get_position_y",
-            "set_position",
+            "get_f32",
+            "set_f32",
+            "get_bool",
+            "set_bool",
+            "get_vec2_x",
+            "get_vec2_y",
+            "set_vec2",
             "print",
             "str",
             "sin",
@@ -1641,7 +1715,7 @@ mod tests {
 
     #[test]
     fn a_script_with_no_state_has_no_start_function() {
-        let bytes = compile_valid("func update(dt: f32) { pos.x = 1.0; }");
+        let bytes = compile_valid("func update(dt: f32) { transform.position.x = 1.0; }");
         let has_start = wasmparser::Parser::new(0)
             .parse_all(&bytes)
             .any(|p| matches!(p, Ok(Payload::StartSection { .. })));

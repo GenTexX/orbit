@@ -6,10 +6,10 @@ let ready = true;
 
 func update(dt: f32) {
     // A bool is not a number.
-    pos.x += ready;
+    transform.position.x += ready;
 
     // Nothing here is called `speed`.
-    pos.y = speed;
+    transform.position.y = speed;
 
     // print takes a String.
     print(dt);

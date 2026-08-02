@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn field_access_chains_left_to_right() {
-        let script = parse_ok("func update(dt: f32) { let x = pos.x; }");
+        let script = parse_ok("func update(dt: f32) { let x = transform.position.x; }");
         let Stmt::Let { init, .. } = &script.functions[0].body.stmts[0] else {
             panic!("expected a let");
         };
@@ -850,7 +850,7 @@ mod tests {
             panic!("expected a field access");
         };
         assert_eq!(field, "x");
-        assert!(matches!(**receiver, Expr::Ident { ref name, .. } if name == "pos"));
+        assert!(matches!(**receiver, Expr::Field { ref field, .. } if field == "position"));
     }
 
     #[test]

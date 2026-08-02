@@ -152,8 +152,8 @@ pub enum Expr {
         value: String,
         span: Span,
     },
-    /// A bare name: a local, a parameter, a piece of script state, or one of the
-    /// magic host-bound names like `pos`. Which one it is, is the checker's call.
+    /// A bare name: a local, a parameter, a piece of script state, or the
+    /// name of a host object like `transform`. Which one it is, is the checker's call.
     Ident {
         name: String,
         span: Span,

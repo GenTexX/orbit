@@ -11,5 +11,5 @@ func clamp(value: f32, lo: f32, hi: f32) -> f32 {
 let speed = 80.0;
 
 func update(dt: f32) {
-    pos.x = clamp(pos.x + speed * dt, -300.0, 300.0);
+    transform.position.x = clamp(transform.position.x + speed * dt, -300.0, 300.0);
 }

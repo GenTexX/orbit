@@ -22,9 +22,19 @@ use wasmtime::{
 const HEADER: i32 = 12;
 const OFF_RC: i32 = 4;
 
+/// The property ids `comet::example_schema()` assigns, in its declaration
+/// order. A real host derives these by walking the schema; a test that acts as
+/// a host is allowed to know them, and asserting them here is what would catch
+/// the numbering drifting.
+const POSITION: i32 = 0;
+const ROTATION: i32 = 1;
+const SCALE: i32 = 2;
+
 #[derive(Default)]
 struct Host {
     position: (f32, f32),
+    rotation: f32,
+    scale: (f32, f32),
     printed: Vec<String>,
 }
 
@@ -39,9 +49,9 @@ impl Script {
     }
 
     /// Instantiate with the node already at `(x, y)`. State initializers run
-    /// during instantiation, so a script whose state reads `pos` sees this.
+    /// during instantiation, so a script whose state reads the position sees this.
     fn at(source: &str, x: f32, y: f32) -> Self {
-        let bytes = match comet::compile(source) {
+        let bytes = match comet::compile(source, &comet::example_schema()) {
             Ok(bytes) => bytes,
             Err(diagnostics) => panic!("fixture should compile: {diagnostics:?}"),
         };
@@ -50,20 +60,72 @@ impl Script {
 
         let mut linker = Linker::new(&engine);
         let host = comet::HOST_MODULE;
+        // The property accessors. Every one takes the property's schema id, so
+        // this table is the same size whatever the schema says - which is the
+        // point of numbering properties rather than importing one function per
+        // property.
         linker
-            .func_wrap(host, "get_position_x", |c: Caller<'_, Host>| {
-                c.data().position.0
+            .func_wrap(host, "get_f32", |c: Caller<'_, Host>, id: i32| {
+                if id == ROTATION {
+                    c.data().rotation
+                } else {
+                    0.0
+                }
             })
             .expect("host binding");
         linker
-            .func_wrap(host, "get_position_y", |c: Caller<'_, Host>| {
-                c.data().position.1
-            })
+            .func_wrap(
+                host,
+                "set_f32",
+                |mut c: Caller<'_, Host>, id: i32, v: f32| {
+                    if id == ROTATION {
+                        c.data_mut().rotation = v;
+                    }
+                },
+            )
             .expect("host binding");
         linker
-            .func_wrap(host, "set_position", |mut c: Caller<'_, Host>, x, y| {
-                c.data_mut().position = (x, y);
-            })
+            .func_wrap(host, "get_bool", |_: Caller<'_, Host>, _id: i32| 0i32)
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "set_bool",
+                |_: Caller<'_, Host>, _id: i32, _v: i32| {},
+            )
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "get_vec2_x",
+                |c: Caller<'_, Host>, id: i32| match id {
+                    POSITION => c.data().position.0,
+                    SCALE => c.data().scale.0,
+                    _ => 0.0,
+                },
+            )
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "get_vec2_y",
+                |c: Caller<'_, Host>, id: i32| match id {
+                    POSITION => c.data().position.1,
+                    SCALE => c.data().scale.1,
+                    _ => 0.0,
+                },
+            )
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "set_vec2",
+                |mut c: Caller<'_, Host>, id: i32, x: f32, y: f32| match id {
+                    POSITION => c.data_mut().position = (x, y),
+                    SCALE => c.data_mut().scale = (x, y),
+                    _ => {}
+                },
+            )
             .expect("host binding");
         linker
             .func_wrap(
@@ -124,7 +186,7 @@ impl Script {
             &engine,
             Host {
                 position: (x, y),
-                printed: Vec::new(),
+                ..Host::default()
             },
         );
         let instance = linker
@@ -148,6 +210,14 @@ impl Script {
 
     fn position(&self) -> (f32, f32) {
         self.store.data().position
+    }
+
+    fn rotation(&self) -> f32 {
+        self.store.data().rotation
+    }
+
+    fn scale(&self) -> (f32, f32) {
+        self.store.data().scale
     }
 
     fn printed(&self) -> Vec<&str> {
@@ -249,7 +319,7 @@ fn the_bouncing_node_moves_and_turns_around_at_both_edges() {
 
 #[test]
 fn writing_one_axis_leaves_the_other_untouched() {
-    // `pos.x = v` has to read y back and write the pair, since the host only
+    // `transform.position.x = v` has to read y back and write the pair, since the host only
     // takes a whole position. Getting that backwards would silently zero y.
     let mut script = Script::at(include_str!("fixtures/bounce.cmt"), 0.0, 7.5);
     script.update(0.5);
@@ -365,7 +435,7 @@ fn an_operand_of_a_remainder_is_evaluated_once() {
             v
         }
         func how_many() -> f32 { calls }
-        func update(dt: f32) { pos.x = counted(7.0) % counted(3.0); }
+        func update(dt: f32) { transform.position.x = counted(7.0) % counted(3.0); }
         ",
     );
     script.update(0.0);
@@ -429,8 +499,8 @@ fn logical_operators_do_not_evaluate_what_they_do_not_need() {
         }
         func hits_so_far() -> f32 { hits }
         func update(dt: f32) {
-            if false && bump() { pos.x = 1.0; }
-            if true || bump() { pos.y = 1.0; }
+            if false && bump() { transform.position.x = 1.0; }
+            if true || bump() { transform.position.y = 1.0; }
         }
         ",
     );
@@ -477,10 +547,10 @@ fn a_vec2_is_copied_not_aliased() {
     let mut script = Script::at(
         "
         func update(dt: f32) {
-            let start = pos;
-            pos.x = 99.0;
-            pos.y = 99.0;
-            pos = start;
+            let start = transform.position;
+            transform.position.x = 99.0;
+            transform.position.y = 99.0;
+            transform.position = start;
         }
         ",
         3.0,
@@ -496,14 +566,14 @@ fn a_vec2_is_copied_not_aliased() {
 
 #[test]
 fn a_vec2_can_be_built_and_taken_apart() {
-    // Before this a Vec2 could only ever come from `pos`, so there was no way
+    // Before this a Vec2 could only ever come from the host, so there was no way
     // to have a second one - a home position, a velocity, a target.
     let mut script = Script::at(
         "
         let home = vec2(10.0, 20.0);
         func make(a: f32, b: f32) -> Vec2 { vec2(a, b) }
         func x_of(v: Vec2) -> f32 { v.x }
-        func update(dt: f32) { pos = home; }
+        func update(dt: f32) { transform.position = home; }
         ",
         99.0,
         99.0,
@@ -527,7 +597,7 @@ fn one_axis_of_a_named_vec2_can_be_written() {
             let v = vec2(5.0, 6.0);
             v.x = 50.0;
             home.y = 20.0;
-            pos = vec2(v.x + v.y, home.x + home.y);
+            transform.position = vec2(v.x + v.y, home.x + home.y);
         }
         ",
     );
@@ -543,7 +613,7 @@ fn one_axis_of_a_named_vec2_can_be_written() {
 fn a_vec2_crosses_the_boundary_as_two_f32s() {
     let mut script = Script::at(
         "
-        func here() -> Vec2 { pos }
+        func here() -> Vec2 { transform.position }
         func x_of(v: Vec2) -> f32 { v.x }
         func y_of(v: Vec2) -> f32 { v.y }
         ",
@@ -551,7 +621,7 @@ fn a_vec2_crosses_the_boundary_as_two_f32s() {
         2.0,
     );
     assert_eq!(script.call::<(), (f32, f32)>("here", ()), (1.0, 2.0));
-    // Field access off a local, rather than the `pos` fast path.
+    // Field access off a local, rather than the host-property fast path.
     assert_eq!(script.call::<(f32, f32), f32>("x_of", (3.0, 4.0)), 3.0);
     assert_eq!(script.call::<(f32, f32), f32>("y_of", (3.0, 4.0)), 4.0);
 }
@@ -560,7 +630,7 @@ fn a_vec2_crosses_the_boundary_as_two_f32s() {
 fn script_state_is_initialized_before_any_call_can_observe_it() {
     let mut script = Script::at(
         "
-        let home = pos;
+        let home = transform.position;
         func home_x() -> f32 { home.x }
         func home_y() -> f32 { home.y }
         ",
@@ -913,7 +983,10 @@ fn a_warning_does_not_stop_a_script_running() {
     script.update(0.0);
     assert_eq!(script.printed(), ["ran"]);
 
-    let (_, diagnostics) = comet::check(&comet::parse("func f() { let x = 1.0; }").0);
+    let (_, diagnostics) = comet::check(
+        &comet::parse("func f() { let x = 1.0; }").0,
+        &comet::example_schema(),
+    );
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(diagnostics[0].severity, comet::Severity::Warning);
 }
@@ -1013,7 +1086,7 @@ fn a_node_moves_by_a_velocity_vector() {
         r#"
         let velocity: Vec2 = vec2(30.0, -10.0);
         func update(dt: f32) {
-            pos += velocity * dt;
+            transform.position += velocity * dt;
         }
         "#,
         100.0,
@@ -1023,4 +1096,73 @@ fn a_node_moves_by_a_velocity_vector() {
     assert_eq!(script.position(), (115.0, 45.0));
     script.update(0.5);
     assert_eq!(script.position(), (130.0, 40.0));
+}
+
+#[test]
+fn a_script_reads_and_writes_a_property_that_is_not_position() {
+    // The point of the schema. `rotation` needed no new IR variant, no new
+    // import, and no change to the checker - it is a row in a table the engine
+    // owns, and the compiler learned it from there.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            transform.rotation = transform.rotation + 0.5;
+        }
+        "#,
+    );
+    script.update(0.0);
+    script.update(0.0);
+    assert_eq!(script.rotation(), 1.0);
+}
+
+#[test]
+fn properties_of_the_same_type_do_not_collide() {
+    // Two Vec2 properties, told apart only by the id passed to the accessor.
+    // Getting that wrong would move the node when the script scaled it.
+    let mut script = Script::at(
+        r#"
+        func update(dt: f32) {
+            transform.scale = vec2(2.0, 3.0);
+        }
+        "#,
+        10.0,
+        20.0,
+    );
+    script.update(0.0);
+    assert_eq!(script.scale(), (2.0, 3.0));
+    assert_eq!(script.position(), (10.0, 20.0), "position is untouched");
+}
+
+#[test]
+fn writing_one_axis_of_a_property_leaves_the_other_alone() {
+    // A Vec2 property is written whole, so a partial write has to read the
+    // other component back first.
+    let mut script = Script::at(
+        r#"
+        func update(dt: f32) {
+            transform.position.x = 99.0;
+        }
+        "#,
+        1.0,
+        2.0,
+    );
+    script.update(0.0);
+    assert_eq!(script.position(), (99.0, 2.0));
+}
+
+#[test]
+fn an_object_name_can_be_shadowed_because_nothing_is_magic_now() {
+    // `transform` is an ordinary name resolved against the schema, not a
+    // keyword, so a local wins - which is also why a script may still call
+    // something `pos`.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let pos = 7.0;
+            print(str(pos));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["7"]);
 }

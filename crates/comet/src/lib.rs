@@ -17,6 +17,7 @@ mod codegen;
 mod diagnostic;
 mod lexer;
 mod parser;
+pub mod schema;
 pub mod service;
 mod span;
 mod tir;
@@ -29,9 +30,9 @@ mod tir;
 /// outcome worse than reporting it. Everything upstream stays error-tolerant, so
 /// the returned diagnostics cover the whole file rather than stopping at the
 /// first mistake.
-pub fn compile(source: &str) -> Result<Vec<u8>, Vec<Diagnostic>> {
+pub fn compile(source: &str, schema: &HostSchema) -> Result<Vec<u8>, Vec<Diagnostic>> {
     let (script, mut diagnostics) = parse(source);
-    let (typed, check_diagnostics) = check(&script);
+    let (typed, check_diagnostics) = check(&script, schema);
     diagnostics.extend(check_diagnostics);
     if diagnostics.iter().any(|d| d.severity == Severity::Error) {
         diagnostics.sort_by_key(|d| (d.span.start, d.span.end));
@@ -49,6 +50,7 @@ pub use codegen::{HOST_MODULE, emit, format_f32, write_str};
 pub use diagnostic::{Diagnostic, Severity};
 pub use lexer::{Token, TokenKind, lex, lex_with_comments};
 pub use parser::parse;
+pub use schema::{FieldRef, HostField, HostObject, HostSchema, HostType, example_schema};
 pub use span::Span;
 pub use tir::{
     Axis, Host, Place, Type, TypedBlock, TypedExpr, TypedExprKind, TypedFn, TypedScript,
