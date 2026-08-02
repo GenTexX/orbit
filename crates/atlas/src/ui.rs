@@ -408,6 +408,8 @@ pub struct EditorRows {
     /// The toolbar actions. Adding a sprite or a script, saving and loading all
     /// live in the menus and on shortcuts; the toolbar is what the pointer is
     /// doing and what the viewport shows.
+    /// The "x" in each component header, and what it takes off.
+    pub component_removes: Vec<(WidgetId, NodeId, usize)>,
     /// The toolbar's view toggles (grid, world axes, snapping): highlighted when
     /// active, flipped on click.
     pub grid: Option<WidgetId>,
@@ -2037,10 +2039,26 @@ fn build_inspector(
         ) else {
             continue;
         };
+        // A Script's own fields (its path) and the variables its source
+        // exports are two different things, so they read as two runs rather
+        // than one list where `source` and `speed` look alike.
+        let exported: Vec<String> = match component {
+            helios::Component::Script(script) => script
+                .exports
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut opened_group = false;
         for name in reflect.field_names() {
             let Some(value) = reflect.get(&name) else {
                 continue;
             };
+            if !opened_group && exported.contains(&name) {
+                add_field_group(ui, card, "Exported", theme);
+                opened_group = true;
+            }
             let field = name.as_str();
             // A Vec2 field gets the two-axis treatment, a Color field a swatch
             // that opens the picker; everything else a plain (numeric where it
@@ -2525,10 +2543,47 @@ fn add_inspector_section(
         Style::new().grow(1.0).foreground(theme.aurora.heading),
     );
     rows.section_toggles.push((header, section));
+    // A component can be taken off again. Only a component - the node's
+    // transform is not one, and there is nothing to remove.
+    if let InspectorSection::Component(index) = section {
+        // "x" when there is no icon set, the same fallback the toolbar uses, so
+        // a headless layout still has the button to find.
+        let caption = if icons.is_some() { "" } else { "x" };
+        let remove = ui.button(
+            header,
+            caption,
+            Style::new()
+                .size(TREE_CHEVRON + 6.0, TREE_CHEVRON + 6.0)
+                .align_center()
+                .padding(3.0)
+                .corner_radius(theme.aurora.control_radius),
+        );
+        if let Some(icons) = icons {
+            ui.image(
+                remove,
+                icons.get(Icon::Close),
+                Style::new().size(TREE_CHEVRON, TREE_CHEVRON),
+            );
+        }
+        rows.component_removes.push((remove, node, index));
+    }
     // The fields live in a transparent, padded body below the header (the card
     // has no padding, so the header bar reaches the edges; the body shows the
     // card fill through it, so the card's rounded border wraps it with no seam).
     (!collapsed).then(|| ui.panel(card, Style::new().column().gap(6.0).padding(8.0)))
+}
+
+/// A small heading over a run of rows inside a component, with space above it so
+/// the run reads as its own group. Not collapsible: it is a label, not a
+/// control, and a component with two rows should not grow two disclosure
+/// triangles.
+fn add_field_group(ui: &mut Ui, card: WidgetId, title: &str, theme: &EditorTheme) {
+    let row = ui.panel(card, Style::new().row().align_center().margin_top(6.0));
+    ui.label(
+        row,
+        title,
+        Style::new().grow(1.0).foreground(theme.aurora.subhead),
+    );
 }
 
 /// One labeled, editable inspector row; returns the text input's id. `numeric`
@@ -3181,6 +3236,29 @@ mod tests {
     }
 
     /// Build a modal on a bare Ui and lay it out (a fresh root + one popup).
+    /// The inspector for `node`, laid out headless.
+    fn laid_out_inspector(scene: &Scene, node: NodeId) -> EditorRows {
+        let theme = EditorTheme::default();
+        let mut ui = Ui::new();
+        ui.set_theme(theme.aurora);
+        let root = ui.root_panel(Style::new().fill());
+        let mut rows = EditorRows::default();
+        build_inspector(
+            &mut ui,
+            root,
+            scene,
+            Some(node),
+            None,
+            &InspectorView::default(),
+            &FileExplorer::new(Path::new("/orbit-nonexistent-test-root")),
+            &Thumbnails::new(),
+            &theme,
+            &mut rows,
+        );
+        ui.layout(Vec2::new(400.0, 700.0)).unwrap();
+        rows
+    }
+
     fn laid_out_modal(modal: &Modal) -> EditorRows {
         let theme = EditorTheme::default();
         let mut ui = Ui::new();
@@ -4228,5 +4306,55 @@ mod tests {
         assert_eq!(columns_for(100.0, 20.0, 0.0, 0.0, 8), 5);
         assert_eq!(columns_for(0.0, 20.0, 5.0, 0.0, 8), 1);
         assert_eq!(columns_for(10_000.0, 20.0, 0.0, 0.0, 3), 3);
+    }
+
+    #[test]
+    fn a_component_header_offers_a_way_to_take_it_off() {
+        // The transform is not a component and has nothing to remove; a Sprite
+        // and a Script each get an "x".
+        let mut scene = Scene::new("root");
+        let node = scene.add_child(scene.root(), Node::new("Thing"));
+        scene
+            .node_mut(node)
+            .components
+            .push(Component::Sprite(SpriteComponent::default()));
+        scene
+            .node_mut(node)
+            .components
+            .push(Component::Script(helios::ScriptComponent::default()));
+
+        let rows = laid_out_inspector(&scene, node);
+        let removed: Vec<usize> = rows
+            .component_removes
+            .iter()
+            .map(|(_, _, index)| *index)
+            .collect();
+        assert_eq!(removed, vec![0, 1], "one per component, in order");
+    }
+
+    #[test]
+    fn a_scripts_exported_values_are_shown_as_their_own_group() {
+        // `source` and `speed` are different kinds of thing - one is which file
+        // runs, the other is what it was tuned to - so they do not read as one
+        // undifferentiated list.
+        let mut scene = Scene::new("root");
+        let node = scene.add_child(scene.root(), Node::new("Thing"));
+        scene
+            .node_mut(node)
+            .components
+            .push(Component::Script(helios::ScriptComponent {
+                source: "s.cmt".into(),
+                exports: vec![("speed".into(), Value::F32(1.0))],
+                hints: Vec::new(),
+            }));
+        let rows = laid_out_inspector(&scene, node);
+        assert!(
+            rows.field_rows.iter().any(|(_, _, _, f)| f == "speed"),
+            "the exported value has a row of its own"
+        );
+        assert!(
+            rows.asset_fields.iter().any(|(_, _, _, f)| f == "source"),
+            "and the path is still the asset field it was"
+        );
     }
 }

@@ -165,6 +165,16 @@ impl Selection {
     }
 }
 
+/// An in-progress slider drag: where it writes, and what was there when it
+/// started, so the whole drag becomes one undo step.
+#[derive(Debug, Clone)]
+struct SliderDrag {
+    node: NodeId,
+    component: usize,
+    field: String,
+    original: Option<Value>,
+}
+
 /// An in-progress inspector label drag-scrub: adjusting one component of a
 /// Vec2 field by the horizontal cursor motion since the press.
 #[derive(Debug, Clone)]
@@ -432,6 +442,7 @@ struct State {
     clipboard: Option<arboard::Clipboard>,
     /// An in-progress inspector label drag-scrub, if any.
     scrub: Option<ScrubDrag>,
+    slider_drag: Option<SliderDrag>,
     /// The toolbar icons, rasterized and registered once at startup.
     icons: Icons,
     /// The open color picker, if any.
@@ -946,7 +957,13 @@ impl ApplicationHandler for App {
             return;
         }
         match State::new(event_loop, self.logs.clone()) {
-            Ok(state) => {
+            Ok(mut state) => {
+                // A scene opened at startup can already have scripts attached,
+                // and their exported values are read from the source files -
+                // which nothing has looked at yet. Without this the inspector
+                // showed a script's path and none of its fields until the
+                // script was next saved.
+                state.reconcile_script_exports();
                 state.window.request_redraw();
                 self.state = Some(state);
             }
@@ -1053,6 +1070,7 @@ impl ApplicationHandler for App {
                         state.finish_reparent();
                         state.end_picker_drag();
                         state.end_scrub();
+                        state.end_slider_drag();
                         state.end_drag();
                         // Aurora's PointerReleased may emit Event::Dropped for a
                         // file-explorer drag onto the viewport (handled in react).
@@ -1351,6 +1369,7 @@ impl State {
                 .inspect_err(|err| tracing::warn!("no clipboard available: {err}"))
                 .ok(),
             scrub: None,
+            slider_drag: None,
             icons,
             picker: None,
             modal: None,
@@ -2379,6 +2398,33 @@ impl State {
         // Update the scrubbed input in place rather than rebuilding every move
         // (the scene re-renders live regardless); see sync_inspector_transform.
         self.sync_vec_input(&scrub.field, scrub.axis);
+    }
+
+    /// Finish a slider drag: rewind to the value it had when the drag began and
+    /// commit the final one through the history, so the whole drag is one undo
+    /// step rather than one per pixel.
+    fn end_slider_drag(&mut self) {
+        let Some(drag) = self.slider_drag.take() else {
+            return;
+        };
+        let reflect = self.project.scene.node(drag.node).components[drag.component].as_reflect();
+        let current = reflect.get(&drag.field);
+        if current == drag.original {
+            return;
+        }
+        if let (Some(original), Some(current)) = (drag.original, current) {
+            self.project.scene.node_mut(drag.node).components[drag.component]
+                .as_reflect_mut()
+                .set(&drag.field, original);
+            self.history.set_field(
+                &mut self.project.scene,
+                drag.node,
+                drag.component,
+                &drag.field,
+                current,
+            );
+        }
+        self.dirty = true;
     }
 
     /// Finish a scrub: rewind to the press-time value and commit the final one
@@ -6282,24 +6328,33 @@ impl State {
                 // A slider is an exported value the script gave a `@range`.
                 // It commits through the history like a typed field does, so
                 // one drag is one undo step.
+                // A slider drag writes straight into the scene and does NOT
+                // mark the shell dirty: a rebuild swaps the whole Ui and drops
+                // aurora's retained pressed state, so the drag would end after
+                // one step. The history entry is made on release, which is also
+                // what makes the whole drag one undo step - the same shape the
+                // inspector's label scrub uses.
                 AuroraEvent::SliderChanged { id, value }
                     if self.rows.field_sliders.iter().any(|(w, ..)| *w == id) =>
                 {
-                    let (_, node, component, field) = self
+                    let (node, component, field) = self
                         .rows
                         .field_sliders
                         .iter()
                         .find(|(w, ..)| *w == id)
-                        .map(|(w, n, c, f)| (*w, *n, *c, f.clone()))
+                        .map(|(_, n, c, f)| (*n, *c, f.clone()))
                         .expect("guarded by the match arm");
-                    self.history.set_field(
-                        &mut self.project.scene,
+                    let reflect = self.project.scene.node(node).components[component].as_reflect();
+                    let original = reflect.get(&field);
+                    self.slider_drag.get_or_insert_with(|| SliderDrag {
                         node,
                         component,
-                        &field,
-                        Value::F32(value),
-                    );
-                    self.dirty = true;
+                        field: field.clone(),
+                        original: original.clone(),
+                    });
+                    self.project.scene.node_mut(node).components[component]
+                        .as_reflect_mut()
+                        .set(&field, Value::F32(value));
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.code_save => {
                     self.save_script();
@@ -6351,6 +6406,20 @@ impl State {
                         find.set_whole_word(checked, &self.script_text);
                         self.reveal_find_match();
                     }
+                }
+                AuroraEvent::Clicked(id)
+                    if self.rows.component_removes.iter().any(|(w, ..)| *w == id) =>
+                {
+                    let (node, index) = self
+                        .rows
+                        .component_removes
+                        .iter()
+                        .find(|(w, ..)| *w == id)
+                        .map(|(_, n, i)| (*n, *i))
+                        .expect("guarded by the match arm");
+                    self.history
+                        .remove_component(&mut self.project.scene, node, index);
+                    self.dirty = true;
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.settings_button => {
                     self.open_settings_modal();

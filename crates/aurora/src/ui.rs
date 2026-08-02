@@ -8248,4 +8248,35 @@ three",
         assert_eq!(ui.drain_events(), vec![Event::Submitted(first)]);
         assert_eq!(ui.focused(), Some(second)); // advanced to the next field
     }
+
+    #[test]
+    fn a_slider_keeps_reporting_while_the_pointer_stays_down() {
+        // The failure this guards: an app that rebuilds its Ui on every
+        // SliderChanged swaps the whole widget tree and drops the retained
+        // `pressed` state, so the drag ends after one step. Aurora's side of
+        // that contract is that a held pointer keeps producing values.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(200.0, 40.0));
+        let s = ui.slider(root, 0.0, 0.0, 100.0, Style::new().size(100.0, 20.0));
+        ui.layout(Vec2::new(200.0, 40.0)).unwrap();
+
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(20.0, 10.0)));
+        ui.handle_input(InputEvent::PointerPressed);
+        let mut seen = ui.drain_events().len();
+        for x in [30.0, 40.0, 50.0, 60.0] {
+            ui.handle_input(InputEvent::PointerMoved(Vec2::new(x, 10.0)));
+            seen += ui.drain_events().len();
+        }
+        assert_eq!(seen, 5, "one per step, not just the press");
+        assert!(
+            (ui.slider_value(s) - 61.9).abs() < 0.5,
+            "it followed the drag"
+        );
+
+        // And it stops once the pointer is up.
+        ui.handle_input(InputEvent::PointerReleased);
+        let settled = ui.slider_value(s);
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(90.0, 10.0)));
+        assert_eq!(ui.slider_value(s), settled, "released, so it stays put");
+    }
 }
