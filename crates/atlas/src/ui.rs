@@ -333,6 +333,10 @@ pub struct EditorRows {
     /// A submitted field row commits its current text to
     /// `(node, component index, field name)`.
     pub field_rows: Vec<(WidgetId, NodeId, usize, String)>,
+    /// Exported values shown as a slider, because the script asked with
+    /// `@range`. Separate from `field_rows` because a slider reports a value
+    /// rather than text.
+    pub field_sliders: Vec<(WidgetId, NodeId, usize, String)>,
     /// Inspector asset (`Value::Asset`) fields: each is a drop target that,
     /// when an explorer image is dropped on it, sets `(node, component, field)`.
     pub asset_fields: Vec<(WidgetId, NodeId, usize, String)>,
@@ -2008,7 +2012,10 @@ fn build_inspector(
             "rotation",
             &Value::F32(t.rotation.to_degrees()),
             true,
-            Some("deg"),
+            FieldShape {
+                unit: Some("deg"),
+                ..FieldShape::default()
+            },
             theme,
         );
         rows.transform_rows.push((input, node, "rotation"));
@@ -2094,8 +2101,45 @@ fn build_inspector(
                     );
                 }
                 _ => {
+                    // What the script asked for, if it is a Script component
+                    // and it asked for anything.
+                    let hints: &[comet::Hint] = match component {
+                        helios::Component::Script(script) => script.hints_for(field),
+                        _ => &[],
+                    };
+                    let readonly = hints.contains(&comet::Hint::Readonly);
+                    let range = hints.iter().find_map(|h| match h {
+                        comet::Hint::Range(low, high) => Some((low, high)),
+                        _ => None,
+                    });
+                    // A range turns the number field into a slider, which is
+                    // the whole reason a tuning pass wants it.
+                    if let (Some((low, high)), Value::F32(current)) = (range, &value) {
+                        let row = ui.panel(card, Style::new().row().gap(6.0).align_center());
+                        ui.label(
+                            row,
+                            field,
+                            Style::new().width(70.0).foreground(theme.aurora.heading),
+                        );
+                        let slider = ui.slider(
+                            row,
+                            *current,
+                            *low,
+                            *high,
+                            Style::new().grow(1.0).enabled(!readonly),
+                        );
+                        rows.field_sliders
+                            .push((slider, node, i, field.to_string()));
+                        continue;
+                    }
                     let numeric = matches!(value, Value::F32(_));
-                    let input = add_value_row(ui, card, field, &value, numeric, None, theme);
+                    let multiline = hints.contains(&comet::Hint::Multiline);
+                    let shape = FieldShape {
+                        multiline,
+                        readonly,
+                        unit: None,
+                    };
+                    let input = add_value_row(ui, card, field, &value, numeric, shape, theme);
                     rows.field_rows.push((input, node, i, field.to_string()));
                 }
             }
@@ -2504,13 +2548,23 @@ fn add_inspector_section(
 
 /// One labeled, editable inspector row; returns the text input's id. `numeric`
 /// restricts typing to numbers.
+/// How a script asked for a field to be shown, beyond its type.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FieldShape<'a> {
+    pub multiline: bool,
+    pub readonly: bool,
+    /// A unit shown after the field, muted, so it reads as an annotation rather
+    /// than part of the value.
+    pub unit: Option<&'a str>,
+}
+
 fn add_value_row(
     ui: &mut Ui,
     panel: WidgetId,
     label: &str,
     value: &Value,
     numeric: bool,
-    unit: Option<&str>,
+    shape: FieldShape<'_>,
     theme: &EditorTheme,
 ) -> WidgetId {
     let row = ui.panel(panel, Style::new().row().gap(6.0).align_center());
@@ -2523,7 +2577,9 @@ fn add_value_row(
         .grow(1.0)
         .padding(4.0)
         .foreground(theme.aurora.heading)
-        .corner_radius(theme.aurora.control_radius);
+        .corner_radius(theme.aurora.control_radius)
+        .multiline_if(shape.multiline)
+        .enabled(!shape.readonly);
     let input = if numeric {
         ui.numeric_input(row, value_to_text(value), style)
     } else {
@@ -2531,7 +2587,7 @@ fn add_value_row(
     };
     // An optional unit hint after the field (e.g. rotation in degrees), muted so
     // it reads as an annotation rather than part of the value.
-    if let Some(unit) = unit {
+    if let Some(unit) = shape.unit {
         ui.label(row, unit, Style::new().foreground(theme.aurora.subhead));
     }
     input

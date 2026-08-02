@@ -867,11 +867,22 @@ impl Checker<'_> {
     /// reported rather than ignored: a typo that silently does nothing is the
     /// wrong failure mode for a language meant to be learned from, and is the
     /// reason annotations are grammar rather than a doc-comment convention.
-    fn annotations(&mut self, decl: &ast::StateDecl) -> bool {
+    fn annotations(&mut self, decl: &ast::StateDecl) -> (bool, Vec<Hint>) {
+        const KNOWN: &[&str] = &[
+            "export",
+            "range",
+            "step",
+            "tooltip",
+            "color",
+            "asset",
+            "multiline",
+            "readonly",
+        ];
         let mut exported = false;
+        let mut hints: Vec<Hint> = Vec::new();
         for annotation in &decl.annotations {
-            if annotation.name != "export" {
-                let message = match nearest(&annotation.name, ["export"].into_iter()) {
+            if !KNOWN.contains(&annotation.name.as_str()) {
+                let message = match nearest(&annotation.name, KNOWN.iter().copied()) {
                     Some(suggestion) => format!(
                         "unknown annotation `@{}` - did you mean `@{suggestion}`?",
                         annotation.name
@@ -881,15 +892,129 @@ impl Checker<'_> {
                 self.error(annotation.name_span, message);
                 continue;
             }
-            if !annotation.args.is_empty() {
-                self.error(annotation.span, "`@export` takes no arguments");
+            if annotation.name == "export" {
+                if !annotation.args.is_empty() {
+                    self.error(annotation.span, "`@export` takes no arguments");
+                }
+                if exported {
+                    self.error(annotation.span, "`@export` is already on this declaration");
+                }
+                exported = true;
+                continue;
             }
-            if exported {
-                self.error(annotation.span, "`@export` is already on this declaration");
+            let Some(hint) = self.hint(annotation) else {
+                continue;
+            };
+            if hints
+                .iter()
+                .any(|had| std::mem::discriminant(had) == std::mem::discriminant(&hint))
+            {
+                self.error(
+                    annotation.span,
+                    format!("`@{}` is already on this declaration", annotation.name),
+                );
+                continue;
             }
-            exported = true;
+            hints.push(hint);
         }
-        exported
+        // Everything but `@export` describes how the inspector should show a
+        // value, so on something the inspector never sees it is a mistake worth
+        // naming rather than silently ignoring.
+        if !exported && !hints.is_empty() {
+            self.error(
+                decl.annotations[0].span,
+                format!(
+                    "`{}` is not exported, so there is nothing for this to describe - add \
+                     `@export`",
+                    decl.name
+                ),
+            );
+        }
+        (exported, hints)
+    }
+
+    /// Check one presentation annotation's arguments, if it has any.
+    ///
+    /// Arguments are literals rather than expressions: they describe a field in
+    /// the editor, which exists before anything has run, so there is nothing for
+    /// an expression to be evaluated against.
+    fn hint(&mut self, annotation: &ast::Annotation) -> Option<Hint> {
+        let number = |at: usize| match annotation.args.get(at) {
+            Some(ast::Expr::Number { value, .. }) => Some(*value as f32),
+            Some(ast::Expr::Int { value, .. }) => Some(*value as f32),
+            _ => None,
+        };
+        let arity = |want: usize| annotation.args.len() == want;
+        match annotation.name.as_str() {
+            "range" => match (arity(2), number(0), number(1)) {
+                (true, Some(low), Some(high)) if low < high => Some(Hint::Range(low, high)),
+                (true, Some(low), Some(high)) => {
+                    self.error(
+                        annotation.span,
+                        format!("`@range({low}, {high})` is empty - the low end comes first"),
+                    );
+                    None
+                }
+                _ => {
+                    self.error(
+                        annotation.span,
+                        "`@range` takes two numbers: the lowest and highest allowed",
+                    );
+                    None
+                }
+            },
+            "step" => match (arity(1), number(0)) {
+                (true, Some(step)) if step > 0.0 => Some(Hint::Step(step)),
+                _ => {
+                    self.error(annotation.span, "`@step` takes one number above zero");
+                    None
+                }
+            },
+            "tooltip" => match annotation.args.as_slice() {
+                [ast::Expr::Str { value, .. }] => Some(Hint::Tooltip(value.clone())),
+                _ => {
+                    self.error(annotation.span, "`@tooltip` takes one piece of text");
+                    None
+                }
+            },
+            other => {
+                if !annotation.args.is_empty() {
+                    self.error(annotation.span, format!("`@{other}` takes no arguments"));
+                    return None;
+                }
+                Some(match other {
+                    "color" => Hint::Color,
+                    "asset" => Hint::Asset,
+                    "multiline" => Hint::Multiline,
+                    _ => Hint::Readonly,
+                })
+            }
+        }
+    }
+
+    /// Whether a hint makes sense on a value of this type.
+    fn hint_fits(&self, hint: &Hint, ty: Type) -> bool {
+        match hint {
+            Hint::Range(..) | Hint::Step(_) => matches!(ty, Type::F32 | Type::Int),
+            Hint::Asset | Hint::Multiline => ty == Type::Str,
+            // Four components, which nothing in the language has yet.
+            Hint::Color => false,
+            Hint::Tooltip(_) | Hint::Readonly => true,
+        }
+    }
+
+    /// What a hint needs, for the message when it does not fit.
+    fn hint_wants(hint: &Hint) -> &'static str {
+        match hint {
+            Hint::Range(..) => "`@range` describes a number, so it needs an `f32` or an `int`",
+            Hint::Step(_) => "`@step` describes a number, so it needs an `f32` or an `int`",
+            Hint::Asset => "`@asset` names a file, so it needs a `String`",
+            Hint::Multiline => "`@multiline` describes text, so it needs a `String`",
+            Hint::Color => {
+                "`@color` needs a type with four components, and the language has none yet"
+            }
+            Hint::Tooltip(_) | Hint::Readonly => unreachable!("these fit anything"),
+        }
     }
 
     /// The value a declaration with no initializer starts with.
@@ -1164,7 +1289,7 @@ impl Checker<'_> {
         // graph.
         let mut state = Vec::new();
         for decl in &script.state {
-            let exported = self.annotations(decl);
+            let (exported, hints) = self.annotations(decl);
             if decl.constant {
                 if exported {
                     self.error(
@@ -1254,11 +1379,25 @@ impl Checker<'_> {
                     format!("`{}` is already defined in this script", decl.name),
                 );
             }
+            for hint in &hints {
+                if !self.hint_fits(hint, ty) && !ty.is_error() {
+                    let held = self.name_of(ty);
+                    self.error(
+                        decl.span,
+                        format!(
+                            "{}, and `{}` is a {held}",
+                            Self::hint_wants(hint),
+                            decl.name
+                        ),
+                    );
+                }
+            }
             state.push(TypedState {
                 name: decl.name.clone(),
                 ty,
                 slot,
                 init,
+                hints,
                 exported,
             });
         }
@@ -4119,6 +4258,83 @@ mod tests {
         // And one that is called is fine wherever the call is.
         check_clean(
             "func update(dt: f32) { print(str(helper(dt))); }\nfunc helper(a: f32) -> f32 { a }",
+        );
+    }
+
+    // --- 4.7: the annotation set ---
+
+    #[test]
+    fn a_presentation_annotation_needs_a_type_that_can_carry_it() {
+        check_clean("@export @range(0.0, 100.0) @step(0.5) let speed: f32;");
+        check_clean("@export @tooltip(\"how fast\") @readonly let speed: f32;");
+        assert_eq!(
+            messages("@export @range(0.0, 1.0) let flag: bool;"),
+            ["`@range` describes a number, so it needs an `f32` or an `int`, and `flag` is a bool"]
+        );
+        assert_eq!(
+            messages("@export @multiline let speed: f32;"),
+            ["`@multiline` describes text, so it needs a `String`, and `speed` is a f32"]
+        );
+    }
+
+    #[test]
+    fn an_annotations_arguments_are_checked_for_shape_and_sense() {
+        assert_eq!(
+            messages("@export @range(0.0) let speed: f32;"),
+            ["`@range` takes two numbers: the lowest and highest allowed"]
+        );
+        assert_eq!(
+            messages("@export @range(10.0, 1.0) let speed: f32;"),
+            ["`@range(10, 1)` is empty - the low end comes first"]
+        );
+        assert_eq!(
+            messages("@export @step(0.0) let speed: f32;"),
+            ["`@step` takes one number above zero"]
+        );
+        assert_eq!(
+            messages("@export @tooltip(1.0) let speed: f32;"),
+            ["`@tooltip` takes one piece of text"]
+        );
+        assert_eq!(
+            messages("@export @readonly(1) let speed: f32;"),
+            ["`@readonly` takes no arguments"]
+        );
+    }
+
+    #[test]
+    fn a_presentation_annotation_without_export_has_nothing_to_describe() {
+        assert_eq!(
+            messages("@tooltip(\"hi\") let speed = 1.0;"),
+            ["`speed` is not exported, so there is nothing for this to describe - add `@export`"]
+        );
+    }
+
+    #[test]
+    fn the_same_annotation_twice_is_reported() {
+        assert_eq!(
+            messages("@export @step(1.0) @step(2.0) let speed: f32;"),
+            ["`@step` is already on this declaration"]
+        );
+    }
+
+    #[test]
+    fn an_unknown_annotation_suggests_from_the_whole_set() {
+        assert_eq!(
+            messages("@export @tooltp(\"hi\") let speed: f32;"),
+            ["unknown annotation `@tooltp` - did you mean `@tooltip`?"]
+        );
+    }
+
+    #[test]
+    fn the_hints_reach_the_export_list_the_editor_reads() {
+        let listed = crate::exports(
+            "@export @range(0.0, 10.0) @tooltip(\"speed\") let speed: f32;",
+            &crate::schema::example_schema(),
+        );
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].hints,
+            vec![Hint::Range(0.0, 10.0), Hint::Tooltip("speed".into())]
         );
     }
 }

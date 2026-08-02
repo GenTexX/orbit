@@ -1270,6 +1270,7 @@ mod tests {
                 ("removed".into(), Value::F32(1.0)),
                 ("retyped".into(), Value::F32(2.0)),
             ],
+            hints: Vec::new(),
         };
         component.reconcile(&[
             ("speed".into(), Value::F32(0.0)),
@@ -1293,6 +1294,7 @@ mod tests {
         let component = ScriptComponent {
             source: "s.cmt".into(),
             exports: vec![("speed".into(), Value::F32(120.0))],
+            hints: Vec::new(),
         };
         assert_eq!(component.field_names(), vec!["source", "speed"]);
         assert_eq!(component.get("speed"), Some(Value::F32(120.0)));

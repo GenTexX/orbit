@@ -129,6 +129,12 @@ pub struct ScriptComponent {
     /// A `Vec` rather than a map so the inspector shows them in the order they
     /// were written, which is the order the author chose.
     pub exports: Vec<(String, Value)>,
+    /// How the script asked for each exported value to be shown, by name.
+    ///
+    /// Not reflected: these describe a field rather than being one, so the
+    /// inspector reads them beside `field_names` and the serializer never sees
+    /// them - they come from the source, and the source is what is saved.
+    pub hints: Vec<(String, Vec<comet::Hint>)>,
 }
 
 impl ScriptComponent {
@@ -139,6 +145,14 @@ impl ScriptComponent {
     /// Keeping by name and type is what makes an edit to the source preserve
     /// tuning - the migration ADR 0008 describes, in the one place a script's
     /// fields can change without the component being touched.
+    /// How the script asked for `field` to be shown.
+    pub fn hints_for(&self, field: &str) -> &[comet::Hint] {
+        self.hints
+            .iter()
+            .find(|(name, _)| name == field)
+            .map_or(&[], |(_, hints)| hints.as_slice())
+    }
+
     pub fn reconcile(&mut self, declared: &[(String, Value)]) {
         let mut next = Vec::with_capacity(declared.len());
         for (name, default) in declared {

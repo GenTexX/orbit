@@ -3862,19 +3862,25 @@ impl State {
             let Ok(text) = std::fs::read_to_string(self.project_dir.join(&source)) else {
                 continue;
             };
-            let declared: Vec<(String, helios::Value)> =
-                comet::exports(&text, helios::script_schema())
-                    .into_iter()
-                    .filter_map(|e| Some((e.name, default_for(e.ty)?)))
-                    .collect();
+            let exported = comet::exports(&text, helios::script_schema());
+            let hints: Vec<(String, Vec<comet::Hint>)> = exported
+                .iter()
+                .filter(|e| !e.hints.is_empty())
+                .map(|e| (e.name.clone(), e.hints.clone()))
+                .collect();
+            let declared: Vec<(String, helios::Value)> = exported
+                .into_iter()
+                .filter_map(|e| Some((e.name, default_for(e.ty)?)))
+                .collect();
             let helios::Component::Script(script) =
                 &mut self.project.scene.node_mut(node).components[index]
             else {
                 continue;
             };
-            let before = script.exports.clone();
+            let before = (script.exports.clone(), script.hints.clone());
             script.reconcile(&declared);
-            changed |= script.exports != before;
+            script.hints = hints;
+            changed |= (script.exports.clone(), script.hints.clone()) != before;
         }
         changed
     }
@@ -6243,6 +6249,28 @@ impl State {
     fn react(&mut self) {
         for event in self.ui.drain_events() {
             match event {
+                // A slider is an exported value the script gave a `@range`.
+                // It commits through the history like a typed field does, so
+                // one drag is one undo step.
+                AuroraEvent::SliderChanged { id, value }
+                    if self.rows.field_sliders.iter().any(|(w, ..)| *w == id) =>
+                {
+                    let (_, node, component, field) = self
+                        .rows
+                        .field_sliders
+                        .iter()
+                        .find(|(w, ..)| *w == id)
+                        .map(|(w, n, c, f)| (*w, *n, *c, f.clone()))
+                        .expect("guarded by the match arm");
+                    self.history.set_field(
+                        &mut self.project.scene,
+                        node,
+                        component,
+                        &field,
+                        Value::F32(value),
+                    );
+                    self.dirty = true;
+                }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.add_sprite => {
                     self.add_sprite_action();
                 }

@@ -430,6 +430,12 @@ impl Style {
     /// instead of submitting, and Up/Down move the caret between lines. The
     /// field measures to its wrapped content height (it grows as lines are
     /// added).
+    /// `multiline()` when `yes`, unchanged otherwise - for a caller deciding
+    /// from data rather than at the call site.
+    pub fn multiline_if(self, yes: bool) -> Self {
+        if yes { self.multiline() } else { self }
+    }
+
     pub fn multiline(mut self) -> Self {
         self.multiline = true;
         self

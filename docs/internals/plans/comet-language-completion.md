@@ -405,7 +405,7 @@ Three bugs, all found by writing the demo or by disabling a fix:
 
 ---
 
-## 4.7 - The annotation set
+## 4.7 - The annotation set (DONE)
 
 **Builds.** Whichever of `@range`, `@step`, `@tooltip`, `@color`, `@asset`,
 `@multiline`, `@readonly` make v1.
@@ -421,6 +421,28 @@ one block that is pure breadth and can be cut entirely without leaving anything
 half-built.
 
 **Risk.** Low, and mostly atlas.
+
+**Done**, all seven. The language validates them - arity, argument shape, and
+whether the type can carry what they describe - and the editor decides what they
+look like, so adding one is a row in the checker and a widget in atlas with
+nothing in between. `@range` turns a number into a slider that commits through
+the history; `@readonly` disables the field; `@multiline` makes it a text area;
+`@tooltip` and `@step` are carried and available.
+
+Two are validated but cannot yet apply, and say so rather than being silently
+inert:
+
+- **`@color`** needs a type with four components, and the language has none. A
+  `Color` value type alongside `Vec2` would settle it and is small, but it is a
+  language addition no decision has asked for.
+- **`@asset` and `@multiline` need an exported `String`**, which ADR 0022
+  refused: handing a refcounted value across the host boundary needs an
+  ownership rule. `@multiline` therefore works on nothing today, and the
+  annotation exists for when the type does.
+
+A presentation annotation on something not exported is an error - it describes
+how the inspector should show a value, so on a value the inspector never sees it
+is a mistake worth naming.
 
 ---
 
@@ -463,7 +485,7 @@ warning working, and the fixtures now say `update`.
 
 ---
 
-## 4.9 - The teaching surface (optional)
+## 4.9 - The teaching surface (CUT)
 
 **Builds.** A panel showing the typed IR, or the emitted WASM, beside the
 source.
@@ -476,6 +498,10 @@ clean tree, so this is unusually cheap for how much it would back the word
 that claim. Cut it without consequence if it does not earn its place.
 
 **Risk.** Low, pure atlas.
+
+**Cut**, on Philip's call, which is what this section always allowed for: cut it
+without consequence if it does not earn its place. Nothing depends on it, and
+the time went to the array element walk instead.
 
 ---
 

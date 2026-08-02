@@ -8,8 +8,13 @@
 // Writing one would be a second answer to the same question, and the compiler
 // says so if you do.
 
-@export let speed: f32;
+// An annotation says how the inspector should show a value. `@range` makes it
+// a slider, `@step` sets how far one drag moves it, `@tooltip` explains it, and
+// `@readonly` shows a value without letting you change it.
+
+@export @range(0.0, 500.0) @tooltip("pixels per second") let speed: f32;
 @export let direction: Vec2;
+@export @readonly @tooltip("set by the script, shown for reference") let travelled: f32;
 
 func start() {
     print("starting at speed " + str(speed));
@@ -17,4 +22,5 @@ func start() {
 
 func update(dt: f32) {
     transform.position += direction * speed * dt;
+    travelled = travelled + speed * dt;
 }

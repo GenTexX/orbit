@@ -50,10 +50,14 @@ pub use codegen::{HOST_MODULE, emit, exported_globals, format_f32, write_str};
 
 /// One `@export`ed variable: what the inspector shows, and which globals hold
 /// it in a compiled module.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Exported {
     pub name: String,
     pub ty: Type,
+    /// How the inspector should present it. The language validates these and
+    /// the editor decides what they look like, so adding one is a row in the
+    /// checker and a widget in atlas with nothing in between.
+    pub hints: Vec<Hint>,
     /// The module's export names for the globals behind it - one for a scalar,
     /// two for a `Vec2`.
     pub globals: Vec<String>,
@@ -76,6 +80,7 @@ pub fn exports(source: &str, schema: &HostSchema) -> Vec<Exported> {
         .map(|state| Exported {
             name: state.name.clone(),
             ty: state.ty,
+            hints: state.hints.clone(),
             globals: codegen::exported_globals(&state.name, state.ty),
         })
         .collect()
@@ -86,6 +91,6 @@ pub use parser::parse;
 pub use schema::{FieldRef, HostField, HostObject, HostSchema, HostType, example_schema};
 pub use span::Span;
 pub use tir::{
-    Axis, Host, Place, Type, TypedBlock, TypedExpr, TypedExprKind, TypedFn, TypedScript,
+    Axis, Hint, Host, Place, Type, TypedBlock, TypedExpr, TypedExprKind, TypedFn, TypedScript,
     TypedState, TypedStmt,
 };

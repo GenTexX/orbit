@@ -104,6 +104,30 @@ impl TypedScript {
     }
 }
 
+/// What an annotation asks the inspector to do with an exported variable.
+///
+/// The language validates these - that the arguments are the right shape and
+/// the type can carry them - and the editor decides what they look like. Adding
+/// one is a row here and a widget there, with nothing in between.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Hint {
+    /// `@range(min, max)`: a slider rather than a number field.
+    Range(f32, f32),
+    /// `@step(n)`: how much one notch of drag-scrub moves it.
+    Step(f32),
+    /// `@tooltip("...")`: hover text, and the only way a script can say what a
+    /// value means to whoever is tuning it.
+    Tooltip(String),
+    /// `@color`: show it as a swatch that opens the picker.
+    Color,
+    /// `@asset`: a project file, with the same drop target a texture field has.
+    Asset,
+    /// `@multiline`: a text area rather than a line.
+    Multiline,
+    /// `@readonly`: shown, but not editable.
+    Readonly,
+}
+
 /// A checked struct: its fields in declaration order, laid out one after
 /// another with no header - a struct is exactly its fields.
 #[derive(Debug, Clone, PartialEq)]
@@ -154,6 +178,9 @@ pub struct TypedState {
     /// the type's default, so codegen never learns that an initializer can be
     /// left out.
     pub init: TypedExpr,
+    /// How the inspector should present it, from the annotations beside
+    /// `@export`. Empty for a variable with none, which is most of them.
+    pub hints: Vec<Hint>,
     /// Whether `@export` marked it inspector-editable, in which case the stored
     /// value the host writes after instantiation is what actually wins.
     pub exported: bool,
