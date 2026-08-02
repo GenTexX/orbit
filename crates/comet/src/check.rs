@@ -443,24 +443,6 @@ impl Checker<'_> {
         }
     }
 
-    /// Whether a value of this type owns a counted reference - so dropping it
-    /// has to do something.
-    ///
-    /// An array's release frees its storage but does not walk its elements, so
-    /// an element that owns anything would leak. Refusing is what keeps that
-    /// from being silent.
-    fn owns_reference(&self, ty: Type) -> bool {
-        match ty {
-            Type::Str | Type::Array(_) => true,
-            Type::Enum(index) => self.enums[index as usize].holds_str,
-            Type::Struct(index) => self.structs[index as usize]
-                .fields
-                .iter()
-                .any(|f| self.owns_reference(f.ty)),
-            _ => false,
-        }
-    }
-
     /// Whether releasing a value of this type has anything to do.
     fn owns_str(&self, ty: Type) -> bool {
         match ty {
@@ -808,17 +790,6 @@ impl Checker<'_> {
             }
             if element == Type::Unit {
                 self.error(name.span, "an array cannot hold `()`");
-                return Type::Error;
-            }
-            if self.owns_reference(element) {
-                let held = self.name_of(element);
-                self.error(
-                    name.span,
-                    format!(
-                        "an array cannot hold `{held}` yet - releasing one would have to walk \
-                         its elements, and that is not built"
-                    ),
-                );
                 return Type::Error;
             }
             return self.array_of(element);

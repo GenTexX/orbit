@@ -1406,9 +1406,7 @@ impl<'a> FnGen<'a> {
                 // An array's elements are reachable only through its handle, so
                 // its release is its own - the general one knows nothing about
                 // the second block.
-                Type::Array(_) => {
-                    self.ins().local_get(base).call(F_ARRAY_RELEASE);
-                }
+                Type::Array(index) => self.release_array_slots(base, index),
                 Type::Enum(index) => self.release_enum_slots(base, index),
                 _ => {}
             }
@@ -1422,6 +1420,109 @@ impl<'a> FnGen<'a> {
     /// which payload is live - and whether there is one at all - depends on it.
     /// The dispatch is emitted only for enums that can hold a `String`; for
     /// every other one, releasing is nothing and there is no tag read.
+    /// Release whatever the value starting at wasm local `base` owns.
+    ///
+    /// One rule for every type that can own something, so an enum's payload, a
+    /// struct's field and an array's element all go the same way - which is
+    /// what lets an array hold any of them.
+    fn release_slots(&mut self, base: u32, ty: Type) {
+        match ty {
+            Type::Str => {
+                self.ins().local_get(base).call(F_RELEASE);
+            }
+            Type::Array(index) => self.release_array_slots(base, index),
+            Type::Enum(index) => self.release_enum_slots(base, index),
+            Type::Struct(index) => {
+                let fields = self.structs[index as usize].fields.clone();
+                for field in fields {
+                    if self.owns_reference(field.ty) {
+                        self.release_slots(base + field.offset, field.ty);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Release an array: its elements, then its storage, then the handle.
+    ///
+    /// The elements are walked only when the handle is about to become
+    /// unowned, and only when the element type owns something at all - an
+    /// `Array<f32>` never reads its own contents to drop them.
+    fn release_array_slots(&mut self, base: u32, index: u32) {
+        let element = self.arrays[index as usize];
+        if !self.owns_reference(element) {
+            self.ins().local_get(base).call(F_ARRAY_RELEASE);
+            return;
+        }
+        let width = val_types(element, self.enums, self.structs).len() as u32;
+        let frame = self.enter_frame();
+        let (at, address) = (frame.i32s[0], frame.i32s[1]);
+        let slots = frame.enum_base;
+
+        self.ins().local_get(base).i32_eqz();
+        self.ins().if_(BlockType::Empty);
+        self.ins().else_();
+        // Only the last owner drops the contents.
+        self.ins()
+            .local_get(base)
+            .i32_load(mem(OFF_RC))
+            .i32_const(1)
+            .i32_eq();
+        self.ins().if_(BlockType::Empty);
+        self.ins().i32_const(0).local_set(at);
+        self.ins().block(BlockType::Empty);
+        self.ins().loop_(BlockType::Empty);
+        self.ins()
+            .local_get(at)
+            .local_get(base)
+            .i32_load(mem(OFF_ARRAY_LEN))
+            .i32_ge_s()
+            .br_if(1);
+        self.ins()
+            .local_get(base)
+            .i32_load(mem(OFF_ARRAY_DATA))
+            .i32_const(HEADER)
+            .i32_add()
+            .local_get(at)
+            .i32_const(width as i32 * 4)
+            .i32_mul()
+            .i32_add()
+            .local_set(address);
+        for slot in 0..width {
+            self.ins()
+                .local_get(address)
+                .i32_load(mem(u64::from(slot) * 4))
+                .local_set(slots + slot);
+        }
+        self.release_slots(slots, element);
+        self.ins()
+            .local_get(at)
+            .i32_const(1)
+            .i32_add()
+            .local_set(at);
+        self.ins().br(0);
+        self.ins().end();
+        self.ins().end();
+        self.ins().end();
+        self.ins().end();
+        self.ins().local_get(base).call(F_ARRAY_RELEASE);
+        self.leave_frame();
+    }
+
+    /// Whether releasing a value of this type has anything to do at all.
+    fn owns_reference(&self, ty: Type) -> bool {
+        match ty {
+            Type::Str | Type::Array(_) => true,
+            Type::Enum(index) => self.enums[index as usize].holds_str,
+            Type::Struct(index) => self.structs[index as usize]
+                .fields
+                .iter()
+                .any(|f| self.owns_reference(f.ty)),
+            _ => false,
+        }
+    }
+
     fn release_enum_slots(&mut self, base: u32, index: u32) {
         if !self.enums[index as usize].holds_str {
             return;
@@ -1433,7 +1534,7 @@ impl<'a> FnGen<'a> {
             let mut owned = Vec::new();
             for ty in &variant.payload {
                 let width = val_types(*ty, self.enums, self.structs).len() as u32;
-                if self.owns_str(*ty) {
+                if self.owns_reference(*ty) {
                     owned.push((at, *ty));
                 }
                 at += width;
@@ -1444,13 +1545,7 @@ impl<'a> FnGen<'a> {
             self.ins().local_get(base).i32_const(tag as i32).i32_eq();
             self.ins().if_(BlockType::Empty);
             for (offset, ty) in owned {
-                match ty {
-                    Type::Str => {
-                        self.ins().local_get(base + offset).call(F_RELEASE);
-                    }
-                    Type::Enum(inner) => self.release_enum_slots(base + offset, inner),
-                    _ => {}
-                }
+                self.release_slots(base + offset, ty);
             }
             self.ins().end();
         }
@@ -1493,7 +1588,7 @@ impl<'a> FnGen<'a> {
             let mut owned = Vec::new();
             for ty in &variant.payload {
                 let width = val_types(*ty, self.enums, self.structs).len() as u32;
-                if self.owns_str(*ty) {
+                if self.owns_reference(*ty) {
                     owned.push((at, *ty));
                 }
                 at += width;
@@ -1516,15 +1611,6 @@ impl<'a> FnGen<'a> {
         }
     }
 
-    /// Whether releasing a value of this type has anything to do.
-    fn owns_str(&self, ty: Type) -> bool {
-        match ty {
-            Type::Str => true,
-            Type::Enum(index) => self.enums[index as usize].holds_str,
-            _ => false,
-        }
-    }
-
     /// Take a reference to the `String` pointer on the stack, leaving it there.
     fn retain_top(&mut self) {
         let tmp = self.scratch().i32s[0];
@@ -1539,8 +1625,11 @@ impl<'a> FnGen<'a> {
             Type::Str => {
                 self.ins().call(F_RELEASE);
             }
-            Type::Array(_) => {
-                self.ins().call(F_ARRAY_RELEASE);
+            Type::Array(index) => {
+                let base = self.enter_frame().i32s[2];
+                self.ins().local_set(base);
+                self.release_array_slots(base, index);
+                self.leave_frame();
             }
             Type::Unit | Type::Error => {}
             // An enum that owns something has to be parked to read its tag,

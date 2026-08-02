@@ -26,11 +26,13 @@ Elements are stored as `i32` words with floats reinterpreted, the same packing a
 
 `a[i]` stays one character for the common case - a loop over an array you just built - and traps on a miss. `get(a, i)` returns `Option<T>`, which the checker makes you handle, and is what decision 8 meant when it said arrays would introduce absence. Both directions of the range are checked: a negative index is as much a miss as one past the end.
 
-## What is not built
+## Releasing an array walks its elements
 
-**An array cannot hold anything that owns a reference** - no `Array<String>`, no `Array<Array<T>>`, no array of a struct or enum that holds either. Releasing an array frees its storage but does not walk its elements, so such an element would leak. It is **refused with a message** rather than accepted and leaked, which is the honest state: the walk needs a per-element-type drop, which is the same tag-consulting problem ADR 0023 solved for enums, one level further out.
+An array may hold anything, including things that own memory. Dropping one walks its elements first - but only when the element type owns something at all, and only when the handle is about to become unowned, so an `Array<f32>` never reads its own contents to drop them.
 
-**Generic structs** are not built either. The template machinery from ADR 0023 would carry them, but nothing needs one yet.
+That walk is one rule, `release_slots`, shared by an enum's payload, a struct's field and an array's element. Writing it that way is what lets an array hold any of them: `Array<String>`, `Array<Array<String>>`, and an array of an enum whose release consults a tag all go through the same path.
+
+**Generic structs** are not built. The template machinery from ADR 0023 would carry them, but nothing needs one yet.
 
 ## Consequences
 

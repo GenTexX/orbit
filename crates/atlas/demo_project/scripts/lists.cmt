@@ -41,6 +41,14 @@ func describe(found: Option<f32>) -> String {
     }
 }
 
+// An array may hold anything, including things that own memory: dropping it
+// walks its elements first.
+let log: Array<String> = [];
+
+func note(line: String) {
+    push(log, line);
+}
+
 func update(dt: f32) {
     remember(dt);
 }

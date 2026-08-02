@@ -1880,29 +1880,82 @@ fn get_works_for_an_element_wider_than_one_slot() {
 }
 
 #[test]
-fn an_array_cannot_hold_something_that_owns_a_reference_yet() {
-    // Releasing an array frees its storage but does not walk its elements, so
-    // an element that owns anything would leak. Refused rather than leaked.
-    for source in [
-        "func update(dt: f32) { let a: Array<String> = []; }",
-        "func update(dt: f32) { let a: Array<Array<f32>> = []; }",
-        "struct S { t: String }\nfunc update(dt: f32) { let a: Array<S> = []; }",
-        "enum E { A, B(String) }\nfunc update(dt: f32) { let a: Array<E> = []; }",
-        "func update(dt: f32) { let a: Array<Option<String>> = []; }",
-    ] {
-        let found = comet::compile(source, &comet::example_schema())
-            .expect_err("an owning element type must be refused");
-        assert!(
-            found
-                .iter()
-                .any(|d| d.message.contains("an array cannot hold")),
-            "{source}: {found:?}"
-        );
+fn an_array_releases_what_its_elements_own() {
+    // Dropping an array walks its elements when - and only when - the element
+    // type owns something and the handle is about to become unowned. An
+    // `Array<f32>` never reads its own contents to drop them.
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let words: Array<String> = [];
+            push(words, "a" + str(dt));
+            push(words, "b" + str(dt));
+            print(words[0] + words[1]);
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["a0b0"]);
+
+    let before = script.memory_bytes();
+    for _ in 0..5_000 {
+        script.update(0.0);
     }
-    // A payload-free enum owns nothing, so it is allowed.
-    let source =
-        "enum E { A, B }\nfunc update(dt: f32) { let a: Array<E> = []; print(str(len(a))); }";
-    assert!(comet::compile(source, &comet::example_schema()).is_ok());
+    assert_eq!(
+        script.memory_bytes(),
+        before,
+        "no leak through the elements"
+    );
+}
+
+#[test]
+fn an_array_of_arrays_releases_all_the_way_down() {
+    let mut script = Script::new(
+        r#"
+        func update(dt: f32) {
+            let rows: Array<Array<String>> = [];
+            let first: Array<String> = [];
+            push(first, "deep " + str(dt));
+            push(rows, first);
+            print(rows[0][0]);
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["deep 0"]);
+
+    let before = script.memory_bytes();
+    for _ in 0..3_000 {
+        script.update(0.0);
+    }
+    assert_eq!(
+        script.memory_bytes(),
+        before,
+        "nested release is balanced too"
+    );
+}
+
+#[test]
+fn an_array_of_something_holding_a_string_goes_through_its_tag() {
+    let mut script = Script::new(
+        r#"
+        enum Event { Tick, Said(String) }
+        func update(dt: f32) {
+            let log: Array<Event> = [];
+            push(log, Event::Tick);
+            push(log, Event::Said("hello " + str(dt)));
+            print(match log[1] { Tick => "-", Said(w) => w });
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["hello 0"]);
+
+    let before = script.memory_bytes();
+    for _ in 0..3_000 {
+        script.update(0.0);
+    }
+    assert_eq!(script.memory_bytes(), before, "the tag walk is balanced");
 }
 
 #[test]
