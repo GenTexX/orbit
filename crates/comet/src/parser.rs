@@ -18,12 +18,14 @@ use crate::span::Span;
 /// an error.
 pub fn parse(source: &str) -> (Script, Vec<Diagnostic>) {
     let (tokens, mut diagnostics) = lex(source);
+    let structs = struct_names(&tokens);
     let mut parser = Parser {
         tokens,
         pos: 0,
         diagnostics: Vec::new(),
         depth: 0,
         depth_reported: false,
+        structs,
     };
     let script = parser.script();
     diagnostics.append(&mut parser.diagnostics);
@@ -43,6 +45,19 @@ pub fn parse(source: &str) -> (Script, Vec<Diagnostic>) {
 /// digits deep, and the deepest expression in comet's own fixtures is four.
 const MAX_DEPTH: u32 = 128;
 
+/// Scan for `struct <name>` before parsing, so a literal can be told from a
+/// block wherever it appears.
+fn struct_names(tokens: &[Token]) -> Vec<String> {
+    tokens
+        .windows(2)
+        .filter(|pair| pair[0].kind == TokenKind::Struct)
+        .filter_map(|pair| match &pair[1].kind {
+            TokenKind::Ident(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -52,6 +67,13 @@ struct Parser {
     /// Whether the depth limit has already been reported, so one runaway file
     /// yields one diagnostic rather than one per level on the way back out.
     depth_reported: bool,
+    /// Every name declared with `struct`, found by a scan before parsing.
+    ///
+    /// `Enemy { health: 1.0 }` and `if x { ... }` differ only in whether the
+    /// name before the brace is a struct, and a script may use one before
+    /// declaring it - so the names are collected up front rather than as they
+    /// are met.
+    structs: Vec<String>,
 }
 
 impl Parser {
@@ -152,6 +174,11 @@ impl Parser {
                         script.enums.push(e);
                     }
                 }
+                TokenKind::Struct => {
+                    if let Some(d) = self.struct_decl() {
+                        script.structs.push(d);
+                    }
+                }
                 TokenKind::Func => {
                     if let Some(f) = self.function() {
                         script.functions.push(f);
@@ -236,6 +263,41 @@ impl Parser {
             name_span,
             params,
             variants,
+            span: start.to(end),
+        })
+    }
+
+    /// `struct Enemy { health: f32, position: Vec2 }`.
+    fn struct_decl(&mut self) -> Option<StructDecl> {
+        let start = self.peek_span();
+        self.advance(); // `struct`
+        let (name, name_span) = self.ident("a struct name");
+        if !self.expect(&TokenKind::LBrace, "`{` after a struct name") {
+            self.recover_to_top_level();
+            return None;
+        }
+        let mut fields = Vec::new();
+        while !self.at_end() && !matches!(self.peek(), TokenKind::RBrace) {
+            let f_start = self.peek_span();
+            let (f_name, f_name_span) = self.ident("a field name");
+            self.expect(&TokenKind::Colon, "`:` after a field name");
+            let ty = self.type_name();
+            fields.push(FieldDecl {
+                name: f_name,
+                name_span: f_name_span,
+                span: f_start.to(ty.span),
+                ty,
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self.peek_span();
+        self.expect(&TokenKind::RBrace, "`}` after a struct's fields");
+        Some(StructDecl {
+            name,
+            name_span,
+            fields,
             span: start.to(end),
         })
     }
@@ -682,6 +744,34 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
+                // `Enemy { health: 1.0 }`. Only when a struct of that name has
+                // been declared, so `if x { ... }` is never mistaken for one -
+                // the parser knows the names because declarations are top-level
+                // and it has already read them.
+                if matches!(self.peek(), TokenKind::LBrace) && self.structs.contains(&name) {
+                    self.advance();
+                    let mut fields = Vec::new();
+                    while !self.at_end() && !matches!(self.peek(), TokenKind::RBrace) {
+                        let (f_name, f_name_span) = self.ident("a field name");
+                        self.expect(&TokenKind::Colon, "`:` after a field name");
+                        fields.push(FieldInit {
+                            name: f_name,
+                            name_span: f_name_span,
+                            value: self.expr(),
+                        });
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    let end = self.peek_span();
+                    self.expect(&TokenKind::RBrace, "`}` after a struct's fields");
+                    return Expr::StructLit {
+                        name,
+                        name_span: span,
+                        fields,
+                        span: span.to(end),
+                    };
+                }
                 // `State::Idle`, or `Hit::Wall(3.0)`.
                 if self.eat(&TokenKind::ColonColon) {
                     let (variant, variant_span) = self.ident("a variant name");

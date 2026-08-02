@@ -324,7 +324,7 @@ string fails to compile instead.
 
 ---
 
-## 4.6 - Containers: arrays and structs
+## 4.6 - Containers: arrays and structs (4.6a DONE, 4.6b next)
 
 **Builds.** `Array<T>` as an ordinary generic declaration rather than a builtin,
 indexing, and user-defined structs.
@@ -350,6 +350,36 @@ proven", and `String` proved it - so this is due rather than new.
 model gets harder.
 
 **ADR.** Container semantics.
+
+**Decided**, and both the way the plan leaned: arrays are **reference** types,
+growable, with an explicit `copy` for when you meant one; structs are **value**
+types. Indexing past the end traps, and `get` returns an `Option` - which is the
+thing decision 8 said arrays would introduce.
+
+**Split into two.** 4.6a is value structs, 4.6b is reference arrays. Structs
+reuse the enum layout spine and need no new runtime machinery, so they are the
+cheaper half and the foundation: the general field path 4.6a builds is what an
+array's element access will want.
+
+**4.6a done.** The shape of it:
+
+- **A struct is exactly its fields**, laid out one after another with no header.
+  Nesting is offsets, not pointers, so `o.inner.hp` reads one slot.
+- **Places generalized from a Vec2 axis to an offset.** `Place::LocalField(slot,
+  Axis)` became `Place::LocalAt { slot, offset, ty }`, and one rule now covers a
+  Vec2 component, a struct field, and any nesting of the two. `TypedExprKind::
+  Field` did the same.
+- **Two bugs worth recording.** The frame gained an f32 park region for picking
+  a field out of a value on the stack, and my edit to the declared-locals list
+  silently did not apply - the region was addressed but never declared, so every
+  struct read failed validation with "expected i32, found f32". And `place()`
+  first keyed on the offset coming out zero rather than on whether there was a
+  path at all: `o.inner.hp` sits at offset 0 and is still a *part* of `o`, so
+  assigning to it stored one slot into a value two slots wide.
+
+Generic structs are not built. The template machinery from 4.5 would carry them,
+but nothing needs one yet - `Array<T>` is a builtin, not a user struct - and it
+is the same "build ahead of the user" call made twice before.
 
 ---
 

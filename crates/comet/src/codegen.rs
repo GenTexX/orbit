@@ -51,7 +51,7 @@ use wasm_encoder::{
 
 use crate::tir::{
     Axis, BinaryOp, Host, Place, Type, TypedArm, TypedBlock, TypedEnum, TypedExpr, TypedExprKind,
-    TypedFn, TypedScript, TypedStmt, UnaryOp,
+    TypedFn, TypedScript, TypedStmt, TypedStruct, UnaryOp,
 };
 
 /// The module the host must satisfy every import from.
@@ -187,8 +187,8 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     functions.function(t_rc);
     for f in &script.functions {
         let ty = types.get(
-            param_types(f, &script.enums),
-            val_types(f.ret, &script.enums),
+            param_types(f, &script.enums, &script.structs),
+            val_types(f.ret, &script.enums, &script.structs),
         );
         functions.function(ty);
     }
@@ -202,7 +202,13 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     code.function(&emit_retain());
     code.function(&emit_release(&globals));
     for f in &script.functions {
-        code.function(&emit_function(f, &script.enums, &globals, &literals));
+        code.function(&emit_function(
+            f,
+            &script.enums,
+            &script.structs,
+            &globals,
+            &literals,
+        ));
     }
     if has_state {
         code.function(&emit_init(script, &globals, &literals));
@@ -210,7 +216,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
 
     let mut global_section = GlobalSection::new();
     for state in &script.state {
-        for vt in val_types(state.ty, &script.enums) {
+        for vt in val_types(state.ty, &script.enums, &script.structs) {
             global_section.global(mutable(vt), &zero_of(vt));
         }
     }
@@ -313,13 +319,6 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
 
 // --- module-level layout ---
 
-/// Which of a `Vec2`'s two slots an axis is.
-fn axis_offset(axis: Axis) -> u32 {
-    match axis {
-        Axis::X => 0,
-        Axis::Y => 1,
-    }
-}
 
 fn align4(value: u32) -> u32 {
     value.div_ceil(4) * 4
@@ -345,11 +344,18 @@ pub fn exported_globals(name: &str, ty: Type) -> Vec<String> {
 /// slot is an `i32` - an `f32` payload is stored reinterpreted, which is one
 /// free instruction each way. A uniform slot type is what lets one layout serve
 /// every variant, and keeps an enum a stack value rather than an allocation.
-fn val_types(ty: Type, enums: &[TypedEnum]) -> Vec<ValType> {
-    if let Type::Enum(index) = ty {
-        return vec![ValType::I32; 1 + enums[index as usize].payload_slots];
+fn val_types(ty: Type, enums: &[TypedEnum], structs: &[TypedStruct]) -> Vec<ValType> {
+    match ty {
+        Type::Enum(index) => vec![ValType::I32; 1 + enums[index as usize].payload_slots],
+        // A struct is exactly its fields, one after another, keeping their own
+        // types - unlike an enum, where one layout has to serve every variant.
+        Type::Struct(index) => structs[index as usize]
+            .fields
+            .iter()
+            .flat_map(|f| val_types(f.ty, enums, structs))
+            .collect(),
+        _ => scalar_types(ty).to_vec(),
     }
-    scalar_types(ty).to_vec()
 }
 
 fn scalar_types(ty: Type) -> &'static [ValType] {
@@ -360,14 +366,16 @@ fn scalar_types(ty: Type) -> &'static [ValType] {
         Type::Vec2 => &[ValType::F32, ValType::F32],
         Type::Str => &[ValType::I32],
         Type::Unit | Type::Error => &[],
-        Type::Enum(_) => unreachable!("handled by val_types, which knows the layouts"),
+        Type::Enum(_) | Type::Struct(_) => {
+            unreachable!("handled by val_types, which knows the layouts")
+        }
     }
 }
 
-fn param_types(f: &TypedFn, enums: &[TypedEnum]) -> Vec<ValType> {
+fn param_types(f: &TypedFn, enums: &[TypedEnum], structs: &[TypedStruct]) -> Vec<ValType> {
     f.locals[..f.param_count]
         .iter()
-        .flat_map(|ty| val_types(*ty, enums))
+        .flat_map(|ty| val_types(*ty, enums, structs))
         .collect()
 }
 
@@ -436,14 +444,14 @@ struct Globals {
 
 impl Globals {
     fn new(script: &TypedScript) -> Self {
-        let enums = &script.enums;
+        let (enums, structs) = (&script.enums, &script.structs);
         let mut base = Vec::new();
         let mut types = Vec::new();
         let mut next = 0;
         for state in &script.state {
             base.push(next);
             types.push(state.ty);
-            next += val_types(state.ty, enums).len() as u32;
+            next += val_types(state.ty, enums, structs).len() as u32;
         }
         Self {
             base,
@@ -555,6 +563,11 @@ fn collect_expr(expr: &TypedExpr, out: &mut Literals) {
         TypedExprKind::MakeVariant { args, .. } => {
             for arg in args {
                 collect_expr(arg, out);
+            }
+        }
+        TypedExprKind::MakeStruct { fields, .. } => {
+            for field in fields {
+                collect_expr(field, out);
             }
         }
         TypedExprKind::Match {
@@ -714,11 +727,20 @@ fn emit_release(globals: &Globals) -> Function {
 fn emit_function(
     f: &TypedFn,
     enums: &[TypedEnum],
+    structs: &[TypedStruct],
     globals: &Globals,
     literals: &Literals,
 ) -> Function {
     let depth = block_depth(&f.body);
-    let mut out = FnGen::new(&f.locals, f.param_count, depth, enums, globals, literals);
+    let mut out = FnGen::new(
+        &f.locals,
+        f.param_count,
+        depth,
+        enums,
+        structs,
+        globals,
+        literals,
+    );
     // A tail expression is the return value. It stays on the stack while the
     // locals it may have been read from are released - it already holds its own
     // reference, so releasing theirs cannot free it.
@@ -735,9 +757,17 @@ fn emit_function(
 
 /// The start function: run each state initializer once, at instantiation.
 fn emit_init(script: &TypedScript, globals: &Globals, literals: &Literals) -> Function {
-    let enums = &script.enums;
+    let (enums, structs) = (&script.enums, &script.structs);
     let depth = script.state.iter().map(|s| expr_depth(&s.init)).max();
-    let mut out = FnGen::new(&[], 0, depth.unwrap_or(0), enums, globals, literals);
+    let mut out = FnGen::new(
+        &[],
+        0,
+        depth.unwrap_or(0),
+        enums,
+        structs,
+        globals,
+        literals,
+    );
     for state in &script.state {
         out.expr(&state.init);
         out.store_global(state.slot);
@@ -784,6 +814,8 @@ struct Frame {
     /// the reasoning local instead of a property of the order things happen to
     /// be emitted in. The cost is a handful of locals the JIT drops.
     enum_base: u32,
+    /// Where a value with f32 slots is parked while part of it is picked out.
+    spare_f32: u32,
     /// Where each arm leaves its value.
     ///
     /// A `match` could have used the `if` block's result instead, but a result
@@ -796,15 +828,25 @@ struct Frame {
 /// The fixed part of a [`Frame`]: three f32 and four i32 scratches.
 const FRAME_SCRATCH: u32 = 7;
 
-/// How wide the two variable regions of a frame are. A `Vec2` is the widest
-/// built-in at two slots; an enum can be wider.
-fn spare_width(enums: &[TypedEnum]) -> u32 {
-    enums
+/// How wide each variable region of a frame is: enough for the widest value in
+/// the script, since any of them may be parked while part of it is picked out.
+fn spare_width(enums: &[TypedEnum], structs: &[TypedStruct]) -> u32 {
+    let widest_enum = enums
         .iter()
         .map(|e| 1 + e.payload_slots as u32)
         .max()
-        .unwrap_or(0)
-        .max(2)
+        .unwrap_or(0);
+    let widest_struct = structs
+        .iter()
+        .map(|s| {
+            s.fields
+                .iter()
+                .map(|f| val_types(f.ty, enums, structs).len() as u32)
+                .sum::<u32>()
+        })
+        .max()
+        .unwrap_or(0);
+    widest_enum.max(widest_struct).max(2)
 }
 
 /// The greatest number of [`Frame`]s a block can need at once.
@@ -855,11 +897,13 @@ fn expr_depth(expr: &TypedExpr) -> usize {
             args.iter().collect::<Vec<_>>(),
         ),
         K::Unary { op, operand } => (usize::from(*op == UnaryOp::NegVec2), vec![operand]),
-        K::Field { receiver, .. } => (0, vec![receiver]),
         K::MakeVec2 { x, y } => (0, vec![x, y]),
         K::Call { args, .. } => (0, args.iter().collect()),
         K::Widen(inner) | K::Narrow(inner) => (0, vec![inner]),
         K::MakeVariant { args, .. } => (0, args.iter().collect()),
+        K::MakeStruct { fields, .. } => (0, fields.iter().collect()),
+        // Picking a field out of a value parks the whole of it first.
+        K::Field { receiver, .. } => (1, vec![receiver]),
         // A match parks its scrutinee to read the tag and then unpack from it.
         K::Match {
             scrutinee, arms, ..
@@ -890,6 +934,8 @@ struct FnGen<'a> {
     owned: Vec<u32>,
     /// The script's enum layouts, for sizing anything that holds one.
     enums: &'a [TypedEnum],
+    /// The script's struct layouts, likewise.
+    structs: &'a [TypedStruct],
     /// One set of scratch locals per level of nesting that needs them, and a
     /// cursor into it. See [`FnGen::enter_frame`].
     frames: Vec<Frame>,
@@ -904,6 +950,7 @@ impl<'a> FnGen<'a> {
         param_count: usize,
         depth: usize,
         enums: &'a [TypedEnum],
+        structs: &'a [TypedStruct],
         globals: &'a Globals,
         literals: &'a Literals,
     ) -> Self {
@@ -911,7 +958,7 @@ impl<'a> FnGen<'a> {
         let mut next = 0;
         for ty in slot_types {
             slot_base.push(next);
-            next += val_types(*ty, enums).len() as u32;
+            next += val_types(*ty, enums, structs).len() as u32;
         }
         // Scratch locals come in frames, one per level of nesting that needs
         // them. A single shared set would be wrong: the outer `%` in
@@ -919,8 +966,8 @@ impl<'a> FnGen<'a> {
         // operand that parks its own - and would overwrite it. wasm-encoder
         // wants the local list before the first instruction, so the depth is
         // measured up front rather than discovered while emitting.
-        let spare = spare_width(enums);
-        let frame_width = FRAME_SCRATCH + spare * 2;
+        let spare = spare_width(enums, structs);
+        let frame_width = FRAME_SCRATCH + spare * 3;
         let frames: Vec<Frame> = (0..depth + 1)
             .map(|i| {
                 let base = next + (i as u32) * frame_width;
@@ -929,18 +976,25 @@ impl<'a> FnGen<'a> {
                     i32s: [base + 3, base + 4, base + 5, base + 6],
                     enum_base: base + FRAME_SCRATCH,
                     result_base: base + FRAME_SCRATCH + spare,
+                    spare_f32: base + FRAME_SCRATCH + spare * 2,
                 }
             })
             .collect();
 
         let declared: Vec<ValType> = slot_types[param_count..]
             .iter()
-            .flat_map(|ty| val_types(*ty, enums))
+            .flat_map(|ty| val_types(*ty, enums, structs))
+            // Three f32 scratches, then the i32 regions - four scratches, the
+            // parked enum, the match result - then an f32 region for parking a
+            // value whose slots are floats.
             .chain(frames.iter().flat_map(|_| {
-                [ValType::F32; 3].into_iter().chain(std::iter::repeat_n(
-                    ValType::I32,
-                    (frame_width - 3) as usize,
-                ))
+                [ValType::F32; 3]
+                    .into_iter()
+                    .chain(std::iter::repeat_n(
+                        ValType::I32,
+                        (frame_width - 3 - spare) as usize,
+                    ))
+                    .chain(std::iter::repeat_n(ValType::F32, spare as usize))
             }))
             .collect();
 
@@ -964,6 +1018,7 @@ impl<'a> FnGen<'a> {
             slot_types,
             owned,
             enums,
+            structs,
             frames,
             frame: 0,
             globals,
@@ -1004,7 +1059,8 @@ impl<'a> FnGen<'a> {
 
     fn load_slot(&mut self, slot: u32) {
         let base = self.slot_base[slot as usize];
-        let width = val_types(self.slot_types[slot as usize], self.enums).len() as u32;
+        let width =
+            val_types(self.slot_types[slot as usize], self.enums, self.structs).len() as u32;
         for i in 0..width {
             self.ins().local_get(base + i);
         }
@@ -1012,7 +1068,8 @@ impl<'a> FnGen<'a> {
 
     fn store_slot(&mut self, slot: u32) {
         let base = self.slot_base[slot as usize];
-        let width = val_types(self.slot_types[slot as usize], self.enums).len() as u32;
+        let width =
+            val_types(self.slot_types[slot as usize], self.enums, self.structs).len() as u32;
         // The stack has the components in order, so they come off backwards.
         for i in (0..width).rev() {
             self.ins().local_set(base + i);
@@ -1021,7 +1078,8 @@ impl<'a> FnGen<'a> {
 
     fn load_global(&mut self, slot: u32) {
         let base = self.globals.base[slot as usize];
-        let width = val_types(self.globals.types[slot as usize], self.enums).len() as u32;
+        let width =
+            val_types(self.globals.types[slot as usize], self.enums, self.structs).len() as u32;
         for i in 0..width {
             self.ins().global_get(base + i);
         }
@@ -1059,7 +1117,7 @@ impl<'a> FnGen<'a> {
             self.ins().global_get(base).call(F_RELEASE);
             self.ins().local_get(tmp);
         }
-        let width = val_types(ty, self.enums).len() as u32;
+        let width = val_types(ty, self.enums, self.structs).len() as u32;
         for i in (0..width).rev() {
             self.ins().global_set(base + i);
         }
@@ -1099,7 +1157,7 @@ impl<'a> FnGen<'a> {
             let mut at = 1u32;
             let mut owned = Vec::new();
             for ty in &variant.payload {
-                let width = val_types(*ty, self.enums).len() as u32;
+                let width = val_types(*ty, self.enums, self.structs).len() as u32;
                 if self.owns_str(*ty) {
                     owned.push((at, *ty));
                 }
@@ -1159,7 +1217,7 @@ impl<'a> FnGen<'a> {
             let mut at = 1u32;
             let mut owned = Vec::new();
             for ty in &variant.payload {
-                let width = val_types(*ty, self.enums).len() as u32;
+                let width = val_types(*ty, self.enums, self.structs).len() as u32;
                 if self.owns_str(*ty) {
                     owned.push((at, *ty));
                 }
@@ -1219,7 +1277,7 @@ impl<'a> FnGen<'a> {
                 self.leave_frame();
             }
             other => {
-                for _ in val_types(other, self.enums) {
+                for _ in val_types(other, self.enums, self.structs) {
                     self.ins().drop();
                 }
             }
@@ -1338,18 +1396,25 @@ impl<'a> FnGen<'a> {
                 self.store_global(*slot);
             }
 
-            // One axis of a named Vec2. A Vec2 is two adjacent slots, so
-            // writing one component is a store into one of them and the other
-            // is simply left alone - no read-modify-write needed.
-            Place::LocalField(slot, axis) => {
+            // Part of a named value - a Vec2 axis, a struct field, a field of a
+            // field. Everything is laid out flat and adjacent, so writing part
+            // of one is a store into the slots it occupies and the rest is
+            // simply left alone: no read-modify-write anywhere.
+            Place::LocalAt { slot, offset, ty } => {
                 self.expr(value);
-                let base = self.slot_base[*slot as usize];
-                self.ins().local_set(base + axis_offset(*axis));
+                let base = self.slot_base[*slot as usize] + offset;
+                let width = val_types(*ty, self.enums, self.structs).len() as u32;
+                for i in (0..width).rev() {
+                    self.ins().local_set(base + i);
+                }
             }
-            Place::GlobalField(slot, axis) => {
+            Place::GlobalAt { slot, offset, ty } => {
                 self.expr(value);
-                let base = self.globals.base[*slot as usize];
-                self.ins().global_set(base + axis_offset(*axis));
+                let base = self.globals.base[*slot as usize] + offset;
+                let width = val_types(*ty, self.enums, self.structs).len() as u32;
+                for i in (0..width).rev() {
+                    self.ins().global_set(base + i);
+                }
             }
 
             // A host property. The id goes on the stack first, because every
@@ -1472,31 +1537,42 @@ impl<'a> FnGen<'a> {
                 self.expr(y);
             }
 
-            TypedExprKind::Field { receiver, axis } => {
-                // `transform.position.x` fetches only the axis it wants. Going
-                // through the general path would call the host twice and throw
-                // one result away, on the single most common line in a script.
+            // Part of a value on the stack. `transform.position.x` fetches only
+            // the axis it wants: going through the general path would call the
+            // host twice and throw one result away, on the most common line in
+            // a script.
+            TypedExprKind::Field {
+                receiver,
+                offset,
+                ty,
+            } => {
                 if let TypedExprKind::HostField {
                     field,
                     ty: Type::Vec2,
                 } = receiver.kind
                 {
-                    self.ins().i32_const(field as i32).call(match axis {
-                        Axis::X => F_GET_VEC2_X,
-                        Axis::Y => F_GET_VEC2_Y,
+                    self.ins().i32_const(field as i32).call(if *offset == 0 {
+                        F_GET_VEC2_X
+                    } else {
+                        F_GET_VEC2_Y
                     });
                     return;
                 }
+                // Otherwise the whole value is on the stack and the wanted
+                // slots are somewhere inside it. Park the lot, then push back
+                // only the part asked for - the surrounding slots are dropped
+                // rather than reached past, because a stack cannot be indexed.
+                let whole = val_types(receiver.ty, self.enums, self.structs);
+                let width = val_types(*ty, self.enums, self.structs).len() as u32;
                 self.expr(receiver);
-                match axis {
-                    Axis::X => {
-                        self.ins().drop();
-                    }
-                    Axis::Y => {
-                        let tmp = self.scratch().f32s[0];
-                        self.ins().local_set(tmp).drop().local_get(tmp);
-                    }
+                let frame = self.enter_frame();
+                for slot in (0..whole.len() as u32).rev() {
+                    self.ins().local_set(Self::park_slot(&frame, &whole, slot));
                 }
+                for slot in *offset..*offset + width {
+                    self.ins().local_get(Self::park_slot(&frame, &whole, slot));
+                }
+                self.leave_frame();
             }
 
             TypedExprKind::Call { index, args } => {
@@ -1581,6 +1657,14 @@ impl<'a> FnGen<'a> {
             // An enum value is its tag, then its payload, then whatever slots
             // the widest variant needs and this one does not - zeroed, because
             // wasm has no undefined value and a match never reads them.
+            // A struct is exactly its fields, in order: building one is
+            // evaluating each of them, and there is no header.
+            TypedExprKind::MakeStruct { fields, .. } => {
+                for field in fields {
+                    self.expr(field);
+                }
+            }
+
             TypedExprKind::MakeVariant {
                 enum_index,
                 variant,
@@ -1611,6 +1695,31 @@ impl<'a> FnGen<'a> {
         }
     }
 
+    /// Where slot `at` of a parked value lives.
+    ///
+    /// The frame has typed regions - f32 scratches and i32 scratches - so a
+    /// value with a mix of both is spread across them by type. Any layout works
+    /// as long as it is the same going in and coming out.
+    fn park_slot(frame: &Frame, layout: &[ValType], at: u32) -> u32 {
+        let mut f32s = 0;
+        let mut i32s = 0;
+        for (index, ty) in layout.iter().enumerate() {
+            let here = if *ty == ValType::F32 {
+                let slot = frame.spare_f32 + f32s;
+                f32s += 1;
+                slot
+            } else {
+                let slot = frame.enum_base + i32s;
+                i32s += 1;
+                slot
+            };
+            if index as u32 == at {
+                return here;
+            }
+        }
+        frame.enum_base
+    }
+
     /// Turn the value on the stack into `n` payload slots, all `i32`.
     ///
     /// A uniform slot type is what lets one layout serve every variant, and
@@ -1633,7 +1742,7 @@ impl<'a> FnGen<'a> {
             }
             Type::Unit | Type::Error => 0,
             // int, bool, String and a nested enum are already i32 slots.
-            _ => val_types(ty, self.enums).len(),
+            _ => val_types(ty, self.enums, self.structs).len(),
         }
     }
 
@@ -1670,7 +1779,7 @@ impl<'a> FnGen<'a> {
         }
 
         let result_ty = arms[0].body.ty;
-        let result_width = val_types(result_ty, self.enums).len() as u32;
+        let result_width = val_types(result_ty, self.enums, self.structs).len() as u32;
         let result_base = frame.result_base;
         self.emit_arms(base, result_base, enum_index, arms, 0);
         // The subject was a value like any other, and this expression consumed
@@ -1720,7 +1829,7 @@ impl<'a> FnGen<'a> {
             .clone();
         let mut at = 1u32;
         for (slot, ty) in arm.bindings.iter().zip(&payload) {
-            let width = val_types(*ty, self.enums).len() as u32;
+            let width = val_types(*ty, self.enums, self.structs).len() as u32;
             for offset in 0..width {
                 self.ins().local_get(base + at + offset);
             }

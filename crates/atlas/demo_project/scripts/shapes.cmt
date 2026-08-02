@@ -1,0 +1,39 @@
+// A struct groups named fields under one name. It is a value, like Vec2 and
+// unlike anything that allocates: `let b = a;` copies, and changing `b` cannot
+// reach `a`.
+
+struct Body {
+    velocity: Vec2,
+    speed: f32,
+    bouncy: bool,
+}
+
+struct World {
+    gravity: Vec2,
+    body: Body,
+}
+
+let world = World {
+    gravity: vec2(0.0, 200.0),
+    body: Body {
+        velocity: vec2(60.0, 0.0),
+        speed: 1.0,
+        bouncy: true,
+    },
+};
+
+func start() {
+    // A struct inside a struct is flattened, not referenced - `world.body` is
+    // part of `world`, and this reads one slot out of it.
+    print("starting speed " + str(world.body.speed));
+
+    // Taking it out makes a copy. Changing the copy leaves the original alone.
+    let taken = world.body;
+    taken.speed = 99.0;
+    print("copy " + str(taken.speed) + ", original " + str(world.body.speed));
+}
+
+func update(dt: f32) {
+    world.body.velocity += world.gravity * dt;
+    transform.position += world.body.velocity * world.body.speed * dt;
+}

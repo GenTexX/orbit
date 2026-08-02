@@ -34,6 +34,9 @@ pub enum Type {
     /// index rather than a name keeps `Type` `Copy` and keeps every comparison
     /// a integer one.
     Enum(u32),
+    /// A user-defined struct, by its index in [`TypedScript::structs`]. A value
+    /// type: flattened into slots, never allocated, copied on assignment.
+    Struct(u32),
     /// The poison type: something already reported as wrong. Anything built from
     /// an `Error` is `Error` and reports nothing further, so one mistake yields
     /// one diagnostic rather than a cascade.
@@ -50,6 +53,7 @@ impl Type {
             Type::Vec2 => "Vec2",
             Type::Str => "String",
             Type::Enum(_) => "enum",
+            Type::Struct(_) => "struct",
             Type::Unit => "()",
             Type::Error => "<error>",
         }
@@ -78,6 +82,7 @@ impl Type {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TypedScript {
     pub enums: Vec<TypedEnum>,
+    pub structs: Vec<TypedStruct>,
     pub state: Vec<TypedState>,
     pub functions: Vec<TypedFn>,
 }
@@ -87,6 +92,22 @@ impl TypedScript {
     pub fn function(&self, name: &str) -> Option<&TypedFn> {
         self.functions.iter().find(|f| f.name == name)
     }
+}
+
+/// A checked struct: its fields in declaration order, laid out one after
+/// another with no header - a struct is exactly its fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedStruct {
+    pub name: String,
+    pub fields: Vec<TypedField>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedField {
+    pub name: String,
+    pub ty: Type,
+    /// Where this field starts within the struct's slots.
+    pub offset: u32,
 }
 
 /// A checked enum: its variants in declaration order, and the layout every
@@ -181,11 +202,23 @@ pub enum TypedStmt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Place {
     Local(u32),
-    /// One axis of a local `Vec2`. The other component is left as it was, which
-    /// is what makes `v.x = 1.0` a partial write rather than a whole one.
-    LocalField(u32, Axis),
+    /// Part of a local: one axis of a `Vec2`, or a struct's field, or a field
+    /// of a field. The rest of the value is left as it was, which is what makes
+    /// `v.x = 1.0` a partial write rather than a whole one.
+    ///
+    /// An offset in slots rather than a named axis, so one form covers a Vec2
+    /// component, a struct field, and any nesting of the two.
+    LocalAt {
+        slot: u32,
+        offset: u32,
+        ty: Type,
+    },
     Global(u32),
-    GlobalField(u32, Axis),
+    GlobalAt {
+        slot: u32,
+        offset: u32,
+        ty: Type,
+    },
     /// A host property, by its schema id. One variant for every property the
     /// engine exposes, rather than one variant per property - which is the
     /// whole point: adding `transform.rotation` costs nothing here.
@@ -235,10 +268,12 @@ pub enum TypedExprKind {
         field: u32,
         ty: Type,
     },
-    /// One component of a `Vec2` value.
+    /// Part of a value already on the stack: a `Vec2` component or a struct's
+    /// field, by where it starts and how wide it is.
     Field {
         receiver: Box<TypedExpr>,
-        axis: Axis,
+        offset: u32,
+        ty: Type,
     },
     /// `vec2(x, y)` - the two components, in order, on the stack.
     MakeVec2 {
@@ -264,6 +299,11 @@ pub enum TypedExprKind {
         op: BinaryOp,
         lhs: Box<TypedExpr>,
         rhs: Box<TypedExpr>,
+    },
+    /// Build a struct value: every field, in declaration order.
+    MakeStruct {
+        struct_index: u32,
+        fields: Vec<TypedExpr>,
     },
     /// Build an enum value: its tag, then its payload.
     MakeVariant {

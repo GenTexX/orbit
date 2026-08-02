@@ -23,6 +23,7 @@ use crate::tir::*;
 pub fn check(script: &ast::Script, schema: &HostSchema) -> (TypedScript, Vec<Diagnostic>) {
     let mut checker = Checker {
         templates: Vec::new(),
+        structs: Vec::new(),
         enums: Vec::new(),
         instances: HashMap::new(),
         building: Vec::new(),
@@ -53,6 +54,8 @@ struct Checker<'a> {
     /// Every enum as written, generic or not. A generic one describes a family
     /// of types; nothing is laid out until it is used at concrete arguments.
     templates: Vec<ast::EnumDecl>,
+    /// The script's structs, in declaration order. `Type::Struct` indexes this.
+    structs: Vec<TypedStruct>,
     /// Concrete enums, in the order they were first needed. `Type::Enum`
     /// indexes this, and it is what reaches codegen.
     enums: Vec<TypedEnum>,
@@ -108,6 +111,7 @@ impl Checker<'_> {
     fn name_of(&self, ty: Type) -> String {
         match ty {
             Type::Enum(index) => self.enums[index as usize].name.clone(),
+            Type::Struct(index) => self.structs[index as usize].name.clone(),
             other => other.name().to_string(),
         }
     }
@@ -461,6 +465,125 @@ impl Checker<'_> {
         }
     }
 
+    /// `Enemy { health: 10.0, position: p }`.
+    ///
+    /// Every field, exactly once, in any order - the value is built in
+    /// declaration order regardless, because that is the layout.
+    fn struct_lit(
+        &mut self,
+        name: &str,
+        name_span: Span,
+        given: &[ast::FieldInit],
+        span: Span,
+    ) -> (TypedExprKind, Type) {
+        let Some(index) = self.struct_index(name) else {
+            self.unresolved(name_span, name);
+            return (TypedExprKind::Error, Type::Error);
+        };
+        let declared = self.structs[index as usize].fields.clone();
+        let mut values: Vec<Option<TypedExpr>> = vec![None; declared.len()];
+        for init in given {
+            let Some(at) = declared.iter().position(|f| f.name == init.name) else {
+                self.field_of(Type::Struct(index), &init.name, init.name_span);
+                continue;
+            };
+            if values[at].is_some() {
+                self.error(init.name_span, format!("`{}` is given twice", init.name));
+                continue;
+            }
+            values[at] = Some(self.checked_against(&init.value, declared[at].ty));
+        }
+        let missing: Vec<&str> = values
+            .iter()
+            .zip(&declared)
+            .filter(|(value, _)| value.is_none())
+            .map(|(_, field)| field.name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            let list = missing.join("`, `");
+            self.error(
+                span,
+                format!(
+                    "`{name}` is missing `{list}` - a struct literal gives every field, so a \
+                     value is never partly built"
+                ),
+            );
+            return (TypedExprKind::Error, Type::Error);
+        }
+        (
+            TypedExprKind::MakeStruct {
+                struct_index: index,
+                fields: values
+                    .into_iter()
+                    .map(|v| v.expect("all present"))
+                    .collect(),
+            },
+            Type::Struct(index),
+        )
+    }
+
+    /// The index of the struct called `name`, if the script declares one.
+    fn struct_index(&self, name: &str) -> Option<u32> {
+        self.structs
+            .iter()
+            .position(|s| s.name == name)
+            .map(|i| i as u32)
+    }
+
+    /// Say that a type has no fields at all.
+    fn no_fields(&mut self, span: Span, ty: Type) {
+        let name = self.name_of(ty);
+        self.error(span, format!("`{name}` has no fields"));
+    }
+
+    /// What `field` means on `ty`: where it starts within the value's slots and
+    /// what it is.
+    ///
+    /// One rule for a `Vec2` axis and a struct's field, because to everything
+    /// downstream they are the same thing - an offset and a width.
+    fn field_of(&mut self, ty: Type, field: &str, span: Span) -> Option<(u32, Type)> {
+        match ty {
+            Type::Vec2 => match field {
+                "x" => Some((0, Type::F32)),
+                "y" => Some((1, Type::F32)),
+                _ => {
+                    self.error(span, format!("`Vec2` has no field `{field}`"));
+                    None
+                }
+            },
+            Type::Struct(index) => {
+                let found = self.structs[index as usize]
+                    .fields
+                    .iter()
+                    .find(|f| f.name == field)
+                    .map(|f| (f.offset, f.ty));
+                if found.is_none() {
+                    let name = self.structs[index as usize].name.clone();
+                    let candidates: Vec<String> = self.structs[index as usize]
+                        .fields
+                        .iter()
+                        .map(|f| f.name.clone())
+                        .collect();
+                    let message = match nearest(field, candidates.iter().map(String::as_str)) {
+                        Some(suggestion) => {
+                            format!(
+                                "`{name}` has no field `{field}` - did you mean `{suggestion}`?"
+                            )
+                        }
+                        None => format!("`{name}` has no field `{field}`"),
+                    };
+                    self.error(span, message);
+                }
+                found
+            }
+            Type::Error => None,
+            other => {
+                self.no_fields(span, other);
+                None
+            }
+        }
+    }
+
     /// The template called `name`, generic or not.
     fn template(&self, name: &str) -> Option<usize> {
         self.templates.iter().position(|t| t.name == name)
@@ -561,6 +684,15 @@ impl Checker<'_> {
             }
             return *bound;
         }
+        if let Some(index) = self.struct_index(&name.name) {
+            if !name.args.is_empty() {
+                self.error(
+                    name.span,
+                    format!("`{}` takes no type arguments", name.name),
+                );
+            }
+            return Type::Struct(index);
+        }
         if let Some(template) = self.template(&name.name) {
             let args: Vec<Type> = name
                 .args
@@ -600,6 +732,12 @@ impl Checker<'_> {
             // The tag plus the widest payload. An enum inside an enum is
             // flattened rather than boxed, so it stays a stack value.
             Type::Enum(index) => 1 + self.enums[index as usize].payload_slots,
+            // A struct is exactly its fields, one after another.
+            Type::Struct(index) => self.structs[index as usize]
+                .fields
+                .iter()
+                .map(|f| self.slots(f.ty))
+                .sum(),
             _ => 1,
         }
     }
@@ -661,6 +799,22 @@ impl Checker<'_> {
                 }),
             },
             Type::Str => TypedExprKind::Str(String::new()),
+            // Every field at its own default, which is what a struct being
+            // exactly its fields means.
+            Type::Struct(index) => {
+                let fields: Vec<Type> = self.structs[index as usize]
+                    .fields
+                    .iter()
+                    .map(|f| f.ty)
+                    .collect();
+                TypedExprKind::MakeStruct {
+                    struct_index: index,
+                    fields: fields
+                        .into_iter()
+                        .map(|ty| self.default_value(ty, span))
+                        .collect(),
+                }
+            }
             Type::Enum(index) => {
                 let first = self.enums[index as usize].variants.first();
                 match first {
@@ -783,6 +937,21 @@ impl Checker<'_> {
             }
             self.templates.push(decl.clone());
         }
+        // Struct names, before their fields, so one struct may hold another
+        // regardless of which was written first.
+        for decl in &script.structs {
+            if self.struct_index(&decl.name).is_some() && !decl.name.is_empty() {
+                self.error(
+                    decl.name_span,
+                    format!("`{}` is already defined in this script", decl.name),
+                );
+            }
+            self.structs.push(TypedStruct {
+                name: decl.name.clone(),
+                fields: Vec::new(),
+            });
+        }
+
         // A non-generic enum has exactly one layout, so it is built now and its
         // name resolves like any other type's.
         for index in 0..self.templates.len() {
@@ -790,6 +959,34 @@ impl Checker<'_> {
                 let span = self.templates[index].span;
                 self.instantiate(index, &[], span);
             }
+        }
+
+        // Then their fields, and the offset each sits at.
+        for (index, decl) in script.structs.iter().enumerate() {
+            let mut fields: Vec<TypedField> = Vec::new();
+            let mut offset = 0;
+            for field in &decl.fields {
+                if fields.iter().any(|f| f.name == field.name) {
+                    self.error(
+                        field.name_span,
+                        format!("`{}` is already a field of this struct", field.name),
+                    );
+                }
+                let ty = self.resolve_type(&field.ty);
+                if ty == Type::Unit {
+                    self.error(field.span, "a field cannot have type `()`");
+                }
+                fields.push(TypedField {
+                    name: field.name.clone(),
+                    ty,
+                    offset,
+                });
+                offset += self.slots(ty) as u32;
+            }
+            if fields.is_empty() && !decl.name.is_empty() {
+                self.error(decl.span, "a struct needs at least one field");
+            }
+            self.structs[index].fields = fields;
         }
 
         // Signatures first, so a function can call one defined later and a
@@ -938,6 +1135,7 @@ impl Checker<'_> {
 
         TypedScript {
             enums: std::mem::take(&mut self.enums),
+            structs: std::mem::take(&mut self.structs),
             state,
             functions,
         }
@@ -1353,136 +1551,113 @@ impl Checker<'_> {
 
     /// Resolve an assignment target to a [`Place`] and the type stored there.
     fn place(&mut self, target: &ast::Expr) -> (Place, Type) {
-        match target {
-            ast::Expr::Ident { name, span } => {
-                if let Some(slot) = self.lookup_local(name) {
-                    return (Place::Local(slot), self.locals[slot as usize]);
-                }
-                if let Some(&slot) = self.globals.get(name) {
-                    return (Place::Global(slot), self.global_types[slot as usize]);
-                }
-                self.unresolved(*span, name);
-                (Place::Error, Type::Error)
-            }
-            ast::Expr::Field {
-                receiver,
-                field,
-                field_span,
-                ..
-            } => {
-                // `transform.position = v`, or one axis of it.
-                if let ast::Expr::Ident { name, .. } = receiver.as_ref()
-                    && self.lookup_local(name).is_none()
-                    && !self.globals.contains_key(name)
-                    && self.schema.has_object(name)
-                {
-                    return match self.schema.resolve(name, field) {
-                        Some(found) => (
-                            Place::Host {
-                                field: found.id,
-                                ty: found.ty.ty(),
-                                axis: None,
-                            },
-                            found.ty.ty(),
-                        ),
-                        None => {
-                            self.unknown_property(name, field, *field_span);
-                            (Place::Error, Type::Error)
-                        }
-                    };
-                }
-                // `transform.position.x = v`: one axis of a Vec2 property,
-                // leaving the other as it was.
-                if let ast::Expr::Field {
-                    receiver: outer,
-                    field: property,
-                    field_span: property_span,
-                    ..
-                } = receiver.as_ref()
-                    && let ast::Expr::Ident { name, .. } = outer.as_ref()
-                    && self.lookup_local(name).is_none()
-                    && !self.globals.contains_key(name)
-                    && self.schema.has_object(name)
-                {
-                    let Some(found) = self.schema.resolve(name, property) else {
-                        self.unknown_property(name, property, *property_span);
-                        return (Place::Error, Type::Error);
-                    };
+        // A place is a named root and a path of fields into it: `v`, `v.x`,
+        // `e.position`, `e.position.y`. The path collapses to one offset,
+        // because to everything downstream that is all a field is.
+        let mut path: Vec<(&str, Span)> = Vec::new();
+        let mut root = target;
+        while let ast::Expr::Field {
+            receiver,
+            field,
+            field_span,
+            ..
+        } = root
+        {
+            path.push((field, *field_span));
+            root = receiver;
+        }
+        path.reverse();
+
+        let ast::Expr::Ident { name, span } = root else {
+            self.error(
+                target.span(),
+                "this cannot be assigned to - only a variable, one of its fields, or an \
+                 engine property can",
+            );
+            return (Place::Error, Type::Error);
+        };
+
+        // A host property, when nothing local shadows the object's name.
+        if self.lookup_local(name).is_none()
+            && !self.globals.contains_key(name)
+            && self.schema.has_object(name)
+        {
+            let Some((property, property_span)) = path.first().copied() else {
+                self.error(
+                    *span,
+                    format!("`{name}` is a group of properties, not a value"),
+                );
+                return (Place::Error, Type::Error);
+            };
+            let Some(found) = self.schema.resolve(name, property) else {
+                self.unknown_property(name, property, property_span);
+                return (Place::Error, Type::Error);
+            };
+            return match path.len() {
+                1 => (
+                    Place::Host {
+                        field: found.id,
+                        ty: found.ty.ty(),
+                        axis: None,
+                    },
+                    found.ty.ty(),
+                ),
+                2 => {
+                    let (axis_name, axis_span) = path[1];
                     if found.ty.ty() != Type::Vec2 {
-                        self.error(
-                            *field_span,
-                            format!("`{}` has no fields", found.ty.ty().name()),
-                        );
+                        self.no_fields(axis_span, found.ty.ty());
                         return (Place::Error, Type::Error);
                     }
-                    let Some(axis) = axis(field) else {
-                        self.error(*field_span, format!("`Vec2` has no field `{field}`"));
+                    let Some(axis) = axis(axis_name) else {
+                        self.error(axis_span, format!("`Vec2` has no field `{axis_name}`"));
                         return (Place::Error, Type::Error);
                     };
-                    return (
+                    (
                         Place::Host {
                             field: found.id,
                             ty: Type::Vec2,
                             axis: Some(axis),
                         },
                         Type::F32,
-                    );
+                    )
                 }
-                // A named `Vec2` - a local, a parameter, or script state - can
-                // have one axis written. Anything else cannot: there is nowhere
-                // to put the result of assigning into a temporary.
-                if let ast::Expr::Ident { name, span } = receiver.as_ref() {
-                    let axis = match axis(field) {
-                        Some(axis) => axis,
-                        None => {
-                            self.error(*field_span, format!("`Vec2` has no field `{field}`"));
-                            return (Place::Error, Type::Error);
-                        }
-                    };
-                    if let Some(slot) = self.lookup_local(name) {
-                        return match self.locals[slot as usize] {
-                            Type::Vec2 => (Place::LocalField(slot, axis), Type::F32),
-                            other => {
-                                self.no_fields(*span, other);
-                                (Place::Error, Type::Error)
-                            }
-                        };
-                    }
-                    if let Some(&slot) = self.globals.get(name) {
-                        return match self.global_types[slot as usize] {
-                            Type::Vec2 => (Place::GlobalField(slot, axis), Type::F32),
-                            other => {
-                                self.no_fields(*span, other);
-                                (Place::Error, Type::Error)
-                            }
-                        };
-                    }
-                    self.unresolved(*span, name);
-                    return (Place::Error, Type::Error);
+                _ => {
+                    self.no_fields(path[2].1, Type::F32);
+                    (Place::Error, Type::Error)
                 }
-                let receiver = self.expr(receiver);
-                if !receiver.ty.is_error() {
-                    self.error(
-                        target.span(),
-                        "only a named `Vec2` can be assigned through a field",
-                    );
-                }
-                (Place::Error, Type::Error)
-            }
-            other => {
-                if !matches!(other, ast::Expr::Error { .. }) {
-                    self.error(other.span(), "this cannot be assigned to");
-                }
-                (Place::Error, Type::Error)
-            }
+            };
         }
-    }
 
-    /// Report that a type has no fields, unless it is already poisoned.
-    fn no_fields(&mut self, span: Span, ty: Type) {
-        if !ty.is_error() {
-            self.error(span, format!("`{}` has no fields", ty.name()));
+        // A local or a piece of state, then the path into it.
+        let (is_local, slot, mut ty) = if let Some(slot) = self.lookup_local(name) {
+            (true, slot, self.locals[slot as usize])
+        } else if let Some(&slot) = self.globals.get(name) {
+            (false, slot, self.global_types[slot as usize])
+        } else {
+            self.unresolved(*span, name);
+            return (Place::Error, Type::Error);
+        };
+
+        let mut offset = 0;
+        let whole = path.is_empty();
+        for (field, field_span) in path {
+            let Some((at, field_ty)) = self.field_of(ty, field, field_span) else {
+                return (Place::Error, Type::Error);
+            };
+            offset += at;
+            ty = field_ty;
         }
+        // Whether there was a path at all, not whether the offset came out
+        // zero: `o.inner.hp` sits at offset 0 and is still a part of `o`, not
+        // the whole of it. Keying on the offset stored one slot into a value
+        // several slots wide.
+        let place = match (is_local, whole) {
+            (true, true) => Place::Local(slot),
+            (false, true) => Place::Global(slot),
+            (true, false) => Place::LocalAt { slot, offset, ty },
+            (false, false) => Place::GlobalAt { slot, offset, ty },
+        };
+        (place, ty)
     }
 
     /// The expression that reads a place - what compound assignment needs for
@@ -1490,27 +1665,29 @@ impl Checker<'_> {
     fn place_read(&mut self, place: &Place, ty: Type, span: Span) -> TypedExpr {
         // Reading a place is what compound assignment does: `x += 1` uses `x`,
         // where a plain `x = 1` does not.
-        if let Place::Local(slot) | Place::LocalField(slot, _) = place {
+        if let Place::Local(slot) | Place::LocalAt { slot, .. } = place {
             self.mark_used(*slot);
         }
         let kind = match place {
             Place::Local(slot) => TypedExprKind::Local(*slot),
             Place::Global(slot) => TypedExprKind::Global(*slot),
-            Place::LocalField(slot, axis) => TypedExprKind::Field {
+            Place::LocalAt { slot, offset, .. } => TypedExprKind::Field {
                 receiver: Box::new(TypedExpr {
                     kind: TypedExprKind::Local(*slot),
-                    ty: Type::Vec2,
+                    ty: self.locals[*slot as usize],
                     span,
                 }),
-                axis: *axis,
+                offset: *offset,
+                ty,
             },
-            Place::GlobalField(slot, axis) => TypedExprKind::Field {
+            Place::GlobalAt { slot, offset, .. } => TypedExprKind::Field {
                 receiver: Box::new(TypedExpr {
                     kind: TypedExprKind::Global(*slot),
-                    ty: Type::Vec2,
+                    ty: self.global_types[*slot as usize],
                     span,
                 }),
-                axis: *axis,
+                offset: *offset,
+                ty,
             },
             // Reading a host property back for a compound assignment. With an
             // axis, that means reading the whole Vec2 and taking one component -
@@ -1532,7 +1709,8 @@ impl Checker<'_> {
                             ty: *field_ty,
                             span,
                         }),
-                        axis: *axis,
+                        offset: axis_offset(*axis),
+                        ty: Type::F32,
                     },
                     None => read,
                 }
@@ -1662,27 +1840,25 @@ impl Checker<'_> {
                     return TypedExpr { kind, ty, span };
                 }
                 let receiver = self.expr(receiver);
-                match receiver.ty {
-                    Type::Vec2 => match axis(field) {
-                        Some(axis) => (
-                            TypedExprKind::Field {
-                                receiver: Box::new(receiver),
-                                axis,
-                            },
-                            Type::F32,
-                        ),
-                        None => {
-                            self.error(*field_span, format!("`Vec2` has no field `{field}`"));
-                            (TypedExprKind::Error, Type::Error)
-                        }
-                    },
-                    Type::Error => (TypedExprKind::Error, Type::Error),
-                    other => {
-                        self.error(*field_span, format!("`{}` has no fields", other.name()));
-                        (TypedExprKind::Error, Type::Error)
-                    }
+                match self.field_of(receiver.ty, field, *field_span) {
+                    Some((offset, ty)) => (
+                        TypedExprKind::Field {
+                            receiver: Box::new(receiver),
+                            offset,
+                            ty,
+                        },
+                        ty,
+                    ),
+                    None => (TypedExprKind::Error, Type::Error),
                 }
             }
+
+            ast::Expr::StructLit {
+                name,
+                name_span,
+                fields,
+                ..
+            } => self.struct_lit(name, *name_span, fields, span),
 
             ast::Expr::Call {
                 callee,
@@ -2122,6 +2298,14 @@ impl TypedExpr {
         } else {
             self.span
         }
+    }
+}
+
+/// Where a `Vec2` axis sits within the value's two slots.
+fn axis_offset(axis: Axis) -> u32 {
+    match axis {
+        Axis::X => 0,
+        Axis::Y => 1,
     }
 }
 
@@ -2639,7 +2823,9 @@ mod tests {
     fn a_literal_cannot_be_assigned_to() {
         assert_eq!(
             messages("func update(dt: f32) { 1.0 = 2.0; }"),
-            vec!["this cannot be assigned to"]
+            vec![
+                "this cannot be assigned to - only a variable, one of its fields, or an engine property can"
+            ]
         );
     }
 
@@ -3434,6 +3620,86 @@ mod tests {
         assert_eq!(
             messages("func f(a: Option<f32>) { let b: Option<bool> = a; }"),
             ["expected `Option<bool>`, found `Option<f32>`"]
+        );
+    }
+
+    // --- structs ---
+
+    #[test]
+    fn a_struct_literal_gives_every_field_exactly_once() {
+        check_clean("struct P { x: f32, y: f32 }\nfunc f() -> P { P { y: 2.0, x: 1.0 } }");
+        assert_eq!(
+            messages("struct P { x: f32, y: f32 }\nfunc f() -> P { P { x: 1.0 } }"),
+            [
+                "`P` is missing `y` - a struct literal gives every field, so a value is never partly built"
+            ]
+        );
+        assert_eq!(
+            messages("struct P { x: f32 }\nfunc f() -> P { P { x: 1.0, x: 2.0 } }"),
+            ["`x` is given twice"]
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_suggests_the_nearest_one() {
+        assert_eq!(
+            messages("struct P { health: f32 }\nfunc f(p: P) -> f32 { p.helth }"),
+            ["`P` has no field `helth` - did you mean `health`?"]
+        );
+    }
+
+    #[test]
+    fn a_field_is_an_offset_and_nesting_adds_them_up() {
+        let typed = check_clean(
+            "struct I { a: f32, b: f32 }\nstruct O { first: f32, inner: I }\n\
+             func f(o: O) -> f32 { o.inner.b }",
+        );
+        // O is [first, inner.a, inner.b]: `inner` starts at 1, `b` at 1 within
+        // it, so `o.inner.b` is slot 2.
+        let outer = typed.structs.iter().find(|s| s.name == "O").unwrap();
+        assert_eq!(outer.fields[0].offset, 0);
+        assert_eq!(outer.fields[1].offset, 1);
+    }
+
+    #[test]
+    fn writing_part_of_a_value_is_a_place_and_writing_all_of_it_is_another() {
+        // Keyed on whether there was a path, not on the offset coming out zero:
+        // `o.inner.a` sits at offset 0 and is still a part of `o`.
+        let typed = check_clean(
+            "struct I { a: f32 }\nstruct O { inner: I }\n\
+             func f() { let o = O { inner: I { a: 1.0 } }; o.inner.a = 2.0; print(str(o.inner.a)); }",
+        );
+        let f = typed.function("f").unwrap();
+        assert!(matches!(
+            f.body.stmts[1],
+            TypedStmt::Assign {
+                place: Place::LocalAt { offset: 0, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_struct_needs_a_name_of_its_own_and_fields_of_their_own() {
+        assert_eq!(
+            messages("struct P { x: f32 }\nstruct P { y: f32 }"),
+            ["`P` is already defined in this script"]
+        );
+        assert_eq!(
+            messages("struct P { x: f32, x: f32 }"),
+            ["`x` is already a field of this struct"]
+        );
+        assert_eq!(
+            messages("struct P { }"),
+            ["a struct needs at least one field"]
+        );
+    }
+
+    #[test]
+    fn a_struct_is_not_generic_yet_and_says_so_rather_than_ignoring_it() {
+        assert_eq!(
+            messages("struct P { x: f32 }\nfunc f(p: P<f32>) { }"),
+            ["`P` takes no type arguments"]
         );
     }
 }

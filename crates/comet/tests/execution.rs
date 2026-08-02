@@ -1621,3 +1621,97 @@ fn a_user_defined_generic_works_the_same_way() {
     script.update(0.0);
     assert_eq!(script.printed(), ["3 1"]);
 }
+
+#[test]
+fn a_struct_is_its_fields_and_nothing_else() {
+    let mut script = Script::new(
+        r#"
+        struct Enemy { health: f32, position: Vec2, alive: bool }
+        func update(dt: f32) {
+            let e = Enemy { health: 12.0, position: vec2(3.0, 4.0), alive: true };
+            print(str(e.health) + " " + str(e.position.x) + "," + str(e.position.y));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["12 3,4"]);
+}
+
+#[test]
+fn a_struct_is_a_value_so_assigning_it_copies() {
+    // The thing that separates a struct from an array, which is a reference.
+    // `b` is its own copy: changing it must not reach `a`.
+    let mut script = Script::new(
+        r#"
+        struct Point { x: f32, y: f32 }
+        func update(dt: f32) {
+            let a = Point { x: 1.0, y: 2.0 };
+            let b = a;
+            b.x = 99.0;
+            print(str(a.x) + " " + str(b.x));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["1 99"]);
+}
+
+#[test]
+fn writing_one_field_leaves_the_others_where_they_were() {
+    // Everything is laid out flat and adjacent, so a partial write is a store
+    // into the slots that field occupies. Distinct values, so a store that hit
+    // the wrong offset shows.
+    let mut script = Script::new(
+        r#"
+        struct Row { a: f32, b: f32, c: f32 }
+        func update(dt: f32) {
+            let r = Row { a: 1.0, b: 2.0, c: 3.0 };
+            r.b = 99.0;
+            print(str(r.a) + "," + str(r.b) + "," + str(r.c));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["1,99,3"]);
+}
+
+#[test]
+fn a_struct_inside_a_struct_is_flattened_rather_than_referenced() {
+    // Nesting is offsets, not pointers: `o.inner.hp` reads one slot and writes
+    // one slot, and `o.inner` is a copy like every other value.
+    let mut script = Script::new(
+        r#"
+        struct Inner { hp: f32, mp: f32 }
+        struct Outer { inner: Inner, tag: f32 }
+        func update(dt: f32) {
+            let o = Outer { inner: Inner { hp: 1.0, mp: 2.0 }, tag: 3.0 };
+            o.inner.mp = 99.0;
+            let taken = o.inner;
+            print(str(o.inner.hp) + "," + str(o.inner.mp) + "," + str(o.tag));
+            print(str(taken.hp) + "," + str(taken.mp));
+        }
+        "#,
+    );
+    script.update(0.0);
+    assert_eq!(script.printed(), ["1,99,3", "1,99"]);
+}
+
+#[test]
+fn a_struct_can_live_in_script_state_and_be_passed_around() {
+    let mut script = Script::at(
+        r#"
+        struct Body { velocity: Vec2, speed: f32 }
+        let body = Body { velocity: vec2(1.0, 0.0), speed: 10.0 };
+        func step(b: Body, dt: f32) -> Vec2 {
+            b.velocity * b.speed * dt
+        }
+        func update(dt: f32) {
+            transform.position += step(body, dt);
+        }
+        "#,
+        0.0,
+        0.0,
+    );
+    script.update(0.5);
+    assert_eq!(script.position(), (5.0, 0.0));
+}

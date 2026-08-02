@@ -31,9 +31,31 @@ pub struct VariantDecl {
     pub span: Span,
 }
 
+/// `struct Enemy { health: f32, position: Vec2 }`.
+///
+/// A value type: flattened into slots the way `Vec2` and an enum are, so it
+/// never allocates and `let b = a;` copies (ADR 0006's "value semantics for
+/// small structs").
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub fields: Vec<FieldDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: TypeName,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Script {
     pub enums: Vec<EnumDecl>,
+    pub structs: Vec<StructDecl>,
     pub state: Vec<StateDecl>,
     pub functions: Vec<Function>,
 }
@@ -57,6 +79,14 @@ pub struct StateDecl {
     /// type or an initializer; with neither there is nothing to infer from.
     pub init: Option<Expr>,
     pub span: Span,
+}
+
+/// One field of a struct literal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldInit {
+    pub name: String,
+    pub name_span: Span,
+    pub value: Expr,
 }
 
 /// One arm: a variant, the names it binds from the payload, and the value.
@@ -212,6 +242,13 @@ pub enum Expr {
         value: String,
         span: Span,
     },
+    /// `Enemy { health: 10.0, position: p }` - every field, in any order.
+    StructLit {
+        name: String,
+        name_span: Span,
+        fields: Vec<FieldInit>,
+        span: Span,
+    },
     /// `State::Idle`, or `Hit::Wall(3.0)` - naming a variant, and giving it its
     /// payload when it has one.
     Variant {
@@ -273,6 +310,7 @@ impl Expr {
             Expr::Int { span, .. }
             | Expr::Number { span, .. }
             | Expr::Variant { span, .. }
+            | Expr::StructLit { span, .. }
             | Expr::Match { span, .. }
             | Expr::Bool { span, .. }
             | Expr::Str { span, .. }

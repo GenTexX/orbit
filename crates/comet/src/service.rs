@@ -137,6 +137,7 @@ fn classify(tokens: &[crate::lexer::Token]) -> Vec<TokenSpan> {
             | TokenKind::For
             | TokenKind::In
             | TokenKind::Enum
+            | TokenKind::Struct
             | TokenKind::Match
             | TokenKind::Return
             | TokenKind::True
@@ -497,6 +498,7 @@ fn keyword_detail(word: &str) -> &'static str {
         "while" => "repeat a block while a condition holds",
         "for" => "repeat a block once per whole number in a range: `for i in 0..4`",
         "enum" => "declare a type that is one of several named variants",
+        "struct" => "declare a type that groups named fields - a value, copied on assignment",
         "match" => "pick a value by which variant something is - every variant needs an arm",
         "in" => "separates a `for` loop's variable from its range",
         "return" => "leave a function with a value",
