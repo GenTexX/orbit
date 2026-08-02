@@ -21,7 +21,7 @@ use crate::{text, theme};
 
 /// The visual state of an interactive widget, derived from the pointer each
 /// frame. Drives the built-in hover and pressed shading.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Interaction {
     Idle,
     Hovered,
@@ -44,6 +44,10 @@ const DRAG_THRESHOLD: f32 = 4.0;
 
 /// Opacity of the drag "ghost" (the faded copy of the dragged widget).
 const DRAG_GHOST_ALPHA: f32 = 0.6;
+
+/// How tall a slider is when its style does not say. Room for the thumb, which
+/// is what a pointer actually aims at.
+const SLIDER_MIN_HEIGHT: f32 = 18.0;
 
 /// What a text widget's buffer was last shaped with, and the size that produced.
 /// `measure_widget` compares the live inputs against this and re-shapes only on a
@@ -1179,6 +1183,7 @@ impl Ui {
             flat: style.flat,
             hit_transparent: style.hit_transparent,
             disabled: style.disabled,
+            hover_self_only: style.hover_self_only,
         });
         if grabby {
             self.grab_widgets.push(id);
@@ -3210,9 +3215,17 @@ impl Ui {
     /// is both armed on it and still over it. A widget also counts as hovered
     /// when the pointer is over one of its interactive children (e.g. a tree row
     /// stays highlighted while the cursor is on its eye toggle), so moving onto a
-    /// nested control does not flicker the parent's highlight off.
+    /// nested control does not flicker the parent's highlight off. A widget that
+    /// says [`hover_self_only`](crate::Style::hover_self_only) opts out, because
+    /// its children do something other than what it does.
     fn interaction(&self, id: WidgetId) -> Interaction {
-        let hovered_here = self.hovered.is_some_and(|h| self.is_within(h, id));
+        let hovered_here = self.hovered.is_some_and(|h| {
+            if self.widgets[id].hover_self_only {
+                h == id
+            } else {
+                self.is_within(h, id)
+            }
+        });
         if self.pressed == Some(id) && hovered_here {
             Interaction::Pressed
         } else if hovered_here {
@@ -4474,12 +4487,20 @@ fn measure_widget(
             );
             return size;
         }
-        // Panels, images, sliders, and splitters have no intrinsic content
-        // size; they take their size from style (fixed size, grow, or fill).
-        WidgetKind::Panel
-        | WidgetKind::Image(_)
-        | WidgetKind::Slider { .. }
-        | WidgetKind::Splitter { .. } => {
+        // A slider has no content either, but it does have a thumb, and a
+        // zero-height one is a widget the pointer can never be inside: it draws
+        // (the thumb has a floor of its own) while being impossible to press.
+        // So it asks for room to be grabbed in. An explicit style height wins,
+        // as it does for every other widget.
+        WidgetKind::Slider { .. } => {
+            return Size {
+                width: 0.0,
+                height: SLIDER_MIN_HEIGHT,
+            };
+        }
+        // Panels, images, and splitters have no intrinsic content size; they
+        // take their size from style (fixed size, grow, or fill).
+        WidgetKind::Panel | WidgetKind::Image(_) | WidgetKind::Splitter { .. } => {
             return Size::ZERO;
         }
     };
@@ -8247,6 +8268,50 @@ three",
 
         assert_eq!(ui.drain_events(), vec![Event::Submitted(first)]);
         assert_eq!(ui.focused(), Some(second)); // advanced to the next field
+    }
+
+    #[test]
+    fn a_parent_can_keep_its_hover_to_itself() {
+        use crate::ui::Interaction;
+        // The default is to share: a tree row stays highlighted while the cursor
+        // is on its eye toggle, because the toggle acts on what the row names.
+        // A header whose button removes the component is the other case.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().fill());
+        let shared = ui.button(root, "row", Style::new().size(100.0, 20.0).row());
+        let inner = ui.button(shared, "eye", Style::new().size(20.0, 20.0));
+        let alone = ui.button(
+            root,
+            "header",
+            Style::new().size(100.0, 20.0).row().hover_self_only(),
+        );
+        let x = ui.button(alone, "x", Style::new().size(20.0, 20.0));
+        ui.layout(Vec2::new(200.0, 200.0)).unwrap();
+
+        let on = |ui: &mut Ui, id| {
+            let r = ui.rect(id).unwrap();
+            ui.handle_input(InputEvent::PointerMoved(r.pos + r.size * 0.5));
+        };
+        on(&mut ui, inner);
+        assert_eq!(ui.hovered(), Some(inner));
+        assert_eq!(
+            ui.interaction(shared),
+            Interaction::Hovered,
+            "shares with its child by default"
+        );
+        on(&mut ui, x);
+        assert_eq!(ui.hovered(), Some(x));
+        assert_eq!(
+            ui.interaction(alone),
+            Interaction::Idle,
+            "opted out, so the child hovers alone"
+        );
+        on(&mut ui, alone);
+        assert_eq!(
+            ui.interaction(alone),
+            Interaction::Hovered,
+            "and it still hovers on its own account"
+        );
     }
 
     #[test]

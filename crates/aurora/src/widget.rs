@@ -287,6 +287,9 @@ pub(crate) struct Widget {
     pub hit_transparent: bool,
     /// Whether this widget is disabled: drawn dimmed and inert to all input.
     pub disabled: bool,
+    /// Whether this widget declines to borrow hover shading from an interactive
+    /// child (see [`Style::hover_self_only`](crate::Style::hover_self_only)).
+    pub hover_self_only: bool,
 }
 
 impl Widget {

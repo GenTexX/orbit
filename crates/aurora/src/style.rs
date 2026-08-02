@@ -36,6 +36,12 @@ pub struct Style {
     /// Render this widget (and its subtree) dimmed and inert: it takes no hover,
     /// press, click, or focus. For controls that are unavailable right now.
     pub disabled: bool,
+    /// Take hover shading only from the cursor being on this widget itself, not
+    /// on an interactive child. The default is the other way round - a tree row
+    /// stays highlighted while the cursor is on its eye toggle - which is right
+    /// when the child acts on what the parent names, and wrong when it does
+    /// something else, like a header whose button removes the thing.
+    pub hover_self_only: bool,
     /// Placeholder text a text input shows, dimmed, while empty. Ignored by
     /// other widget kinds.
     pub placeholder: Option<String>,
@@ -110,6 +116,7 @@ impl Default for Style {
             flat: false,
             hit_transparent: false,
             disabled: false,
+            hover_self_only: false,
             placeholder: None,
             mask: Mask::None,
             font_size: None,
@@ -548,6 +555,14 @@ impl Style {
     /// at all: no highlight, and no `Dropped` naming it.
     pub fn accepts(mut self, mask: u32) -> Self {
         self.accepts = mask;
+        self
+    }
+
+    /// Do not borrow hover shading from an interactive child: while the cursor
+    /// is on one, this widget reads as idle. For a parent whose children do
+    /// something other than what clicking the parent does.
+    pub fn hover_self_only(mut self) -> Self {
+        self.hover_self_only = true;
         self
     }
 

@@ -2515,6 +2515,10 @@ fn add_inspector_section(
         .align_center()
         .padding_x(8.0)
         .padding_y(6.0)
+        // The remove button sits inside this bar, and it does something else -
+        // aiming at it should not leave the bar looking like it is about to be
+        // clicked.
+        .hover_self_only()
         .background(theme.aurora.header_bg)
         .border(theme.aurora.border_width, theme.aurora.card_border);
     let header_style = if collapsed {
@@ -3237,7 +3241,14 @@ mod tests {
 
     /// Build a modal on a bare Ui and lay it out (a fresh root + one popup).
     /// The inspector for `node`, laid out headless.
+    use aurora::InputEvent;
+
     fn laid_out_inspector(scene: &Scene, node: NodeId) -> EditorRows {
+        laid_out_inspector_ui(scene, node).1
+    }
+
+    /// The same, keeping the Ui so a test can look at where things landed.
+    fn laid_out_inspector_ui(scene: &Scene, node: NodeId) -> (Ui, EditorRows) {
         let theme = EditorTheme::default();
         let mut ui = Ui::new();
         ui.set_theme(theme.aurora);
@@ -3256,7 +3267,7 @@ mod tests {
             &mut rows,
         );
         ui.layout(Vec2::new(400.0, 700.0)).unwrap();
-        rows
+        (ui, rows)
     }
 
     fn laid_out_modal(modal: &Modal) -> EditorRows {
@@ -4355,6 +4366,48 @@ mod tests {
         assert!(
             rows.asset_fields.iter().any(|(_, _, _, f)| f == "source"),
             "and the path is still the asset field it was"
+        );
+    }
+
+    #[test]
+    fn a_ranged_export_gets_a_slider_that_can_actually_be_grabbed() {
+        // A slider has no intrinsic height - it takes one from its style - and a
+        // row that gives it none lays it out zero tall. It still draws, because
+        // the thumb has a floor, so the miss is invisible: the widget is simply
+        // never under the cursor and no press ever reaches it.
+        let mut scene = Scene::new("root");
+        let node = scene.add_child(scene.root(), Node::new("Thing"));
+        scene
+            .node_mut(node)
+            .components
+            .push(Component::Script(helios::ScriptComponent {
+                source: "s.cmt".into(),
+                exports: vec![("speed".into(), Value::F32(1.0))],
+                hints: vec![("speed".into(), vec![comet::Hint::Range(0.0, 10.0)])],
+            }));
+        let (mut ui, rows) = laid_out_inspector_ui(&scene, node);
+        let (slider, ..) = *rows
+            .field_sliders
+            .first()
+            .expect("a ranged export is a slider");
+        let rect = ui.rect(slider).expect("laid out");
+        assert!(rect.size.y >= 14.0, "tall enough to hit: {rect:?}");
+
+        // And grabbing it moves it: press in the middle of the track, drag right.
+        let mid = Vec2::new(
+            rect.pos.x + rect.size.x * 0.5,
+            rect.pos.y + rect.size.y * 0.5,
+        );
+        ui.handle_input(InputEvent::PointerMoved(mid));
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerMoved(Vec2::new(
+            rect.pos.x + rect.size.x - 1.0,
+            mid.y,
+        )));
+        assert!(
+            ui.slider_value(slider) > 8.0,
+            "dragged to the right end, got {}",
+            ui.slider_value(slider)
         );
     }
 }
