@@ -42,6 +42,12 @@ Two structural lessons came out of it and are worth carrying into M4. **A rebuil
 
 A survey the day after the pane first worked found 229 things it still cannot do, and twenty of them are defects rather than gaps. That list is [code-editor-backlog.md](code-editor-backlog.md); three of its entries were reproduced with a test, and one - Tab replacing a multi-line selection with four spaces - was a same-day regression fixed on the spot.
 
+### Iteration phase 4.1 - 4.9 - completing the language (planned)
+
+After Milestone 4 the [Comet language design record](comet-language-design.md) took fourteen decisions about what the language should become, left two questions open, and listed a further set not yet put. **Plan:** [completing the Comet language](plans/comet-language-completion.md), nine iterations ordered by dependency rather than by the order the decisions were taken.
+
+**It runs before Milestone 5, deliberately.** That delays the killer feature, and buys building M5's hot-reload field migration once against a settled language. The connection is not incidental: M5's promise to preserve reflected field values is a sentence with no content for scripts until `@export` exists, because a `Script` component's reflected fields *are* its exported variables - today it has only `source: String`. Iteration 4.2 likewise gives input somewhere to live that is not another magic identifier. Everything from 4.5 onward (sum types, generics, containers) is language depth M5 does not need, and is where the phase can be cut short if Play starts to matter more than completeness.
+
 ### Milestone 5 - Play & Hot Reload
 **Done when:** you attach a Comet script to a node, press Play, the game runs *in the viewport*, and editing the script hot-reloads it live while preserving reflected field values.
 **Proves:** the killer feature and the reason the whole architecture is shaped this way - in-process runtime, reflection driving both inspector and hot-reload migration, input feeding the running game.

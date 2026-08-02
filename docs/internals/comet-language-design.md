@@ -8,10 +8,15 @@ promoted to numbered ADRs once the set is complete - which one, and how many,
 is itself still open (see "Still to decide").
 
 **Status: incomplete.** Fourteen decisions are settled and two questions are
-open. One of those - default values for a bare export - is part of decision 14
-rather than independent of it, so decision 14 should not be built before it is
-answered. A further set, listed under "Still to decide", has not been put yet.
-Nothing here is implemented.
+open. Implementation is sequenced in
+[the completion plan](plans/comet-language-completion.md), which runs before
+Milestone 5 and orders the decisions by dependency rather than by the order they
+were taken. One of those - default values for a bare export - is part of
+decision 14 rather than independent of it. The plan dissolves rather than answers
+it, by scheduling `@export` before user-defined enums exist: every type in the
+language until then has an obvious default, and the enum case is answered
+alongside the enum work. A further set, listed under "Still to decide", has not
+been put yet. Nothing here is implemented.
 
 ## Where the language actually stands
 
@@ -269,12 +274,14 @@ natural default.
 - **Default values for a bare `@export let x: T;`** (from decision 14). Most
   types answer easily - `f32` is `0.0`, `int` is `0`, `bool` is `false`, `Vec2`
   is the origin, `String` is empty, `Option<T>` is `None`. **A user-defined enum
-  has no natural default**, which is the real question: either its first variant
-  is it (cheap, and an arbitrary rule the author may not have thought about),
-  or an exported enum keeps its initializer and is exempt from decision 14's
-  warning (honest, but it makes the warning conditional on type), or enums are
-  simply not exportable in v1 (smallest, and it defers the question to when
-  someone wants it).
+  has no natural default**, which is the real question. It stops blocking
+  decision 14 once `@export` is scheduled ahead of user-defined enums (iteration
+  4.4 before 4.5), leaving it to be answered with the enum work in front of us:
+  either its first variant is it (cheap, and an arbitrary rule the author may
+  not have thought about), or an exported enum keeps its initializer and is
+  exempt from decision 14's warning (honest, but it makes the warning
+  conditional on type), or enums are simply not exportable in v1 (smallest, and
+  it defers the question to when someone wants it).
 - **Arrays: reference or value semantics.** Deliberately deferred to when arrays
   are actually scheduled, rather than decided ahead of the work. The tension is
   recorded so it is not rediscovered: reference semantics match ADR 0006's "GC

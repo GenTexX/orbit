@@ -18,6 +18,7 @@ nav:
           - internals/plans/milestone-2-aurora.md
           - internals/plans/milestone-3-scenes-editor.md
           - internals/plans/milestone-4-comet.md
+          - internals/plans/comet-language-completion.md
       - Subsystems:
           - internals/renderer.md
       - internals/benchmarks.md
