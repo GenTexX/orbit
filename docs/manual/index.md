@@ -17,8 +17,14 @@ scripts/player.cmt    a script
 assets/sprite.png     art
 ```
 
-The editor opens `crates/atlas/demo_project` today. Pointing it at a directory
-of your own is not built yet.
+Open one by passing its path:
+
+```
+atlas path/to/project
+```
+
+The path can be the directory or its `orbit.toml`. With no path, the bundled
+demo project opens.
 
 ## What a scene is
 

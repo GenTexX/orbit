@@ -100,6 +100,18 @@ const TOOLTIP_DELAY: std::time::Duration = std::time::Duration::from_millis(450)
 /// The editor's base window title; prefixed with "* " when there are unsaved
 /// changes.
 const WINDOW_TITLE: &str = "Orbit - Atlas";
+/// The manifest at the root of a project directory, as a person might name it
+/// on the command line.
+const MANIFEST_NAME: &str = "orbit.toml";
+
+/// The demo project shipped with the source tree.
+///
+/// A build-time path, so it is right when atlas is run from a checkout (which
+/// is every way it is run today) and absent when it is not - in which case
+/// opening it fails and says so, which is better than pretending.
+fn demo_project_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo_project")
+}
 
 /// The open color picker: which field it edits, the color it had when opened
 /// (so the whole drag commits as one undo step), and aurora's picker - which
@@ -197,9 +209,76 @@ struct ScrubDrag {
     start_x: f32,
 }
 
+/// What the command line asked for.
+#[derive(Debug, PartialEq)]
+enum Startup {
+    /// Open this project directory.
+    Open(PathBuf),
+    /// Print this and exit - `--help`, or something that cannot be a project.
+    Say(String),
+}
+
+/// Which project a command line asks for.
+///
+/// The editor opened one hard-coded directory, at a path baked in at *build*
+/// time, so a copy of the binary on another machine opened a project that was
+/// not there. This is the smallest thing that makes it an editor rather than a
+/// demo: a path, and the demo project when there is none.
+///
+/// A path to `orbit.toml` is taken as its directory. A person who drags a
+/// manifest onto the binary means the project it belongs to, and refusing that
+/// on a technicality is the sort of thing that makes a tool feel unfriendly.
+fn startup(args: &[std::ffi::OsString], fallback: PathBuf) -> Startup {
+    let mut paths = Vec::new();
+    for arg in args {
+        match arg.to_str() {
+            Some("-h") | Some("--help") => {
+                return Startup::Say(format!(
+                    "{WINDOW_TITLE}\n\n\
+                     usage: atlas [PROJECT]\n\n\
+                     \x20 PROJECT   a project directory (or its orbit.toml).\n\
+                     \x20           Defaults to the bundled demo project."
+                ));
+            }
+            _ => paths.push(PathBuf::from(arg)),
+        }
+    }
+    match paths.len() {
+        0 => Startup::Open(fallback),
+        1 => {
+            let path = paths.remove(0);
+            let dir = if path.file_name().is_some_and(|n| n == MANIFEST_NAME) {
+                // `Path::parent` of a bare "orbit.toml" is `Some("")`, not
+                // `None`, and opening "" fails with a message about a directory
+                // nobody named. The current directory is what was meant.
+                match path.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                    _ => PathBuf::from("."),
+                }
+            } else {
+                path
+            };
+            Startup::Open(dir)
+        }
+        n => Startup::Say(format!(
+            "atlas opens one project at a time; {n} paths were given.\n\
+             usage: atlas [PROJECT]"
+        )),
+    }
+}
+
 fn main() -> Result<()> {
     let logs = init_logging();
     tracing::info!("atlas starting");
+
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let project_dir = match startup(&args, demo_project_dir()) {
+        Startup::Open(dir) => dir,
+        Startup::Say(text) => {
+            println!("{text}");
+            return Ok(());
+        }
+    };
 
     // Kept alive for the whole run; dropping it would stop the profiler server.
     let _profiler = init_profiling();
@@ -207,7 +286,11 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
     // A live viewport redraws continuously, like the sandbox's game loop.
     event_loop.set_control_flow(ControlFlow::Poll);
-    event_loop.run_app(&mut App { state: None, logs })?;
+    event_loop.run_app(&mut App {
+        state: None,
+        logs,
+        project_dir,
+    })?;
     Ok(())
 }
 
@@ -249,6 +332,8 @@ fn init_profiling() -> Option<puffin_http::Server> {
 
 struct App {
     state: Option<State>,
+    /// The project to open, from the command line (see [`startup`]).
+    project_dir: PathBuf,
     /// The shared log ring the console pane shows (also written by the tracing
     /// layer); handed to `State` when the window is created.
     logs: console::LogBuffer,
@@ -704,7 +789,7 @@ impl ApplicationHandler for App {
         if self.state.is_some() {
             return;
         }
-        match State::new(event_loop, self.logs.clone()) {
+        match State::new(event_loop, self.logs.clone(), self.project_dir.clone()) {
             Ok(mut state) => {
                 // A scene opened at startup can already have scripts attached,
                 // and their exported values are read from the source files -
@@ -952,7 +1037,11 @@ impl ApplicationHandler for App {
 impl State {
     /// Bootstrap the shared GPU context (ADR 0018), the two renderers it feeds,
     /// the demo project (opened or created), and the editor shell around it.
-    fn new(event_loop: &ActiveEventLoop, logs: console::LogBuffer) -> Result<Self> {
+    fn new(
+        event_loop: &ActiveEventLoop,
+        logs: console::LogBuffer,
+        project_dir: PathBuf,
+    ) -> Result<Self> {
         let window = Arc::new(
             event_loop
                 .create_window(Window::default_attributes().with_title(WINDOW_TITLE))
@@ -984,7 +1073,7 @@ impl State {
         let picker_images = AuroraPicker::initial_bitmaps()
             .map(|b| gui.register_image_rgba_unmipped(&b.rgba, b.width, b.height));
 
-        let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo_project");
+        tracing::info!(project = %project_dir.display(), "opening project");
         // Before anything can fail: from here on a panic writes whatever has
         // been recorded into <project>/.orbit/recovered/ rather than taking the
         // session with it.
@@ -3888,9 +3977,13 @@ impl State {
     }
 
     /// The window title for the current state ("* " prefix when unsaved).
+    ///
+    /// The project's name is in it now that there can be more than one: two
+    /// windows open on two projects were the same window as far as a taskbar
+    /// was concerned.
     fn title(&self) -> String {
         let mark = if self.is_modified() { "* " } else { "" };
-        format!("{mark}{WINDOW_TITLE}")
+        format!("{mark}{} - {WINDOW_TITLE}", self.project.name)
     }
 
     fn save_project(&mut self) {
@@ -7720,10 +7813,12 @@ fn translate_key(event: &winit::event::KeyEvent, ctrl: bool, shift: bool) -> Vec
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{
-        Case, TextEncoding, coalesces, completion_anchor, join_block, narrowest_at,
-        step_symbol_target, tidy_for_save, toggle_comment_block, transposition, word_before,
-        word_before_or_around, write_atomic,
+        Case, Startup, TextEncoding, coalesces, completion_anchor, join_block, narrowest_at,
+        startup, step_symbol_target, tidy_for_save, toggle_comment_block, transposition,
+        word_before, word_before_or_around, write_atomic,
     };
     use comet::{Diagnostic, Span};
 
@@ -8045,5 +8140,47 @@ mod tests {
             checked >= 2,
             "expected to find the demo scripts, found {checked}"
         );
+    }
+
+    #[test]
+    fn a_path_on_the_command_line_is_the_project_to_open() {
+        let args = |v: &[&str]| -> Vec<std::ffi::OsString> {
+            v.iter().map(std::ffi::OsString::from).collect()
+        };
+        let fallback = || PathBuf::from("/demo");
+
+        assert_eq!(startup(&args(&[]), fallback()), Startup::Open(fallback()));
+        assert_eq!(
+            startup(&args(&["/games/pong"]), fallback()),
+            Startup::Open(PathBuf::from("/games/pong"))
+        );
+
+        // A manifest means the project it belongs to. Somebody dragging an
+        // orbit.toml onto the binary means the obvious thing, and refusing it
+        // on a technicality is how a tool comes to feel unfriendly.
+        assert_eq!(
+            startup(&args(&["/games/pong/orbit.toml"]), fallback()),
+            Startup::Open(PathBuf::from("/games/pong"))
+        );
+        // Including one with no directory part, which has no parent to take.
+        assert_eq!(
+            startup(&args(&["orbit.toml"]), fallback()),
+            Startup::Open(PathBuf::from("."))
+        );
+
+        // Help and a second path both print rather than open something.
+        assert!(matches!(
+            startup(&args(&["--help"]), fallback()),
+            Startup::Say(_)
+        ));
+        assert!(matches!(
+            startup(&args(&["/one", "/two"]), fallback()),
+            Startup::Say(_)
+        ));
+        // Help wins wherever it appears - it is a question, not an argument.
+        assert!(matches!(
+            startup(&args(&["/one", "-h"]), fallback()),
+            Startup::Say(_)
+        ));
     }
 }
