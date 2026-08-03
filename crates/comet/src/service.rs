@@ -834,6 +834,13 @@ pub fn definition_at(source: &str, schema: &HostSchema, offset: usize) -> Option
     if name.is_empty() {
         return None;
     }
+    // A name in a member position is not the local of the same name. Without
+    // this, `transform.position.x` resolved its `x` to a local `x` in scope,
+    // and rename - whose own comment promises it never touches a field -
+    // rewrote it, producing `transform.position.speed`.
+    if in_member_position(source, start) {
+        return None;
+    }
     // A call resolves against functions first: `print` the call is the builtin
     // even if some local is also called `print`.
     let called = source[end..].trim_start().starts_with('(');
@@ -845,6 +852,44 @@ pub fn definition_at(source: &str, schema: &HostSchema, offset: usize) -> Option
         called,
         Span::new(start as u32, end as u32),
     )
+}
+
+/// Whether the name starting at `start` is a member rather than a name in its
+/// own right: after a `.` or a `::`, or the label of a struct literal's field.
+///
+/// A label is recognized by the `:` after it, which is unambiguous here because
+/// nothing else in the language puts a `:` after a bare name in an expression -
+/// a declaration's type annotation is `name: Type`, and that name *is* a
+/// declaration, which resolves to itself and so must not be excluded. So the
+/// check is deliberately narrow: only inside braces, which is where a struct
+/// literal's fields are.
+fn in_member_position(source: &str, start: usize) -> bool {
+    let before = source[..start].trim_end();
+    if before.ends_with('.') || before.ends_with("::") {
+        return true;
+    }
+    // A struct literal's field label: `Enemy { health: h }`. Recognized by the
+    // `:` after it plus a `{` or `,` before it, with the nearest unclosed
+    // delimiter being a brace. That last part is what keeps a parameter -
+    // `func f(a: f32, b: f32)` - out of it, since its unclosed delimiter is a
+    // paren, and a `let x: f32` is excluded by the character before it being a
+    // letter rather than a brace or a comma.
+    let after = source[start..].trim_start_matches(|c: char| c.is_alphanumeric() || c == '_');
+    let labelled = after.trim_start().starts_with(':') && !after.trim_start().starts_with("::");
+    if !labelled || !(before.ends_with('{') || before.ends_with(',')) {
+        return false;
+    }
+    let mut depth: i32 = 0;
+    for c in before.chars().rev() {
+        match c {
+            '}' | ')' => depth += 1,
+            '{' if depth == 0 => return true,
+            '(' if depth == 0 => return false,
+            '{' | '(' => depth -= 1,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// What `name` would refer to if it were written at `offset` - which is how a
@@ -1565,6 +1610,42 @@ func third(c: f32) { let x = nope; }
             .into_iter()
             .map(|t| (t.span.text(source), t.class))
             .collect()
+    }
+
+    #[test]
+    fn rename_leaves_alone_every_name_that_is_only_spelled_the_same() {
+        // The function's own comment promises `transform.position.x` is never
+        // touched. It was: definition_at never looked at what came before a
+        // name, so a member resolved to the local of the same name and rename
+        // rewrote it into something that does not compile.
+        let source = "func update(dt: f32) { let x = 1.0; transform.position.x = x; }";
+        let at = source.find("let x").expect("in the fixture") + 4;
+        let spans = rename_spans(source, at).expect("a local can be renamed");
+        assert_eq!(spans.len(), 2, "the declaration and the use, not the axis");
+        assert!(
+            spans
+                .iter()
+                .all(|s| (s.start as usize) < source.find("transform").unwrap()
+                    || (s.start as usize) > source.find("= x;").unwrap()),
+            "nothing inside the dotted path: {spans:?}"
+        );
+
+        // A struct literal's field label is the struct's, not the local's.
+        let source = "struct Enemy { health: f32 }\n\
+                      func f() { let health = 1.0; let e = Enemy { health: health }; }";
+        let at = source.find("let health").expect("in the fixture") + 4;
+        let spans = rename_spans(source, at).expect("a local can be renamed");
+        let label = source.find("{ health: ").expect("in the fixture") + 2;
+        assert!(
+            !spans.iter().any(|s| s.start as usize == label),
+            "the label stayed put: {spans:?}"
+        );
+
+        // And a parameter, which also has a `:` after it, still renames.
+        let source = "func f(speed: f32) -> f32 { speed * 2.0 }";
+        let at = source.find("speed").expect("in the fixture");
+        let spans = rename_spans(source, at).expect("a parameter can be renamed");
+        assert_eq!(spans.len(), 2, "the declaration and the use");
     }
 
     #[test]
