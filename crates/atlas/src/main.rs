@@ -2045,11 +2045,15 @@ impl State {
             ModalAction::Close => self.close_modal(),
             ModalAction::SaveSettings => self.save_settings_from_modal(),
             ModalAction::SaveThenProceed => {
-                let quitting = matches!(
+                // Both of these throw the scene away if it is not written
+                // first; opening a script does not, so it does not ask.
+                let scene_at_risk = matches!(
                     self.modal.as_ref().map(|m| &m.body),
-                    Some(modal::ModalBody::Confirm(c)) if c.pending == modal::Pending::Quit
+                    Some(modal::ModalBody::Confirm(c))
+                        if c.pending == modal::Pending::Quit
+                            || c.pending == modal::Pending::ReloadProject
                 );
-                if quitting && self.is_modified() {
+                if scene_at_risk && self.is_modified() {
                     self.save_project();
                 }
                 if self.script_dirty() {
@@ -2078,6 +2082,7 @@ impl State {
         match pending {
             modal::Pending::Quit => self.quit_requested = true,
             modal::Pending::OpenScript(path) => self.open_script_file(&path),
+            modal::Pending::ReloadProject => self.load_project(),
         }
     }
 
@@ -2115,6 +2120,25 @@ impl State {
     /// Whether quitting right now would throw away unsaved work of any kind.
     fn close_would_lose_work(&self) -> bool {
         self.script_dirty() || self.is_modified()
+    }
+
+    /// Reload the project from disk, asking first if that would lose work.
+    ///
+    /// A reload replaces the scene and resets the undo stack, so it destroys
+    /// exactly what closing the window does - and closing has asked since M3.
+    /// ctrl+O is the chord every application binds to "open", which is what
+    /// made an unguarded one dangerous: it is reached by accident, from a
+    /// pane that has nothing to do with files, and the unsaved marker
+    /// disappears with the work so nothing even reports the loss.
+    fn reload_project_requested(&mut self) {
+        if !self.is_modified() {
+            self.load_project();
+            return;
+        }
+        self.open_modal(modal::Modal::confirm(
+            "The scene has unsaved changes. Save before reloading the project?",
+            modal::Pending::ReloadProject,
+        ));
     }
 
     /// Ask before closing the window over unsaved work.
@@ -3087,7 +3111,7 @@ impl State {
         // on the keyboard - and none of them was reachable any other way, which
         // is why they are here rather than simply deleted.
         if c.eq_ignore_ascii_case("o") && !self.code_context_focused() {
-            self.load_project();
+            self.reload_project_requested();
             return true;
         }
         if self.modifiers.shift_key() && !self.code_context_focused() {

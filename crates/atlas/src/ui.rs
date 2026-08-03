@@ -3288,6 +3288,28 @@ mod tests {
     }
 
     #[test]
+    fn losing_the_scene_always_offers_the_same_three_answers() {
+        // Reloading the project replaces the scene and resets the undo stack,
+        // which is exactly what closing the window does - so it gets the same
+        // question, with the same way out. ctrl+O used to just do it.
+        for pending in [
+            crate::modal::Pending::Quit,
+            crate::modal::Pending::ReloadProject,
+        ] {
+            let rows = laid_out_modal(&Modal::confirm("Unsaved changes.", pending.clone()));
+            assert_eq!(
+                rows.modal_buttons.len(),
+                3,
+                "save, discard, and a way to change your mind"
+            );
+            assert!(
+                rows.modal_close.is_some(),
+                "and Escape has something to hit"
+            );
+        }
+    }
+
+    #[test]
     fn a_message_modal_lays_out_with_a_card_close_and_one_button() {
         let err = std::io::Error::new(std::io::ErrorKind::AlreadyExists, "x");
         let rows = laid_out_modal(&Modal::error("Rename failed", &err));

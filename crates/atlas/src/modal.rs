@@ -53,6 +53,8 @@ pub enum Pending {
     Quit,
     /// Open a different script into the Code pane.
     OpenScript(std::path::PathBuf),
+    /// Reload the project from disk, discarding the scene and the undo stack.
+    ReloadProject,
 }
 
 /// Which reflected component field an asset chooser writes to.
