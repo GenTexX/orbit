@@ -19,6 +19,11 @@ mod script;
 mod serialize;
 mod transform;
 
+/// Re-exported so callers can name the type helios' own public fields are made
+/// of - a `Transform`'s translation, an `Input`'s mouse - without having to
+/// guess which version of glam this crate was built against.
+pub use glam::Vec2;
+
 pub use command::{Edit, History};
 pub use component::{CameraComponent, Component, ScriptComponent, SpriteComponent};
 pub use error::HeliosError;

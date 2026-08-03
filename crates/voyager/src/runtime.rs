@@ -150,6 +150,10 @@ impl Runtime {
     /// second.
     pub fn step(&mut self, scene: &mut Scene, dt: f32) {
         for running in &mut self.running {
+            // Every script sees the same input this frame, set before the call
+            // rather than read during it: a frame's input is a fixed thing
+            // while that frame runs.
+            running.script.set_input(self.input);
             if let Err(err) = running.script.update(scene, running.node, dt) {
                 self.problems
                     .push(format!("[{}] {err}", running.script.label()));
@@ -740,6 +744,140 @@ mod tests {
             runtime.live_exports(&scene, node, 0),
             Some(Vec::new()),
             "a script with no exports has none, which is not the same as none running"
+        );
+    }
+
+    /// The player script from the Milestone 5 plan, unchanged except for the
+    /// ground line - the north star, in the syntax that plan assumed.
+    const PLAYER: &str = "
+        @export let speed: f32 = 220.0;
+        @export let jump: f32 = 520.0;
+        @export let gravity: f32 = 1400.0;
+        let vy = 0.0;
+        let grounded = false;
+
+        func update(dt: f32) {
+            let vx = 0.0;
+            if input.left { vx -= speed; }
+            if input.right { vx += speed; }
+            if input.jump && grounded {
+                vy = -jump;
+                grounded = false;
+            }
+            vy += gravity * dt;
+            transform.position.x += vx * dt;
+            transform.position.y += vy * dt;
+            if transform.position.y > 400.0 {
+                transform.position.y = 400.0;
+                vy = 0.0;
+                grounded = true;
+            }
+        }
+    ";
+
+    #[test]
+    fn the_player_script_runs_and_jumps() {
+        // Milestone 5's proof point, the way "a node moves" was Milestone 4's.
+        // When this plan was written the script produced three diagnostics, all
+        // of them `cannot find 'input' in this scope`, and input was named as
+        // the only language work the milestone needed. This is that work
+        // arriving.
+        let (dir, mut scene, node) = project(PLAYER);
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+
+        // Falling, with nothing held.
+        for _ in 0..10 {
+            runtime.step(&mut scene, 0.016);
+        }
+        assert!(x(&scene, node).abs() < f32::EPSILON, "nothing pushed it");
+        let fell = scene.node(node).transform.translation.y;
+        assert!(fell > 0.0, "gravity: {fell}");
+
+        // Land, then walk right.
+        for _ in 0..60 {
+            runtime.step(&mut scene, 0.016);
+        }
+        let standing = scene.node(node).transform.translation.y;
+        assert_eq!(standing, 400.0, "it came to rest on the ground line");
+
+        runtime.input_mut().right = true;
+        for _ in 0..10 {
+            runtime.step(&mut scene, 0.016);
+        }
+        let walked = x(&scene, node);
+        assert!(walked > 30.0, "it walked right: {walked}");
+
+        // Let go and it stops where it is - polled state, not events.
+        runtime.input_mut().right = false;
+        runtime.step(&mut scene, 0.016);
+        assert!(
+            (x(&scene, node) - walked).abs() < f32::EPSILON,
+            "releasing the key stops it"
+        );
+
+        // Jump: grounded, so it leaves the floor.
+        runtime.input_mut().jump = true;
+        runtime.step(&mut scene, 0.016);
+        let airborne = scene.node(node).transform.translation.y;
+        assert!(airborne < 400.0, "it left the ground: {airborne}");
+
+        // Held, not re-pressed: the script sees `input.jump` true on every
+        // frame, so it bounces the moment it lands again. That is what polled
+        // state means, and it is the answer to M5's first open question sitting
+        // in a test rather than in prose.
+        let mut left_the_ground_again = false;
+        for _ in 0..200 {
+            runtime.step(&mut scene, 0.016);
+            let y = scene.node(node).transform.translation.y;
+            if y == 400.0 {
+                // Landed. One more frame and a held jump takes it back up.
+                runtime.step(&mut scene, 0.016);
+                left_the_ground_again = scene.node(node).transform.translation.y < 400.0;
+                break;
+            }
+        }
+        assert!(left_the_ground_again, "a held jump bounces");
+
+        // Let go and it settles.
+        runtime.input_mut().jump = false;
+        for _ in 0..200 {
+            runtime.step(&mut scene, 0.016);
+        }
+        assert_eq!(
+            scene.node(node).transform.translation.y,
+            400.0,
+            "released, it stays on the ground"
+        );
+    }
+
+    #[test]
+    fn a_script_cannot_write_to_the_input_it_is_given() {
+        // The input is the host's answer to "what is the player doing". A
+        // script writing to it would be telling the keyboard what was pressed.
+        let (dir, mut scene, node) = project(
+            "func update(dt: f32) {
+                 input.jump = true;
+                 if input.jump { transform.position.x += 1.0; }
+             }",
+        );
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, node), 0.0, "the write did not take");
+    }
+
+    #[test]
+    fn the_mouse_arrives_where_the_script_can_use_it() {
+        let (dir, mut scene, node) =
+            project("func update(dt: f32) { transform.position = input.mouse; }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        runtime.input_mut().mouse = helios::Vec2::new(12.0, 34.0);
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(
+            scene.node(node).transform.translation,
+            helios::Vec2::new(12.0, 34.0)
         );
     }
 }

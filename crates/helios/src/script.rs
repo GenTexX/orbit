@@ -40,6 +40,7 @@ use wasmtime::{
     StoreLimitsBuilder, TypedFunc, Val,
 };
 
+use crate::input::Input;
 use crate::reflect::Value;
 use crate::scene::{NodeId, Scene};
 use crate::transform::Transform;
@@ -316,6 +317,7 @@ impl ScriptHost {
             &self.engine,
             ScriptState {
                 transform: scene.node(node).transform,
+                input: Input::default(),
                 printed: Vec::new(),
                 limits: StoreLimitsBuilder::new()
                     .memory_size(MAX_SCRIPT_MEMORY)
@@ -441,6 +443,15 @@ impl ScriptInstance {
     /// module gets a fresh store and deserves a fresh chance.
     pub fn resume(&mut self) {
         self.stopped = false;
+    }
+
+    /// Set what this script will read from `input` on its next call.
+    ///
+    /// Copied in rather than read out through a callback, the same way the
+    /// transform is: a frame's input is a fixed thing while that frame runs, so
+    /// two reads of `input.left` in one `update` cannot disagree.
+    pub fn set_input(&mut self, input: Input) {
+        self.store.data_mut().input = input;
     }
 
     /// Give the next call its budget.
@@ -623,6 +634,9 @@ impl Limit {
 #[derive(Debug)]
 struct ScriptState {
     transform: Transform,
+    /// Copied in before every call, like the transform. A script reads it and
+    /// never writes it.
+    input: Input,
     printed: Vec<String>,
     /// Read through the store's limiter, so it has to live where the store can
     /// hand out a mutable reference to it.
@@ -677,6 +691,12 @@ enum Property {
     Position,
     Rotation,
     Scale,
+    InputLeft,
+    InputRight,
+    InputUp,
+    InputDown,
+    InputJump,
+    InputMouse,
 }
 
 /// Everything a script can reach outside itself, and what each thing is.
@@ -698,7 +718,123 @@ const PROPERTIES: &[(&str, &str, comet::HostType, Property)] = &[
         Property::Rotation,
     ),
     ("transform", "scale", comet::HostType::Vec2, Property::Scale),
+    // Input. Read-only in practice - a script assigning to `input.jump` is
+    // ignored rather than refused, because the schema has no way to say
+    // read-only and inventing one is a change to the compiler. Worth fixing;
+    // not worth blocking input on.
+    ("input", "left", comet::HostType::Bool, Property::InputLeft),
+    (
+        "input",
+        "right",
+        comet::HostType::Bool,
+        Property::InputRight,
+    ),
+    ("input", "up", comet::HostType::Bool, Property::InputUp),
+    ("input", "down", comet::HostType::Bool, Property::InputDown),
+    ("input", "jump", comet::HostType::Bool, Property::InputJump),
+    (
+        "input",
+        "mouse",
+        comet::HostType::Vec2,
+        Property::InputMouse,
+    ),
 ];
+
+/// Read a property the script asked for as an `f32`.
+///
+/// Every accessor below is exhaustive over [`Property`], which is the whole
+/// point of them being functions rather than arms inside a closure. They used to
+/// end in `_ => 0.0`, and a row added to `PROPERTIES` without its arm compiled
+/// cleanly and silently read zero - a trap that sprang three times during 4.x.
+/// Now the compiler names every accessor that has not been told about a new
+/// property.
+///
+/// A property of another type reaching here means a module compiled against a
+/// different schema than the one it is running on, so it reads as a default
+/// rather than as an error: the values are already meaningless, and a trap would
+/// blame the script for the host's version skew.
+fn read_f32(state: &ScriptState, property: Property) -> f32 {
+    match property {
+        Property::Rotation => state.transform.rotation,
+        Property::Position
+        | Property::Scale
+        | Property::InputMouse
+        | Property::InputLeft
+        | Property::InputRight
+        | Property::InputUp
+        | Property::InputDown
+        | Property::InputJump => 0.0,
+    }
+}
+
+fn write_f32(state: &mut ScriptState, property: Property, value: f32) {
+    match property {
+        Property::Rotation => state.transform.rotation = value,
+        Property::Position
+        | Property::Scale
+        | Property::InputMouse
+        | Property::InputLeft
+        | Property::InputRight
+        | Property::InputUp
+        | Property::InputDown
+        | Property::InputJump => {}
+    }
+}
+
+fn read_bool(state: &ScriptState, property: Property) -> bool {
+    match property {
+        Property::InputLeft => state.input.left,
+        Property::InputRight => state.input.right,
+        Property::InputUp => state.input.up,
+        Property::InputDown => state.input.down,
+        Property::InputJump => state.input.jump,
+        Property::Position | Property::Rotation | Property::Scale | Property::InputMouse => false,
+    }
+}
+
+fn write_bool(_state: &mut ScriptState, property: Property, _value: bool) {
+    match property {
+        // The input is the host's answer to "what is the player doing". A
+        // script writing to it would be telling the keyboard what was pressed.
+        Property::InputLeft
+        | Property::InputRight
+        | Property::InputUp
+        | Property::InputDown
+        | Property::InputJump
+        | Property::Position
+        | Property::Rotation
+        | Property::Scale
+        | Property::InputMouse => {}
+    }
+}
+
+fn read_vec2(state: &ScriptState, property: Property) -> Vec2 {
+    match property {
+        Property::Position => state.transform.translation,
+        Property::Scale => state.transform.scale,
+        Property::InputMouse => state.input.mouse,
+        Property::Rotation
+        | Property::InputLeft
+        | Property::InputRight
+        | Property::InputUp
+        | Property::InputDown
+        | Property::InputJump => Vec2::ZERO,
+    }
+}
+
+fn write_vec2(state: &mut ScriptState, property: Property, value: Vec2) {
+    match property {
+        Property::Position => state.transform.translation = value,
+        Property::Scale => state.transform.scale = value,
+        Property::InputMouse
+        | Property::Rotation
+        | Property::InputLeft
+        | Property::InputRight
+        | Property::InputUp
+        | Property::InputDown
+        | Property::InputJump => {}
+    }
+}
 
 /// The host surface every script in this engine is compiled against.
 ///
@@ -742,72 +878,55 @@ fn bind_host(linker: &mut Linker<ScriptState>) -> Result<(), ScriptError> {
     // The property accessors. Each takes the property's schema id, so this
     // table stays the same size however many properties the engine exposes.
     linker
-        .func_wrap(
-            host,
-            "get_f32",
-            |c: Caller<'_, ScriptState>, id: i32| match property(id) {
-                Some(Property::Rotation) => c.data().transform.rotation,
-                _ => 0.0,
-            },
-        )
+        .func_wrap(host, "get_f32", |c: Caller<'_, ScriptState>, id: i32| {
+            property(id).map_or(0.0, |p| read_f32(c.data(), p))
+        })
         .map_err(ScriptError::runtime)?;
     linker
         .func_wrap(
             host,
             "set_f32",
             |mut c: Caller<'_, ScriptState>, id: i32, value: f32| {
-                if let Some(Property::Rotation) = property(id) {
-                    c.data_mut().transform.rotation = value;
+                if let Some(p) = property(id) {
+                    write_f32(c.data_mut(), p, value);
                 }
             },
         )
         .map_err(ScriptError::runtime)?;
-    // No property is a bool yet. The accessors exist so that adding one is a
-    // change to PROPERTIES rather than to the ABI.
+    // comet's bools cross the ABI as i32, since wasm has no bool.
     linker
-        .func_wrap(host, "get_bool", |_: Caller<'_, ScriptState>, _id: i32| {
-            0i32
+        .func_wrap(host, "get_bool", |c: Caller<'_, ScriptState>, id: i32| {
+            property(id).is_some_and(|p| read_bool(c.data(), p)) as i32
         })
         .map_err(ScriptError::runtime)?;
     linker
         .func_wrap(
             host,
             "set_bool",
-            |_: Caller<'_, ScriptState>, _id: i32, _value: i32| {},
-        )
-        .map_err(ScriptError::runtime)?;
-    linker
-        .func_wrap(
-            host,
-            "get_vec2_x",
-            |c: Caller<'_, ScriptState>, id: i32| match property(id) {
-                Some(Property::Position) => c.data().transform.translation.x,
-                Some(Property::Scale) => c.data().transform.scale.x,
-                _ => 0.0,
+            |mut c: Caller<'_, ScriptState>, id: i32, value: i32| {
+                if let Some(p) = property(id) {
+                    write_bool(c.data_mut(), p, value != 0);
+                }
             },
         )
         .map_err(ScriptError::runtime)?;
     linker
-        .func_wrap(
-            host,
-            "get_vec2_y",
-            |c: Caller<'_, ScriptState>, id: i32| match property(id) {
-                Some(Property::Position) => c.data().transform.translation.y,
-                Some(Property::Scale) => c.data().transform.scale.y,
-                _ => 0.0,
-            },
-        )
+        .func_wrap(host, "get_vec2_x", |c: Caller<'_, ScriptState>, id: i32| {
+            property(id).map_or(0.0, |p| read_vec2(c.data(), p).x)
+        })
+        .map_err(ScriptError::runtime)?;
+    linker
+        .func_wrap(host, "get_vec2_y", |c: Caller<'_, ScriptState>, id: i32| {
+            property(id).map_or(0.0, |p| read_vec2(c.data(), p).y)
+        })
         .map_err(ScriptError::runtime)?;
     linker
         .func_wrap(
             host,
             "set_vec2",
             |mut c: Caller<'_, ScriptState>, id: i32, x: f32, y: f32| {
-                let value = Vec2::new(x, y);
-                match property(id) {
-                    Some(Property::Position) => c.data_mut().transform.translation = value,
-                    Some(Property::Scale) => c.data_mut().transform.scale = value,
-                    _ => {}
+                if let Some(p) = property(id) {
+                    write_vec2(c.data_mut(), p, Vec2::new(x, y));
                 }
             },
         )
