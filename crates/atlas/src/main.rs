@@ -22,6 +22,7 @@ mod play;
 mod project;
 mod recovery;
 mod settings;
+mod shortcuts;
 mod textures;
 mod theme;
 mod thumbnails;
@@ -3590,6 +3591,13 @@ impl State {
             // "jump to the matching bracket" in the Code pane, and a shortcut
             // that means two things depending on focus is worse than a spare
             // function key.
+            NamedKey::F1 => {
+                self.open_modal(modal::Modal::report(
+                    "Keyboard shortcuts",
+                    shortcuts::as_text(),
+                ));
+                true
+            }
             NamedKey::F11 => {
                 self.toggle_maximized();
                 true

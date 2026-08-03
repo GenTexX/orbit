@@ -109,6 +109,8 @@ An exported variable carries no initializer - writing one would be a second
 answer to the same question, and the compiler says so.
 
 **F11** fills the window with the pane under the pointer, and puts it back.
+**F1** lists every shortcut; they are also in the
+[reference](reference.md#editor-shortcuts).
 
 ## Playing
 

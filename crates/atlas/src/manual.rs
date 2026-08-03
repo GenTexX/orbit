@@ -16,6 +16,8 @@
 
 use std::fmt::Write;
 
+use crate::shortcuts;
+
 /// Where the generated page lives, relative to the workspace root.
 pub const PATH: &str = "docs/manual/reference.md";
 
@@ -71,6 +73,21 @@ pub fn reference() -> String {
     );
     for (action, keys) in crate::keys::bindings() {
         let _ = writeln!(out, "- `input.{action}` - {keys}");
+    }
+
+    out.push_str("\n## Editor shortcuts\n\n");
+    out.push_str("F1 shows this list in the editor.\n");
+    for scope in [
+        shortcuts::Scope::Editor,
+        shortcuts::Scope::Scene,
+        shortcuts::Scope::Code,
+        shortcuts::Scope::Files,
+    ] {
+        let _ = writeln!(out, "\n### {}\n", scope.title());
+        let _ = writeln!(out, "| Keys | What |\n|---|---|");
+        for row in shortcuts::SHORTCUTS.iter().filter(|s| s.scope == scope) {
+            let _ = writeln!(out, "| `{}` | {} |", row.keys, row.what);
+        }
     }
 
     out

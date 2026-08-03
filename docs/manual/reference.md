@@ -60,3 +60,65 @@ Held-key state, not events: `input.left` is true for as long as the key is down.
 - `input.up` - ArrowUp or KeyW
 - `input.down` - ArrowDown or KeyS
 - `input.jump` - Space
+
+## Editor shortcuts
+
+F1 shows this list in the editor.
+
+### Anywhere
+
+| Keys | What |
+|---|---|
+| `F1` | This list |
+| `F5` | Play, or stop |
+| `shift+F5` | Restart the game |
+| `F11` | Maximize the pane under the pointer |
+| `ctrl+S` | Save (the script, with the Code pane focused) |
+| `ctrl+O` | Reload the project from disk |
+| `F2` | Rename the selected node or file |
+| `Delete` | Delete the selection |
+
+### Scene
+
+| Keys | What |
+|---|---|
+| `Q / W / E / R` | Select, Move, Rotate, Scale |
+| `ctrl+shift+N` | Add a sprite node |
+| `ctrl+shift+M` | Add a script node |
+| `ctrl+shift+K` | Add a camera node |
+| `ctrl+D` | Duplicate the selection |
+| `ctrl+C / ctrl+X / ctrl+V` | Copy, cut, paste nodes |
+| `ctrl+A` | Select every node |
+| `ctrl+Z / ctrl+Y` | Undo, redo |
+
+### Code pane
+
+| Keys | What |
+|---|---|
+| `ctrl+F` | Find (and replace) |
+| `F3 / shift+F3` | Next, previous match |
+| `F8 / shift+F8` | Next, previous problem |
+| `F12` | Go to what declares the name at the caret |
+| `ctrl+click` | The same, on the name under the pointer |
+| `F2` | Rename the name at the caret |
+| `ctrl+G` | Go to line |
+| `ctrl+shift+O` | Go to a declaration by name |
+| `ctrl+M` | Jump to the matching bracket |
+| `ctrl+space` | Ask for completions |
+| `ctrl+/` | Comment or uncomment the selected lines |
+| `ctrl+D` | Duplicate the selected lines |
+| `ctrl+K` | Delete the selected lines |
+| `alt+up / alt+down` | Move the selected lines |
+| `ctrl+up / ctrl+down` | Previous, next declaration |
+| `ctrl+shift+J` | Join the selected lines |
+| `ctrl+T` | Transpose the characters around the caret |
+| `ctrl+shift+U / L / Y` | Upper, lower, title case |
+| `ctrl+shift+S` | Sort the selected lines (alt: drop duplicates) |
+| `ctrl+Z / ctrl+Y` | Undo, redo - the script's own history |
+
+### Files pane
+
+| Keys | What |
+|---|---|
+| `ctrl+C / ctrl+X / ctrl+V` | Copy, cut, paste files |
+| `ctrl+A` | Select every file |
