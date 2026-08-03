@@ -942,13 +942,15 @@ fn completion_anchor(text: &str, caret: usize) -> Option<usize> {
 
 /// The identifier the caret sits in or just after: where it starts, and its
 /// text. An empty name means the caret is not in one.
+///
+/// comet's, not a second copy: this decides what a completion replaces, so the
+/// language it is completing should be the one that says where a name begins.
+/// The copy that used to live here stepped one *byte* past the character it
+/// found, so a single non-ASCII character before the caret - an em dash pasted
+/// into a comment - sliced mid-character and took the editor down. This runs on
+/// every keystroke in the Code pane.
 fn word_before(text: &str, caret: usize) -> (usize, &str) {
-    let caret = caret.min(text.len());
-    let before = &text[..caret];
-    let start = before
-        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .map_or(0, |at| at + 1);
-    (start, &before[start..])
+    comet::service::word_before(text, caret)
 }
 
 impl ApplicationHandler for App {

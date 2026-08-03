@@ -1230,19 +1230,53 @@ fn word_span(source: &str, offset: usize) -> Option<(usize, usize)> {
     (start < end).then_some((start, end))
 }
 
+/// Where the name ending at the end of `text` starts: just past the last
+/// character that cannot be part of one.
+///
+/// The obvious spelling - `rfind(..).map_or(0, |at| at + 1)` - is wrong, and
+/// wrong in the way that takes a process down rather than the way that returns
+/// the wrong answer: `rfind` gives the *byte* index of that character, so
+/// adding one lands inside it whenever it is multi-byte, and the next slice
+/// panics. One em dash pasted into a comment was enough. Every scan that needs
+/// this goes through here.
+fn name_start(text: &str, extra: fn(char) -> bool) -> usize {
+    text.char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || extra(*c)))
+        .map_or(0, |(at, c)| at + c.len_utf8())
+}
+
+fn never(_: char) -> bool {
+    false
+}
+
+fn is_dot(c: char) -> bool {
+    c == '.'
+}
+
+/// The identifier the caret sits in or just after: where it starts, and its
+/// text. An empty name means the caret is not in one.
+///
+/// Public because the editor asks the same question when deciding what a
+/// completion should replace, and "what is a name" has one definition - this
+/// language's - rather than one per caller.
+pub fn word_before(text: &str, caret: usize) -> (usize, &str) {
+    let mut caret = caret.min(text.len());
+    while !text.is_char_boundary(caret) {
+        caret -= 1;
+    }
+    let before = &text[..caret];
+    let start = name_start(before, never);
+    (start, &before[start..])
+}
+
 /// The enum name before the `::` immediately left of `offset`, if the caret is
 /// where a variant goes.
 fn variant_receiver(source: &str, offset: usize) -> Option<&str> {
     let before = &source[..offset];
-    let name_start = before
-        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .map_or(0, |at| at + 1);
-    let before = &before[..name_start];
+    let before = &before[..name_start(before, never)];
     let colons = before.strip_suffix("::")?;
-    let start = colons
-        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .map_or(0, |at| at + 1);
-    let receiver = &colons[start..];
+    let receiver = &colons[name_start(colons, never)..];
     (!receiver.is_empty()).then_some(receiver)
 }
 
@@ -1256,15 +1290,9 @@ fn variant_receiver(source: &str, offset: usize) -> Option<&str> {
 fn field_receiver(source: &str, offset: usize) -> Option<&str> {
     let before = &source[..offset];
     // Skip the partial field name already typed.
-    let name_start = before
-        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .map_or(0, |at| at + 1);
-    let before = &before[..name_start];
+    let before = &before[..name_start(before, never)];
     let dot = before.strip_suffix('.')?;
-    let start = dot
-        .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
-        .map_or(0, |at| at + 1);
-    let receiver = dot[start..].trim_end_matches('.');
+    let receiver = dot[name_start(dot, is_dot)..].trim_end_matches('.');
     (!receiver.is_empty()).then_some(receiver)
 }
 
@@ -1463,10 +1491,37 @@ func third(c: f32) { let x = nope; }
         assert!(found.windows(2).all(|w| w[0].span.start <= w[1].span.start));
     }
 
+    /// Every public entry point, at every offset, over one source. The editor
+    /// calls all of these on the live buffer as it is typed, in the editor's
+    /// own process, so a panic in any of them is the application going away
+    /// with the unsaved file in it.
+    fn hammer_every_entry_point(source: &str) {
+        diagnostics(source);
+        highlight(source);
+        brackets(source);
+        symbols(source);
+        is_identifier(source);
+        Analysis::new(source, &schema());
+        for offset in 0..=source.len() {
+            if !source.is_char_boundary(offset) {
+                continue;
+            }
+            bracket_at(source, offset);
+            occurrences_at(source, offset);
+            completions_at(source, offset);
+            signature_at(source, offset);
+            hover_at(source, offset);
+            definition_at(source, offset);
+            rename_spans(source, offset);
+            super::rename_is_safe(source, &schema(), offset, "renamed");
+            word_before(source, offset);
+        }
+    }
+
     #[test]
     fn nothing_a_person_can_type_makes_the_service_panic() {
         // Every prefix of a real script - i.e. every state it passes through
-        // while being typed - plus a few deliberately hostile ones.
+        // while being typed - plus deliberately hostile ones.
         let script = include_str!("../tests/fixtures/bounce.cmt");
         for end in 0..=script.len() {
             if script.is_char_boundary(end) {
@@ -1482,8 +1537,23 @@ func third(c: f32) { let x = nope; }
             "func (",
             "let = ;",
             "\"unclosed",
+            // Non-ASCII, which is how this went wrong: a scan that stepped one
+            // *byte* past the character it found landed inside it, and the next
+            // slice panicked. Prose in a comment is the ordinary way to meet
+            // this - an em dash or a curly quote pasted from a web page.
+            "// don't \u{2014} do this\nfunc f() { let a = 1.0; }",
+            "let a = 1.0; // \u{201c}quoted\u{201d}",
+            "func f() { let x = 1.0; \u{20ac} }",
+            "let a = \"\\\u{fc}\";",
+            "\u{e9}",
+            "a\u{2014}",
+            "\u{2014}a",
+            "transform.\u{2014}",
+            "State::\u{2014}",
+            "\u{1f600}.",
+            "let \u{e9}mile = 1.0;",
         ] {
-            diagnostics(source);
+            hammer_every_entry_point(source);
         }
     }
 

@@ -221,7 +221,19 @@ impl<'src> Lexer<'src> {
                         Some(b't') => value.push('\t'),
                         Some(b'"') => value.push('"'),
                         Some(b'\\') => value.push('\\'),
-                        Some(other) => value.push(other as char),
+                        // Anything else is itself. Taken as a whole character
+                        // rather than a byte: `peek` is one byte, so `\` before
+                        // a multi-byte character used to advance into the
+                        // middle of it and the next slice panicked - which,
+                        // since the editor lexes the live buffer on every
+                        // keystroke, took the editor with it.
+                        Some(_) => {
+                            let rest = &self.source[self.pos..];
+                            let ch = rest.chars().next().expect("peek confirmed a byte");
+                            value.push(ch);
+                            self.pos += ch.len_utf8();
+                            continue;
+                        }
                         None => break,
                     }
                     self.pos += 1;

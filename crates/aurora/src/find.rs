@@ -370,10 +370,18 @@ fn find_all(haystack: &str, needle: &str, match_case: bool, whole_word: bool) ->
         let end = at + needle_bytes.len();
         // Whole-word means neither neighbour continues the word: searching for
         // `pos` should not stop on every `position`.
-        let bounded = !whole_word
-            || (!haystack[..at].chars().next_back().is_some_and(is_word)
-                && !haystack[end..].chars().next().is_some_and(is_word));
-        if hit && bounded {
+        //
+        // Only asked once the bytes match, and that ordering is load-bearing:
+        // `end` is a character boundary exactly when they do, so computing this
+        // for a failed match could slice into the middle of a multi-byte
+        // character and panic. One accented letter anywhere in the file plus
+        // "Whole word" ticked was enough.
+        let bounded = || {
+            !whole_word
+                || (!haystack[..at].chars().next_back().is_some_and(is_word)
+                    && !haystack[end..].chars().next().is_some_and(is_word))
+        };
+        if hit && bounded() {
             found.push(at..end);
             at = end;
         } else {
@@ -395,6 +403,25 @@ mod tests {
     use crate::input::InputEvent;
 
     const TEXT: &str = "let pos = 1.0;\nlet post = pos + pos;";
+
+    #[test]
+    fn a_search_over_non_ascii_text_does_not_panic() {
+        // The whole-word bound looks at the character after the match, and the
+        // byte just past a *failed* match can be inside a multi-byte one. One
+        // accented letter in a comment plus "Whole word" used to abort.
+        let text = "h\u{e9}llo he world\n// caf\u{e9} \u{2014} caf\u{e9}\nl\u{e9}on hen";
+        for query in ["he", "hello", "caf", "\u{e9}", "\u{2014}", "on", "l"] {
+            for whole in [false, true] {
+                for case in [false, true] {
+                    find_all(text, query, case, whole);
+                }
+            }
+        }
+        // And it still answers correctly: `he` stands alone once, and also
+        // occurs inside "hen" - which whole-word must not count.
+        assert_eq!(find_all(text, "he", true, true).len(), 1);
+        assert_eq!(find_all(text, "he", true, false).len(), 2);
+    }
 
     fn bar(query: &str) -> FindBar {
         let mut bar = FindBar::new(Vec2::ZERO);
