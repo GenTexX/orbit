@@ -53,9 +53,15 @@ After Milestone 4 the [Comet language design record](comet-language-design.md) t
 **Two things that kept recurring, worth carrying into M5.** A tree walk that does not handle a new node kind fails at *emission* with no source location - `collect_literals` caused exactly that three times, twice in the same function, and only a demo script using the combination ever found it. And a test can look right and check nothing: the refcount tests passed with the whole fix disabled because they used string *literals*, which are immortal, and the leak oracle was too coarse to see a 24-byte leak inside a 64KB page. Both were caught by deliberately breaking the fix and expecting red, which is now the habit rather than the exception.
 
 ### Milestone 5 - Play & Hot Reload
-**Done when:** you attach a Comet script to a node, press Play, the game runs *in the viewport*, and editing the script hot-reloads it live while preserving reflected field values.
+**Done when:** you attach a Comet script to a node, press Play, the game runs *in the viewport*, and **saving the script reloads it** while preserving reflected field values.
 **Proves:** the killer feature and the reason the whole architecture is shaped this way - in-process runtime, reflection driving both inspector and hot-reload migration, input feeding the running game.
 **Brings online:** `voyager` as a library embedded by the editor; the hot-reload field-migration path.
+
+**"Hot reload" here means the file changed on disk and the game noticed** - decided 2026-08-03, after the review found that the original sentence was compatible with two different milestones. The trigger is a save or an external edit, found by an mtime poll modelled on the theme's; the reload path recompiles and swaps the instance and never writes into the Code pane's buffer. *Typing in the Code pane while the game runs in the same window* is deliberately **not** M5: it makes the in-place inspector refresh, console-output-without-a-rebuild, and the input seam into prerequisites rather than polish, and roughly doubles the milestone. It becomes its own iteration afterwards.
+
+**The north-star game is a one-screen platformer** - decided 2026-08-03, at the point roadmap said to revisit it. A character, gravity, platforms, one goal. It is one artifact serving three roles: what Play is first pressed on, what M6 exports first, and what the teaching material builds toward. It wants components that do not exist yet (Camera, AnimatedSprite, eventually Tilemap), and that is the point - it is the scope filter that says which ones to build.
+
+**Before M6, portability is its own block** - decided 2026-08-03. `scale_factor` appears zero times in the workspace, so the editor renders at half size on any hidpi display; `project_dir` is `env!("CARGO_MANIFEST_DIR")` with no argv path; there is no LICENSE file and no `license` field in any of the eleven manifests. Together they are the difference between a tool and one person's tool, and M6 ships to someone else by definition.
 
 ### Milestone 6 - Build & Ship
 **Done when:** you export a Game Package and the standalone `voyager` binary plays it with no editor present.
