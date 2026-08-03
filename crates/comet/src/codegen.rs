@@ -2457,13 +2457,30 @@ impl<'a> FnGen<'a> {
                 self.ins().i32_const(width as i32);
                 self.ins().call(F_ARRAY_AT).local_set(at);
                 self.ins().local_get(handle).call(F_ARRAY_RELEASE);
+                // A value read out of an array is a second owner of whatever it
+                // holds, the same as reading one out of a local - and it has to
+                // be retained from the element's *packed slots*, not from the
+                // stack copy. `retain_value` cannot do it: a struct on the
+                // stack has mixed wasm types and no home to read from, which is
+                // why struct retain lives at the site a value is read from. An
+                // array element has a home, at the address comet_array_at just
+                // returned, so the slots are parked and retained there - the
+                // same thing `get(a, i)` does with the slots it copies into its
+                // Option. Without this the two readers of an element disagreed
+                // about ownership, and `a[i]` on an array of structs holding a
+                // String freed what the array still pointed at.
+                let base = frame.enum_base;
                 for slot in 0..width {
-                    self.ins().local_get(at).i32_load(mem(u64::from(slot) * 4));
+                    self.ins()
+                        .local_get(at)
+                        .i32_load(mem(u64::from(slot) * 4))
+                        .local_set(base + slot);
+                }
+                self.retain_slots(base, *ty);
+                for slot in 0..width {
+                    self.ins().local_get(base + slot);
                 }
                 self.unpack(*ty);
-                // A value read out of an array is a second owner of whatever it
-                // holds, the same as reading one out of a local.
-                self.retain_value(*ty);
                 self.leave_frame();
             }
 

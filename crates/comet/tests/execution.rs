@@ -2233,3 +2233,46 @@ fn the_run_example_still_runs_a_script() {
         "it compiled and stepped the script: {text}"
     );
 }
+
+#[test]
+fn reading_a_struct_out_of_an_array_takes_a_reference_to_it() {
+    // `a[i]` and `get(a, i)` are the two ways to read an element and they have
+    // to agree about ownership. ArrayGet retains the element's slots; Index
+    // went through retain_value, whose struct arm does nothing - struct retain
+    // lives at the site a value is read *from*, and an array element is read
+    // from an address rather than a local. So the copy was not a second owner,
+    // the local it was stored into released it on the way out, and the array
+    // was left pointing at a freed block.
+    //
+    // The oracle is the heap, not the printed text: with one live allocation a
+    // premature free often reads back fine, and it was a corrupted free list -
+    // comet_heap_used itself trapping - that gave this away.
+    let both = |source: &str| {
+        let mut script = Script::new(source);
+        script.update(0.016);
+        script.update(0.016);
+        let settled = script.heap_used();
+        for _ in 0..200 {
+            script.update(0.016);
+        }
+        (settled, script.heap_used())
+    };
+    let source = |read: &str| {
+        format!(
+            "struct Named {{ label: String, value: f32 }}\n\
+             let a: Array<Named> = [];\n\
+             func update(dt: f32) {{\n\
+               if len(a) == 0 {{ push(a, Named {{ label: \"seed\" + str(dt), value: 1.0 }}); }}\n\
+               let taken = {read};\n\
+               let junk = \"j\" + str(dt);\n\
+             }}"
+        )
+    };
+    let (settled, after) = both(&source("a[0]"));
+    assert_eq!(
+        after, settled,
+        "200 reads through a[i] leaked nothing and freed nothing twice"
+    );
+    let (settled, after) = both(&source("get(a, 0)"));
+    assert_eq!(after, settled, "and get(a, i) agrees");
+}
