@@ -11,19 +11,19 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use helios::{
-    Begin, Component, Input, NodeId, Scene, ScriptError, ScriptHost, ScriptInstance, Value,
+    Begin, Component, FRAME_BUDGET, Input, NodeId, Scene, ScriptError, ScriptHost, ScriptInstance,
+    Value,
 };
 
 /// One script instance, and the address in the scene it belongs to.
 struct Running {
     node: NodeId,
-    /// The resolved path this instance was compiled from. Kept so a saved file
-    /// can find the instances running it without re-reading the scene, which
-    /// may have been re-pointed at another script since.
-    source: PathBuf,
+    /// The file this instance was compiled from, as the component names it -
+    /// project-relative, so it reads the way the inspector shows it.
+    relative: String,
     /// Which of the node's components this instance is running for.
     ///
     /// A node may carry several scripts, so the node alone does not identify an
@@ -31,6 +31,95 @@ struct Running {
     /// is the update order.
     component: usize,
     script: ScriptInstance,
+}
+
+/// The most a whole frame may spend on scripts before the rest are deferred.
+///
+/// helios enforces a budget per *call*, so twenty runaway scripts cost twenty
+/// times it - measured at two seconds for one `step`, which is the editor gone
+/// with an unsaved scene in it. This bounds the pile-up.
+///
+/// Deliberately several call budgets rather than one. At exactly one, a single
+/// runaway would eat the whole frame and every other script would be skipped -
+/// which trades a bounded cost for a broken guarantee, and the guarantee is the
+/// one this runtime is built on: one bad script must not cost the other
+/// nineteen their frame. At four, a runaway still costs only its own budget,
+/// the good scripts around it still run, and the worst case is four budgets
+/// rather than twenty. Traps latch, so the frame after is clean either way.
+const FRAME_LIMIT: Duration = Duration::from_millis(FRAME_BUDGET.as_millis() as u64 * 4);
+
+/// What one script is doing, for anything that wants to show a play session.
+///
+/// The runtime knew all of this and none of it was reachable: `Running` is
+/// private and `Runtime` exposed only a count, so a script that trapped was
+/// indistinguishable from one with nothing to do - the game looked like it was
+/// playing while one node quietly sat still forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceInfo {
+    pub node: NodeId,
+    pub component: usize,
+    /// The source file, as the component names it - project-relative, so it
+    /// reads the way the inspector shows it.
+    pub source: String,
+    /// False once a trap has latched it off. It will not be called again until
+    /// a reload replaces it.
+    pub running: bool,
+}
+
+/// Something the runtime wants a console to say, with what an editor needs to
+/// act on it kept rather than flattened into the sentence.
+///
+/// helios goes to real trouble producing this: a compile failure carries every
+/// diagnostic with its span, and a trap carries the comet function lifted out
+/// of the wasm backtrace. Turning all of it into a `String` here made the
+/// errors from actually running the game the only ones in the editor that could
+/// not open a file or squiggle a line.
+#[derive(Debug, Clone)]
+pub struct Problem {
+    /// The script it happened in, project-relative, or empty for a problem that
+    /// belongs to the frame rather than to one script.
+    pub source: String,
+    /// The comet function a trap happened in, when the module's name section
+    /// named it. An editor can put a caret here.
+    pub function: Option<String>,
+    /// Every diagnostic, spans included, when this was a compile failure.
+    pub diagnostics: Vec<comet::Diagnostic>,
+    pub message: String,
+}
+
+impl std::fmt::Display for Problem {
+    /// The line a shipped game prints, and the one the console showed before
+    /// any of the structure above existed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.source.is_empty() {
+            true => write!(f, "{}", self.message),
+            false => write!(f, "[{}] {}", self.source, self.message),
+        }
+    }
+}
+
+impl Problem {
+    fn from_error(source: &str, err: &ScriptError) -> Self {
+        Problem {
+            source: source.to_string(),
+            function: err.trapped_in().map(str::to_string),
+            diagnostics: match err {
+                ScriptError::Compile(diagnostics) => diagnostics.clone(),
+                _ => Vec::new(),
+            },
+            message: err.to_string(),
+        }
+    }
+
+    /// A problem that belongs to the frame rather than to one script.
+    fn frame(message: String) -> Self {
+        Problem {
+            source: String::new(),
+            function: None,
+            diagnostics: Vec::new(),
+            message,
+        }
+    }
 }
 
 /// Owns every running script, and steps them.
@@ -52,7 +141,7 @@ pub struct Runtime {
     /// Collected rather than returned: a script failing is not the caller's
     /// error, it is news. The frame carries on, the other scripts still run,
     /// and the host decides when to read this.
-    problems: Vec<String>,
+    problems: Vec<Problem>,
     /// When each running script's source file was last written, as of the last
     /// time anybody looked.
     ///
@@ -65,6 +154,11 @@ pub struct Runtime {
     /// watch handle. It also works the same on every platform, which a watcher
     /// famously does not.
     watched: HashMap<PathBuf, Option<SystemTime>>,
+    /// Every `(node, component)` this session has tried to bring up, including
+    /// the ones that would not compile. `running` holds only the successes, so
+    /// without this a reload has no way to find the address that needs one
+    /// most.
+    attached: std::collections::HashSet<(NodeId, usize)>,
     /// Lines printed by instances that no longer exist.
     ///
     /// A script's `on_destroy` is its last word, and it is said into a store
@@ -87,6 +181,7 @@ impl Runtime {
             input: Input::default(),
             problems: Vec::new(),
             watched: HashMap::new(),
+            attached: std::collections::HashSet::new(),
             output: Vec::new(),
             playing: false,
         })
@@ -157,19 +252,27 @@ impl Runtime {
         }
         // Copied out before instantiating: starting a script takes the scene
         // mutably, because a state initializer can move the node it runs for.
-        let path = self.root.join(&script.source);
+        let relative = script.source.clone();
+        let path = self.root.join(&relative);
         let exports = script.exports.clone();
+
+        // Watched before it is compiled, not after. A file that does not
+        // compile when Play is pressed is exactly the file somebody is about to
+        // fix, and watching only what succeeded meant the fix was never noticed
+        // - press Play, read the error, fix the typo, save, and nothing
+        // happened. This reverses a rule that used to be written here.
+        self.watched
+            .entry(path.clone())
+            .or_insert_with(|| modified(&path));
+        self.attached.insert((node, component));
 
         let instance = self
             .host
             .instantiate_file(&path, scene, node, &exports, begin)?;
-        // Watched next to the instance it belongs to. A path with nothing
-        // running has nothing to reload, so an entry for one would be an entry
-        // nobody could act on.
         self.watched.insert(path.clone(), modified(&path));
         let slot = Running {
             node,
-            source: path,
+            relative,
             component,
             script: instance,
         };
@@ -187,15 +290,31 @@ impl Runtime {
     /// itself as stopped, so this reports it once rather than sixty times a
     /// second.
     pub fn step(&mut self, scene: &mut Scene, dt: f32) {
+        let deadline = Instant::now() + FRAME_LIMIT;
+        let mut skipped = 0usize;
         for running in &mut self.running {
+            if Instant::now() >= deadline {
+                skipped += 1;
+                continue;
+            }
             // Every script sees the same input this frame, set before the call
             // rather than read during it: a frame's input is a fixed thing
             // while that frame runs.
             running.script.set_input(self.input);
             if let Err(err) = running.script.update(scene, running.node, dt) {
                 self.problems
-                    .push(format!("[{}] {err}", running.script.label()));
+                    .push(Problem::from_error(&running.relative, &err));
             }
+        }
+        // Said once with a count rather than once per script, because a frame
+        // that ran out of time has nothing useful to say about the twentieth
+        // script it did not reach.
+        if skipped > 0 {
+            let budget = FRAME_LIMIT.as_millis();
+            self.problems.push(Problem::frame(format!(
+                "this frame ran out of its {budget}ms before {skipped} more scripts \
+                 could run - something in this scene is far too slow"
+            )));
         }
     }
 
@@ -291,22 +410,51 @@ impl Runtime {
         // Forgotten first, so the recompile below reads the file rather than
         // the module cached from before the save.
         self.host.forget(path);
-        let targets: Vec<(NodeId, usize)> = self
-            .running
+        // From what was attached rather than from what is running: an instance
+        // that failed to compile is in neither `running` nor anywhere else, and
+        // it is the one whose reload matters most.
+        let mut targets: Vec<(NodeId, usize)> = self
+            .attached
             .iter()
-            .filter(|running| running.source == path)
-            .map(|running| (running.node, running.component))
+            .copied()
+            .filter(|&(node, component)| {
+                matches!(
+                    scene.node(node).components.get(component),
+                    Some(Component::Script(script)) if self.root.join(&script.source) == path
+                )
+            })
             .collect();
+        // A set has no order and a reload of two nodes should be the same
+        // reload twice.
+        targets.sort_by_key(|&(node, component)| (self.index_of(node, component), component));
         for (node, component) in targets {
             if let Err(err) = self.bring_up(scene, node, component, Begin::Reload) {
-                self.problems.push(format!("[{}] {err}", path.display()));
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string();
+                self.problems.push(Problem::from_error(&relative, &err));
             }
         }
     }
 
     /// Take what has gone wrong since this was last called.
-    pub fn take_problems(&mut self) -> Vec<String> {
+    pub fn take_problems(&mut self) -> Vec<Problem> {
         std::mem::take(&mut self.problems)
+    }
+
+    /// What every script in this session is doing.
+    pub fn instances(&self) -> Vec<InstanceInfo> {
+        self.running
+            .iter()
+            .map(|running| InstanceInfo {
+                node: running.node,
+                component: running.component,
+                source: running.relative.clone(),
+                running: !running.script.is_stopped(),
+            })
+            .collect()
     }
 
     /// Whether a play session is running.
@@ -341,7 +489,7 @@ impl Runtime {
         self.playing = true;
         for (node, component, source) in scripts_in_pre_order(scene) {
             if let Err(err) = self.attach(scene, node, component) {
-                self.problems.push(format!("[{source}] {err}"));
+                self.problems.push(Problem::from_error(&source, &err));
             }
         }
     }
@@ -361,10 +509,11 @@ impl Runtime {
         }
         self.playing = false;
         self.watched.clear();
+        self.attached.clear();
         for mut running in std::mem::take(&mut self.running) {
             if let Err(err) = running.script.destroy(scene, running.node) {
                 self.problems
-                    .push(format!("[{}] {err}", running.script.label()));
+                    .push(Problem::from_error(&running.relative, &err));
             }
             // Said into a store that is about to be dropped, so it is taken
             // here or it is lost.
@@ -563,7 +712,7 @@ mod tests {
         let problems = runtime.take_problems();
         assert_eq!(problems.len(), 1, "reported: {problems:?}");
         assert!(
-            problems[0].contains("loop with no way out"),
+            problems[0].to_string().contains("loop with no way out"),
             "and reported usefully: {problems:?}"
         );
 
@@ -715,7 +864,7 @@ mod tests {
         let problems = runtime.take_problems();
         assert_eq!(problems.len(), 1, "and reported: {problems:?}");
         assert!(
-            problems[0].contains("broken.cmt"),
+            problems[0].to_string().contains("broken.cmt"),
             "naming the file, since the message is about a file: {problems:?}"
         );
 
@@ -740,7 +889,10 @@ mod tests {
         assert!(runtime.is_empty());
         let problems = runtime.take_problems();
         assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("vanished.cmt"), "{problems:?}");
+        assert!(
+            problems[0].to_string().contains("vanished.cmt"),
+            "{problems:?}"
+        );
     }
 
     #[test]
@@ -1220,7 +1372,10 @@ mod tests {
         }
         let problems = runtime.take_problems();
         assert_eq!(problems.len(), 1, "reported: {problems:?}");
-        assert!(problems[0].contains("script.cmt"), "{problems:?}");
+        assert!(
+            problems[0].to_string().contains("script.cmt"),
+            "{problems:?}"
+        );
 
         assert_eq!(runtime.len(), 1, "and still running");
         runtime.step(&mut scene, 0.016);
@@ -1275,5 +1430,169 @@ mod tests {
         runtime.reload(&mut scene, &dir.path().join("elsewhere.cmt"));
         assert_eq!(runtime.len(), 1);
         assert!(runtime.take_problems().is_empty());
+    }
+
+    #[test]
+    fn a_frame_of_runaway_scripts_is_bounded() {
+        // The per-call budget is 100ms and `step` had no clock of its own, so
+        // twenty runaway scripts cost twenty times it - two seconds of a frozen
+        // editor holding an unsaved scene.
+        let (dir, mut scene, first) = project("func update(dt: f32) { while true { } }");
+        for n in 0..19 {
+            let node = scene.add_child(scene.root(), Node::new(format!("spin{n}")));
+            attach_script(&mut scene, node, "script.cmt");
+        }
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.play(&mut scene);
+        assert_eq!(runtime.len(), 20);
+        let _ = first;
+
+        let started = std::time::Instant::now();
+        runtime.step(&mut scene, 0.016);
+        let took = started.elapsed();
+        assert!(
+            took < FRAME_LIMIT * 2,
+            "the frame was bounded, took {took:?}"
+        );
+        // And it says what happened rather than leaving twenty silent skips.
+        let problems = runtime.take_problems();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.to_string().contains("ran out of its")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn one_runaway_still_leaves_the_others_their_frame() {
+        // The guarantee the frame limit must not trade away. At exactly one
+        // call budget a single runaway would eat the whole frame.
+        let (dir, mut scene, spinner) = project("func update(dt: f32) { while true { } }");
+        let good = scene.add_child(scene.root(), Node::new("good"));
+        attach_script(&mut scene, good, "good.cmt");
+        std::fs::write(
+            dir.path().join("good.cmt"),
+            "func update(dt: f32) { transform.position.x += 1.0; }",
+        )
+        .expect("writing the second script");
+
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, spinner, 0).expect("it compiles");
+        runtime
+            .attach(&mut scene, good, 0)
+            .expect("so does the other");
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, good), 1.0);
+    }
+
+    #[test]
+    fn a_script_broken_when_play_was_pressed_can_still_be_fixed() {
+        // The beginner's loop: press Play, read the error, fix the typo, save.
+        // The fix used to be invisible, because a file that did not compile was
+        // never watched and `reload` scanned only what was running - so the one
+        // script whose reload mattered most was the one that could not have one.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            dir.path().join("script.cmt"),
+            "func update(dt: f32) { $$$ }",
+        )
+        .expect("writing the broken script");
+        let mut scene = Scene::new("root");
+        let node = scene.add_child(scene.root(), Node::new("player"));
+        attach_script(&mut scene, node, "script.cmt");
+
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.play(&mut scene);
+        assert!(runtime.is_empty(), "nothing compiled");
+        assert_eq!(runtime.take_problems().len(), 1);
+
+        rewrite(
+            dir.path(),
+            "script.cmt",
+            "func update(dt: f32) { transform.position.x += 5.0; }",
+        );
+        let changed = runtime.changed_sources();
+        assert_eq!(changed.len(), 1, "the fix was noticed");
+        for path in changed {
+            runtime.reload(&mut scene, &path);
+        }
+        assert_eq!(runtime.len(), 1, "and it is running now");
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, node), 5.0);
+    }
+
+    #[test]
+    fn a_session_can_say_what_is_running_and_what_has_stopped() {
+        // The runtime knew all of this and none of it was reachable, so a
+        // script that trapped was indistinguishable from one with nothing to
+        // do - the game looked fine while one node sat still forever.
+        let (dir, mut scene, spinner) = project("func update(dt: f32) { while true { } }");
+        let good = scene.add_child(scene.root(), Node::new("good"));
+        attach_script(&mut scene, good, "good.cmt");
+        std::fs::write(
+            dir.path().join("good.cmt"),
+            "func update(dt: f32) { transform.position.x += 1.0; }",
+        )
+        .expect("writing the second script");
+
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.play(&mut scene);
+        assert!(
+            runtime.instances().iter().all(|i| i.running),
+            "everything starts running"
+        );
+
+        runtime.step(&mut scene, 0.016);
+        let instances = runtime.instances();
+        let stopped: Vec<&InstanceInfo> = instances.iter().filter(|i| !i.running).collect();
+        assert_eq!(stopped.len(), 1, "{instances:?}");
+        assert_eq!(stopped[0].node, spinner);
+        assert_eq!(
+            stopped[0].source, "script.cmt",
+            "named as the component does"
+        );
+        assert_eq!(instances.len(), 2, "and the good one is still listed");
+    }
+
+    #[test]
+    fn a_compile_failure_keeps_its_diagnostics_and_a_trap_keeps_its_function() {
+        // helios goes to real trouble producing both, and flattening them into
+        // a string here made Play's errors the only ones in the editor that
+        // could not open a file or squiggle a line.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            dir.path().join("script.cmt"),
+            "func update(dt: f32) { $$$ }",
+        )
+        .expect("writing the broken script");
+        let mut scene = Scene::new("root");
+        let node = scene.add_child(scene.root(), Node::new("player"));
+        attach_script(&mut scene, node, "script.cmt");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.play(&mut scene);
+
+        let problems = runtime.take_problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].source, "script.cmt");
+        assert!(
+            !problems[0].diagnostics.is_empty(),
+            "the spans survived: {problems:?}"
+        );
+        // And it still reads as the line a shipped game would print.
+        assert!(problems[0].to_string().starts_with("[script.cmt] "));
+
+        // A trap keeps the comet function instead.
+        let (dir, mut scene, node) =
+            project("func update(dt: f32) { let a = [1.0]; let b = a[9]; }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        runtime.step(&mut scene, 0.016);
+        let problems = runtime.take_problems();
+        assert_eq!(
+            problems[0].function.as_deref(),
+            Some("update"),
+            "{problems:?}"
+        );
     }
 }

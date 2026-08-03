@@ -6092,6 +6092,23 @@ impl State {
             }
             _ => (String::new(), String::new()),
         };
+        // While a game runs, what it is running. Without this a script that
+        // trapped is indistinguishable from one with nothing to do: the console
+        // says so once, and once that line has scrolled past there is nothing
+        // anywhere to say a node stopped moving on purpose.
+        let diagnostic = match self.play.is_playing() {
+            false => diagnostic,
+            true => {
+                let instances = self.play.instances();
+                let stopped = instances.iter().filter(|i| !i.running).count();
+                let total = instances.len();
+                match (total, stopped) {
+                    (0, _) => "playing - no scripts in this scene".to_string(),
+                    (n, 0) => format!("playing - {n} scripts"),
+                    (n, s) => format!("playing - {n} scripts, {s} stopped"),
+                }
+            }
+        };
         let zoom = format!("zoom {:.0}%", self.camera.zoom * 100.0);
         let fps = format!("{:.0} fps", self.last_fps);
         let modified = if self.is_modified() {

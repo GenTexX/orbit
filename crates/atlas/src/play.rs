@@ -108,6 +108,15 @@ impl Play {
         self.runtime.as_mut()?.live_exports(scene, node, component)
     }
 
+    /// What every script in this session is doing - what is running, what has
+    /// stopped, and which file each came from.
+    pub fn instances(&self) -> Vec<voyager::InstanceInfo> {
+        self.runtime
+            .as_ref()
+            .map(Runtime::instances)
+            .unwrap_or_default()
+    }
+
     /// Which running scripts' source files have been written since they were
     /// last read.
     pub fn changed_sources(&mut self) -> Vec<std::path::PathBuf> {
@@ -135,7 +144,7 @@ impl Play {
 
     /// Take what went wrong: a script that would not compile when the game
     /// started, or one that trapped mid-frame.
-    pub fn take_problems(&mut self) -> Vec<String> {
+    pub fn take_problems(&mut self) -> Vec<voyager::Problem> {
         self.runtime
             .as_mut()
             .map(Runtime::take_problems)
@@ -404,7 +413,10 @@ mod tests {
 
         let problems = play.take_problems();
         assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("broken.cmt"), "{problems:?}");
+        assert!(
+            problems[0].to_string().contains("broken.cmt"),
+            "{problems:?}"
+        );
     }
 
     #[test]
