@@ -1791,6 +1791,14 @@ impl Checker<'_> {
         };
 
         let mut body = self.block(body);
+        // A body ending in a bare expression is that block's tail, and the loop
+        // discards it - but it still has to *happen* where it was written.
+        // Appending the increment to `stmts` while the tail sat separately put
+        // it after, so `for i in 0..3 { print(str(i)) }` printed 1, 2, 3, and
+        // `for i in 0..len(xs) { xs[i] }` indexed one past the end.
+        if let Some(tail) = body.tail.take() {
+            body.stmts.push(TypedStmt::Expr(tail));
+        }
         body.stmts.push(TypedStmt::Assign {
             place: Place::Local(slot),
             value: TypedExpr {
@@ -3110,9 +3118,15 @@ fn is_reserved_name(name: &str) -> bool {
 /// a missing return, so it is deliberately conservative: it understands `return`
 /// and `if`/`else` where both sides return, and assumes nothing about loops.
 fn always_returns(block: &TypedBlock) -> bool {
-    if block.tail.is_some() {
-        return true;
-    }
+    // A tail is deliberately *not* a return here. `if` is a statement (ADR-level,
+    // ast.rs), so emission drops the tail of its arms - a function whose whole
+    // body was `if c { 1.0 } else { 2.0 }` passed this check and compiled to
+    // code that computed the value, dropped it, and hit `unreachable`. A trap
+    // with no source location, for the most natural thing to write.
+    //
+    // The only tail that is a return is the function body's own, and the caller
+    // takes that one before asking (`body.tail.take()`), so it never reaches
+    // here.
     block.stmts.iter().any(|stmt| match stmt {
         TypedStmt::Return { .. } => true,
         TypedStmt::If {
@@ -4306,6 +4320,21 @@ mod tests {
             messages("struct P { }"),
             ["a struct needs at least one field"]
         );
+    }
+
+    #[test]
+    fn an_if_is_a_statement_so_its_arms_are_not_the_functions_value() {
+        // `always_returns` treated any block with a tail as returning, and
+        // recursed into an `if` statement's arms - but `if` is a statement, so
+        // emission drops those tails and closes the function with `unreachable`.
+        // This compiled clean and trapped at runtime with no source location.
+        assert_eq!(
+            messages("func f(c: bool) -> f32 { if c { 1.0 } else { 2.0 } }"),
+            ["this function must return `f32`, but some paths reach the end without one"]
+        );
+        // Written the way it has to be written, it is still accepted.
+        check_clean("func f(c: bool) -> f32 { if c { return 1.0; } else { return 2.0; } }");
+        check_clean("func f(c: bool) -> f32 { if c { return 1.0; } 2.0 }");
     }
 
     #[test]

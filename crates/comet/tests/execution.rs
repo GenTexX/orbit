@@ -2138,3 +2138,26 @@ fn an_enum_payload_that_owns_something_is_released_whatever_it_is() {
     let (settled, after) = heap_after(&mut script, 500);
     assert_eq!(after, settled, "500 structs inside an enum leaked nothing");
 }
+
+#[test]
+fn a_for_body_ending_in_an_expression_runs_it_before_the_counter_moves() {
+    // The increment was appended to the body's statements while a trailing
+    // bare expression sat separately as the block's tail, and emission writes
+    // statements first - so the tail ran one iteration late.
+    let mut script = Script::new("func update(dt: f32) { for i in 0..3 { print(str(i)) } }");
+    script.update(0.016);
+    assert_eq!(script.printed(), ["0", "1", "2"]);
+
+    // The same bug indexed one past the end, which traps rather than lying.
+    let mut script = Script::new(
+        "func update(dt: f32) { let xs = [10.0, 20.0]; \
+         for i in 0..len(xs) { print(str(xs[i])) } }",
+    );
+    script.update(0.016);
+    assert_eq!(script.printed(), ["10", "20"]);
+
+    // A semicolon on the last line was never affected; it must stay right.
+    let mut script = Script::new("func update(dt: f32) { for i in 0..3 { print(str(i)); } }");
+    script.update(0.016);
+    assert_eq!(script.printed(), ["0", "1", "2"]);
+}
