@@ -197,8 +197,10 @@ pub enum Stmt {
     },
 }
 
-/// `if` is a statement rather than an expression in v1: nothing needs its value,
-/// and keeping it a statement means a block's tail expression stays unambiguous.
+/// `if`, in both the positions it can appear: as a statement, where its value is
+/// ignored and `else` is optional, and as an [`Expr::If`], where every branch has
+/// to produce one and `else` is required. One node, because the shape is the
+/// same and only the demand on it differs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IfStmt {
     pub cond: Expr,
@@ -314,6 +316,18 @@ pub enum Expr {
     /// A parse error stood in for an expression here. Carrying it in the tree
     /// rather than bailing is what lets the checker keep going and report about
     /// the rest of the file (ADR 0010).
+    /// A block used for its value: `{ let a = 1.0; a * 2.0 }`.
+    ///
+    /// The same `Block` a statement uses, so a match arm that grew from one
+    /// expression into several statements is the same construct rather than a
+    /// second one.
+    Block(Block),
+    /// `if` used for its value: `let d = if left { -1.0 } else { 1.0 };`.
+    ///
+    /// The same [`IfStmt`] the statement form uses. Whether it is an expression
+    /// is a question about where it appears, not about its shape, and sharing
+    /// the node means an `else if` chain keeps working with no second tree.
+    If(Box<IfStmt>),
     Error {
         span: Span,
     },
@@ -351,6 +365,8 @@ impl Expr {
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Error { span } => *span,
+            Expr::Block(block) => block.span,
+            Expr::If(if_stmt) => if_stmt.span,
         }
     }
 }

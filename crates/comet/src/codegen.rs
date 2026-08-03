@@ -665,6 +665,16 @@ fn collect_expr(expr: &TypedExpr, out: &mut Literals) {
                 collect_expr(&arm.body, out);
             }
         }
+        TypedExprKind::Block(block) => collect_block(block, out),
+        TypedExprKind::IfElse {
+            cond,
+            then,
+            otherwise,
+        } => {
+            collect_expr(cond, out);
+            collect_block(then, out);
+            collect_block(otherwise, out);
+        }
         // Listed rather than caught by a wildcard: a new kind that holds a
         // string must fail to compile here rather than panic at emission with
         // "every literal was interned", which is how this was found.
@@ -2531,6 +2541,14 @@ impl<'a> FnGen<'a> {
                 arms,
             } => self.match_expr(scrutinee, *enum_index, arms),
 
+            TypedExprKind::Block(block) => self.block(block),
+
+            TypedExprKind::IfElse {
+                cond,
+                then,
+                otherwise,
+            } => self.if_else(cond, then, otherwise),
+
             TypedExprKind::Error => {
                 self.ins().unreachable();
             }
@@ -2677,6 +2695,43 @@ impl<'a> FnGen<'a> {
         }
         self.unpack(result_ty);
         self.leave_frame();
+    }
+
+    /// `if` used for its value.
+    ///
+    /// The same shape `match` uses, and for the same reason: a branch's result
+    /// goes into a reserved region of the frame rather than being left on the
+    /// stack, so one rule covers every width - an `f32` and a `Vec2` and a
+    /// struct all pack and unpack the same way. wasm's own typed `if` would
+    /// handle the one-slot case and would need a type-section entry for the
+    /// rest, which is two paths where this is one.
+    fn if_else(&mut self, cond: &TypedExpr, then: &TypedBlock, otherwise: &TypedBlock) {
+        let frame = self.enter_frame();
+        let result_base = frame.result_base;
+        let ty = then.ty;
+        let width = val_types(ty, self.enums, self.structs).len() as u32;
+
+        self.expr(cond);
+        self.ins().if_(BlockType::Empty);
+        self.branch_into(then, result_base);
+        self.ins().else_();
+        self.branch_into(otherwise, result_base);
+        self.ins().end();
+
+        for slot in 0..width {
+            self.ins().local_get(result_base + slot);
+        }
+        self.unpack(ty);
+        self.leave_frame();
+    }
+
+    /// Emit one branch of an if-expression and park what it produced.
+    fn branch_into(&mut self, block: &TypedBlock, result_base: u32) {
+        self.block(block);
+        let width = self.pack(block.ty) as u32;
+        for slot in (0..width).rev() {
+            self.ins().local_set(result_base + slot);
+        }
     }
 
     /// The tag chain, one `if` per arm bar the last.

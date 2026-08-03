@@ -1963,6 +1963,92 @@ impl Checker<'_> {
         }
     }
 
+    /// `if` used for its value.
+    ///
+    /// Three things the statement form does not require. There has to be an
+    /// `else`, because the false path still has to give something back. Both
+    /// branches have to end in a value rather than in a statement. And the two
+    /// have to agree on a type, the same rule `match` arms already follow.
+    fn if_expr(&mut self, if_stmt: &ast::IfStmt, expected: Option<Type>) -> (TypedExprKind, Type) {
+        let cond = self.expr(&if_stmt.cond);
+        self.expect_type(Type::Bool, cond.ty, cond.span);
+        let then = self.block_hinted(&if_stmt.then, expected);
+
+        let Some(otherwise) = if_stmt.otherwise.as_deref() else {
+            self.error(
+                if_stmt.span,
+                "this `if` is used for its value, so it needs an `else` - there is nothing \
+                 to give back when the condition is false",
+            );
+            return (TypedExprKind::Error, Type::Error);
+        };
+        let otherwise = match otherwise {
+            ast::Else::Block(b) => self.block_hinted(b, expected),
+            ast::Else::If(nested) => {
+                // `else if` is an if-expression too, so a chain keeps its value
+                // all the way down rather than becoming a statement halfway.
+                let (kind, ty) = self.if_expr(nested, expected);
+                TypedBlock {
+                    stmts: Vec::new(),
+                    tail: Some(TypedExpr {
+                        kind,
+                        ty,
+                        span: nested.span,
+                    }),
+                    ty,
+                }
+            }
+        };
+
+        // A branch that ends in a statement has no value. Reported per branch,
+        // because saying "the branches disagree" when one of them simply has
+        // nothing in it sends the reader looking for a type error.
+        for (block, span) in [(&then, if_stmt.then.span), (&otherwise, if_stmt.span)] {
+            if block.ty == Type::Unit {
+                self.error(
+                    span,
+                    "this branch has no value - an `if` used for its value needs one in \
+                     every branch, written last and without a semicolon",
+                );
+                return (TypedExprKind::Error, Type::Error);
+            }
+        }
+        if then.ty.is_error() || otherwise.ty.is_error() {
+            return (TypedExprKind::Error, Type::Error);
+        }
+        let ty = self.unify_branches(then.ty, otherwise.ty, if_stmt.span);
+        (
+            TypedExprKind::IfElse {
+                cond: Box::new(cond),
+                then: Box::new(then),
+                otherwise: Box::new(otherwise),
+            },
+            ty,
+        )
+    }
+
+    /// The type an if-expression has, given what its two branches produced.
+    ///
+    /// An `int` branch beside an `f32` one widens, the one-way widening ADR
+    /// 0021 already applies everywhere else.
+    fn unify_branches(&mut self, then: Type, otherwise: Type, span: Span) -> Type {
+        if then == otherwise {
+            return then;
+        }
+        if matches!(
+            (then, otherwise),
+            (Type::Int, Type::F32) | (Type::F32, Type::Int)
+        ) {
+            return Type::F32;
+        }
+        let (a, b) = (self.name_of(then), self.name_of(otherwise));
+        self.error(
+            span,
+            format!("this `if` gives back `{a}` on one path and `{b}` on the other"),
+        );
+        Type::Error
+    }
+
     fn if_stmt(&mut self, if_stmt: &ast::IfStmt) -> TypedStmt {
         let cond = self.expr(&if_stmt.cond);
         self.expect_type(Type::Bool, cond.ty, cond.span);
@@ -2407,6 +2493,14 @@ impl Checker<'_> {
                 args,
                 expected,
             ),
+
+            ast::Expr::Block(block) => {
+                let checked = self.block_hinted(block, expected);
+                let ty = checked.ty;
+                (TypedExprKind::Block(Box::new(checked)), ty)
+            }
+
+            ast::Expr::If(if_stmt) => self.if_expr(if_stmt, expected),
 
             ast::Expr::Match {
                 scrutinee, arms, ..
@@ -4357,18 +4451,30 @@ mod tests {
     }
 
     #[test]
-    fn an_if_is_a_statement_so_its_arms_are_not_the_functions_value() {
-        // `always_returns` treated any block with a tail as returning, and
-        // recursed into an `if` statement's arms - but `if` is a statement, so
-        // emission drops those tails and closes the function with `unreachable`.
-        // This compiled clean and trapped at runtime with no source location.
+    fn an_if_statement_is_not_the_functions_value() {
+        // `always_returns` treated any block with a tail as returning and
+        // recursed into an `if` *statement's* arms - but emission drops a
+        // statement's tails and closes the function with `unreachable`, so this
+        // compiled clean and trapped at runtime with no source location.
+        //
+        // An `if` with an `else` and value-shaped branches is now the block's
+        // value, so the shape that still reproduces the original hazard is the
+        // one that cannot be a value: no `else` to produce one on the other
+        // path.
         assert_eq!(
-            messages("func f(c: bool) -> f32 { if c { 1.0 } else { 2.0 } }"),
+            messages("func f(c: bool) -> f32 { if c { 1.0 } }"),
             ["this function must return `f32`, but some paths reach the end without one"]
         );
-        // Written the way it has to be written, it is still accepted.
+        // Nor when the branches end in statements rather than in values.
+        assert_eq!(
+            messages("func f(c: bool) -> f32 { if c { let a = 1.0; } else { let b = 2.0; } }"),
+            ["this function must return `f32`, but some paths reach the end without one"]
+        );
+        // Both explicit spellings are still accepted.
         check_clean("func f(c: bool) -> f32 { if c { return 1.0; } else { return 2.0; } }");
         check_clean("func f(c: bool) -> f32 { if c { return 1.0; } 2.0 }");
+        // And the one this used to reject now works, because it is a value.
+        check_clean("func f(c: bool) -> f32 { if c { 1.0 } else { 2.0 } }");
     }
 
     #[test]

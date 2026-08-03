@@ -399,6 +399,17 @@ pub enum TypedExprKind {
         /// never has to consider a fallthrough.
         arms: Vec<TypedArm>,
     },
+    /// A block used for its value. Its statements run, then its tail is what it
+    /// gives back.
+    Block(Box<TypedBlock>),
+    /// `if` used for its value. `otherwise` is not optional here, unlike the
+    /// statement form: a branch that is not taken still has to produce
+    /// something, and a missing `else` has nothing to produce.
+    IfElse {
+        cond: Box<TypedExpr>,
+        then: Box<TypedBlock>,
+        otherwise: Box<TypedBlock>,
+    },
     /// Something that did not check. Always paired with [`Type::Error`].
     Error,
 }

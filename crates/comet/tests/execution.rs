@@ -2322,3 +2322,106 @@ fn allocating_without_bound_traps_at_the_declared_maximum() {
         "grew to {grown} bytes, expected to stop just under {cap}"
     );
 }
+
+/// `if` used for its value, on a real engine.
+///
+/// The checker proves the types agree and wasmparser proves the module is
+/// well-formed; neither can tell whether the false branch's value is the one
+/// that comes back. Only running it can.
+#[test]
+fn an_if_expression_yields_the_branch_that_was_taken() {
+    let mut script = Script::new(
+        "func pick(left: bool) -> f32 { if left { -1.0 } else { 1.0 } }
+         func update(dt: f32) {
+             transform.position.x = pick(true);
+             transform.position.y = pick(false);
+         }",
+    );
+    script.update(0.016);
+    assert_eq!(script.position(), (-1.0, 1.0));
+}
+
+#[test]
+fn an_if_expression_carries_a_whole_vec2() {
+    // The width that would break a naive lowering: a Vec2 is two wasm slots, so
+    // a branch result parked in one local would drop half of it.
+    let mut script = Script::new(
+        "func update(dt: f32) {
+             transform.position = if dt > 0.0 { vec2(3.0, 4.0) } else { vec2(9.0, 9.0) };
+         }",
+    );
+    script.update(0.016);
+    assert_eq!(script.position(), (3.0, 4.0));
+    script.update(0.0);
+    assert_eq!(script.position(), (9.0, 9.0));
+}
+
+#[test]
+fn an_else_if_chain_keeps_its_value_all_the_way_down() {
+    let mut script = Script::new(
+        "func band(x: f32) -> f32 {
+             if x < 1.0 { 10.0 } else if x < 2.0 { 20.0 } else { 30.0 }
+         }
+         func update(dt: f32) {
+             transform.position.x = band(0.5) + band(1.5) + band(2.5);
+         }",
+    );
+    script.update(0.016);
+    assert_eq!(script.position().0, 60.0);
+}
+
+#[test]
+fn a_match_arm_can_be_a_block() {
+    // The failure this exists to remove: an arm written as a block used to be
+    // an eight-error cascade led by a false "this `match` does not cover ...".
+    let mut script = Script::new(
+        "enum Mood { Calm, Restless }
+         let mood = Mood::Restless;
+         func speed(m: Mood) -> f32 {
+             match m {
+                 Calm => { 1.0 }
+                 Restless => {
+                     let base = 20.0;
+                     let boost = 2.0;
+                     base * boost
+                 }
+             }
+         }
+         func update(dt: f32) { transform.position.x = speed(mood); }",
+    );
+    script.update(0.016);
+    assert_eq!(script.position().0, 40.0);
+}
+
+#[test]
+fn a_block_expression_runs_its_statements_before_its_tail() {
+    let mut script = Script::new(
+        "func update(dt: f32) {
+             transform.position.x = { let a = 2.0; let b = a * 3.0; b + 1.0 };
+         }",
+    );
+    script.update(0.016);
+    assert_eq!(script.position().0, 7.0);
+}
+
+#[test]
+fn an_if_expression_only_runs_the_branch_it_takes() {
+    // Both branches allocate, so a lowering that evaluated both would leak one
+    // string per call - which `comet_heap_used` can see exactly.
+    let mut script = Script::new(
+        "func update(dt: f32) {
+             let s = if dt > 0.0 { \"yes\" + str(dt) } else { \"no\" + str(dt) };
+             transform.position.x = 1.0;
+         }",
+    );
+    script.update(0.016);
+    let settled = script.heap_used();
+    for _ in 0..50 {
+        script.update(0.016);
+    }
+    assert_eq!(
+        script.heap_used(),
+        settled,
+        "fifty frames leaked nothing, so only one branch ever allocated"
+    );
+}

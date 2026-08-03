@@ -354,6 +354,10 @@ impl Parser {
             }
             self.expect(&TokenKind::FatArrow, "`=>` after a pattern");
             let body = self.expr();
+            // A block-bodied arm needs no comma after it: the `}` already says
+            // where the arm ended, and requiring one is the difference between
+            // a construct people use and one they fight.
+            let block_bodied = matches!(body, Expr::Block(_));
             let arm_end = self.peek_span();
             arms.push(MatchArm {
                 variant,
@@ -362,7 +366,7 @@ impl Parser {
                 body,
                 span: arm_start.to(arm_end),
             });
-            if !self.eat(&TokenKind::Comma) {
+            if !self.eat(&TokenKind::Comma) && !block_bodied {
                 break;
             }
         }
@@ -552,7 +556,30 @@ impl Parser {
                     span: start.to(end),
                 })
             }
-            TokenKind::If => StmtOrTail::Stmt(Stmt::If(self.if_stmt())),
+            // An `if` is a statement unless it is the last thing in the block,
+            // in which case it is the block's value - the same rule a bare
+            // expression already follows, and the reason
+            // `func sign(x: f32) -> f32 { if x < 0.0 { -1.0 } else { 1.0 } }`
+            // works. Deciding by what follows rather than by what it contains
+            // keeps `if c { a; } more();` a statement even when its branches
+            // happen to end in a value.
+            TokenKind::If => {
+                let if_stmt = self.if_stmt();
+                // The block's value, if it is the last thing here and it looks
+                // like it was written to produce one: an `else` to produce it
+                // on the other path, and a branch ending in an expression
+                // rather than a statement. Decided from the shape rather than
+                // from types, because the parser has no types - and it means
+                // `if past_edge(x) { velocity = -velocity; }` at the end of an
+                // `update` is still exactly the statement it has always been.
+                let is_value = matches!(self.peek(), TokenKind::RBrace)
+                    && if_stmt.otherwise.is_some()
+                    && if_stmt.then.tail.is_some();
+                match is_value {
+                    true => StmtOrTail::Tail(Expr::If(Box::new(if_stmt))),
+                    false => StmtOrTail::Stmt(Stmt::If(if_stmt)),
+                }
+            }
             TokenKind::While => {
                 self.advance();
                 let cond = self.expr();
@@ -765,6 +792,13 @@ impl Parser {
         let span = self.peek_span();
         match self.peek().clone() {
             TokenKind::Match => self.match_expr(),
+            // `if` and `{` in expression position. A condition is parsed with
+            // `expr` too, so `if grounded { ... }` could in principle read the
+            // `{` as a block - it does not, because `grounded` is a complete
+            // expression and no operator starts with `{`. That is the same
+            // reasoning the struct-literal guard below relies on.
+            TokenKind::If => Expr::If(Box::new(self.if_stmt())),
+            TokenKind::LBrace => Expr::Block(self.block()),
             TokenKind::LBracket => {
                 self.advance();
                 let mut elements = Vec::new();
