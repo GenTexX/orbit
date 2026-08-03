@@ -184,7 +184,11 @@ pub fn save(project_dir: &Path, state: &EditorState) -> std::io::Result<()> {
     let pretty = ron::ser::PrettyConfig::default();
     let text = ron::ser::to_string_pretty(state, pretty)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(dir.join("editor.ron"), text)
+    // Through helios's atomic write like the scene and the manifest. This one
+    // is view state rather than authored content, so losing it costs a dock
+    // layout - but it is one line, and a half-written file here means the next
+    // launch silently forgets where everything was.
+    helios::write_atomic(&dir.join("editor.ron"), text.as_bytes())
 }
 
 #[cfg(test)]

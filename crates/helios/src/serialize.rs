@@ -16,9 +16,26 @@ use crate::reflect::Value;
 use crate::scene::{Node, NodeId, Scene};
 use crate::transform::Transform;
 
+/// The format this build writes.
+///
+/// One line, and it cannot be added honestly later: a file with no version
+/// could have been written by any build, so the first version number is the
+/// only one whose absence means something specific. Bumped when a change to the
+/// shape would make an older build read a newer file wrongly - which is not the
+/// same as adding a field, since an unknown field is already ignored.
+const FORMAT: u32 = 1;
+
 #[derive(Serialize, Deserialize)]
 struct SceneDoc {
+    /// Absent in files written before this existed, which are format 1 by
+    /// definition - nothing incompatible had happened yet.
+    #[serde(default = "first_format")]
+    version: u32,
     root: NodeDoc,
+}
+
+fn first_format() -> u32 {
+    1
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,6 +77,7 @@ impl Scene {
     /// Serialize this scene to pretty, diff-friendly RON (ADR 0017).
     pub fn to_ron(&self) -> Result<String, HeliosError> {
         let doc = SceneDoc {
+            version: FORMAT,
             root: node_to_doc(self, self.root()),
         };
         Ok(ron::ser::to_string_pretty(&doc, PrettyConfig::default())?)
@@ -77,6 +95,16 @@ impl Scene {
         let doc: SceneDoc = ron::Options::default()
             .with_recursion_limit(1024)
             .from_str(text)?;
+        // A file from a newer build says so, rather than being read as if the
+        // shape had not changed. There is nothing to migrate yet - this is
+        // format 1 - but a reader that cannot tell has no way to start.
+        if doc.version > FORMAT {
+            return Err(HeliosError::Format(format!(
+                "this scene was written in format {} and this build reads {FORMAT} - \
+                 it needs a newer Orbit",
+                doc.version
+            )));
+        }
         let mut scene = Scene::new(&doc.root.name);
         let root = scene.root();
         apply_doc(&mut scene, root, &doc.root)?;
@@ -264,5 +292,30 @@ mod tests {
             Scene::from_ron(&ron),
             Err(crate::error::HeliosError::UnknownComponent(_))
         ));
+    }
+
+    #[test]
+    fn a_scene_carries_its_format_version() {
+        let scene = Scene::new("root");
+        let text = scene.to_ron().expect("it serializes");
+        assert!(text.contains("version: 1"), "{text}");
+    }
+
+    #[test]
+    fn a_file_from_a_newer_build_says_so_rather_than_being_guessed_at() {
+        let text = "(version: 99, root: (name: \"root\", transform: (translation: (0.0, 0.0), \
+                    rotation: 0.0, scale: (1.0, 1.0)), components: [], children: []))";
+        let err = Scene::from_ron(text).expect_err("this build cannot read format 99");
+        assert!(err.to_string().contains("needs a newer Orbit"), "{err}");
+    }
+
+    #[test]
+    fn a_file_written_before_versions_existed_still_loads() {
+        // The reason the first version number is the only one whose absence
+        // means something: every file written until now has none.
+        let text = "(root: (name: \"root\", transform: (translation: (0.0, 0.0), \
+                    rotation: 0.0, scale: (1.0, 1.0)), components: [], children: []))";
+        let scene = Scene::from_ron(text).expect("an unversioned file is format 1");
+        assert_eq!(scene.node(scene.root()).name, "root");
     }
 }

@@ -27,6 +27,9 @@ pub enum HeliosError {
     /// A serialized component named a kind this build does not know.
     #[error("unknown component kind {0:?}")]
     UnknownComponent(String),
+    /// The scene file's format is newer than this build reads.
+    #[error("{0}")]
+    Format(String),
 }
 
 impl HeliosError {

@@ -57,6 +57,15 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub struct Project {
     pub name: String,
     pub scene: Scene,
+    /// Where the scene lives, relative to the project directory.
+    ///
+    /// Remembered from the manifest rather than assumed, because `save` used to
+    /// write `scenes/main.ron` whatever it had loaded - so opening a project
+    /// whose scene lives anywhere else and pressing Save orphaned the original
+    /// file and left a second copy behind, with the manifest rewritten to point
+    /// at the new one. Latent only because the single project the editor can
+    /// open already says `scenes/main.ron`.
+    pub scene_path: String,
 }
 
 impl Project {
@@ -65,6 +74,7 @@ impl Project {
         Self {
             name: name.into(),
             scene,
+            scene_path: MAIN_SCENE.to_string(),
         }
     }
 
@@ -80,7 +90,7 @@ impl Project {
 
         let manifest = Manifest {
             name: self.name.clone(),
-            main_scene: MAIN_SCENE.to_string(),
+            main_scene: self.scene_path.clone(),
         };
         let manifest_text =
             toml::to_string_pretty(&manifest).map_err(|e| HeliosError::Manifest(e.to_string()))?;
@@ -88,7 +98,7 @@ impl Project {
         write_atomic(&manifest_path, manifest_text.as_bytes())
             .map_err(|e| HeliosError::io("writing", &manifest_path, e))?;
 
-        let scene_path = dir.join(MAIN_SCENE);
+        let scene_path = dir.join(&self.scene_path);
         if let Some(parent) = scene_path.parent() {
             fs::create_dir_all(parent).map_err(|e| HeliosError::io("creating", parent, e))?;
         }
@@ -112,6 +122,7 @@ impl Project {
         let scene = Scene::from_ron(&scene_text)?;
         Ok(Project {
             name: manifest.name,
+            scene_path: manifest.main_scene,
             scene,
         })
     }
@@ -179,5 +190,44 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn save_writes_back_to_the_scene_the_manifest_named() {
+        // `save` used to write `scenes/main.ron` whatever it had loaded, and
+        // rewrite the manifest to match - so opening a project whose scene
+        // lives anywhere else and pressing Save orphaned the original file and
+        // left a second copy behind.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir_all(dir.path().join("levels")).expect("the folder");
+        std::fs::write(
+            dir.path().join("orbit.toml"),
+            "name = \"Elsewhere\"\nmain_scene = \"levels/one.ron\"\n",
+        )
+        .expect("the manifest");
+        std::fs::write(
+            dir.path().join("levels/one.ron"),
+            Scene::new("root").to_ron().expect("ron"),
+        )
+        .expect("the scene");
+
+        let mut project = Project::load(dir.path()).expect("it loads");
+        assert_eq!(project.scene_path, "levels/one.ron");
+        project
+            .scene
+            .add_child(project.scene.root(), Node::new("added"));
+        project.save(dir.path()).expect("it saves");
+
+        assert!(
+            !dir.path().join("scenes/main.ron").exists(),
+            "no second copy was left behind"
+        );
+        let reloaded = Project::load(dir.path()).expect("it loads again");
+        assert_eq!(
+            reloaded.scene.len(),
+            2,
+            "and the edit landed in the right file"
+        );
+        assert_eq!(reloaded.scene_path, "levels/one.ron");
     }
 }

@@ -97,6 +97,37 @@ pub fn read() -> Option<Settings> {
     }
 }
 
+/// Write `bytes` to `path` without ever leaving it half-written: a temp sibling
+/// is written and flushed first, then renamed over the target.
+///
+/// A deliberate second copy of `helios::write_atomic`, not a shared one.
+/// spectrum cannot depend on helios - helios pulls in photon and wasmtime, and
+/// spectrum is the crate a theming tool links - and one shared function is not
+/// worth a crate of its own. It is eleven lines with no logic in them to drift;
+/// if a third caller appears, that is the moment to give it a home.
+///
+/// This file is the whole authored theme document, edited live by prism and
+/// hot-reloaded by mtime in atlas, so a crash or a full disk mid-write left a
+/// half-file that `read` rejects - and the editor then silently ran on defaults
+/// with the theme gone.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp = path.with_file_name(format!(".{name}.tmp"));
+    {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(err)
+        }
+    }
+}
+
 /// Write `settings` to the settings file (creating the config directory).
 pub fn save(settings: &Settings) -> std::io::Result<()> {
     let Some(path) = settings_path() else {
@@ -107,7 +138,7 @@ pub fn save(settings: &Settings) -> std::io::Result<()> {
     }
     let text = ron::ser::to_string_pretty(settings, ron::ser::PrettyConfig::default())
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(path, text)
+    write_atomic(&path, text.as_bytes())
 }
 
 #[cfg(test)]
