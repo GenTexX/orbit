@@ -4045,6 +4045,35 @@ mod tests {
         ui.handle_input(InputEvent::Scroll(96.0));
         assert_eq!(ui.vscroll_for_test(editor), 96.0);
 
+        // And the pane redraws lower down: the text and its line numbers both
+        // move, since the gutter is positioned from the same scrolled origin.
+        // A gutter that stayed put would look like the numbers had come off
+        // the lines.
+        let top_after = |ui: &Ui| {
+            ui.draw_list()
+                .commands
+                .iter()
+                .filter_map(|c| match c {
+                    aurora::DrawCommand::Text { glyphs, .. } => glyphs
+                        .iter()
+                        .map(|g| g.y)
+                        .fold(None, |acc: Option<f32>, y| {
+                            Some(acc.map_or(y, |a| a.min(y)))
+                        }),
+                    _ => None,
+                })
+                .fold(None, |acc: Option<f32>, y| {
+                    Some(acc.map_or(y, |a| a.min(y)))
+                })
+        };
+        let scrolled = top_after(&ui).expect("the pane draws text");
+        ui.handle_input(InputEvent::Scroll(-96.0));
+        let back = top_after(&ui).expect("still draws text");
+        assert!(
+            back > scrolled,
+            "scrolling back up moved the content down: {scrolled} -> {back}"
+        );
+
         // It stops at the end rather than scrolling into blank space.
         for _ in 0..500 {
             ui.handle_input(InputEvent::Scroll(96.0));
