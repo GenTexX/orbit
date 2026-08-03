@@ -13,6 +13,7 @@ mod file_ops;
 mod icons;
 mod modal;
 mod project;
+mod recovery;
 mod settings;
 mod textures;
 mod theme;
@@ -320,6 +321,9 @@ struct State {
     /// The history revision at the last save or load; the project has unsaved
     /// changes when it differs from the live `history.revision()`.
     saved_revision: u64,
+    /// The history revision the recovery snapshot was taken at, so a `Scene`
+    /// clone happens once per edit rather than once per frame.
+    recorded_revision: u64,
     /// The window title currently applied (set only on change, like the cursor).
     applied_title: String,
     /// The shared log ring shown in the Console pane (written by the tracing
@@ -1198,6 +1202,10 @@ impl State {
             .map(|b| gui.register_image_rgba_unmipped(&b.rgba, b.width, b.height));
 
         let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo_project");
+        // Before anything can fail: from here on a panic writes whatever has
+        // been recorded into <project>/.orbit/recovered/ rather than taking the
+        // session with it.
+        recovery::install(&project_dir);
         let project = project::open_or_create(&project_dir)?;
         // Decode the demo sprite once for its natural pixel size (the default
         // size for newly spawned sprites); its pixels load through the cache.
@@ -1324,6 +1332,7 @@ impl State {
             pointer_time: std::time::Duration::ZERO,
             applied_cursor: aurora::CursorHint::Default,
             saved_revision: 0,
+            recorded_revision: 0,
             applied_title: WINDOW_TITLE.to_string(),
             logs,
             last_log_gen: 0,
@@ -3570,6 +3579,20 @@ impl State {
         self.history.revision() != self.saved_revision
     }
 
+    /// Keep the recovery snapshot current: a `Scene` clone per undoable edit,
+    /// never per frame. Cheap because the revision only moves when something
+    /// was actually edited.
+    fn record_for_recovery(&mut self) {
+        let revision = self.history.revision();
+        if revision == self.recorded_revision {
+            return;
+        }
+        self.recorded_revision = revision;
+        if self.is_modified() {
+            recovery::record_scene(&self.project.scene);
+        }
+    }
+
     /// The current per-project editor state, for saving.
     fn editor_state(&self) -> editor_state::EditorState {
         let mut pane_scrolls: Vec<(dock::Pane, f32)> =
@@ -3634,6 +3657,8 @@ impl State {
         match self.project.save(&self.project_dir) {
             Ok(()) => {
                 self.saved_revision = self.history.revision();
+                // On disk now, so the file is the better copy.
+                recovery::forget_scene();
                 tracing::info!("project saved to {}", self.project_dir.display());
             }
             Err(err) => {
@@ -3969,6 +3994,7 @@ impl State {
         match write_atomic(&path, body.as_bytes()) {
             Ok(()) => {
                 self.script_modified = false;
+                recovery::forget_script();
                 // The file just changed, so what it exports may have too.
                 self.reconcile_script_exports();
                 self.dirty = true;
@@ -5639,6 +5665,9 @@ impl State {
             }
         }
         self.script_redo.clear();
+        if let Some(open) = &self.open_script {
+            recovery::record_script(open, &self.script_text);
+        }
         self.analyze_script();
         self.script_caret = self.ui.caret_offset().unwrap_or(self.script_text.len());
         if !self.script_modified {
@@ -5861,6 +5890,7 @@ impl State {
             self.sync_explorer_view();
         }
         self.update_file_tooltip();
+        self.record_for_recovery();
         let t_react = fstart.elapsed();
         let mut phase = std::time::Instant::now();
         // Whether this frame rebuilds the shell. The insertion-line overlay is
