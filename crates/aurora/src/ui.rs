@@ -203,6 +203,16 @@ pub struct Ui {
     /// and re-shaped it, on every frame, for a buffer that changes only when a
     /// line is added or removed.
     gutter_shaped: SecondaryMap<WidgetId, (usize, u32, Face)>,
+    /// The same for placeholders: the text, the size and the face. Without it
+    /// every layout re-shaped every empty input's placeholder, which the
+    /// re-shape counter could not see either.
+    ///
+    /// Deliberately not keyed on the field's width. A placeholder is one line
+    /// of hint text that is never wrapped, so a wider box does not change a
+    /// single glyph - and keying on width would re-shape every placeholder in
+    /// the editor on every splitter drag, which is exactly the cost this is
+    /// here to remove.
+    placeholder_shaped: SecondaryMap<WidgetId, (String, u32, Face)>,
     /// A shaped check-glyph buffer per checkbox (its main buffer holds the label
     /// caption instead), produced during measure and drawn when checked.
     check_buffers: SecondaryMap<WidgetId, Buffer>,
@@ -292,6 +302,7 @@ impl Ui {
             gutter_numbers: SecondaryMap::new(),
             gutter_widths: SecondaryMap::new(),
             gutter_shaped: SecondaryMap::new(),
+            placeholder_shaped: SecondaryMap::new(),
             check_buffers: SecondaryMap::new(),
             text_vscroll: SecondaryMap::new(),
             scroll_offsets: SecondaryMap::new(),
@@ -1221,7 +1232,7 @@ impl Ui {
         // Before measuring: the gutter's width depends only on the line count
         // and the font, but the text wraps into what is left of the box, so the
         // strip has to be sized first.
-        self.shape_gutters();
+        let gutter_shapes = self.shape_gutters();
 
         // Split the borrows so the measure closure can shape text (widgets +
         // buffers + font_system) while taffy computes layout.
@@ -1257,9 +1268,12 @@ impl Ui {
                 )
             },
         )?;
-        self.last_measure_count = reshapes;
-        // shape_placeholders and ellipsize below shape text too; they add to the
-        // count so it reflects all of layout's shaping work, not just measure's.
+        // Everything layout shapes, not just what `measure` shaped. The gutter
+        // and placeholder passes were left out, which is how a counter built to
+        // catch per-frame shaping came to read 0 while several milliseconds of
+        // it happened every frame - the exact failure it exists to prevent,
+        // committed by the instrument itself.
+        self.last_measure_count = reshapes + gutter_shapes;
 
         self.rects.clear();
         self.content_origin.clear();
@@ -1282,7 +1296,7 @@ impl Ui {
         }
         // Shape placeholder text now that fields have their widths (needed to
         // wrap), so emit can draw it while a field is empty.
-        self.shape_placeholders();
+        self.last_measure_count += self.shape_placeholders();
         // Now the focused field's width and caret x are known, so keep its caret
         // in view (scrolling long single-line content horizontally).
         self.update_hscroll();
@@ -1305,7 +1319,9 @@ impl Ui {
     /// One buffer rather than one per line: the numbers never wrap, so a
     /// multi-line buffer's runs line up with the numbers by index, and a file
     /// with a thousand lines costs one shape instead of a thousand.
-    fn shape_gutters(&mut self) {
+    /// Re-shape the line numbers of every gutter whose line count, size or face
+    /// changed, and count the work - see [`last_measure_count`].
+    fn shape_gutters(&mut self) -> u32 {
         let jobs: Vec<(WidgetId, String, f32, Face)> = self
             .widgets
             .iter()
@@ -1330,6 +1346,7 @@ impl Ui {
         let widths = &mut self.gutter_widths;
         let shaped = &mut self.gutter_shaped;
         let font_system = &mut self.font_system;
+        let mut reshaped = 0u32;
         for (id, numbers, font_size, face) in jobs {
             // Nothing about the numbers can change without one of these
             // changing, so a matching key means the buffer is already right.
@@ -1352,7 +1369,9 @@ impl Ui {
                 .map(|r| r.line_w)
                 .fold(0.0f32, f32::max);
             widths.insert(id, (widest + theme::GUTTER_PAD * 2.0).ceil());
+            reshaped += 1;
         }
+        reshaped
     }
 
     /// The logical line the cursor is over, if it is inside `id`'s gutter strip.
@@ -1384,7 +1403,8 @@ impl Ui {
         self.gutter_widths.get(id).copied().unwrap_or(0.0)
     }
 
-    fn shape_placeholders(&mut self) {
+    /// Shape the placeholder of every empty input, and count the work.
+    fn shape_placeholders(&mut self) -> u32 {
         // Collect the work first (text + field width), then split the buffer and
         // font-system borrows to shape - the same borrow dance as layout().
         let jobs: Vec<(WidgetId, String, f32, f32, Face)> = self
@@ -1404,8 +1424,15 @@ impl Ui {
             })
             .collect();
         let buffers = &mut self.placeholder_buffers;
+        let shaped = &mut self.placeholder_shaped;
         let font_system = &mut self.font_system;
+        let mut reshaped = 0u32;
         for (id, text, width, font_size, face) in jobs {
+            let key = (text.clone(), font_size.to_bits(), face);
+            if shaped.get(id) == Some(&key) && buffers.contains_key(id) {
+                continue;
+            }
+            shaped.insert(id, key);
             let metrics = text::metrics_for(font_size);
             if !buffers.contains_key(id) {
                 buffers.insert(id, Buffer::new(font_system, metrics));
@@ -1415,7 +1442,9 @@ impl Ui {
             borrowed.set_size(Some(width.max(1.0)), None);
             borrowed.set_text(&text, &text::attrs_for(face), Shaping::Advanced, None);
             borrowed.shape_until_scroll(false);
+            reshaped += 1;
         }
+        reshaped
     }
 
     /// Truncate the text of any ellipsis widget whose (already shaped) text is
@@ -2070,9 +2099,12 @@ impl Ui {
     /// large count means shaping work is being repeated (e.g. the shape cache is
     /// being defeated, or many strings genuinely changed).
     ///
-    /// Counts every shape layout performs, including the ones `ellipsize` does
-    /// while fitting truncated text - those are just as expensive, and leaving
-    /// them out once hid a resize regression from the tests that watch this.
+    /// Counts every shape layout performs: `measure`'s, `ellipsize`'s while
+    /// fitting truncated text, the gutter's line numbers, and an empty input's
+    /// placeholder. Leaving any of them out defeats the whole point - the
+    /// ellipsize omission once hid a resize regression, and the gutter omission
+    /// hid several milliseconds of per-frame shaping until it was measured by
+    /// hand.
     pub fn last_measure_count(&self) -> u32 {
         self.last_measure_count
     }
@@ -8291,6 +8323,43 @@ three",
 
         assert_eq!(ui.drain_events(), vec![Event::Submitted(first)]);
         assert_eq!(ui.focused(), Some(second)); // advanced to the next field
+    }
+
+    #[test]
+    fn the_reshape_counter_sees_the_gutter_and_the_placeholder_too() {
+        // It did not, so it read 0 while shape_gutters re-shaped every line
+        // number on every layout - a counter built to catch per-frame shaping,
+        // blind to the largest per-frame shaping in the crate.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(600.0, 400.0));
+        ui.text_input(
+            root,
+            (0..50).map(|i| format!("line {i}\n")).collect::<String>(),
+            Style::new()
+                .size(500.0, 300.0)
+                .multiline()
+                .monospace()
+                .gutter(),
+        );
+        ui.text_input(
+            root,
+            String::new(),
+            Style::new().size(200.0, 24.0).placeholder("type here"),
+        );
+        ui.layout(Vec2::new(600.0, 400.0)).unwrap();
+        let first = ui.last_measure_count();
+        assert!(
+            first >= 2,
+            "the gutter and the placeholder are in it: {first}"
+        );
+
+        // And a second layout with nothing changed re-shapes neither.
+        ui.layout(Vec2::new(600.0, 400.0)).unwrap();
+        assert!(
+            ui.last_measure_count() < first,
+            "nothing changed, so less work: {} vs {first}",
+            ui.last_measure_count()
+        );
     }
 
     #[test]
