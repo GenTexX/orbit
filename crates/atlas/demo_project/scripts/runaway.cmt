@@ -1,0 +1,55 @@
+// This file is wrong on purpose, like squiggles.cmt - but these mistakes
+// compile. They only go wrong when the game runs, which is the harder half to
+// learn, because the compiler cannot help you.
+//
+// Attach this to a node, press Play, and uncomment one line at a time. The
+// engine stops the script and says what happened; the game keeps running, and
+// the other scripts in the scene carry on.
+
+let ticks = 0;
+
+func update(dt: f32) {
+    ticks = ticks + 1;
+
+    // 1. A loop with no way out.
+    //
+    // `while` is the only loop, and forgetting to move the condition along is
+    // one keystroke. Without a guard this would hang the editor, because the
+    // game runs in the editor's own process - so a call that takes longer than
+    // 100ms is stopped and the script is switched off.
+    //
+    //     while true { }
+
+    // 2. Asking for memory until there is none.
+    //
+    // Doubling a string reaches the 16MB ceiling in about two dozen steps.
+    // Without a limit this would grow until the machine gave up, and take
+    // whatever else was running with it.
+    //
+    //     let text = "x";
+    //     while true { text = text + text; }
+
+    // 3. Reading past the end of an array.
+    //
+    // Indexing is one character and traps if the position is not there. `get`
+    // is the version that cannot: it hands back an `Option` and makes you say
+    // what happens when there is nothing.
+    //
+    //     let scores = [10.0, 20.0];
+    //     print(str(scores[5]));
+
+    // 4. A function that calls itself with no way to stop.
+    //
+    // Nothing in this language recurses by accident, so if the stack runs out,
+    // a function is calling itself.
+    //
+    //     print(str(deeper(0.0)));
+
+    // A script that has been stopped is not called again - so this line stops
+    // counting the moment one of the above fires, which is how you can tell.
+    print("tick " + str(ticks));
+}
+
+func deeper(n: f32) -> f32 {
+    deeper(n + 1.0)
+}

@@ -17,11 +17,11 @@ The per-frame list of high-level drawing commands (filled rects, text runs, clip
 _Avoid_: render list, command buffer
 
 **Comet**:
-The scripting language: statically typed, garbage-collected, compiled to WASM. Script source files use the .cmt extension.
+The scripting language: statically typed, reference-counted, compiled to WASM. Reference counting rather than a collector was chosen in ADR 0007, which accepts that reference cycles leak. Script source files use the .cmt extension.
 _Avoid_: the scripting language (in docs), orbit-script
 
 **Photon**:
-The 2D drawing crate - sprites, shapes, text, render targets - and the engine's renderer. It touches wgpu, as do the GUI's backend (aurora-wgpu) and the editor's shared GPU bootstrap (ADR 0018); wgpu stays out of the engine and model logic.
+The 2D drawing crate - textured sprites and render targets today; shapes and text are wanted and not built - and the engine's renderer. It touches wgpu, as do the GUI's backend (aurora-wgpu) and the editor's shared GPU bootstrap (ADR 0018); wgpu stays out of the engine and model logic.
 _Avoid_: the renderer (as a proper name), orbit-renderer
 
 **Helios**:
