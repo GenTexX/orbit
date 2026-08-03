@@ -146,6 +146,7 @@ fn doc_to_transform(d: &TransformDoc) -> Transform {
 #[cfg(test)]
 mod tests {
     use crate::component::{Component, ScriptComponent, SpriteComponent};
+    use crate::reflect::Value;
     use crate::scene::{Node, Scene};
     use crate::transform::Transform;
     use glam::Vec2;
@@ -162,8 +163,17 @@ mod tests {
             size: Vec2::new(32.0, 48.0),
         };
         player.components.push(Component::Sprite(sprite));
+        // Tuned exported values, deliberately: a Script whose `exports` is empty
+        // is the one shape where a broken load path is a no-op, and this fixture
+        // used to have exactly that - so every serialization test passed while
+        // every tuned value in a real project was being dropped on load.
         player.components.push(Component::Script(ScriptComponent {
             source: "scripts/player.cmt".into(),
+            exports: vec![
+                ("speed".to_string(), Value::F32(240.0)),
+                ("home".to_string(), Value::Vec2(Vec2::new(12.0, -3.0))),
+                ("chases".to_string(), Value::Bool(true)),
+            ],
             ..Default::default()
         }));
         let player = scene.add_child(root, player);
@@ -208,6 +218,16 @@ mod tests {
             panic!("the test saved a script after the sprite");
         };
         assert_eq!(script.source, "scripts/player.cmt");
+        // The tuning, which is the whole point of an exported variable: what
+        // the inspector owns has to be what comes back (ADR 0022).
+        assert_eq!(
+            script.exports,
+            vec![
+                ("speed".to_string(), Value::F32(240.0)),
+                ("home".to_string(), Value::Vec2(Vec2::new(12.0, -3.0))),
+                ("chases".to_string(), Value::Bool(true)),
+            ]
+        );
     }
 
     #[test]

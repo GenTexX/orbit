@@ -142,9 +142,6 @@ impl ScriptComponent {
     /// now declares: keep what is still there and still the right type, drop
     /// what is gone, and add what is new at its default.
     ///
-    /// Keeping by name and type is what makes an edit to the source preserve
-    /// tuning - the migration ADR 0008 describes, in the one place a script's
-    /// fields can change without the component being touched.
     /// How the script asked for `field` to be shown.
     pub fn hints_for(&self, field: &str) -> &[comet::Hint] {
         self.hints
@@ -153,6 +150,13 @@ impl ScriptComponent {
             .map_or(&[], |(_, hints)| hints.as_slice())
     }
 
+    /// Bring the stored values into line with what `declared` says the script
+    /// now exports: keep what is still there and still the right type, drop
+    /// what is gone, and add what is new at its default.
+    ///
+    /// Keeping by name and type is what makes an edit to the source preserve
+    /// tuning - the migration ADR 0008 describes, in the one place a script's
+    /// fields can change without the component being touched.
     pub fn reconcile(&mut self, declared: &[(String, Value)]) {
         let mut next = Vec::with_capacity(declared.len());
         for (name, default) in declared {
@@ -199,7 +203,13 @@ impl Reflect for ScriptComponent {
     }
 
     fn set(&mut self, field: &str, value: Value) -> bool {
-        if let ("source", Value::Asset(s)) = (field, &value) {
+        // `source` is a real field of a fixed type, so a mismatch is refused
+        // rather than falling through to the declare-on-write path below - a
+        // script does not get to export a variable called `source`.
+        if field == "source" {
+            let Value::Asset(s) = &value else {
+                return false;
+            };
             self.source = s.clone();
             return true;
         }
@@ -207,12 +217,26 @@ impl Reflect for ScriptComponent {
         // stored value from an older version of the script must not be written
         // back into a field that has since changed type.
         for (name, held) in &mut self.exports {
-            if name == field && std::mem::discriminant(held) == std::mem::discriminant(&value) {
+            if name == field {
+                if std::mem::discriminant(held) != std::mem::discriminant(&value) {
+                    return false;
+                }
                 *held = value;
                 return true;
             }
         }
-        false
+        // A name this component has never held is *declared* by writing it.
+        //
+        // Every other component has a fixed field set, so `set` on an unknown
+        // name is a mistake; this one's fields are whatever its script exports,
+        // and the serializer rebuilds a component from `from_type_name` - an
+        // empty one - before replaying what it read. Refusing here meant every
+        // tuned value in a scene file was silently dropped at load and the
+        // field came back at its type default, which is the opposite of what
+        // ADR 0022 promises. Nothing bogus survives: `reconcile` runs against
+        // the source afterwards and drops any name the script does not declare.
+        self.exports.push((field.to_string(), value));
+        true
     }
 }
 
@@ -233,8 +257,35 @@ mod tests {
             Some(Value::Asset("scripts/bounce.cmt".into()))
         );
 
+        // `source` has a fixed type, so a mismatch is refused.
         assert!(!script.set("source", Value::Str("not an asset".into())));
-        assert!(!script.set("nope", Value::Bool(true)));
+        assert_eq!(
+            script.get("source"),
+            Some(Value::Asset("scripts/bounce.cmt".into()))
+        );
+    }
+
+    #[test]
+    fn an_exported_name_this_component_never_held_is_declared_by_writing_it() {
+        // This is what a load does: the serializer rebuilds an empty component
+        // and replays the fields it read. Refusing an unknown name meant every
+        // tuned value in a scene file was dropped and came back at its default.
+        let mut script = ScriptComponent::default();
+        assert!(script.set("speed", Value::F32(240.0)));
+        assert_eq!(script.get("speed"), Some(Value::F32(240.0)));
+        assert_eq!(script.field_names(), &["source", "speed"]);
+
+        // A second write to a name it now holds still goes through the
+        // type guard: same type overwrites, a different one is refused.
+        assert!(script.set("speed", Value::F32(12.0)));
+        assert!(!script.set("speed", Value::Bool(true)));
+        assert_eq!(script.get("speed"), Some(Value::F32(12.0)));
+
+        // And a name the script does not declare does not survive reconcile,
+        // which is what keeps a stale scene file from accumulating fields.
+        script.reconcile(&[("speed".to_string(), Value::F32(0.0))]);
+        assert_eq!(script.field_names(), &["source", "speed"]);
+        assert_eq!(script.get("speed"), Some(Value::F32(12.0)), "tuning kept");
     }
 
     #[test]
