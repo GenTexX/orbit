@@ -401,6 +401,12 @@ struct State {
     panning: bool,
     /// The last cursor position, in window pixels.
     cursor: Vec2,
+    /// The one pane filling the window, if any (F11).
+    ///
+    /// Session-only, deliberately not in `editor.ron`: maximizing is "let me
+    /// look at this closely for a moment", and coming back to a project to find
+    /// one pane and no obvious way out of it is a bad way to be greeted.
+    maximized: Option<dock::Pane>,
     /// The open script and selection as of the last editor-state save, so a
     /// change to either can be noticed without a flag at every call site.
     saved_session: (Option<String>, Vec<NodeId>),
@@ -1249,6 +1255,7 @@ impl State {
             drag: None,
             panning: false,
             cursor: Vec2::ZERO,
+            maximized: None,
             saved_session: (None, Vec::new()),
             scale,
             modifiers: ModifiersState::default(),
@@ -1357,6 +1364,40 @@ impl State {
         self.code.script_orphaned = false;
         self.adopt_open_script();
         self.dirty = true;
+    }
+
+    /// Fill the window with the pane under the pointer, or put the layout back.
+    ///
+    /// Under the *pointer*, not "the focused pane": most panes here never take
+    /// keyboard focus, so a focus-based version would do nothing for the
+    /// viewport and the scene tree - which are the two you most want to look at
+    /// closely.
+    fn toggle_maximized(&mut self) {
+        if self.maximized.take().is_some() {
+            self.dirty = true;
+            return;
+        }
+        let Some(pane) = self.pane_at(self.cursor) else {
+            self.note("Point at a pane to maximize it");
+            return;
+        };
+        self.maximized = Some(pane);
+        self.note(format!("{} maximized - F11 to restore", pane.title()));
+        self.dirty = true;
+    }
+
+    /// The pane whose body covers `point`.
+    fn pane_at(&self, point: Vec2) -> Option<dock::Pane> {
+        self.rows
+            .dock_groups
+            .iter()
+            .find(|(id, _)| self.ui.rect(*id).is_some_and(|r| r.contains(point)))
+            .map(|&(_, pane)| pane)
+    }
+
+    /// The dock layout to build this frame (see [`dock::shown`]).
+    fn shown_dock(&self) -> DockNode {
+        dock::shown(&self.dock, self.maximized)
     }
 
     /// Take a new display scale, rebuilding the shell at the new size.
@@ -2802,6 +2843,12 @@ impl State {
     /// Start a tab reorder drag if the press landed on a tab. Returns whether
     /// it did, so the caller can let the press fall through otherwise.
     fn press_tab_bar(&mut self) -> bool {
+        // The bar shown while a pane is maximized belongs to a layout that does
+        // not exist: one leaf, one tab. Dragging that tab would drop against the
+        // real dock using rows measured from the fake one.
+        if self.maximized.is_some() {
+            return false;
+        }
         let cursor = self.cursor;
         self.tab_bars
             .resize_with(self.rows.dock_tab_bars.len(), Default::default);
@@ -3538,6 +3585,15 @@ impl State {
             // is the most frequent action in any edit-run loop and used to cost
             // two of each, and it is the only escape hatch a trapped script has
             // short of stopping the whole session.
+            // F11: the pane under the pointer fills the window, and again puts
+            // it back. Named rather than a ctrl chord because ctrl+m is already
+            // "jump to the matching bracket" in the Code pane, and a shortcut
+            // that means two things depending on focus is worse than a spare
+            // function key.
+            NamedKey::F11 => {
+                self.toggle_maximized();
+                true
+            }
             NamedKey::F5 if self.modifiers.shift_key() => {
                 self.restart_play();
                 true
@@ -6472,6 +6528,16 @@ impl State {
     /// rebuild restores them. Called each frame after layout, when the Ui and
     /// dock structure are guaranteed to match.
     fn sync_dock_state(&mut self) {
+        // What is on screen while a pane is maximized is not the layout being
+        // edited: it has no splitters, and only one pane's scroll to read. Read
+        // back from it and the real dock's sizes go to their minimum and every
+        // other pane's scroll position is lost - restoring would give you the
+        // right panes at the wrong sizes, scrolled to the top.
+        if self.maximized.is_some() {
+            let shown = capture_dock_scrolls(&self.ui, &self.rows);
+            self.pane_scrolls.extend(shown);
+            return;
+        }
         let sizes = capture_dock_sizes(&self.ui, &self.rows);
         self.dock.set_fixed_sizes(&sizes);
         self.pane_scrolls = capture_dock_scrolls(&self.ui, &self.rows);
@@ -6716,13 +6782,16 @@ impl State {
             // While a tab is being carried out of its bar, the shell is built
             // as if that pane were already removed - the real dock is untouched,
             // so abandoning the drag simply restores it.
+            //
+            // Maximizing is the same trick: the shell is built from a
+            // one-pane layout while the real dock sits untouched, so putting it
+            // back is forgetting a flag rather than reconstructing a tree.
             let dock_view = match self.carrying {
                 Some(pane) => self
-                    .dock
-                    .clone()
+                    .shown_dock()
                     .remove_pane(pane)
-                    .unwrap_or_else(|| self.dock.clone()),
-                None => self.dock.clone(),
+                    .unwrap_or_else(|| self.shown_dock()),
+                None => self.shown_dock(),
             };
             let logs: Vec<console::LogLine> = {
                 let ring = self.logs.lock().expect("log ring not poisoned");

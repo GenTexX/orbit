@@ -155,7 +155,7 @@ impl DockNode {
     }
 
     /// Every pane in the tree, in order (may contain duplicates if malformed).
-    fn flat_panes(&self) -> Vec<Pane> {
+    pub(crate) fn flat_panes(&self) -> Vec<Pane> {
         let mut out = Vec::new();
         fn walk(node: &DockNode, out: &mut Vec<Pane>) {
             match node {
@@ -406,8 +406,45 @@ impl DockNode {
     }
 }
 
+/// The layout to *show*: one pane filling the window while something is
+/// maximized, the real one otherwise.
+///
+/// A view over the dock rather than an edit to it, so restoring is forgetting a
+/// flag instead of reconstructing a tree - which is the only way a maximize can
+/// be guaranteed to put back exactly what was there.
+///
+/// A pane the dock does not contain falls back to the whole layout. Nothing can
+/// reach that state today (every pane is always somewhere), but the failure it
+/// prevents - a window showing one pane that is not in the layout, with no way
+/// back to the rest - is not one to leave to a future edit.
+pub fn shown(dock: &DockNode, maximized: Option<Pane>) -> DockNode {
+    match maximized {
+        Some(pane) if dock.flat_panes().contains(&pane) => DockNode::leaf(pane),
+        _ => dock.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn maximizing_shows_one_pane_without_touching_the_layout() {
+        let dock = DockNode::default_layout();
+        assert_eq!(shown(&dock, None), dock);
+
+        let one = shown(&dock, Some(Pane::Viewport));
+        assert_eq!(one.flat_panes(), vec![Pane::Viewport]);
+        // The real layout is untouched, which is what makes restoring exact.
+        assert!(dock.is_complete());
+    }
+
+    #[test]
+    fn maximizing_a_pane_that_is_not_in_the_layout_shows_the_layout() {
+        // A window showing one pane that is not in the dock has no way back to
+        // the rest of them.
+        let dock = DockNode::leaf(Pane::Viewport);
+        assert_eq!(shown(&dock, Some(Pane::Console)), dock);
+    }
     use super::*;
 
     #[test]

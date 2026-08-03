@@ -105,6 +105,8 @@ shows a value the script drives without letting you change it.
 An exported variable carries no initializer - writing one would be a second
 answer to the same question, and the compiler says so.
 
+**F11** fills the window with the pane under the pointer, and puts it back.
+
 ## Playing
 
 **F5** starts the game, **F5** again stops it, **shift+F5** restarts. The
