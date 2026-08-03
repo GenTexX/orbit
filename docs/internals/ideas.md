@@ -12,35 +12,45 @@ remembers); when one dies, delete it too.
 
 Seeded after M3 (2026-07-23), swept on 2026-07-28, swept again on 2026-07-30
 after the six iteration-phase reports (3.1-3.6) were written - the writing
-itself was an audit - and swept on 2026-07-31 when M4 shipped, which retired
-the whole "Toward Comet" section by building all six of its entries.
+itself was an audit - swept on 2026-07-31 when M4 shipped, which retired the
+whole "Toward Comet" section by building all six of its entries, and swept on
+2026-08-03 after the whole-project review
+([review-2026-08-03.md](review-2026-08-03.md)), which is the same kind of audit
+by other means.
 
 ## Where the project actually stands
 
 Worth stating plainly, because it should steer what we pick next.
 
-The editor and the GUI framework are the mature part of Orbit: atlas is
-~13k lines and aurora ~7.5k, against ~1.9k for helios and ~1.6k for photon -
-roughly six times as much authoring tool as engine. `comet` and `voyager` are
-still one-line stubs. Concretely, that means:
+The editor and the GUI framework are the mature part of Orbit: atlas is ~18k
+lines and aurora ~13k, against ~3.7k for helios and ~1.7k for photon. `comet` is
+~16k and is no longer anywhere near a stub - the language is complete through
+containers and annotations. `voyager` still is one: six lines, an empty
+dependency list, and the thing M5 is supposed to bring online.
 
-- **helios has two components: `Sprite` and `Script`.** M4 added the second,
-  which is what finally makes an Add/Remove Component UI worth building - and
-  it arrived with the history edits (`add_component`/`remove_component`) that
-  such a UI needs. A third kind is still the thing that would prove the model.
+The ratio understates it rather than overstating it. Of helios, `command.rs` is
+an authoring subsystem a shipped game will link and never call, and `script.rs`
+is the host; the actual scene-and-component engine is about a thousand lines.
+Concretely:
+
+- **helios has two components: `Sprite` and `Script`.** A third kind is still
+  the thing that would prove the model, and M5 needs a specific one - a Camera,
+  so the running game has a view that is not the editor's pan and zoom.
 - **photon draws exactly one thing: textured quads.** The editor's grid, axes,
   and gizmos are all faked with sprites (`grid_sprites`, `gizmo_sprites`).
   There are no line, circle, or arc primitives, and no world-space text.
-- **There is no input abstraction in the engine**, so nothing can be played
-  even in principle. M4 got as far as a script moving a node from a test;
-  nothing calls it per frame, which is M5's job.
+- **There is no input abstraction in the engine**, so nothing can be played even
+  in principle - and atlas has never observed a key *release*, so it cannot
+  answer "is left held now" about any key. Both are M5's.
+- **Nothing in the editor has ever run a script.** `helios::ScriptHost` appears
+  nowhere in atlas: comet is used there only for the language service. M5 is an
+  integration from zero, not a wiring-up - though a smaller one than that
+  sounds, because the frame loop already computes a clamped `dt` and re-reads
+  the scene every frame with no Ui rebuild.
 
-So the next few bundles have a choice to make: keep polishing the authoring
-experience, or start giving the engine something worth authoring. The scene
-you can edit so nicely is still, today, a pile of static sprites - but as of
-M4 one of them can be handed a script that provably moves it, and the only
-missing piece between here and watching that happen is something calling
-`update` once a frame.
+So the choice the next bundles face is unchanged, and sharper: keep polishing
+the authoring experience, or give the engine something worth authoring. The
+scene you can edit so nicely is still a pile of static sprites.
 
 ## Engine (helios / photon)
 
@@ -221,9 +231,9 @@ missing:
 
 ## Editor: scene editing
 
-- **Add/remove components UI** - an "Add Component" picker and a per-component
-  remove button. Blocked on there being more than one component to add (see
-  Engine) and on the dropdown widget; unblocks itself the moment both land.
+- **Add Component picker.** The per-component remove "x" shipped; adding is the
+  remaining half, and it wants the closed-set `select` control aurora does not
+  have yet plus a second component kind worth adding (see Engine).
 - **Node lock** (excluded from picking and dragging). The visibility eye
   shipped; lock is the remaining half.
 - **Sibling order controls**: explicit move-up/move-down. Drag-to-reorder works
@@ -256,9 +266,11 @@ missing:
 
 ## Editor: shell and workflow
 
-- **Confirm-on-quit when dirty.** The unsaved indicator and the modal system
-  both shipped; `CloseRequested` still exits immediately, so unsaved work is
-  one stray click from gone. Small, and the most likely to actually bite.
+- **A recovery file is not a save.** The panic hook writes the open buffer and
+  the scene to `.orbit/recovered/` when the editor dies, which is a floor rather
+  than a feature: nothing offers to restore from it on the next launch, and
+  nothing cleans it up. An actual autosave, and an offer to reopen what was
+  recovered, is the next step.
 - **New/Open project**: still hardwired to demo_project. Needs a native file
   dialog (the rfd crate) or an own popup browser.
 - **Scene tabs / multiple open scenes.** The dock handles tabs and rearranging
