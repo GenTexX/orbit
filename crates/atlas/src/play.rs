@@ -117,6 +117,13 @@ impl Play {
             .unwrap_or_default()
     }
 
+    /// Swap in the current contents of `path` under every instance running it.
+    pub fn reload(&mut self, scene: &mut Scene, path: &std::path::Path) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.reload(scene, path);
+        }
+    }
+
     /// Take what the running scripts printed, each line tagged with which
     /// script printed it.
     pub fn take_output(&mut self) -> Vec<String> {

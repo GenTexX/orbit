@@ -170,6 +170,27 @@ fn budget_ticks() -> u64 {
 /// was doing.
 pub const MAX_SCRIPT_MEMORY: usize = comet::MAX_PAGES as usize * 64 * 1024;
 
+/// Whether a script being brought up is starting or being swapped in under a
+/// game that is already running.
+///
+/// The difference is one call, and it is ADR 0008's, amended when hot reload was
+/// designed: a reload does not re-run `start`. A script whose `start` places the
+/// node - which is what `start` is for - would teleport it back to its opening
+/// position on every save, and the person watching would conclude that saving
+/// resets the game.
+///
+/// The state a `start` would have set is not recovered. A reloaded script begins
+/// its first frame with its declarations at their initializers and its exported
+/// variables at what the component holds (ADR 0022), which is the same thing a
+/// reload preserves everywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Begin {
+    /// Run `start()` before the first frame.
+    Fresh,
+    /// Skip it: something was already running here.
+    Reload,
+}
+
 /// The engine and compiled-module cache shared by every script in a project.
 ///
 /// One of these per editor or game: an [`Engine`] is expensive to build and
@@ -268,7 +289,7 @@ impl ScriptHost {
         exports: &[(String, Value)],
     ) -> Result<ScriptInstance, ScriptError> {
         let module = self.compile(source)?;
-        self.start(&module, scene, node, exports)
+        self.start(&module, scene, node, exports, Begin::Fresh)
     }
 
     /// The same, reading the source from `path`. A path compiled before reuses
@@ -280,6 +301,7 @@ impl ScriptHost {
         scene: &mut Scene,
         node: NodeId,
         exports: &[(String, Value)],
+        begin: Begin,
     ) -> Result<ScriptInstance, ScriptError> {
         if !self.modules.contains_key(path) {
             let source = std::fs::read_to_string(path).map_err(|source| ScriptError::Io {
@@ -290,7 +312,7 @@ impl ScriptHost {
             self.modules.insert(path.to_path_buf(), module);
         }
         let module = self.modules[path].clone();
-        let mut instance = self.start(&module, scene, node, exports)?;
+        let mut instance = self.start(&module, scene, node, exports, begin)?;
         instance.set_label(path.display().to_string());
         Ok(instance)
     }
@@ -312,6 +334,7 @@ impl ScriptHost {
         scene: &mut Scene,
         node: NodeId,
         exports: &[(String, Value)],
+        begin: Begin,
     ) -> Result<ScriptInstance, ScriptError> {
         let mut store = Store::new(
             &self.engine,
@@ -354,7 +377,9 @@ impl ScriptHost {
         // otherwise hang the editor at the moment a script is attached, which
         // is worse than hanging it at Play - the user has not pressed anything
         // yet.
-        if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, START) {
+        if begin == Begin::Fresh
+            && let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, START)
+        {
             store.set_epoch_deadline(budget_ticks());
             start.call(&mut store, ()).map_err(ScriptError::trap)?;
         }
@@ -1343,7 +1368,13 @@ mod tests {
         let mut host = ScriptHost::new().unwrap();
         let (mut scene, node) = scene_with_node(Vec2::ZERO);
         let err = host
-            .instantiate_file(Path::new("/nowhere/missing.cmt"), &mut scene, node, &[])
+            .instantiate_file(
+                Path::new("/nowhere/missing.cmt"),
+                &mut scene,
+                node,
+                &[],
+                Begin::Fresh,
+            )
             .expect_err("no such file");
         assert!(matches!(err, ScriptError::Io { .. }));
         assert!(err.to_string().contains("missing.cmt"));
@@ -1363,14 +1394,18 @@ mod tests {
         let a = scene.add_child(root, Node::new("a"));
         let b = scene.add_child(root, Node::new("b"));
 
-        let mut script_a = host.instantiate_file(&path, &mut scene, a, &[]).unwrap();
-        let mut script_b = host.instantiate_file(&path, &mut scene, b, &[]).unwrap();
+        let mut script_a = host
+            .instantiate_file(&path, &mut scene, a, &[], Begin::Fresh)
+            .unwrap();
+        let mut script_b = host
+            .instantiate_file(&path, &mut scene, b, &[], Begin::Fresh)
+            .unwrap();
 
         // Deleting the file after the first read proves the second instance came
         // from the cache rather than reading it again.
         std::fs::remove_file(&path).unwrap();
         let mut script_c = host
-            .instantiate_file(&path, &mut scene, a, &[])
+            .instantiate_file(&path, &mut scene, a, &[], Begin::Fresh)
             .expect("the module was cached");
 
         // Each instance keeps its own state: stepping one does not move another.
@@ -1384,7 +1419,7 @@ mod tests {
         script_c.update(&mut scene, a, 0.0).unwrap();
         host.forget(&path);
         assert!(matches!(
-            host.instantiate_file(&path, &mut scene, a, &[]),
+            host.instantiate_file(&path, &mut scene, a, &[], Begin::Fresh),
             Err(ScriptError::Io { .. })
         ));
     }

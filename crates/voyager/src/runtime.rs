@@ -13,11 +13,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use helios::{Component, Input, NodeId, Scene, ScriptError, ScriptHost, ScriptInstance, Value};
+use helios::{
+    Begin, Component, Input, NodeId, Scene, ScriptError, ScriptHost, ScriptInstance, Value,
+};
 
 /// One script instance, and the address in the scene it belongs to.
 struct Running {
     node: NodeId,
+    /// The resolved path this instance was compiled from. Kept so a saved file
+    /// can find the instances running it without re-reading the scene, which
+    /// may have been re-pointed at another script since.
+    source: PathBuf,
     /// Which of the node's components this instance is running for.
     ///
     /// A node may carry several scripts, so the node alone does not identify an
@@ -133,6 +139,16 @@ impl Runtime {
         node: NodeId,
         component: usize,
     ) -> Result<(), ScriptError> {
+        self.bring_up(scene, node, component, Begin::Fresh)
+    }
+
+    fn bring_up(
+        &mut self,
+        scene: &mut Scene,
+        node: NodeId,
+        component: usize,
+        begin: Begin,
+    ) -> Result<(), ScriptError> {
         let Some(Component::Script(script)) = scene.node(node).components.get(component) else {
             return Ok(());
         };
@@ -144,13 +160,16 @@ impl Runtime {
         let path = self.root.join(&script.source);
         let exports = script.exports.clone();
 
-        let instance = self.host.instantiate_file(&path, scene, node, &exports)?;
+        let instance = self
+            .host
+            .instantiate_file(&path, scene, node, &exports, begin)?;
         // Watched next to the instance it belongs to. A path with nothing
         // running has nothing to reload, so an entry for one would be an entry
         // nobody could act on.
         self.watched.insert(path.clone(), modified(&path));
         let slot = Running {
             node,
+            source: path,
             component,
             script: instance,
         };
@@ -241,6 +260,48 @@ impl Runtime {
         // same reload twice.
         changed.sort();
         changed
+    }
+
+    /// Swap in the current contents of `path` under every instance running it.
+    ///
+    /// The four steps are the whole of hot reload: forget the compiled module so
+    /// the file is read again, recompile it, instantiate with the values the
+    /// component holds, and put the new instance in the old one's place.
+    ///
+    /// **A source that no longer compiles leaves the old instance running** and
+    /// reports. That is the decision the rest of this is arranged around: saving
+    /// a file mid-thought is how people work, and a game that stops dead on a
+    /// half-typed line is a game nobody can iterate on. The old module stays
+    /// alive because the running instance holds it, so the game keeps playing
+    /// the last version that worked until one compiles again.
+    ///
+    /// **`start` does not run** (see [`Begin`]). A script whose `start` places
+    /// its node would teleport it back on every save.
+    ///
+    /// **The component's values win, not the running module's.** ADR 0022 makes
+    /// the component the owner; a script that has been assigning to its own
+    /// exported variable loses what it made of them. That is written down rather
+    /// than discovered - it is the same rule the inspector follows everywhere
+    /// else, and the alternative is a reload that quietly disagrees with the
+    /// panel next to it.
+    ///
+    /// The instance keeps its position in the update order, because
+    /// [`attach`](Self::attach) replaces in place.
+    pub fn reload(&mut self, scene: &mut Scene, path: &Path) {
+        // Forgotten first, so the recompile below reads the file rather than
+        // the module cached from before the save.
+        self.host.forget(path);
+        let targets: Vec<(NodeId, usize)> = self
+            .running
+            .iter()
+            .filter(|running| running.source == path)
+            .map(|running| (running.node, running.component))
+            .collect();
+        for (node, component) in targets {
+            if let Err(err) = self.bring_up(scene, node, component, Begin::Reload) {
+                self.problems.push(format!("[{}] {err}", path.display()));
+            }
+        }
     }
 
     /// Take what has gone wrong since this was last called.
@@ -1046,5 +1107,165 @@ mod tests {
             runtime.changed_sources().is_empty(),
             "nothing is running, so nothing is watching"
         );
+    }
+
+    #[test]
+    fn a_saved_script_swaps_in_under_the_running_game() {
+        // The milestone's second half in one test: change the file, and what
+        // the game does changes, without restarting it.
+        let (dir, mut scene, node) =
+            project("func update(dt: f32) { transform.position.x += 1.0; }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, node), 1.0);
+
+        rewrite(
+            dir.path(),
+            "script.cmt",
+            "func update(dt: f32) { transform.position.x += 100.0; }",
+        );
+        for path in runtime.changed_sources() {
+            runtime.reload(&mut scene, &path);
+        }
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, node), 101.0, "the new version is what ran");
+        assert!(runtime.take_problems().is_empty());
+    }
+
+    #[test]
+    fn a_reload_does_not_re_run_start() {
+        // ADR 0008, amended when this was designed. A script whose `start`
+        // places its node would teleport it back on every save, and the person
+        // watching would conclude that saving resets the game.
+        // `start` places the node, which is what `start` is for. If a reload
+        // ran it, the sprite would jump back to 100 every time the file was
+        // saved - and a save is not a request to restart the level.
+        let source = "func start() { transform.position.x = 100.0; }
+                      func update(dt: f32) { transform.position.x += 1.0; }";
+        let (dir, mut scene, node) = project(source);
+
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        for _ in 0..5 {
+            runtime.step(&mut scene, 0.016);
+        }
+        assert_eq!(x(&scene, node), 105.0);
+
+        rewrite(dir.path(), "script.cmt", source);
+        for path in runtime.changed_sources() {
+            runtime.reload(&mut scene, &path);
+        }
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(
+            x(&scene, node),
+            106.0,
+            "it carried on from where the game was, not from where it began"
+        );
+    }
+
+    #[test]
+    fn a_reload_keeps_the_value_the_component_holds() {
+        // ADR 0022: the component owns an exported value, so a reload restores
+        // what the inspector holds - not what the running script had made of
+        // it. The alternative is a reload that quietly disagrees with the panel
+        // next to it.
+        let source = "@export let speed: f32 = 1.0;
+                      func update(dt: f32) { speed = speed + 1.0; transform.position.x = speed; }";
+        let (dir, mut scene, node) = project(source);
+        let Some(Component::Script(script)) = scene.node_mut(node).components.get_mut(0) else {
+            panic!("the fixture attaches a script");
+        };
+        script.exports = vec![("speed".to_string(), Value::F32(50.0))];
+
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        runtime.step(&mut scene, 0.016);
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, node), 52.0, "the script has been adding to it");
+
+        rewrite(dir.path(), "script.cmt", source);
+        for path in runtime.changed_sources() {
+            runtime.reload(&mut scene, &path);
+        }
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(
+            x(&scene, node),
+            51.0,
+            "back to the tuned 50, not on from the module's 52"
+        );
+    }
+
+    #[test]
+    fn a_save_that_does_not_compile_leaves_the_game_running() {
+        // Saving mid-thought is how people work. A game that stops dead on a
+        // half-typed line is a game nobody can iterate on.
+        let (dir, mut scene, node) =
+            project("func update(dt: f32) { transform.position.x += 1.0; }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        runtime.step(&mut scene, 0.016);
+
+        rewrite(dir.path(), "script.cmt", "func update(dt: f32) { $$$ }");
+        for path in runtime.changed_sources() {
+            runtime.reload(&mut scene, &path);
+        }
+        let problems = runtime.take_problems();
+        assert_eq!(problems.len(), 1, "reported: {problems:?}");
+        assert!(problems[0].contains("script.cmt"), "{problems:?}");
+
+        assert_eq!(runtime.len(), 1, "and still running");
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, node), 2.0, "the last version that worked");
+
+        // And a fix afterwards takes.
+        rewrite(
+            dir.path(),
+            "script.cmt",
+            "func update(dt: f32) { transform.position.x += 10.0; }",
+        );
+        for path in runtime.changed_sources() {
+            runtime.reload(&mut scene, &path);
+        }
+        assert!(runtime.take_problems().is_empty());
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, node), 12.0);
+    }
+
+    #[test]
+    fn a_reload_swaps_every_node_running_that_file_and_keeps_the_order() {
+        let (dir, mut scene, first) =
+            project("func update(dt: f32) { transform.position.x += 1.0; }");
+        let second = scene.add_child(scene.root(), Node::new("other"));
+        attach_script(&mut scene, second, "script.cmt");
+
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, first, 0).expect("it compiles");
+        runtime
+            .attach(&mut scene, second, 0)
+            .expect("so does the other");
+
+        rewrite(
+            dir.path(),
+            "script.cmt",
+            "func update(dt: f32) { transform.position.x += 5.0; }",
+        );
+        for path in runtime.changed_sources() {
+            runtime.reload(&mut scene, &path);
+        }
+        assert_eq!(runtime.len(), 2, "replaced in place, not added to");
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, first), 5.0);
+        assert_eq!(x(&scene, second), 5.0);
+    }
+
+    #[test]
+    fn reloading_a_file_nothing_is_running_does_nothing() {
+        let (dir, mut scene, node) = project("func update(dt: f32) { }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        runtime.reload(&mut scene, &dir.path().join("elsewhere.cmt"));
+        assert_eq!(runtime.len(), 1);
+        assert!(runtime.take_problems().is_empty());
     }
 }

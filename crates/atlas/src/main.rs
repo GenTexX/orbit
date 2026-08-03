@@ -1599,14 +1599,29 @@ impl State {
             return;
         }
         self.script_poll = std::time::Instant::now();
-        for path in self.play.changed_sources() {
+        let changed = self.play.changed_sources();
+        if changed.is_empty() {
+            return;
+        }
+        // Before the swap, and once for all of them: the new source may export
+        // different variables, and the component is what the new instance is
+        // seeded from. Keeping what is still declared at the same type is ADR
+        // 0008's migration, which already existed and had no caller that ran
+        // while a game did.
+        self.reconcile_script_exports();
+        for path in changed {
             let named = path
                 .strip_prefix(&self.project_dir)
                 .unwrap_or(&path)
                 .display()
                 .to_string();
-            tracing::info!(target: "script", "{named} changed on disk");
+            tracing::info!(target: "script", "reloading {named}");
+            self.play.reload(&mut self.project.scene, &path);
         }
+        // The inspector may now be showing a different set of exported fields,
+        // and unlike the values they hold, which rows exist is a question only a
+        // rebuild can answer.
+        self.dirty = true;
     }
 
     /// Hot-reload the theme when the user's settings file changes. Polls the

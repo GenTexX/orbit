@@ -32,5 +32,5 @@ pub use project::{Manifest, Project, write_atomic};
 pub use reflect::{Reflect, Value};
 pub use render::SpriteDraw;
 pub use scene::{Node, NodeId, Scene};
-pub use script::{ScriptError, ScriptHost, ScriptInstance, schema as script_schema};
+pub use script::{Begin, ScriptError, ScriptHost, ScriptInstance, schema as script_schema};
 pub use transform::Transform;
