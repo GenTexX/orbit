@@ -21,6 +21,7 @@ use crate::parser::parse;
 use crate::schema::HostSchema;
 use crate::span::Span;
 use crate::tir::Type;
+use crate::tir::TypedScript;
 
 /// Everything an editor asks about one revision of a file, computed once.
 ///
@@ -33,6 +34,18 @@ pub struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
     pub tokens: Vec<TokenSpan>,
     pub brackets: Vec<Bracket>,
+    /// The parsed tree, kept rather than dropped.
+    ///
+    /// Every type-aware question the editor asks - hover, go-to-definition,
+    /// completions, signature help - used to re-run the front end over raw
+    /// text, and `type_of_name` ran a *second* whole `check()` to answer a
+    /// single hover. The cost was never the milliseconds; it was that each of
+    /// those answers was blocked on a tree this had already computed and thrown
+    /// away.
+    pub script: Script,
+    /// What the check produced. `check` returns it and this used to bind it to
+    /// `_`.
+    pub typed: TypedScript,
 }
 
 impl Analysis {
@@ -40,14 +53,25 @@ impl Analysis {
     pub fn new(source: &str, schema: &HostSchema) -> Self {
         let (with_comments, _) = lex_with_comments(source);
         let (script, mut diagnostics) = parse(source);
-        let (_, checked) = crate::check::check(&script, schema);
+        let (typed, checked) = crate::check::check(&script, schema);
         diagnostics.extend(checked);
         diagnostics.sort_by_key(|d| (d.span.start, d.span.end));
         Self {
             diagnostics,
             tokens: classify(&with_comments),
             brackets: pair_up(&with_comments),
+            script,
+            typed,
         }
+    }
+
+    /// What the name at `offset` is, using the trees this already holds.
+    ///
+    /// The same answer `hover_at` gives, without parsing the file again and
+    /// without the second `check()` that used to answer a hover on script
+    /// state.
+    pub fn hover_at(&self, source: &str, schema: &HostSchema, offset: usize) -> Option<String> {
+        hover_in(&self.script, Some(&self.typed), source, schema, offset)
     }
 
     /// The bracket touching `offset` on either side, and its partner.
@@ -510,7 +534,7 @@ pub fn completions_at(source: &str, schema: &HostSchema, offset: usize) -> Vec<C
         ));
     }
     for name in names_in_scope(&script, offset) {
-        let detail = type_of_name(&script, schema, offset, &name)
+        let detail = type_of_name(&script, None, schema, offset, &name)
             .map(|ty| ty.name().to_string())
             .unwrap_or_default();
         items.push(detailed(&name, CompletionKind::Variable, detail));
@@ -613,9 +637,25 @@ fn keyword_detail(word: &str) -> &'static str {
 /// worked on annotated ones would almost never fire. A local inside a function
 /// still needs its annotation: the checker resolves those to slots, and nothing
 /// maps a slot back to the name it came from yet.
-fn type_of_name(script: &Script, schema: &HostSchema, offset: usize, name: &str) -> Option<Type> {
+fn type_of_name(
+    script: &Script,
+    typed: Option<&TypedScript>,
+    schema: &HostSchema,
+    offset: usize,
+    name: &str,
+) -> Option<Type> {
     if script.state.iter().any(|s| s.name == name) {
-        let (typed, _) = crate::check::check(script, schema);
+        // A checked tree if the caller had one, and a check of our own only
+        // when nobody did. This used to be unconditional - a whole second run
+        // of the front end to answer one hover.
+        let checked;
+        let typed = match typed {
+            Some(typed) => typed,
+            None => {
+                checked = crate::check::check(script, schema).0;
+                &checked
+            }
+        };
         return typed
             .state
             .iter()
@@ -749,8 +789,20 @@ fn signature_of(function: &Function) -> String {
 /// signature again - and in a teaching language that is most of what a person
 /// needs while writing.
 pub fn hover_at(source: &str, schema: &HostSchema, offset: usize) -> Option<String> {
-    let offset = offset.min(source.len());
     let (script, _) = parse(source);
+    hover_in(&script, None, source, schema, offset)
+}
+
+/// The body of [`hover_at`], with the checked tree passed in when the caller
+/// already has one.
+fn hover_in(
+    script: &Script,
+    typed: Option<&TypedScript>,
+    source: &str,
+    schema: &HostSchema,
+    offset: usize,
+) -> Option<String> {
+    let offset = offset.min(source.len());
     let (start, end) = word_span(source, offset)?;
     let name = &source[start..end];
 
@@ -783,7 +835,7 @@ pub fn hover_at(source: &str, schema: &HostSchema, offset: usize) -> Option<Stri
             .collect();
         return Some(format!("{name} - {}", properties.join(", ")));
     }
-    let ty = type_of_name(&script, schema, offset, name)?;
+    let ty = type_of_name(script, typed, schema, offset, name)?;
     Some(format!("{name}: {}", ty.name()))
 }
 
@@ -2481,5 +2533,28 @@ func f() {
         // The standalone name still answers.
         let at = source.find('x').expect("the declaration");
         assert_eq!(hover_at(source, at), Some("x: bool".to_string()));
+    }
+
+    #[test]
+    fn an_analysis_answers_a_hover_from_the_tree_it_already_has() {
+        // It kept the diagnostics and dropped both trees, so every type-aware
+        // answer re-ran the front end over raw text - and a hover on script
+        // state ran a whole second `check()` on top of that.
+        let source = "let speed = 12.0;\nfunc update(dt: f32) { transform.rotation = speed; }";
+        let analysis = Analysis::new(source, &schema());
+        assert!(!analysis.script.state.is_empty(), "the parsed tree is kept");
+        assert!(!analysis.typed.state.is_empty(), "and the checked one");
+
+        let at = source.find("speed").expect("the declaration");
+        assert_eq!(
+            analysis.hover_at(source, &schema(), at),
+            Some("speed: f32".to_string()),
+        );
+        // And it is the same answer the standalone entry point gives, so the
+        // two cannot drift.
+        assert_eq!(
+            analysis.hover_at(source, &schema(), at),
+            hover_at(source, at)
+        );
     }
 }

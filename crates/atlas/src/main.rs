@@ -4495,7 +4495,12 @@ impl State {
         if let Some(d) = self.diagnostic_at(offset) {
             return Some(d.message.clone());
         }
-        comet::service::hover_at(&self.code.script_text, helios::script_schema(), offset)
+        // Through the analysis this frame already has, rather than parsing the
+        // file again and checking it a second time on top - which is what a
+        // hover on script state used to cost.
+        self.code
+            .analysis
+            .hover_at(&self.code.script_text, helios::script_schema(), offset)
     }
 
     /// Move the caret to the next problem after it, or the previous one before
