@@ -1552,6 +1552,23 @@ impl State {
             return;
         }
 
+        // A camera's marker is an overlay drawn over everything, and it is
+        // picked the same way: before the sprites underneath it. Without this a
+        // camera parented onto the player is unclickable, because the only
+        // pixels there belong to the player.
+        if let Some(node) = viewport::camera_at(&self.project.scene, world, self.camera.zoom) {
+            self.selection.select_one(node);
+            if !playing {
+                self.drag = Some(Drag::Move {
+                    node,
+                    original: self.project.scene.node(node).transform,
+                    grab_world: world,
+                });
+            }
+            self.dirty = true;
+            return;
+        }
+
         match self.pick_node_at_cursor() {
             Some(mut node) => {
                 // Alt-drag duplicates: leave the original in place and drag a
@@ -6890,6 +6907,13 @@ impl State {
             {
                 overlay.push(guide);
             }
+            overlay.extend(viewport::camera_sprites(
+                &self.project.scene,
+                Vec2::new(w as f32, h as f32),
+                self.camera.zoom,
+                self.selection.primary(),
+                &pal,
+            ));
             if let Some(drag) = &self.drag {
                 overlay.extend(viewport::rotate_feedback_sprites(
                     drag,

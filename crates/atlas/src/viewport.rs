@@ -8,7 +8,7 @@
 //! translation - the sprite's center - never moves under either.
 
 use glam::Vec2;
-use helios::{Component, NodeId, Scene, Transform};
+use helios::{CameraComponent, Component, NodeId, Scene, Transform};
 use photon::{Camera, Color, Sprite, shapes};
 
 /// The viewport's themeable colors (in photon color space), built from the
@@ -58,6 +58,11 @@ const ROTATE_OFFSET_PX: f32 = 26.0;
 /// The move arrows' heads: how long, and how wide at the base.
 const ARROW_HEAD_PX: f32 = 13.0;
 const ARROW_HEAD_HALF_PX: f32 = 5.5;
+/// The camera marker: the body's half-size, and the lens sticking out of it.
+const CAMERA_BODY_HALF_PX: f32 = 11.0;
+const CAMERA_LENS_PX: f32 = 9.0;
+/// How translucent an inactive camera's frame is against the active one's.
+const CAMERA_IDLE_ALPHA: f32 = 0.35;
 /// Radius of the wedge drawn during a rotate drag, and how translucent it is.
 const ROTATE_FEEDBACK_PX: f32 = 44.0;
 const ROTATE_FEEDBACK_ALPHA: f32 = 0.30;
@@ -313,6 +318,106 @@ impl Gizmo {
         let half = self.size * 0.5;
         offset.dot(self.axis_x).abs() <= half.x && offset.dot(self.axis_y).abs() <= half.y
     }
+}
+
+/// Every camera in the scene, in pre-order, with its component and the world
+/// position of the node carrying it.
+fn cameras(scene: &Scene) -> Vec<(NodeId, &CameraComponent, Vec2)> {
+    let mut out = Vec::new();
+    let mut stack = vec![scene.root()];
+    while let Some(id) = stack.pop() {
+        for component in &scene.node(id).components {
+            if let Component::Camera(camera) = component {
+                out.push((id, camera, scene.world_transform(id).translation));
+            }
+        }
+        stack.extend(scene.children(id).iter().rev().copied());
+    }
+    out
+}
+
+/// What each camera in the scene will frame, plus a marker where it sits.
+///
+/// A camera had nothing to see and nothing to grab: no sprite, so no gizmo, no
+/// pick, and no rectangle. You aimed it by selecting it in the tree and typing
+/// numbers, and found out what it framed by pressing Play. The frame is the
+/// answer to "what will the player see", drawn where the answer is.
+///
+/// `viewport_px` is the size of the render target, because that is what the
+/// camera's own [`view`](CameraComponent::view) is a function of - a camera does
+/// not carry a resolution of its own yet, so a wider pane genuinely does show
+/// more world.
+///
+/// The inactive ones are drawn too, dimmed. A scene with three cameras and one
+/// active is a normal thing to be building, and the two that are off are still
+/// where you left them.
+pub fn camera_sprites(
+    scene: &Scene,
+    viewport_px: Vec2,
+    zoom: f32,
+    selected: Option<NodeId>,
+    pal: &Palette,
+) -> Vec<Sprite> {
+    let t = OUTLINE_PX / zoom;
+    let half = CAMERA_BODY_HALF_PX / zoom;
+    let lens = CAMERA_LENS_PX / zoom;
+    let mut out = Vec::new();
+
+    // Pre-order, and the first active one wins - the same rule `active_camera`
+    // uses to pick the one Play looks through, so what is drawn bright is the
+    // one that will be used.
+    let mut live = scene.active_camera().is_some();
+    for (node, camera, at) in cameras(scene) {
+        let active = camera.active && live;
+        if active {
+            live = false;
+        }
+        let base = if Some(node) == selected {
+            pal.outline
+        } else {
+            pal.rotate_handle
+        };
+        let color = if active {
+            base
+        } else {
+            Color::new(base.r, base.g, base.b, base.a * CAMERA_IDLE_ALPHA)
+        };
+
+        let extent = viewport_px / camera.zoom.max(CameraComponent::MIN_ZOOM);
+        out.extend(shapes::rect_outline(at - extent * 0.5, extent, t, color));
+        // The body: a box with a lens pointing the way a camera looks, which is
+        // out of the screen - so it points up, the direction "toward the
+        // viewer" is drawn in every diagram ever.
+        out.extend(shapes::rect_outline(
+            at - Vec2::splat(half),
+            Vec2::splat(half * 2.0),
+            t,
+            color,
+        ));
+        out.extend(shapes::arrow_head(
+            at - Vec2::new(0.0, half + lens),
+            -Vec2::Y,
+            lens,
+            half * 0.7,
+            color,
+        ));
+    }
+    out
+}
+
+/// The camera whose marker covers `world`, topmost first.
+///
+/// A separate pick from the sprite one: the marker is an overlay drawn in the
+/// editor and has no pixels for the GPU pick to find, and its size is in screen
+/// pixels so it stays grabbable at any zoom. Later cameras win, matching the
+/// overlay's own draw order.
+pub fn camera_at(scene: &Scene, world: Vec2, zoom: f32) -> Option<NodeId> {
+    let half = CAMERA_BODY_HALF_PX / zoom;
+    cameras(scene)
+        .into_iter()
+        .rev()
+        .find(|(_, _, at)| (world - *at).abs().cmple(Vec2::splat(half)).all())
+        .map(|(node, _, _)| node)
 }
 
 /// The topmost node in `order` (back to front, as drawn) whose quad covers
@@ -958,6 +1063,153 @@ mod tests {
             node_at(&scene, &[under, over], Vec2::new(500.0, 0.0), 1.0),
             None
         );
+    }
+
+    /// A scene with one camera at `at`, plus the id of the node carrying it.
+    fn scene_with_camera(at: Vec2, active: bool, zoom: f32) -> (Scene, NodeId) {
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        let mut node = Node::new("camera");
+        node.transform = Transform::from_translation(at);
+        node.components
+            .push(Component::Camera(CameraComponent { active, zoom }));
+        let id = scene.add_child(root, node);
+        (scene, id)
+    }
+
+    #[test]
+    fn a_camera_frames_what_it_will_show() {
+        let (scene, _) = scene_with_camera(Vec2::new(100.0, 40.0), true, 1.0);
+        let viewport = Vec2::new(800.0, 600.0);
+        let sprites = camera_sprites(&scene, viewport, 1.0, None, &Palette::DEFAULT);
+        assert!(!sprites.is_empty());
+
+        // The frame is centred on the node, and is the size the camera's own
+        // `view` gives for this viewport - which is what makes it an answer to
+        // "what will the player see" rather than a decoration.
+        let (min, max) = bounds(&sprites);
+        let frame = max - min;
+        assert!((frame - viewport).length() < 4.0, "{frame:?}");
+        let center = (min + max) * 0.5;
+        assert!(
+            (center - Vec2::new(100.0, 40.0)).length() < 2.0,
+            "{center:?}"
+        );
+    }
+
+    #[test]
+    fn zooming_a_camera_in_frames_less_world() {
+        let viewport = Vec2::new(800.0, 600.0);
+        let (wide, _) = scene_with_camera(Vec2::ZERO, true, 1.0);
+        let (tight, _) = scene_with_camera(Vec2::ZERO, true, 2.0);
+        let wide = bounds(&camera_sprites(
+            &wide,
+            viewport,
+            1.0,
+            None,
+            &Palette::DEFAULT,
+        ));
+        let tight = bounds(&camera_sprites(
+            &tight,
+            viewport,
+            1.0,
+            None,
+            &Palette::DEFAULT,
+        ));
+        assert!(
+            (tight.1 - tight.0).x < (wide.1 - wide.0).x * 0.6,
+            "twice the zoom is half the world"
+        );
+    }
+
+    #[test]
+    fn an_inactive_camera_is_still_drawn_dimmer() {
+        // A scene being built has cameras that are off, and they are still
+        // where you left them - but only one of them is what Play will use, and
+        // the drawing has to say which.
+        let viewport = Vec2::new(800.0, 600.0);
+        let (on, _) = scene_with_camera(Vec2::ZERO, true, 1.0);
+        let (off, _) = scene_with_camera(Vec2::ZERO, false, 1.0);
+        let on = camera_sprites(&on, viewport, 1.0, None, &Palette::DEFAULT);
+        let off = camera_sprites(&off, viewport, 1.0, None, &Palette::DEFAULT);
+        assert_eq!(on.len(), off.len(), "both are drawn");
+        assert!(
+            off[0].tint.a < on[0].tint.a,
+            "{} vs {}",
+            off[0].tint.a,
+            on[0].tint.a
+        );
+    }
+
+    #[test]
+    fn only_the_first_active_camera_is_the_live_one() {
+        // Two active cameras is a mistake rather than a configuration, and
+        // `active_camera` resolves it by taking the first in pre-order. The
+        // overlay has to resolve it the same way or the bright rectangle is not
+        // the one Play looks through.
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        for name in ["first", "second"] {
+            let mut node = Node::new(name);
+            node.components.push(Component::Camera(CameraComponent {
+                active: true,
+                zoom: 1.0,
+            }));
+            scene.add_child(root, node);
+        }
+        let sprites = camera_sprites(
+            &scene,
+            Vec2::new(800.0, 600.0),
+            1.0,
+            None,
+            &Palette::DEFAULT,
+        );
+        let half = sprites.len() / 2;
+        assert!(
+            sprites[half].tint.a < sprites[0].tint.a,
+            "the second one is dimmed"
+        );
+    }
+
+    #[test]
+    fn a_camera_marker_can_be_grabbed_at_any_zoom() {
+        let (scene, id) = scene_with_camera(Vec2::new(50.0, 50.0), true, 1.0);
+        assert_eq!(camera_at(&scene, Vec2::new(50.0, 50.0), 1.0), Some(id));
+        assert_eq!(camera_at(&scene, Vec2::new(50.0, 56.0), 1.0), Some(id));
+        assert_eq!(camera_at(&scene, Vec2::new(200.0, 50.0), 1.0), None);
+
+        // The marker is sized in screen pixels, so zooming out shrinks the world
+        // area it covers - and it stays exactly as easy to hit on screen.
+        assert_eq!(camera_at(&scene, Vec2::new(50.0, 56.0), 4.0), None);
+        assert_eq!(camera_at(&scene, Vec2::new(50.0, 56.0), 0.5), Some(id));
+    }
+
+    #[test]
+    fn a_scene_without_a_camera_draws_nothing() {
+        let scene = Scene::new("root");
+        assert!(
+            camera_sprites(
+                &scene,
+                Vec2::new(800.0, 600.0),
+                1.0,
+                None,
+                &Palette::DEFAULT
+            )
+            .is_empty()
+        );
+        assert_eq!(camera_at(&scene, Vec2::ZERO, 1.0), None);
+    }
+
+    /// The world-space rectangle a pile of sprites covers, ignoring rotation
+    /// (every sprite these tests look at is axis-aligned).
+    fn bounds(sprites: &[Sprite]) -> (Vec2, Vec2) {
+        let mut min = Vec2::splat(f32::MAX);
+        let mut max = Vec2::splat(f32::MIN);
+        for s in sprites {
+            min = min.min(s.position);
+            max = max.max(s.position + s.size);
+        }
+        (min, max)
     }
 
     #[test]

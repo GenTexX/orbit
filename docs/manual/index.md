@@ -36,6 +36,11 @@ A camera being a component is the whole reason it is worth having: put one on an
 empty node and the view stays put, put one on the player and the view follows,
 with no code either way.
 
+Every camera draws the rectangle it will frame, so you can aim one without
+pressing Play, and a marker you can click and drag even when there is no sprite
+under it. The one Play will look through is drawn bright and the rest are
+dimmed.
+
 Y grows **downward** (ADR 0012), so "below" is a greater y. A sprite is centred
 on its node's origin (ADR 0019), which is what makes rotation and scale pivot
 where you expect.
