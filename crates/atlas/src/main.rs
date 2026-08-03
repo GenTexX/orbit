@@ -6890,6 +6890,14 @@ impl State {
             {
                 overlay.push(guide);
             }
+            if let Some(drag) = &self.drag {
+                overlay.extend(viewport::rotate_feedback_sprites(
+                    drag,
+                    &self.project.scene,
+                    &self.camera,
+                    &pal,
+                ));
+            }
             if let Some(sel) = self.selection.primary()
                 && let Some(g) = viewport::gizmo(&self.project.scene, sel, self.camera.zoom)
             {

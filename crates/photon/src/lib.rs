@@ -7,6 +7,7 @@ mod color;
 mod error;
 mod renderer;
 mod scene_target;
+pub mod shapes;
 mod sprite;
 mod texture;
 

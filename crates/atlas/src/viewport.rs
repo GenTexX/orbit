@@ -9,7 +9,7 @@
 
 use glam::Vec2;
 use helios::{Component, NodeId, Scene, Transform};
-use photon::{Camera, Color, Sprite};
+use photon::{Camera, Color, Sprite, shapes};
 
 /// The viewport's themeable colors (in photon color space), built from the
 /// editor theme each frame and passed to the drawing functions. Only colors live
@@ -55,6 +55,12 @@ const GRAB_RADIUS_PX: f32 = 10.0;
 const ARROW_PX: f32 = 56.0;
 /// How far above the sprite's top edge the rotate handle floats.
 const ROTATE_OFFSET_PX: f32 = 26.0;
+/// The move arrows' heads: how long, and how wide at the base.
+const ARROW_HEAD_PX: f32 = 13.0;
+const ARROW_HEAD_HALF_PX: f32 = 5.5;
+/// Radius of the wedge drawn during a rotate drag, and how translucent it is.
+const ROTATE_FEEDBACK_PX: f32 = 44.0;
+const ROTATE_FEEDBACK_ALPHA: f32 = 0.30;
 /// Thickness of the full-viewport guide line shown during an axis drag.
 const GUIDE_PX: f32 = 1.5;
 /// The guide line's translucency (drawn in the dragged axis's color).
@@ -370,22 +376,39 @@ pub fn gizmo_sprites(gizmo: &Gizmo, zoom: f32, mode: GizmoMode, pal: &Palette) -
         quad(at(Vec2::new(0.0, h - t)), Vec2::new(w, t), pal.outline),
         quad(at(Vec2::new(w - t, 0.0)), Vec2::new(t, h), pal.outline),
     ];
+    // The arrows end in a head rather than a square: a square says "grab me and
+    // something happens", which is what the scale handles say, and these two do
+    // a different thing. The head also points, so the axis is readable without
+    // relying on the color alone.
+    let head = ARROW_HEAD_PX / zoom;
     if mode.shows(GizmoHit::MoveX) {
-        // A shaft from the center along local X, with an endpoint square (red).
+        // A shaft from the center along local X, stopping where the head starts.
         sprites.push(quad(
             gizmo.center - gizmo.axis_y * (t * 0.5),
-            Vec2::new(arrow, t),
+            Vec2::new((arrow - head).max(0.0), t),
             pal.axis_x,
         ));
-        sprites.push(handle(gizmo.arrow_x_end, pal.axis_x));
+        sprites.extend(shapes::arrow_head(
+            gizmo.arrow_x_end,
+            gizmo.axis_x,
+            head,
+            ARROW_HEAD_HALF_PX / zoom,
+            pal.axis_x,
+        ));
     }
     if mode.shows(GizmoHit::MoveY) {
         sprites.push(quad(
             gizmo.center - gizmo.axis_x * (t * 0.5),
-            Vec2::new(t, arrow),
+            Vec2::new(t, (arrow - head).max(0.0)),
             pal.axis_y,
         ));
-        sprites.push(handle(gizmo.arrow_y_end, pal.axis_y));
+        sprites.extend(shapes::arrow_head(
+            gizmo.arrow_y_end,
+            gizmo.axis_y,
+            head,
+            ARROW_HEAD_HALF_PX / zoom,
+            pal.axis_y,
+        ));
     }
     if mode.shows(GizmoHit::Rotate) {
         // A stem from the top edge up to the rotate handle (blue).
@@ -457,6 +480,63 @@ pub fn axis_guide_sprite(
     s.rotation = dir.to_angle();
     s.tint = Color::new(color.r, color.g, color.b, GUIDE_ALPHA);
     Some(s)
+}
+
+/// How far a rotate drag has turned the node, as a translucent wedge from the
+/// angle you grabbed at to the angle it is at now.
+///
+/// Read off the node's *current* transform rather than off the cursor, so what
+/// is shown is the rotation that actually landed - snapped, if Ctrl is held.
+/// The cursor can be a couple of degrees past the wedge; the wedge is right.
+///
+/// `None` for every drag that is not a rotation, and for one that has not turned
+/// yet - a zero-width wedge is a stray sliver at the pivot.
+pub fn rotate_feedback_sprites(
+    drag: &Drag,
+    scene: &Scene,
+    camera: &EditorCamera,
+    pal: &Palette,
+) -> Vec<Sprite> {
+    let Drag::Rotate {
+        node,
+        original,
+        pivot,
+        grab_angle,
+    } = *drag
+    else {
+        return Vec::new();
+    };
+    // The delta against the *local* rotation, not the world one: a parent's own
+    // rotation is part of the world angle and is not turning, so subtracting the
+    // local press-time angle from a world one would offset the whole wedge.
+    let turned = scene.node(node).transform.rotation - original.rotation;
+    if turned.abs() < 1.0e-3 {
+        return Vec::new();
+    }
+
+    let radius = ROTATE_FEEDBACK_PX / camera.zoom;
+    let color = pal.rotate_handle;
+    let translucent = Color::new(color.r, color.g, color.b, ROTATE_FEEDBACK_ALPHA);
+    // One segment per two degrees, so a small turn is not a triangle and a full
+    // one does not cost hundreds of quads.
+    let segments = ((turned.abs().to_degrees() / 2.0).ceil() as usize).clamp(2, 180);
+
+    let mut out = shapes::pie(pivot, radius, grab_angle, turned, translucent, segments);
+    // The two straight edges, opaque, so the wedge reads as an amount between
+    // two marks rather than as a smudge.
+    out.push(shapes::line(
+        pivot,
+        pivot + Vec2::from_angle(grab_angle) * radius,
+        GUIDE_PX / camera.zoom,
+        color,
+    ));
+    out.push(shapes::line(
+        pivot,
+        pivot + Vec2::from_angle(grab_angle + turned) * radius,
+        GUIDE_PX / camera.zoom,
+        color,
+    ));
+    out
 }
 
 /// The smallest "nice" step (a 1/2/5 times a power of ten) that is at least
@@ -877,6 +957,88 @@ mod tests {
         assert_eq!(
             node_at(&scene, &[under, over], Vec2::new(500.0, 0.0), 1.0),
             None
+        );
+    }
+
+    #[test]
+    fn a_rotate_drag_shows_how_far_it_has_turned() {
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        let node = scene.add_child(root, Node::new("sprite"));
+        let original = Transform::default();
+        let drag = Drag::Rotate {
+            node,
+            original,
+            pivot: Vec2::ZERO,
+            grab_angle: 0.0,
+        };
+        let camera = EditorCamera::default();
+        let pal = Palette::DEFAULT;
+
+        // Nothing has turned yet, so there is nothing to say - a zero-width
+        // wedge is a stray sliver at the pivot.
+        assert!(rotate_feedback_sprites(&drag, &scene, &camera, &pal).is_empty());
+
+        scene.node_mut(node).transform.rotation = 30f32.to_radians();
+        let small = rotate_feedback_sprites(&drag, &scene, &camera, &pal);
+        assert!(!small.is_empty());
+        scene.node_mut(node).transform.rotation = 120f32.to_radians();
+        let large = rotate_feedback_sprites(&drag, &scene, &camera, &pal);
+        assert!(
+            large.len() > small.len(),
+            "a bigger turn is a bigger wedge: {} vs {}",
+            large.len(),
+            small.len()
+        );
+
+        // And it stays around the pivot rather than smearing across the view.
+        let radius = ROTATE_FEEDBACK_PX / camera.zoom;
+        for sprite in &large {
+            assert!(
+                sprite.position.length() <= radius * 1.5,
+                "{:?} is off past the wedge",
+                sprite.position
+            );
+        }
+    }
+
+    #[test]
+    fn the_wedge_follows_the_node_under_a_rotated_parent() {
+        // The wedge's sweep is the *local* delta. Taking it from the world
+        // angle would add the parent's own rotation, which is not turning, and
+        // the wedge would jump to the wrong quadrant the moment the drag began.
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        let parent = scene.add_child(root, Node::new("parent"));
+        scene.node_mut(parent).transform.rotation = 90f32.to_radians();
+        let node = scene.add_child(parent, Node::new("sprite"));
+        let drag = Drag::Rotate {
+            node,
+            original: Transform::default(),
+            pivot: Vec2::ZERO,
+            grab_angle: 0.0,
+        };
+        assert!(
+            rotate_feedback_sprites(&drag, &scene, &EditorCamera::default(), &Palette::DEFAULT)
+                .is_empty(),
+            "the child has not turned; only its parent is rotated"
+        );
+    }
+
+    #[test]
+    fn only_a_rotate_drag_draws_a_wedge() {
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        let node = scene.add_child(root, Node::new("sprite"));
+        scene.node_mut(node).transform.rotation = 1.0;
+        let drag = Drag::Move {
+            node,
+            original: Transform::default(),
+            grab_world: Vec2::ZERO,
+        };
+        assert!(
+            rotate_feedback_sprites(&drag, &scene, &EditorCamera::default(), &Palette::DEFAULT)
+                .is_empty()
         );
     }
 
