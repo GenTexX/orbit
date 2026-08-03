@@ -12,6 +12,7 @@ mod editor_state;
 mod explorer;
 mod file_ops;
 mod icons;
+mod keys;
 mod modal;
 mod play;
 mod project;
@@ -38,7 +39,7 @@ use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key as WinitKey, ModifiersState, NamedKey},
+    keyboard::{Key as WinitKey, ModifiersState, NamedKey, PhysicalKey},
     window::{Window, WindowId},
 };
 
@@ -311,6 +312,9 @@ struct State {
     panning: bool,
     /// The last cursor position, in window pixels.
     cursor: Vec2,
+    /// The keyboard as the running game sees it. Fed from winit directly,
+    /// because aurora's input model has no key release to route this through.
+    keys: keys::GameKeys,
     /// The current keyboard modifiers (for the undo/redo shortcuts).
     modifiers: ModifiersState,
     /// The demo texture's natural pixel size (spawned sprites default to it).
@@ -725,6 +729,10 @@ impl ApplicationHandler for App {
                 state.pending_cursor = Some(Vec2::new(position.x as f32, position.y as f32));
             }
             WindowEvent::CursorLeft { .. } => state.ui.handle_input(InputEvent::PointerLeft),
+            // A key held as the window goes away has its release delivered to
+            // whoever has focus now, which is not us - so without this, alt-
+            // tabbing mid-jump leaves the key held for the rest of the session.
+            WindowEvent::Focused(false) => state.keys.release_all(),
             WindowEvent::MouseInput {
                 state: btn_state,
                 button,
@@ -820,7 +828,22 @@ impl ApplicationHandler for App {
                 // text selection.
                 state.ui.set_shift(m.state().shift_key());
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            WindowEvent::KeyboardInput { event, .. } => {
+                // Before everything, and for releases too. This is the only
+                // place a key going *up* is ever seen; the rest of the editor
+                // is built entirely out of presses.
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    let taking_text = state.ui.focused().is_some() || state.modal.is_some();
+                    state.keys.observe(
+                        code,
+                        event.state == ElementState::Pressed,
+                        event.repeat,
+                        taking_text,
+                    );
+                }
+                if event.state != ElementState::Pressed {
+                    return;
+                }
                 // A modal takes over the keyboard: Escape closes it, Enter
                 // confirms its default action (when no field is focused), and
                 // every other key reaches only a focused modal input - the
@@ -1146,6 +1169,7 @@ impl State {
             hover_file: None,
             tooltip_target: None,
             pointer_down: false,
+            keys: keys::GameKeys::default(),
             pending_cursor: None,
             tab_bars: Vec::new(),
             carrying: None,
@@ -1176,6 +1200,22 @@ impl State {
     fn cursor_world(&self) -> Option<Vec2> {
         let rect = self.viewport_rect()?;
         Some(self.camera.screen_to_world(self.cursor - rect.pos))
+    }
+
+    /// The cursor in world coordinates, through whatever camera the viewport is
+    /// currently drawn with.
+    ///
+    /// Not [`cursor_world`](Self::cursor_world), which always uses the editor's
+    /// camera because that is what the gizmos and the picker work in. While a
+    /// game runs the view can be the scene's own, and a script asking where the
+    /// mouse is has to get an answer in the space its own position is in.
+    fn play_cursor_world(&self) -> Option<Vec2> {
+        let rect = self.viewport_rect()?;
+        if rect.size.x <= 0.0 || rect.size.y <= 0.0 {
+            return None;
+        }
+        let camera = self.scene_camera(rect.size);
+        Some(camera.position + (self.cursor - rect.pos) * camera.viewport / rect.size)
     }
 
     /// Apply the newest pointer position reported since the last call, if any.
@@ -6365,6 +6405,11 @@ impl State {
         // moved it. `dt` is the editor's own, clamped: a script that has just
         // been paused on a breakpoint - or an editor that spent 400ms opening a
         // file - must not hand a game a step it can tunnel through walls with.
+        // The keyboard as of this instant, and the pointer through whatever
+        // camera the viewport is being drawn with - so a script comparing the
+        // mouse against its own position is comparing two points in one space.
+        let mouse = self.play_cursor_world().unwrap_or_default();
+        self.play.set_input(self.keys.input(mouse));
         self.play.step(&mut self.project.scene, dt);
         self.drain_script_output();
         self.sync_inspector_to_game();

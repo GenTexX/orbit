@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use helios::{NodeId, Scene, Value};
+use helios::{Input, NodeId, Scene, Value};
 use voyager::Runtime;
 
 /// The editor's play session: a runtime, and the scene as it was before it ran.
@@ -124,6 +124,17 @@ impl Play {
             .as_mut()
             .map(Runtime::take_problems)
             .unwrap_or_default()
+    }
+
+    /// Set what the scripts will read as input on the next frame.
+    ///
+    /// Pushed in rather than pulled out, because the host is what knows the
+    /// difference between a key that means "left" and a key that means the
+    /// letter A. voyager holds the answer; atlas decides it.
+    pub fn set_input(&mut self, input: Input) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            *runtime.input_mut() = input;
+        }
     }
 
     /// Run one frame, if a game is running.
