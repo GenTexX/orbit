@@ -3696,6 +3696,62 @@ impl State {
         self.select_new_node(node);
     }
 
+    /// Add an empty node under the selection, or under the root.
+    ///
+    /// Under the selection because that is what somebody who has just clicked a
+    /// node and reached for this means; the root is the fallback when nothing
+    /// is selected rather than the rule.
+    fn add_node_action(&mut self) {
+        if self.scene_edits_blocked() {
+            return;
+        }
+        let parent = self
+            .selection
+            .primary()
+            .unwrap_or(self.project.scene.root());
+        let node = actions::add_node(&mut self.project.scene, &mut self.history, parent);
+        // Expanded, or a node added under a collapsed parent appears to do
+        // nothing at all.
+        self.tree_collapsed.remove(&parent);
+        self.select_new_node(node);
+    }
+
+    /// Offer the component kinds for the selected node.
+    fn open_component_chooser(&mut self) {
+        if self.scene_edits_blocked() {
+            return;
+        }
+        let Some(node) = self.selection.primary() else {
+            self.note("select a node to add a component to");
+            return;
+        };
+        self.open_modal(modal::Modal::component_chooser(node));
+    }
+
+    /// Attach a component of `kind` to the node the chooser was opened for.
+    fn add_component(&mut self, kind: &str) {
+        let Some(modal::ModalBody::ComponentChooser(node)) = self.modal.as_ref().map(|m| &m.body)
+        else {
+            return;
+        };
+        let node = *node;
+        self.close_modal();
+        if self.scene_edits_blocked() {
+            return;
+        }
+        let Some(component) = helios::Component::from_type_name(kind) else {
+            return;
+        };
+        self.history
+            .add_component(&mut self.project.scene, node, component);
+        // A Script component's exported fields come from the file it names, and
+        // a fresh one names none - but the same call is what fills them in when
+        // one is picked, and running it here keeps the inspector honest either
+        // way.
+        self.reconcile_script_exports();
+        self.dirty = true;
+    }
+
     /// The toolbar's Add Script: give the selected node a Script component. The
     /// `.cmt` file is chosen afterwards in the inspector, the same way a
     /// sprite's texture is - so this needs a selection, not a viewport point.
@@ -4589,11 +4645,35 @@ impl State {
         if self.code.tooltip_rested.elapsed() < HOVER_DELAY {
             return;
         }
-        let message = self.hover_under_pointer();
+        // The Code pane's hover first, then anything that registered explaining
+        // text - an inspector field with an `@tooltip`, today.
+        let message = self
+            .hover_under_pointer()
+            .or_else(|| self.tooltip_under_pointer());
         if message != self.code.diagnostic_tooltip {
             self.code.diagnostic_tooltip = message;
             self.dirty = true;
         }
+    }
+
+    /// What the widget under the pointer explains about itself, if anything.
+    ///
+    /// `@tooltip` has been parsed, validated and stored on the component since
+    /// 4.7, and nothing ever read it - so a script saying what a number means to
+    /// whoever is tuning it said it to nobody.
+    fn tooltip_under_pointer(&self) -> Option<String> {
+        let hit = self.ui.hit_test(self.cursor)?;
+        // The row is what registers, and the pointer is usually over a child of
+        // it - the label, the field, the slider - so walk up rather than
+        // requiring an exact hit on the gap between them.
+        let mut at = Some(hit);
+        while let Some(id) = at {
+            if let Some((_, text)) = self.rows.tooltips.iter().find(|(w, _)| *w == id) {
+                return Some(text.clone());
+            }
+            at = self.ui.parent(id);
+        }
+        None
     }
 
     /// A press outside the completion popup dismisses it. Clicking elsewhere
@@ -7039,6 +7119,24 @@ impl State {
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.play_button => {
                     self.toggle_play();
+                }
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.add_node => {
+                    self.add_node_action();
+                }
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.add_component => {
+                    self.open_component_chooser();
+                }
+                AuroraEvent::Clicked(id)
+                    if self.rows.component_choices.iter().any(|(w, _)| *w == id) =>
+                {
+                    let kind = self
+                        .rows
+                        .component_choices
+                        .iter()
+                        .find(|(w, _)| *w == id)
+                        .map(|(_, kind)| *kind)
+                        .expect("guarded by the match arm");
+                    self.add_component(kind);
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.settings_button => {
                     self.open_settings_modal();

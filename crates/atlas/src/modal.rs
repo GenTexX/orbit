@@ -37,6 +37,9 @@ pub enum ModalBody {
     /// An image picker: a grid of the project's images; clicking one sets the
     /// target field.
     AssetChooser(AssetChooser),
+    /// A component picker: one row per kind, clicking one attaches it to the
+    /// node the chooser was opened for.
+    ComponentChooser(helios::NodeId),
 }
 
 /// A "you have unsaved changes" question, and what to do once it is answered.
@@ -154,6 +157,15 @@ impl Modal {
     /// Ask before dropping unsaved work. Not closable by Escape alone: the
     /// three answers are the only ways out, because dismissing it would have to
     /// mean one of them and there is no safe guess.
+    /// Offer the component kinds, to attach one to `node`.
+    pub fn component_chooser(node: helios::NodeId) -> Self {
+        Self {
+            title: "Add component".to_string(),
+            closable: true,
+            body: ModalBody::ComponentChooser(node),
+        }
+    }
+
     pub fn confirm(message: impl Into<String>, pending: Pending) -> Self {
         Self {
             title: "Unsaved changes".to_string(),
@@ -228,7 +240,10 @@ impl Modal {
             // it is the only one that cannot lose work, which is what a default
             // has to be.
             ModalBody::Confirm(_) => ModalAction::SaveThenProceed,
-            ModalBody::Message(_) | ModalBody::AssetChooser(_) => ModalAction::Close,
+            // A chooser commits by picking, so Enter can only mean "never mind".
+            ModalBody::Message(_) | ModalBody::AssetChooser(_) | ModalBody::ComponentChooser(_) => {
+                ModalAction::Close
+            }
         }
     }
 }

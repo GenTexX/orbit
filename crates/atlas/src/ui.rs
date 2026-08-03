@@ -435,6 +435,16 @@ pub struct EditorRows {
     /// The toolbar's Play/Stop button - the same widget in both states, since
     /// it is one control with two labels rather than two controls.
     pub play_button: Option<WidgetId>,
+    /// Widgets that explain themselves on hover, and what they say. Filled from
+    /// a script's `@tooltip` - which the compiler has parsed and stored since
+    /// 4.7 and nothing has ever read.
+    pub tooltips: Vec<(WidgetId, String)>,
+    /// The scene tree's Add Node button.
+    pub add_node: Option<WidgetId>,
+    /// The inspector's Add Component button.
+    pub add_component: Option<WidgetId>,
+    /// A component kind offered by the chooser modal, and its type name.
+    pub component_choices: Vec<(WidgetId, &'static str)>,
     /// The toolbar's gizmo-mode buttons, each mapped to the mode it selects.
     pub mode_buttons: Vec<(WidgetId, GizmoMode)>,
     /// Numeric inputs for the x/y components of a Vec2 field: submitting one
@@ -1487,6 +1497,7 @@ pub fn build_modal(
         ModalBody::AssetChooser(chooser) => {
             build_asset_chooser_body(ui, card, chooser, thumbnails, icons, theme, rows);
         }
+        ModalBody::ComponentChooser(_) => build_component_chooser_body(ui, card, theme, rows),
     }
 
     // Footer: action buttons pushed to the right; the last one is the accented
@@ -1507,7 +1518,9 @@ pub fn build_modal(
             ("Save", ModalAction::SaveSettings),
         ],
         // The chooser commits by clicking an image; the footer just cancels.
-        ModalBody::AssetChooser(_) => &[("Cancel", ModalAction::Close)],
+        ModalBody::AssetChooser(_) | ModalBody::ComponentChooser(_) => {
+            &[("Cancel", ModalAction::Close)]
+        }
     };
     for (i, &(label, action)) in buttons.iter().enumerate() {
         let primary = i == buttons.len() - 1;
@@ -1587,6 +1600,40 @@ fn build_settings_body(
 const CHOOSER_H: f32 = 320.0;
 const CHOOSER_CELL: f32 = 92.0;
 const CHOOSER_THUMB: f32 = 72.0;
+
+/// The component picker: one row per kind, each saying what it does.
+///
+/// A list rather than a grid, unlike the asset chooser: there are three of
+/// them and each needs a sentence, which a cell has nowhere to put.
+fn build_component_chooser_body(
+    ui: &mut Ui,
+    card: WidgetId,
+    theme: &EditorTheme,
+    rows: &mut EditorRows,
+) {
+    let list = ui.panel(card, Style::new().column().gap(6.0).width(MODAL_W - 32.0));
+    for (kind, description) in helios::Component::KINDS {
+        let choice = ui.button(
+            list,
+            "",
+            Style::new()
+                .column()
+                .gap(2.0)
+                .padding(8.0)
+                .width(MODAL_W - 32.0)
+                .background(theme.aurora.menu_bg)
+                .corner_radius(theme.aurora.control_radius)
+                .border(theme.aurora.border_width, theme.aurora.card_border),
+        );
+        ui.label(choice, *kind, Style::new().foreground(theme.aurora.heading));
+        ui.label(
+            choice,
+            *description,
+            Style::new().foreground(theme.aurora.subhead).ellipsis(),
+        );
+        rows.component_choices.push((choice, kind));
+    }
+}
 
 fn build_asset_chooser_body(
     ui: &mut Ui,
@@ -1708,6 +1755,21 @@ fn build_scene_tree(
             .placeholder("Search..."),
     );
     rows.tree_filter = Some(search);
+    // Adding a node was reachable only as "Add Sprite", which spawns one with a
+    // component already on it - so an empty node to parent things under, or to
+    // hang a camera on, had no path at all.
+    rows.add_node = Some(
+        ui.button(
+            panel,
+            "Add node",
+            Style::new()
+                .padding(5.0)
+                .background(theme.aurora.menu_bg)
+                .corner_radius(theme.aurora.control_radius)
+                .border(theme.aurora.border_width, theme.aurora.card_border)
+                .foreground(theme.aurora.heading),
+        ),
+    );
 
     let query = filter.trim().to_lowercase();
     let ctx = TreeCtx {
@@ -2082,7 +2144,7 @@ fn build_inspector(
         );
         // Rotation is a single scalar, edited in degrees (stored radians); the
         // "deg" unit hint makes that explicit next to the field.
-        let input = add_value_row(
+        let (input, _) = add_value_row(
             ui,
             card,
             "rotation",
@@ -2248,6 +2310,7 @@ fn build_inspector(
                         );
                         rows.field_sliders
                             .push((slider, node, i, field.to_string()));
+                        add_tooltip(rows, row, hints);
                         continue;
                     }
                     let numeric = matches!(value, Value::F32(_) | Value::Int(_));
@@ -2257,12 +2320,29 @@ fn build_inspector(
                         readonly,
                         unit: None,
                     };
-                    let input = add_value_row(ui, card, field, &value, numeric, shape, theme);
+                    let (input, row) =
+                        add_value_row(ui, card, field, &value, numeric, shape, theme);
                     rows.field_rows.push((input, node, i, field.to_string()));
+                    add_tooltip(rows, row, hints);
                 }
             }
         }
     }
+    // Last, under the components it adds to. The per-component remove "x"
+    // shipped in M3 and this is the other half of it; until now a component
+    // could only be added by a keyboard shortcut that knew one kind each.
+    rows.add_component = Some(
+        ui.button(
+            panel,
+            "Add component",
+            Style::new()
+                .padding(5.0)
+                .background(theme.aurora.menu_bg)
+                .corner_radius(theme.aurora.control_radius)
+                .border(theme.aurora.border_width, theme.aurora.card_border)
+                .foreground(theme.aurora.heading),
+        ),
+    );
     panel
 }
 
@@ -2740,6 +2820,21 @@ pub struct FieldShape<'a> {
     pub unit: Option<&'a str>,
 }
 
+/// Record a field's `@tooltip`, if the script wrote one.
+///
+/// The annotation has been parsed, validated and stored on the component since
+/// 4.7 and nothing ever read it, so `@tooltip("pixels per second")` did exactly
+/// nothing - which is the same shape of bug as an annotation that describes a
+/// value the language cannot declare.
+fn add_tooltip(rows: &mut EditorRows, widget: WidgetId, hints: &[comet::Hint]) {
+    if let Some(text) = hints.iter().find_map(|hint| match hint {
+        comet::Hint::Tooltip(text) => Some(text.clone()),
+        _ => None,
+    }) {
+        rows.tooltips.push((widget, text));
+    }
+}
+
 fn add_value_row(
     ui: &mut Ui,
     panel: WidgetId,
@@ -2748,7 +2843,7 @@ fn add_value_row(
     numeric: bool,
     shape: FieldShape<'_>,
     theme: &EditorTheme,
-) -> WidgetId {
+) -> (WidgetId, WidgetId) {
     let row = ui.panel(panel, Style::new().row().gap(6.0).align_center());
     ui.label(
         row,
@@ -2772,7 +2867,7 @@ fn add_value_row(
     if let Some(unit) = shape.unit {
         ui.label(row, unit, Style::new().foreground(theme.aurora.subhead));
     }
-    input
+    (input, row)
 }
 
 /// A Vec2 field as two rows: a colored, draggable axis label (X red, Y green)
@@ -4905,6 +5000,146 @@ mod tests {
             ui.slider_value(slider) > 8.0,
             "dragged to the right end, got {}",
             ui.slider_value(slider)
+        );
+    }
+
+    #[test]
+    fn the_tree_and_the_inspector_each_offer_a_way_to_add() {
+        // Adding a node was reachable only as "Add Sprite", which spawns one
+        // with a component already on it, and adding a component only through
+        // two shortcuts that each knew one kind.
+        let (scene, handle) = demo_scene();
+        let dir = std::env::temp_dir();
+        let sprite = scene
+            .children(scene.root())
+            .first()
+            .copied()
+            .expect("the demo scene has a node");
+        let (_, rows) = build_editor_ui_test(
+            &scene,
+            Some(sprite),
+            handle,
+            &dir,
+            (),
+            None,
+            GizmoMode::Select,
+            None,
+            &TreeView::default(),
+            &InspectorView::default(),
+            &EditorTheme::default(),
+        );
+        assert!(rows.add_node.is_some(), "the scene tree offers Add node");
+        assert!(
+            rows.add_component.is_some(),
+            "and the inspector offers Add component"
+        );
+    }
+
+    #[test]
+    fn the_component_chooser_offers_every_kind_that_can_be_built() {
+        // Driven by `Component::KINDS`, so a fourth kind cannot ship with a
+        // picker that has not heard of it.
+        let (scene, handle) = demo_scene();
+        let node = scene.root();
+        let rows = laid_out_modal(&Modal::component_chooser(node));
+        let offered: Vec<&str> = rows.component_choices.iter().map(|(_, k)| *k).collect();
+        let expected: Vec<&str> = helios::Component::KINDS.iter().map(|(k, _)| *k).collect();
+        assert_eq!(offered, expected);
+        assert!(rows.modal_close.is_some());
+        assert_eq!(
+            rows.modal_buttons.len(),
+            1,
+            "picking commits; Cancel is the footer"
+        );
+        let _ = handle;
+    }
+
+    #[test]
+    fn an_exported_field_with_a_tooltip_registers_one() {
+        // `@tooltip` has been parsed, validated and stored on the component
+        // since 4.7, and the inspector never read it - so a script saying what
+        // a number means to whoever is tuning it said it to nobody.
+        let mut scene = Scene::new("root");
+        let node = scene.add_child(scene.root(), Node::new("player"));
+        scene
+            .node_mut(node)
+            .components
+            .push(helios::Component::Script(helios::ScriptComponent {
+                source: "player.cmt".to_string(),
+                exports: vec![
+                    ("speed".to_string(), Value::F32(220.0)),
+                    ("quiet".to_string(), Value::F32(1.0)),
+                ],
+                hints: vec![(
+                    "speed".to_string(),
+                    vec![comet::Hint::Tooltip("pixels per second".to_string())],
+                )],
+            }));
+        let (_, handle) = demo_scene();
+        let dir = std::env::temp_dir();
+        let (_, rows) = build_editor_ui_test(
+            &scene,
+            Some(node),
+            handle,
+            &dir,
+            (),
+            None,
+            GizmoMode::Select,
+            None,
+            &TreeView::default(),
+            &InspectorView::default(),
+            &EditorTheme::default(),
+        );
+        let said: Vec<&str> = rows.tooltips.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(
+            said,
+            ["pixels per second"],
+            "the field with the annotation, and only that one"
+        );
+    }
+
+    #[test]
+    fn a_tooltip_on_a_slider_registers_too() {
+        // `@range` turns the field into a slider, which is a different build
+        // path - and the field most likely to carry both annotations.
+        let mut scene = Scene::new("root");
+        let node = scene.add_child(scene.root(), Node::new("player"));
+        scene
+            .node_mut(node)
+            .components
+            .push(helios::Component::Script(helios::ScriptComponent {
+                source: "player.cmt".to_string(),
+                exports: vec![("speed".to_string(), Value::F32(220.0))],
+                hints: vec![(
+                    "speed".to_string(),
+                    vec![
+                        comet::Hint::Range(0.0, 600.0),
+                        comet::Hint::Tooltip("pixels per second".to_string()),
+                    ],
+                )],
+            }));
+        let (_, handle) = demo_scene();
+        let dir = std::env::temp_dir();
+        let (_, rows) = build_editor_ui_test(
+            &scene,
+            Some(node),
+            handle,
+            &dir,
+            (),
+            None,
+            GizmoMode::Select,
+            None,
+            &TreeView::default(),
+            &InspectorView::default(),
+            &EditorTheme::default(),
+        );
+        assert_eq!(rows.field_sliders.len(), 1, "it is a slider");
+        assert_eq!(
+            rows.tooltips
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>(),
+            ["pixels per second"]
         );
     }
 }

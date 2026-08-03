@@ -37,6 +37,16 @@ pub fn spawn_sprite(
     history.add_node(scene, root, node)
 }
 
+/// Create an empty node under `parent`, and return it.
+///
+/// No components: what it is for is being a parent, or a place to hang one
+/// thing on. Everything else here spawns a node with something already
+/// attached, which is why an empty one had no path at all.
+pub fn add_node(scene: &mut Scene, history: &mut History, parent: NodeId) -> NodeId {
+    let node = Node::new(format!("Node {}", scene.len()));
+    history.add_node(scene, parent, node)
+}
+
 /// Create a camera node under the scene root, at `world`, and return it.
 ///
 /// A node of its own rather than a component on the selection, because where a

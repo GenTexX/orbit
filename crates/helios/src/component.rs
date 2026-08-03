@@ -40,6 +40,17 @@ impl Component {
     /// Construct a default component of the given [`type_name`](Reflect::type_name),
     /// or `None` if the kind is unknown. Deserialization uses this, then applies
     /// the saved fields through [`Reflect::set`].
+    /// Every kind a component can be, with a sentence about what it does.
+    ///
+    /// The list a picker offers, and the list `from_type_name` accepts, from
+    /// one place - so a fourth component kind cannot ship with a UI that does
+    /// not know about it. A test asserts the two agree.
+    pub const KINDS: &'static [(&'static str, &'static str)] = &[
+        ("Sprite", "Draws a texture at this node."),
+        ("Script", "Runs a Comet script for this node."),
+        ("Camera", "The view the game is played through."),
+    ];
+
     pub fn from_type_name(kind: &str) -> Option<Component> {
         match kind {
             "Sprite" => Some(Component::Sprite(SpriteComponent::default())),
@@ -506,5 +517,25 @@ mod tests {
         // export name costs somebody their tuned number, and that is worth
         // knowing rather than discovering.
         assert!(!script.exports.iter().any(|(name, _)| name == "gone"));
+    }
+
+    #[test]
+    fn the_kinds_a_picker_offers_are_the_kinds_that_can_be_built() {
+        // Two lists that have to agree, and nothing but this checks it: a
+        // fourth component kind could otherwise ship with a picker that does
+        // not offer it, or a picker offering one that cannot be constructed.
+        for (kind, description) in Component::KINDS {
+            let built = Component::from_type_name(kind)
+                .unwrap_or_else(|| panic!("the picker offers {kind}, which cannot be built"));
+            assert_eq!(built.as_reflect().type_name(), *kind);
+            assert!(!description.is_empty(), "{kind} says what it does");
+        }
+        // And the other direction: every kind that can be built is offered.
+        for kind in ["Sprite", "Script", "Camera"] {
+            assert!(
+                Component::KINDS.iter().any(|(name, _)| name == &kind),
+                "{kind} can be built and is not offered"
+            );
+        }
     }
 }
