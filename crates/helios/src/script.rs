@@ -538,6 +538,21 @@ impl ScriptInstance {
         self.settle(result)
     }
 
+    /// Write one exported variable into this running script.
+    ///
+    /// The write half of `read_exports`, and the thing that turns Play from a
+    /// rehearsal you watch into one you can turn the dials on: drag `gravity`
+    /// and the jump changes under your hand, rather than stop, edit, play, and
+    /// lose your position.
+    ///
+    /// A live override, not an edit. ADR 0022 keeps the component the owner, so
+    /// the authored value is untouched and Stop puts it back - which is also why
+    /// this needs no undo entry and cannot lose anybody's work.
+    pub fn write_export(&mut self, name: &str, value: &Value) {
+        let instance = self.instance;
+        write_export(&mut self.store, &instance, name, value);
+    }
+
     /// Carry this script's plain top-level state over from `previous`.
     ///
     /// What a hot reload should feel like: your code changed and your game kept
@@ -756,35 +771,45 @@ struct ScriptState {
 /// than writing a float into a bool.
 fn apply_exports(store: &mut Store<ScriptState>, instance: &Instance, exports: &[(String, Value)]) {
     for (name, value) in exports {
-        let globals = match value {
-            Value::Vec2(_) => comet::exported_globals(name, comet::Type::Vec2),
-            Value::F32(_) => comet::exported_globals(name, comet::Type::F32),
-            Value::Bool(_) => comet::exported_globals(name, comet::Type::Bool),
-            // comet's `Int` and a payload-free enum's tag are both one i32
-            // global, and `exported_globals` names them the same way, so one
-            // arm covers both.
-            Value::Int(_) => comet::exported_globals(name, comet::Type::Int),
-            _ => continue,
+        write_export(store, instance, name, value);
+    }
+}
+
+/// Write one exported variable into the module's globals.
+///
+/// The half of `apply_exports` that does the work, split out because it has a
+/// second caller now: the inspector, writing a value into a script that is
+/// already running. That is the difference between Play being a rehearsal you
+/// watch and one you can turn the dials on.
+fn write_export(store: &mut Store<ScriptState>, instance: &Instance, name: &str, value: &Value) {
+    let globals = match value {
+        Value::Vec2(_) => comet::exported_globals(name, comet::Type::Vec2),
+        Value::F32(_) => comet::exported_globals(name, comet::Type::F32),
+        Value::Bool(_) => comet::exported_globals(name, comet::Type::Bool),
+        // comet's `Int` and a payload-free enum's tag are both one i32 global,
+        // and `exported_globals` names them the same way, so one arm covers
+        // both.
+        Value::Int(_) => comet::exported_globals(name, comet::Type::Int),
+        _ => return,
+    };
+    let wasm: Vec<Val> = match value {
+        Value::F32(v) => vec![Val::F32(v.to_bits())],
+        Value::Int(v) => vec![Val::I32(*v)],
+        Value::Bool(v) => vec![Val::I32(i32::from(*v))],
+        Value::Vec2(v) => vec![Val::F32(v.x.to_bits()), Val::F32(v.y.to_bits())],
+        _ => return,
+    };
+    for (name, value) in globals.iter().zip(wasm) {
+        let Some(global) = instance.get_global(&mut *store, name) else {
+            continue;
         };
-        let wasm: Vec<Val> = match value {
-            Value::F32(v) => vec![Val::F32(v.to_bits())],
-            Value::Int(v) => vec![Val::I32(*v)],
-            Value::Bool(v) => vec![Val::I32(i32::from(*v))],
-            Value::Vec2(v) => vec![Val::F32(v.x.to_bits()), Val::F32(v.y.to_bits())],
-            _ => continue,
-        };
-        for (name, value) in globals.iter().zip(wasm) {
-            let Some(global) = instance.get_global(&mut *store, name) else {
-                continue;
-            };
-            // A failure here is a real disagreement between the component and
-            // the module - the value's type is not the global's - and used to
-            // be thrown away with `let _`, which is how an exported int came to
-            // be editable, saved, and silently inert. helios takes no logging
-            // dependency (that is the editor's), so it is dropped deliberately
-            // and named rather than swallowed anonymously.
-            let _mismatch = global.set(&mut *store, value);
-        }
+        // A failure here is a real disagreement between the component and the
+        // module - the value's type is not the global's - and used to be thrown
+        // away with `let _`, which is how an exported int came to be editable,
+        // saved, and silently inert. helios takes no logging dependency (that
+        // is the editor's), so it is dropped deliberately and named rather than
+        // swallowed anonymously.
+        let _mismatch = global.set(&mut *store, value);
     }
 }
 

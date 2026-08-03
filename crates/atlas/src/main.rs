@@ -4704,6 +4704,87 @@ impl State {
         self.camera.camera(viewport)
     }
 
+    /// Send a value into a running script instead of into the document.
+    ///
+    /// Returns whether it was taken. While a game runs, an edit to a script's
+    /// `@export`ed field is not a document edit at all - ADR 0022 keeps the
+    /// component the owner, so the authored value is untouched and Stop puts it
+    /// back. That is what makes this safe to allow while the other twenty-six
+    /// paths stay refused: there is nothing for undo to know about and nothing
+    /// to lose.
+    ///
+    /// It is also the single most educational thing the editor can offer. Drag
+    /// `gravity` and the jump changes under your hand, rather than stop, edit,
+    /// play, and lose your position - which is what `@range` and `@step` were
+    /// built for in the first place.
+    fn tune_running_script(
+        &mut self,
+        node: NodeId,
+        component: usize,
+        field: &str,
+        value: &Value,
+    ) -> bool {
+        if !self.play.is_playing() {
+            return false;
+        }
+        let exported = matches!(
+            self.project.scene.node(node).components.get(component),
+            Some(helios::Component::Script(script))
+                if script.exports.iter().any(|(name, _)| name == field)
+        );
+        if !exported {
+            return false;
+        }
+        if self.play.set_export(node, component, field, value) {
+            self.note(format!("{field} is live - Stop puts the saved value back"));
+            return true;
+        }
+        false
+    }
+
+    /// A submitted text field that names a running script's exported variable,
+    /// routed into the module rather than into the document.
+    ///
+    /// Returns whether it was taken, so the ordinary commit path can run when
+    /// it was not.
+    fn commit_live_export(&mut self, id: aurora::WidgetId) -> bool {
+        if !self.play.is_playing() {
+            return false;
+        }
+        let Some((_, node, component, field)) = self
+            .rows
+            .field_rows
+            .iter()
+            .find(|(widget, ..)| *widget == id)
+            .map(|(w, n, c, f)| (*w, *n, *c, f.clone()))
+        else {
+            return false;
+        };
+        let WidgetKind::TextInput(text) = self.ui.kind(id) else {
+            return false;
+        };
+        let text = text.clone();
+        let Some(old) = self
+            .project
+            .scene
+            .node(node)
+            .components
+            .get(component)
+            .and_then(|c| c.as_reflect().get(&field))
+        else {
+            return false;
+        };
+        let Some(new) = parse_value(&text, &old) else {
+            // Unparseable text stays on screen, the same as when stopped.
+            return self.play.is_playing()
+                && matches!(
+                    self.project.scene.node(node).components.get(component),
+                    Some(helios::Component::Script(_))
+                );
+        };
+        self.tune_running_script(node, component, &field, &new)
+    }
+
     /// Whether an edit to the scene must be refused because a game is running.
     ///
     /// In-process Play (ADR 0002) leaves the whole editing UI live and
@@ -6766,8 +6847,7 @@ impl State {
                 // what makes the whole drag one undo step - the same shape the
                 // inspector's label scrub uses.
                 AuroraEvent::SliderChanged { id, value }
-                    if self.rows.field_sliders.iter().any(|(w, ..)| *w == id)
-                        && !self.scene_edits_blocked() =>
+                    if self.rows.field_sliders.iter().any(|(w, ..)| *w == id) =>
                 {
                     let (node, component, field) = self
                         .rows
@@ -6776,6 +6856,14 @@ impl State {
                         .find(|(w, ..)| *w == id)
                         .map(|(_, n, c, f)| (*n, *c, f.clone()))
                         .expect("guarded by the match arm");
+                    // A running script's own value, or the document's - and
+                    // while a game runs it is never both.
+                    if self.tune_running_script(node, component, &field, &Value::F32(value)) {
+                        continue;
+                    }
+                    if self.scene_edits_blocked() {
+                        continue;
+                    }
                     let reflect = self.project.scene.node(node).components[component].as_reflect();
                     let original = reflect.get(&field);
                     self.slider_drag.get_or_insert_with(|| SliderDrag {
@@ -6831,8 +6919,7 @@ impl State {
                 // history: a checkbox has no half-typed state to protect, so
                 // there is nothing to defer to a focus-out.
                 AuroraEvent::Toggled { id, checked }
-                    if self.rows.field_checkboxes.iter().any(|(w, ..)| *w == id)
-                        && !self.scene_edits_blocked() =>
+                    if self.rows.field_checkboxes.iter().any(|(w, ..)| *w == id) =>
                 {
                     if let Some((_, node, component, field)) = self
                         .rows
@@ -6841,6 +6928,13 @@ impl State {
                         .find(|(w, ..)| *w == id)
                         .map(|(w, n, c, f)| (*w, *n, *c, f.clone()))
                     {
+                        if self.tune_running_script(node, component, &field, &Value::Bool(checked))
+                        {
+                            continue;
+                        }
+                        if self.scene_edits_blocked() {
+                            continue;
+                        }
                         self.history.set_field(
                             &mut self.project.scene,
                             node,
@@ -7150,9 +7244,11 @@ impl State {
                         }
                         continue;
                     }
-                    // Every inspector commit at once: they are only ever
-                    // reached from here, so one gate covers all four.
-                    if !self.scene_edits_blocked() {
+                    // A script's exported field goes into the running module
+                    // instead, which is not a document edit and so is allowed.
+                    // Everything else is one gate for all four, since they are
+                    // only ever reached from here.
+                    if !self.commit_live_export(id) && !self.scene_edits_blocked() {
                         self.commit_field(id);
                         self.commit_transform_field(id);
                         self.commit_vec_input(id);

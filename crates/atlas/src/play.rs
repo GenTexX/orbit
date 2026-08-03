@@ -111,6 +111,20 @@ impl Play {
         self.runtime.as_mut()?.live_exports(scene, node, component)
     }
 
+    /// Write one exported variable into a running script, returning whether
+    /// there was one to write to.
+    pub fn set_export(
+        &mut self,
+        node: helios::NodeId,
+        component: usize,
+        name: &str,
+        value: &Value,
+    ) -> bool {
+        self.runtime
+            .as_mut()
+            .is_some_and(|runtime| runtime.set_export(node, component, name, value))
+    }
+
     /// What every script in this session is doing - what is running, what has
     /// stopped, and which file each came from.
     pub fn instances(&self) -> Vec<voyager::InstanceInfo> {
@@ -589,5 +603,61 @@ mod tests {
             before.to_ron().expect("ron"),
             "Stop restored the level"
         );
+    }
+
+    #[test]
+    fn a_running_script_can_be_tuned_without_touching_the_document() {
+        // The single most educational move an engine can offer, and the one
+        // Play used to forbid: drag `speed` while the thing is moving and watch
+        // it change. It is safe to allow while every other edit stays refused
+        // because ADR 0022 keeps the component the owner - so this is a live
+        // override with nothing for undo to know about and nothing to lose.
+        let (dir, mut scene, node, component) = demo_scene_running("scripts/tunable.cmt");
+        let Some(Component::Script(script)) = scene.node_mut(node).components.get_mut(component)
+        else {
+            panic!("the fixture attaches a script");
+        };
+        script.exports = vec![
+            ("speed".to_string(), helios::Value::F32(10.0)),
+            (
+                "direction".to_string(),
+                helios::Value::Vec2(glam::Vec2::new(1.0, 0.0)),
+            ),
+            ("travelled".to_string(), helios::Value::F32(0.0)),
+        ];
+
+        let mut play = Play::new(&dir);
+        play.start(&mut scene);
+        play.step(&mut scene, 1.0);
+        let slow = scene.node(node).transform.translation.x;
+        assert!((slow - 10.0).abs() < 0.001, "one second at 10: {slow}");
+
+        // Turn the dial while it runs.
+        assert!(play.set_export(node, component, "speed", &helios::Value::F32(100.0)));
+        play.step(&mut scene, 1.0);
+        let fast = scene.node(node).transform.translation.x - slow;
+        assert!((fast - 100.0).abs() < 0.001, "and now at 100: {fast}");
+
+        // The document never heard about it, so Stop puts the authored number
+        // back with nothing to undo.
+        let Some(Component::Script(script)) = scene.node(node).components.get(component) else {
+            panic!("it is a script component");
+        };
+        assert_eq!(
+            script.exports.iter().find(|(n, _)| n == "speed"),
+            Some(&("speed".to_string(), helios::Value::F32(10.0))),
+            "the component still holds what was authored"
+        );
+    }
+
+    #[test]
+    fn tuning_a_script_that_is_not_running_does_nothing() {
+        let (dir, mut scene, node, component) = demo_scene_running("scripts/tunable.cmt");
+        let mut play = Play::new(&dir);
+        assert!(
+            !play.set_export(node, component, "speed", &helios::Value::F32(1.0)),
+            "there is nothing to write to"
+        );
+        let _ = &mut scene;
     }
 }

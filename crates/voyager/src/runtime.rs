@@ -451,6 +451,26 @@ impl Runtime {
         }
     }
 
+    /// Write one exported variable into the script running at
+    /// `(node, component)`, if one is.
+    ///
+    /// A live override rather than an edit: the component still owns the value
+    /// (ADR 0022), so Stop puts the authored number back and there is nothing
+    /// for undo to know about.
+    pub fn set_export(
+        &mut self,
+        node: NodeId,
+        component: usize,
+        name: &str,
+        value: &Value,
+    ) -> bool {
+        let Some(at) = self.index_of(node, component) else {
+            return false;
+        };
+        self.running[at].script.write_export(name, value);
+        true
+    }
+
     /// Take what has gone wrong since this was last called.
     pub fn take_problems(&mut self) -> Vec<Problem> {
         std::mem::take(&mut self.problems)
