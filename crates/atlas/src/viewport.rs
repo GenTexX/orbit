@@ -219,7 +219,10 @@ pub fn gizmo(scene: &Scene, node: NodeId, zoom: f32) -> Option<Gizmo> {
     // sprite, and the gizmo belongs to the sprite wherever in the list it sits.
     let sprite_size = scene.node(node).components.iter().find_map(|c| match c {
         Component::Sprite(s) => Some(s.size),
-        Component::Script(_) => None,
+        // Neither a script nor a camera has an extent to frame. A camera is
+        // still selectable and still movable through the inspector; it just has
+        // no rectangle for a gizmo to grab.
+        Component::Script(_) | Component::Camera(_) => None,
     })?;
     let affine = scene.world_transform(node);
     let (scale, angle, translation) = affine.to_scale_angle_translation();

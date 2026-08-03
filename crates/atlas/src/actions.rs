@@ -37,6 +37,26 @@ pub fn spawn_sprite(
     history.add_node(scene, root, node)
 }
 
+/// Create a camera node under the scene root, at `world`, and return it.
+///
+/// A node of its own rather than a component on the selection, because where a
+/// camera is *is* what it does: putting one on the player is a decision (the
+/// view follows them), and so is putting one on an empty node in the middle of
+/// the level (it does not). Dropping it onto whatever happened to be selected
+/// would make that decision for you.
+pub fn spawn_camera(scene: &mut Scene, history: &mut History, world: Vec2) -> NodeId {
+    let root = scene.root();
+    let local = scene
+        .world_transform(root)
+        .inverse()
+        .transform_point2(world);
+    let mut node = Node::new("Camera");
+    node.transform = Transform::from_translation(local);
+    node.components
+        .push(Component::Camera(helios::CameraComponent::default()));
+    history.add_node(scene, root, node)
+}
+
 /// Attach an empty [`ScriptComponent`] to `node`, returning its index. Undoable:
 /// one history step. Returns `None` if the node already has a script - a node
 /// runs one script, so a second one would just be an inspector row nothing ever
@@ -330,5 +350,32 @@ mod tests {
         // And its world position round-trips back to the drop point.
         let world = scene.world_transform(node).transform_point2(Vec2::ZERO);
         assert!((world - Vec2::new(140.0, 40.0)).length() < 1.0e-4);
+    }
+
+    #[test]
+    fn spawn_camera_makes_a_node_of_its_own_and_one_undo_step() {
+        // Its own node, because where a camera is *is* what it does. Attaching
+        // it to whatever happened to be selected would decide that for you.
+        let mut scene = Scene::new("Root");
+        let mut history = History::new();
+        let node = spawn_camera(&mut scene, &mut history, Vec2::new(120.0, -40.0));
+
+        assert_eq!(
+            scene.node(node).transform.translation,
+            Vec2::new(120.0, -40.0)
+        );
+        assert!(matches!(
+            scene.node(node).components.as_slice(),
+            [Component::Camera(_)]
+        ));
+        assert_eq!(
+            scene.active_camera().map(|(_, at)| at),
+            Some(Vec2::new(120.0, -40.0)),
+            "and it is the camera the scene plays through"
+        );
+
+        assert!(history.undo(&mut scene));
+        assert!(scene.children(scene.root()).is_empty());
+        assert!(scene.active_camera().is_none());
     }
 }

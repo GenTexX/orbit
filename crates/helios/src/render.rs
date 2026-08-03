@@ -68,6 +68,11 @@ impl Scene {
                 // A script draws nothing. What it does is move the node, which
                 // this walk reads back through the transform like any other.
                 Component::Script(_) => {}
+                // Nor does a camera. It decides what the *whole* list is seen
+                // through, which is a question for whoever renders it and not
+                // for one entry in it - and a camera that drew itself would
+                // appear in its own view.
+                Component::Camera(_) => {}
             }
         }
         for &child in self.children(id) {

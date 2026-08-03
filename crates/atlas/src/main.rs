@@ -3045,6 +3045,10 @@ impl State {
                 self.add_script_action();
                 return true;
             }
+            if c.eq_ignore_ascii_case("k") {
+                self.add_camera_action();
+                return true;
+            }
         }
         // Only when the code editor or the find bar itself has focus. It used
         // to fire whenever a Code pane existed at all, so ctrl+f while renaming
@@ -3541,6 +3545,23 @@ impl State {
             "assets/sprite.png",
             self.texture_size,
         );
+        self.select_new_node(node);
+    }
+
+    /// Add a camera at the middle of the current view.
+    ///
+    /// Its own node, placed where you are looking, so pressing Play immediately
+    /// afterwards shows roughly what the editor was showing - a camera that
+    /// starts at the world origin would look like Play had broken the view.
+    fn add_camera_action(&mut self) {
+        if self.scene_edits_blocked() {
+            return;
+        }
+        let Some(rect) = self.viewport_rect() else {
+            return;
+        };
+        let world = self.camera.screen_to_world(rect.size * 0.5);
+        let node = actions::spawn_camera(&mut self.project.scene, &mut self.history, world);
         self.select_new_node(node);
     }
 
@@ -4520,6 +4541,27 @@ impl State {
         // The mode changes what the shell draws and what the inspector shows,
         // so this one is a rebuild rather than a redraw.
         self.dirty = true;
+    }
+
+    /// What the viewport is drawn through.
+    ///
+    /// While a game runs, the scene's own camera - so what you see on Play is
+    /// what a player would see, which is the only reason a Camera component is
+    /// worth having. A scene with no camera keeps the view you were already
+    /// looking at, so Play demoes before anybody has added one; that fallback
+    /// is the difference between a feature you can try and a feature you have
+    /// to set up first.
+    ///
+    /// While stopped it is always the editor's camera, even in a scene that has
+    /// one, because panning and zooming while editing must not be a change to
+    /// the document.
+    fn scene_camera(&self, viewport: Vec2) -> photon::Camera {
+        if self.play.is_playing()
+            && let Some((camera, at)) = self.project.scene.active_camera()
+        {
+            return camera.view(at, viewport);
+        }
+        self.camera.camera(viewport)
     }
 
     /// Whether an edit to the scene must be refused because a game is running.
@@ -6395,7 +6437,7 @@ impl State {
             grid_minor: to_photon(self.theme.grid_line),
             grid_major: to_photon(self.theme.grid_line_strong),
         };
-        let camera = self.camera.camera(Vec2::new(w as f32, h as f32));
+        let camera = self.scene_camera(Vec2::new(w as f32, h as f32));
         // Draw the scene as per-texture runs, so each sprite shows the texture
         // it names (consecutive same-texture sprites batch, order preserved).
         let draws = self.project.scene.sprite_draws();

@@ -1,9 +1,9 @@
 //! helios scene: the Node tree (ADR 0003) as a slotmap arena of Nodes with handles.
 
-use glam::Affine2;
+use glam::{Affine2, Vec2};
 use slotmap::{SlotMap, new_key_type};
 
-use crate::component::Component;
+use crate::component::{CameraComponent, Component};
 use crate::transform::Transform;
 
 new_key_type! {
@@ -112,6 +112,33 @@ impl Scene {
             Some(parent) => self.world_transform(parent) * local,
             None => local,
         }
+    }
+
+    /// The camera the game is played through, and where it is in the world.
+    ///
+    /// The first active [`CameraComponent`](crate::CameraComponent) in scene
+    /// pre-order - the same order scripts run in, so "first" means the same
+    /// thing everywhere - together with the world position of the node carrying
+    /// it. `None` when the scene has no camera, which a host answers however it
+    /// likes; the editor falls back to the view you were already looking at.
+    ///
+    /// Pre-order rather than "the one marked default", because a scene with two
+    /// active cameras is a mistake rather than a configuration, and the rule
+    /// that resolves it should be one a person can predict from the panel
+    /// rather than one they have to go looking for.
+    pub fn active_camera(&self) -> Option<(&CameraComponent, Vec2)> {
+        let mut stack = vec![self.root()];
+        while let Some(id) = stack.pop() {
+            for component in &self.nodes[id].components {
+                if let Component::Camera(camera) = component
+                    && camera.active
+                {
+                    return Some((camera, self.world_transform(id).translation));
+                }
+            }
+            stack.extend(self.children(id).iter().rev().copied());
+        }
+        None
     }
 
     // ---- low-level tree ops, used by the edit commands (command.rs) ----
@@ -231,5 +258,61 @@ mod tests {
         // The parent's 2x scale doubles the child's local offset in world space.
         let world = scene.world_transform(child);
         assert_eq!(world.transform_point2(Vec2::ZERO), Vec2::new(10.0, 0.0));
+    }
+
+    #[test]
+    fn the_active_camera_is_the_first_one_in_pre_order() {
+        // Pre-order, the same order scripts run in, so "first" means the same
+        // thing everywhere in the engine. Two active cameras is a mistake
+        // rather than a configuration, and the rule that resolves it should be
+        // one a person can read off the panel.
+        let mut scene = Scene::new("root");
+        let a = scene.add_child(scene.root(), Node::new("a"));
+        let child = scene.add_child(a, Node::new("a-child"));
+        let b = scene.add_child(scene.root(), Node::new("b"));
+
+        for node in [child, b] {
+            scene
+                .node_mut(node)
+                .components
+                .push(Component::Camera(CameraComponent::default()));
+        }
+        scene.node_mut(child).transform.translation = Vec2::new(7.0, 0.0);
+        scene.node_mut(b).transform.translation = Vec2::new(99.0, 0.0);
+
+        let (_, at) = scene.active_camera().expect("a camera");
+        assert_eq!(at, Vec2::new(7.0, 0.0), "the deeper one comes first");
+
+        // Turning it off is how you switch, without moving anything.
+        let Some(Component::Camera(camera)) = scene.node_mut(child).components.first_mut() else {
+            panic!("it is a camera");
+        };
+        camera.active = false;
+        let (_, at) = scene.active_camera().expect("the other camera");
+        assert_eq!(at, Vec2::new(99.0, 0.0));
+    }
+
+    #[test]
+    fn a_camera_reports_where_it_is_in_the_world_not_where_it_is_in_its_parent() {
+        // The whole point of a camera being a component: parent it to the
+        // player and it follows, with no code and no script.
+        let mut scene = Scene::new("root");
+        let player = scene.add_child(scene.root(), Node::new("player"));
+        scene.node_mut(player).transform.translation = Vec2::new(500.0, 300.0);
+        let eye = scene.add_child(player, Node::new("camera"));
+        scene.node_mut(eye).transform.translation = Vec2::new(0.0, -40.0);
+        scene
+            .node_mut(eye)
+            .components
+            .push(Component::Camera(CameraComponent::default()));
+
+        let (_, at) = scene.active_camera().expect("a camera");
+        assert_eq!(at, Vec2::new(500.0, 260.0));
+    }
+
+    #[test]
+    fn a_scene_with_no_camera_has_none() {
+        let scene = Scene::new("root");
+        assert!(scene.active_camera().is_none());
     }
 }

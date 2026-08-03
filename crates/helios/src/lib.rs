@@ -20,7 +20,7 @@ mod serialize;
 mod transform;
 
 pub use command::{Edit, History};
-pub use component::{Component, ScriptComponent, SpriteComponent};
+pub use component::{CameraComponent, Component, ScriptComponent, SpriteComponent};
 pub use error::HeliosError;
 pub use input::Input;
 pub use project::{Manifest, Project, write_atomic};

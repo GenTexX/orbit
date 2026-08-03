@@ -13,6 +13,8 @@ pub enum Component {
     Sprite(SpriteComponent),
     /// Runs a Comet script for the owning node.
     Script(ScriptComponent),
+    /// The view the game is played through, centred on the owning node.
+    Camera(CameraComponent),
 }
 
 impl Component {
@@ -22,6 +24,7 @@ impl Component {
         match self {
             Component::Sprite(s) => s,
             Component::Script(s) => s,
+            Component::Camera(c) => c,
         }
     }
 
@@ -30,6 +33,7 @@ impl Component {
         match self {
             Component::Sprite(s) => s,
             Component::Script(s) => s,
+            Component::Camera(c) => c,
         }
     }
 
@@ -40,6 +44,7 @@ impl Component {
         match kind {
             "Sprite" => Some(Component::Sprite(SpriteComponent::default())),
             "Script" => Some(Component::Script(ScriptComponent::default())),
+            "Camera" => Some(Component::Camera(CameraComponent::default())),
             _ => None,
         }
     }
@@ -100,6 +105,90 @@ impl Reflect for SpriteComponent {
             }
             ("size", Value::Vec2(v)) => {
                 self.size = v;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The view a game is played through: where the viewport is centred, and how
+/// much of the world it shows.
+///
+/// The position comes from the owning node's *world* transform rather than from
+/// a field here, which is the whole point of it being a component: parent a
+/// camera to the player and it follows, with no code and no script.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CameraComponent {
+    /// Whether this is the camera to look through.
+    ///
+    /// A scene may hold several - one per level section, one for a cutscene -
+    /// and only one can be looked through at a time. Turning one off is how you
+    /// switch, and it is a field rather than a scene-level setting so it can be
+    /// saved with the node it belongs to.
+    pub active: bool,
+    /// How much the view is magnified. Above 1 shows less of the world, larger.
+    pub zoom: f32,
+}
+
+impl Default for CameraComponent {
+    fn default() -> Self {
+        Self {
+            active: true,
+            zoom: 1.0,
+        }
+    }
+}
+
+impl CameraComponent {
+    /// The smallest zoom that can be set.
+    ///
+    /// Not zero, and not merely because dividing by it is undefined: a zoom of
+    /// zero asks to show an infinite amount of world, and the projection that
+    /// comes out of it is degenerate rather than empty. The floor is the same
+    /// kind of guard the gizmo puts on a node's scale.
+    pub const MIN_ZOOM: f32 = 0.01;
+
+    /// The view this camera gives of a `viewport`-sized render target, with
+    /// `center` (the owning node's world position) in the middle of it.
+    ///
+    /// Centred, unlike the editor's own camera, which anchors at the top left
+    /// because that is what a pannable canvas wants. A game camera is a thing
+    /// that follows something, and what it follows belongs in the middle.
+    pub fn view(&self, center: Vec2, viewport: Vec2) -> photon::Camera {
+        let extent = viewport / self.zoom.max(Self::MIN_ZOOM);
+        photon::Camera::new(center - extent * 0.5, extent)
+    }
+}
+
+impl Reflect for CameraComponent {
+    fn type_name(&self) -> &'static str {
+        "Camera"
+    }
+
+    fn field_names(&self) -> Vec<String> {
+        ["active", "zoom"].into_iter().map(String::from).collect()
+    }
+
+    fn get(&self, field: &str) -> Option<Value> {
+        match field {
+            "active" => Some(Value::Bool(self.active)),
+            "zoom" => Some(Value::F32(self.zoom)),
+            _ => None,
+        }
+    }
+
+    fn set(&mut self, field: &str, value: Value) -> bool {
+        match (field, value) {
+            ("active", Value::Bool(b)) => {
+                self.active = b;
+                true
+            }
+            ("zoom", Value::F32(z)) => {
+                // Clamped rather than refused: a zero typed into the inspector
+                // is a number on its way to being another number, and refusing
+                // it mid-keystroke makes the field fight the person using it.
+                self.zoom = z.max(Self::MIN_ZOOM);
                 true
             }
             _ => false,
@@ -285,14 +374,75 @@ mod tests {
     }
 
     #[test]
-    fn both_component_kinds_round_trip_through_their_type_name() {
+    fn every_component_kind_round_trips_through_its_type_name() {
         // What deserialization relies on: a saved kind tag reconstructs the
         // right variant, and an unknown one is rejected rather than guessed.
-        for kind in ["Sprite", "Script"] {
+        for kind in ["Sprite", "Script", "Camera"] {
             let component = Component::from_type_name(kind).expect("a known kind");
             assert_eq!(component.as_reflect().type_name(), kind);
         }
-        assert!(Component::from_type_name("Camera").is_none());
+        assert!(Component::from_type_name("Light").is_none());
+    }
+
+    #[test]
+    fn a_camera_reflects_its_fields_and_refuses_a_degenerate_zoom() {
+        let mut camera = CameraComponent::default();
+        assert_eq!(camera.type_name(), "Camera");
+        assert_eq!(camera.field_names(), &["active", "zoom"]);
+        assert_eq!(camera.get("active"), Some(Value::Bool(true)));
+        assert_eq!(camera.get("zoom"), Some(Value::F32(1.0)));
+
+        assert!(camera.set("zoom", Value::F32(2.5)));
+        assert_eq!(camera.get("zoom"), Some(Value::F32(2.5)));
+
+        // A zoom of zero asks to show an infinite amount of world. Clamped
+        // rather than refused, so a field being typed into does not fight back.
+        assert!(camera.set("zoom", Value::F32(0.0)));
+        assert_eq!(
+            camera.get("zoom"),
+            Some(Value::F32(CameraComponent::MIN_ZOOM))
+        );
+        assert!(camera.set("zoom", Value::F32(-4.0)));
+        assert_eq!(
+            camera.get("zoom"),
+            Some(Value::F32(CameraComponent::MIN_ZOOM))
+        );
+
+        assert!(
+            !camera.set("zoom", Value::Bool(true)),
+            "and a zoom is a number"
+        );
+    }
+
+    #[test]
+    fn a_cameras_view_is_centred_on_the_node_and_scaled_by_its_zoom() {
+        // The editor's own camera anchors at the top left, because that is what
+        // a pannable canvas wants. A game camera follows something, and what it
+        // follows belongs in the middle - so these two must not be confused.
+        let camera = CameraComponent::default();
+        let view = camera.view(Vec2::new(100.0, 50.0), Vec2::new(800.0, 600.0));
+        assert_eq!(view.viewport, Vec2::new(800.0, 600.0));
+        assert_eq!(
+            view.position,
+            Vec2::new(-300.0, -250.0),
+            "the node is in the middle of what the view shows"
+        );
+
+        let closer = CameraComponent {
+            zoom: 2.0,
+            ..CameraComponent::default()
+        };
+        let view = closer.view(Vec2::new(100.0, 50.0), Vec2::new(800.0, 600.0));
+        assert_eq!(
+            view.viewport,
+            Vec2::new(400.0, 300.0),
+            "zooming in shows less world"
+        );
+        assert_eq!(
+            view.position,
+            Vec2::new(-100.0, -100.0),
+            "and still centred on the node"
+        );
     }
 
     #[test]
