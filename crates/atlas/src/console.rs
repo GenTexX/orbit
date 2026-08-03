@@ -19,6 +19,36 @@ use tracing_subscriber::layer::Context;
 /// The most recent log lines kept for the Console pane (older ones are dropped).
 const LOG_CAP: usize = 2000;
 
+/// How long new output waits before the shell is rebuilt to show it, with the
+/// editor idle. Short enough to read as immediate.
+const IDLE_CADENCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// The same, while a game is running.
+///
+/// A game's output is a firehose - `print` in `update` is sixty lines a second -
+/// and showing a new line costs a whole shell rebuild. At the idle cadence that
+/// is the editor rearranging itself seven times a second underneath somebody who
+/// is watching their game, which is worse than output arriving a beat later.
+const PLAYING_CADENCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether new log output should rebuild the shell now.
+///
+/// Not while the pointer is down, whatever the cadence says. A rebuild replaces
+/// every widget, so aurora's retained `pressed` goes with them and the click
+/// never lands. Ordinary editor logs are rare enough that this could not fire;
+/// a script printing every frame makes it certain, and the click it would eat is
+/// the one on Stop.
+pub fn should_refresh(pointer_down: bool, playing: bool, since_last: std::time::Duration) -> bool {
+    if pointer_down {
+        return false;
+    }
+    let cadence = match playing {
+        true => PLAYING_CADENCE,
+        false => IDLE_CADENCE,
+    };
+    since_last >= cadence
+}
+
 /// One captured log record: its level, source module, and rendered message.
 #[derive(Debug, Clone)]
 pub struct LogLine {
@@ -121,6 +151,33 @@ mod tests {
         // The oldest 10 were evicted, so the front is line 10.
         assert_eq!(ring.lines.front().unwrap().message, "10");
         assert_eq!(ring.generation, (LOG_CAP + 10) as u64);
+    }
+
+    #[test]
+    fn output_never_rebuilds_the_shell_under_a_held_pointer() {
+        // The click this protects is the one on Stop, pressed while the game
+        // whose output is arriving is still printing.
+        assert!(
+            !should_refresh(true, true, PLAYING_CADENCE * 10),
+            "however overdue the refresh is"
+        );
+        assert!(!should_refresh(true, false, IDLE_CADENCE * 10));
+    }
+
+    #[test]
+    fn a_running_game_refreshes_the_console_more_slowly() {
+        assert!(should_refresh(false, false, IDLE_CADENCE));
+        assert!(
+            !should_refresh(false, true, IDLE_CADENCE),
+            "the idle cadence is too fast for a game's output"
+        );
+        assert!(should_refresh(false, true, PLAYING_CADENCE));
+    }
+
+    #[test]
+    fn nothing_refreshes_before_its_cadence() {
+        assert!(!should_refresh(false, false, IDLE_CADENCE / 2));
+        assert!(!should_refresh(false, true, PLAYING_CADENCE / 2));
     }
 
     #[test]

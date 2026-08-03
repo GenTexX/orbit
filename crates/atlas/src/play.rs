@@ -97,6 +97,24 @@ impl Play {
         }
     }
 
+    /// Take what the running scripts printed, each line tagged with which
+    /// script printed it.
+    pub fn take_output(&mut self) -> Vec<String> {
+        self.runtime
+            .as_mut()
+            .map(Runtime::take_output)
+            .unwrap_or_default()
+    }
+
+    /// Take what went wrong: a script that would not compile when the game
+    /// started, or one that trapped mid-frame.
+    pub fn take_problems(&mut self) -> Vec<String> {
+        self.runtime
+            .as_mut()
+            .map(Runtime::take_problems)
+            .unwrap_or_default()
+    }
+
     /// Run one frame, if a game is running.
     pub fn step(&mut self, scene: &mut Scene, dt: f32) {
         if !self.is_playing() {
@@ -222,6 +240,74 @@ mod tests {
         );
         play.stop(&mut scene);
         assert_eq!(scene.node(scripted).transform.translation, before);
+    }
+
+    #[test]
+    fn on_destroy_sees_the_game_rather_than_the_document() {
+        // Teardown runs before the restore, because a script's last word is
+        // about the game it was in. Running it after would hand it a scene the
+        // game never saw.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            dir.path().join("last.cmt"),
+            "func update(dt: f32) { transform.position.x += 10.0; }
+             func on_destroy() { print(str(transform.position.x)); }",
+        )
+        .expect("writing the script");
+
+        let mut scene = Scene::new("root");
+        let node = scene.add_child(scene.root(), Node::new("player"));
+        scene
+            .node_mut(node)
+            .components
+            .push(Component::Script(ScriptComponent {
+                source: "last.cmt".to_string(),
+                ..ScriptComponent::default()
+            }));
+
+        let mut play = Play::new(dir.path());
+        play.start(&mut scene);
+        play.step(&mut scene, 0.016);
+        play.stop(&mut scene);
+
+        let output = play.take_output().join(" ");
+        assert!(
+            output.contains("10"),
+            "it saw where the game left it, not where the document says: {output}"
+        );
+        assert_eq!(
+            scene.node(node).transform.translation.x,
+            0.0,
+            "and the document is still restored afterwards"
+        );
+    }
+
+    #[test]
+    fn a_script_that_will_not_compile_is_a_problem_rather_than_a_refusal_to_play() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            dir.path().join("broken.cmt"),
+            "func update(dt: f32) { $$$ }",
+        )
+        .expect("writing the script");
+
+        let mut scene = Scene::new("root");
+        let node = scene.add_child(scene.root(), Node::new("player"));
+        scene
+            .node_mut(node)
+            .components
+            .push(Component::Script(ScriptComponent {
+                source: "broken.cmt".to_string(),
+                ..ScriptComponent::default()
+            }));
+
+        let mut play = Play::new(dir.path());
+        play.start(&mut scene);
+        assert!(play.is_playing(), "the session started anyway");
+
+        let problems = play.take_problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("broken.cmt"), "{problems:?}");
     }
 
     #[test]

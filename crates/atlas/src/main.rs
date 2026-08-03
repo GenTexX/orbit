@@ -5767,7 +5767,11 @@ impl State {
     /// Rebuild the shell when the log ring has new lines and the console pane is
     /// visible - throttled so a burst of logs does not rebuild every frame.
     fn poll_console(&mut self) {
-        if self.last_log_poll.elapsed() < std::time::Duration::from_millis(150) {
+        if !console::should_refresh(
+            self.pointer_down,
+            self.play.is_playing(),
+            self.last_log_poll.elapsed(),
+        ) {
             return;
         }
         self.last_log_poll = std::time::Instant::now();
@@ -5781,6 +5785,28 @@ impl State {
             .map_or(self.last_log_gen, |ring| ring.generation);
         if generation != self.last_log_gen {
             self.dirty = true;
+        }
+    }
+
+    /// Move what the running scripts said into the editor's log, which is what
+    /// the Console pane shows.
+    ///
+    /// Through `tracing` rather than into a list of its own, so a script's
+    /// `print` lands in the same place as everything else the editor has to
+    /// say, in the order it happened, subject to the same cap. `[script]` is
+    /// the target, so the pane's own column already says where a line came
+    /// from, and each line is additionally tagged with which script printed it
+    /// - `print("hi")` from two nodes is otherwise two identical lines.
+    ///
+    /// Deliberately not setting `dirty`: see `poll_console`, which decides when
+    /// new output is worth a rebuild. Setting it here would rebuild the shell on
+    /// the frame a script printed, which during a game is every frame.
+    fn drain_script_output(&mut self) {
+        for line in self.play.take_output() {
+            tracing::info!(target: "script", "{line}");
+        }
+        for problem in self.play.take_problems() {
+            tracing::error!(target: "script", "{problem}");
         }
     }
 
@@ -6195,6 +6221,7 @@ impl State {
         // been paused on a breakpoint - or an editor that spent 400ms opening a
         // file - must not hand a game a step it can tunnel through walls with.
         self.play.step(&mut self.project.scene, dt);
+        self.drain_script_output();
         self.tick_tab_bars(dt);
         if let Some(id) = self.rows.carried_tab {
             // The carried tab sits under the pointer at the same point it was
