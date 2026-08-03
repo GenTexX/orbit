@@ -2904,6 +2904,16 @@ impl Ui {
         Some((view_h, content_h))
     }
 
+    #[doc(hidden)]
+    pub fn text_area_extent_for_test(&self, id: WidgetId) -> Option<(f32, f32)> {
+        self.text_area_extent(id)
+    }
+
+    #[doc(hidden)]
+    pub fn vscroll_for_test(&self, id: WidgetId) -> f32 {
+        self.vscroll_of(id)
+    }
+
     /// A text area's current vertical scroll (0 for other kinds), clamped to its
     /// content. Applied to its text, selection, caret, and click mapping.
     fn vscroll_of(&self, id: WidgetId) -> f32 {
@@ -8386,6 +8396,36 @@ three",
             "nothing changed, so less work: {} vs {first}",
             ui.last_measure_count()
         );
+    }
+
+    #[test]
+    fn probe_scroll() {
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(600.0, 400.0));
+        let field = ui.text_input(
+            root,
+            (0..300)
+                .map(|i| format!("let a{i} = 0.0;\n"))
+                .collect::<String>(),
+            Style::new()
+                .size(500.0, 300.0)
+                .multiline()
+                .monospace()
+                .gutter()
+                .no_wrap(),
+        );
+        ui.layout(Vec2::new(600.0, 400.0)).unwrap();
+        let r = ui.rect(field).unwrap();
+        println!("PROBE rect {r:?}");
+        println!("PROBE extent {:?}", ui.text_area_extent(field));
+        ui.handle_input(InputEvent::PointerMoved(r.pos + r.size * 0.5));
+        println!(
+            "PROBE hit {:?} field {:?}",
+            ui.hit_test(r.pos + r.size * 0.5),
+            field
+        );
+        ui.handle_input(InputEvent::Scroll(96.0));
+        println!("PROBE vscroll {}", ui.vscroll_of(field));
     }
 
     #[test]

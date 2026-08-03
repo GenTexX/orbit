@@ -867,6 +867,13 @@ fn build_code_pane(ui: &mut Ui, parent: WidgetId, ctx: &PaneCtx, rows: &mut Edit
         Style::new()
             .column()
             .grow(1.0)
+            // Clipped so `grow` can actually bound it. A column's automatic
+            // minimum height is its content, and the editor's content is the
+            // whole script - so without this the pane laid itself out taller
+            // than the window and the editor with it, which is why the Code
+            // pane could not be scrolled: there was nothing to scroll, because
+            // the view *was* the content and the rest was simply off screen.
+            .clip()
             .background(theme.aurora.panel_bg),
     );
 
@@ -924,6 +931,11 @@ fn build_code_pane(ui: &mut Ui, parent: WidgetId, ctx: &PaneCtx, rows: &mut Edit
         ctx.script_text.to_string(),
         Style::new()
             .grow(1.0)
+            // Clipped for the same reason the pane is: a text area's automatic
+            // minimum height is its content, so `grow` alone cannot bound it.
+            // Both are needed - the pane balloons on its children's content,
+            // and the editor on its own.
+            .clip()
             .multiline()
             .monospace()
             .gutter()
@@ -3935,6 +3947,80 @@ mod tests {
             &[],
             &EditorTheme::default(),
         )
+    }
+
+    #[test]
+    fn a_long_script_scrolls_in_the_code_pane() {
+        let (scene, handle) = demo_scene();
+        let dock = DockNode::Leaf {
+            panes: vec![Pane::Code],
+            active: 0,
+        };
+        let text: String = (0..400).map(|i| format!("let a{i} = 0.0;\n")).collect();
+        let (mut ui, rows) = build_editor_ui(
+            &scene,
+            &HashSet::new(),
+            None,
+            handle,
+            &test_explorer(),
+            &Thumbnails::new(),
+            3,
+            &dock,
+            &HashMap::new(),
+            None,
+            GizmoMode::Select,
+            true,
+            true,
+            false,
+            None,
+            &TreeView::default(),
+            "",
+            None,
+            &InspectorView::default(),
+            &[],
+            true,
+            Some("scripts/x.cmt"),
+            &text,
+            false,
+            false,
+            &[],
+            &[],
+            &EditorTheme::default(),
+        );
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        let editor = rows.code_editor.expect("a code editor");
+        let r = ui.rect(editor).unwrap();
+
+        // The editor is bounded by the window, not by its own content. It used
+        // to lay out at the height of the whole script - 8000px in an 800px
+        // pane - which is why it could not be scrolled: the view *was* the
+        // content, so there was nothing to scroll, and everything past the
+        // first screenful was simply off the bottom of the window.
+        assert!(
+            r.size.y < 800.0,
+            "the editor fits the window, not the script: {r:?}"
+        );
+        let (view, content) = ui
+            .text_area_extent_for_test(editor)
+            .expect("a multiline field has an extent");
+        assert!(content > view * 5.0, "there is more script than view");
+
+        // And the wheel over it scrolls it. hit_test has to find it first,
+        // which it could not when the middle of the widget was off screen.
+        let mid = r.pos + r.size * 0.5;
+        ui.handle_input(InputEvent::PointerMoved(mid));
+        assert_eq!(ui.hit_test(mid), Some(editor), "the wheel lands on it");
+        ui.handle_input(InputEvent::Scroll(96.0));
+        assert_eq!(ui.vscroll_for_test(editor), 96.0);
+
+        // It stops at the end rather than scrolling into blank space.
+        for _ in 0..500 {
+            ui.handle_input(InputEvent::Scroll(96.0));
+        }
+        assert!(
+            (ui.vscroll_for_test(editor) - (content - view)).abs() < 1.0,
+            "clamped to the last line"
+        );
     }
 
     #[test]
