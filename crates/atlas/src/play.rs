@@ -108,6 +108,15 @@ impl Play {
         self.runtime.as_mut()?.live_exports(scene, node, component)
     }
 
+    /// Which running scripts' source files have been written since they were
+    /// last read.
+    pub fn changed_sources(&mut self) -> Vec<std::path::PathBuf> {
+        self.runtime
+            .as_mut()
+            .map(Runtime::changed_sources)
+            .unwrap_or_default()
+    }
+
     /// Take what the running scripts printed, each line tagged with which
     /// script printed it.
     pub fn take_output(&mut self) -> Vec<String> {

@@ -9,7 +9,9 @@
 //! It depends on helios and nothing else. Stepping a scene is not drawing one,
 //! so photon stays out of this crate's dependency list on purpose.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use helios::{Component, Input, NodeId, Scene, ScriptError, ScriptHost, ScriptInstance, Value};
 
@@ -45,6 +47,18 @@ pub struct Runtime {
     /// error, it is news. The frame carries on, the other scripts still run,
     /// and the host decides when to read this.
     problems: Vec<String>,
+    /// When each running script's source file was last written, as of the last
+    /// time anybody looked.
+    ///
+    /// Keyed by the resolved absolute path, so two nodes running one file share
+    /// an entry - a save is one change however many instances it affects.
+    ///
+    /// An mtime poll rather than a filesystem watcher, following the precedent
+    /// the theme already set: a handful of `stat` calls a few times a second
+    /// costs nothing measurable, needs no new dependency, and cannot leak a
+    /// watch handle. It also works the same on every platform, which a watcher
+    /// famously does not.
+    watched: HashMap<PathBuf, Option<SystemTime>>,
     /// Lines printed by instances that no longer exist.
     ///
     /// A script's `on_destroy` is its last word, and it is said into a store
@@ -66,6 +80,7 @@ impl Runtime {
             running: Vec::new(),
             input: Input::default(),
             problems: Vec::new(),
+            watched: HashMap::new(),
             output: Vec::new(),
             playing: false,
         })
@@ -130,6 +145,10 @@ impl Runtime {
         let exports = script.exports.clone();
 
         let instance = self.host.instantiate_file(&path, scene, node, &exports)?;
+        // Watched next to the instance it belongs to. A path with nothing
+        // running has nothing to reload, so an entry for one would be an entry
+        // nobody could act on.
+        self.watched.insert(path.clone(), modified(&path));
         let slot = Running {
             node,
             component,
@@ -193,6 +212,37 @@ impl Runtime {
         Some(self.running[at].script.read_exports(&declared))
     }
 
+    /// Which running scripts' source files have been written since they were
+    /// last read.
+    ///
+    /// Reporting a change also *accepts* it: the same save is never offered
+    /// twice, even if acting on it fails. A file that will not compile would
+    /// otherwise be retried sixty times a second, and the console would fill
+    /// with one syntax error while the person was still typing the line.
+    ///
+    /// A file that cannot be stat-ed at all - deleted, or renamed out from
+    /// under a running game - reads as unchanged. Deleting a script is not a
+    /// request to reload it, and there would be nothing to reload it from; the
+    /// instance keeps running what it was given, which is the same answer a
+    /// broken save gets.
+    pub fn changed_sources(&mut self) -> Vec<PathBuf> {
+        let mut changed = Vec::new();
+        for (path, seen) in &mut self.watched {
+            let Some(now) = modified(path) else {
+                continue;
+            };
+            if *seen != Some(now) {
+                *seen = Some(now);
+                changed.push(path.clone());
+            }
+        }
+        // The map's iteration order is a hash's, and a caller acting on this
+        // list should not depend on one. Sorted so a reload of two files is the
+        // same reload twice.
+        changed.sort();
+        changed
+    }
+
     /// Take what has gone wrong since this was last called.
     pub fn take_problems(&mut self) -> Vec<String> {
         std::mem::take(&mut self.problems)
@@ -249,6 +299,7 @@ impl Runtime {
             return;
         }
         self.playing = false;
+        self.watched.clear();
         for mut running in std::mem::take(&mut self.running) {
             if let Err(err) = running.script.destroy(scene, running.node) {
                 self.problems
@@ -265,6 +316,11 @@ impl Runtime {
             .iter()
             .position(|running| running.node == node && running.component == component)
     }
+}
+
+/// When `path` was last written, or `None` if it cannot be read at all.
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 /// Every script component in the scene, in pre-order: a node before its
@@ -878,6 +934,117 @@ mod tests {
         assert_eq!(
             scene.node(node).transform.translation,
             helios::Vec2::new(12.0, 34.0)
+        );
+    }
+
+    /// Rewrite `script.cmt` in a project directory and make sure its mtime
+    /// really moved.
+    ///
+    /// Filesystem timestamps are coarser than a test is fast - some report
+    /// whole seconds - so writing twice in a row can leave the same mtime and
+    /// make a poll test pass or fail for reasons that have nothing to do with
+    /// the code. Bumping it explicitly is exact and takes no time.
+    fn rewrite(dir: &Path, name: &str, source: &str) {
+        let path = dir.join(name);
+        std::fs::write(&path, source).expect("rewriting the script");
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("opening the script");
+        file.set_modified(later).expect("bumping the mtime");
+    }
+
+    #[test]
+    fn a_saved_script_shows_up_as_a_changed_source() {
+        let (dir, mut scene, node) = project("func update(dt: f32) { }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        assert!(
+            runtime.changed_sources().is_empty(),
+            "nothing has been written since it started"
+        );
+
+        rewrite(dir.path(), "script.cmt", "func update(dt: f32) { }");
+        assert_eq!(
+            runtime.changed_sources(),
+            vec![dir.path().join("script.cmt")]
+        );
+    }
+
+    #[test]
+    fn the_same_save_is_never_offered_twice() {
+        // Reporting a change accepts it. A file that will not compile would
+        // otherwise be retried every poll, and the console would fill with one
+        // syntax error while somebody was still typing the line.
+        let (dir, mut scene, node) = project("func update(dt: f32) { }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+
+        rewrite(dir.path(), "script.cmt", "func update(dt: f32) { $$$ }");
+        assert_eq!(runtime.changed_sources().len(), 1);
+        assert!(runtime.changed_sources().is_empty(), "said once");
+    }
+
+    #[test]
+    fn a_deleted_script_is_not_a_change() {
+        // Deleting is not a request to reload, and there would be nothing to
+        // reload from. The instance keeps running what it was given.
+        let (dir, mut scene, node) = project("func update(dt: f32) { }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+
+        std::fs::remove_file(dir.path().join("script.cmt")).expect("deleting it");
+        assert!(runtime.changed_sources().is_empty());
+    }
+
+    #[test]
+    fn two_nodes_running_one_file_share_one_change() {
+        // A save is one change however many instances it affects, which is what
+        // keys the watch by path rather than by instance.
+        let (dir, mut scene, first) = project("func update(dt: f32) { }");
+        let second = scene.add_child(scene.root(), Node::new("other"));
+        attach_script(&mut scene, second, "script.cmt");
+
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, first, 0).expect("it compiles");
+        runtime
+            .attach(&mut scene, second, 0)
+            .expect("so does the other");
+        assert_eq!(runtime.len(), 2);
+
+        rewrite(dir.path(), "script.cmt", "func update(dt: f32) { }");
+        assert_eq!(runtime.changed_sources().len(), 1);
+    }
+
+    #[test]
+    fn a_broken_save_does_not_stop_the_next_one_being_noticed() {
+        // The sequence that matters. Save something broken, then fix it: the
+        // broken save is accepted so it is not retried every poll, and the fix
+        // is a fresh change, so whatever acts on this gets its second chance.
+        let (dir, mut scene, node) = project("func update(dt: f32) { }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+
+        rewrite(dir.path(), "script.cmt", "func update(dt: f32) { $$$ }");
+        assert_eq!(runtime.changed_sources().len(), 1, "the broken save");
+        assert!(runtime.changed_sources().is_empty(), "offered once");
+
+        rewrite(dir.path(), "script.cmt", "func update(dt: f32) { }");
+        assert_eq!(runtime.changed_sources().len(), 1, "and the fix after it");
+    }
+
+    #[test]
+    fn stopping_forgets_what_was_being_watched() {
+        let (dir, mut scene, _node) = project("func update(dt: f32) { }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.play(&mut scene);
+        runtime.stop(&mut scene);
+
+        rewrite(dir.path(), "script.cmt", "func update(dt: f32) { }");
+        assert!(
+            runtime.changed_sources().is_empty(),
+            "nothing is running, so nothing is watching"
         );
     }
 }

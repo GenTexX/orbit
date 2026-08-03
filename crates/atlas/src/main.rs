@@ -413,6 +413,8 @@ struct State {
     /// time it was polled - the theme hot-reloads when the file changes.
     settings_mtime: Option<std::time::SystemTime>,
     settings_poll: std::time::Instant,
+    /// When the running scripts' files were last checked for a save.
+    script_poll: std::time::Instant,
     /// An in-progress reparent drag: the row being dragged and the current
     /// drop target under the cursor.
     reparent: Option<ReparentDrag>,
@@ -478,6 +480,14 @@ const HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// How long a status-bar note stays up before the ordinary readout returns.
 const STATUS_NOTE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// How often a running game's scripts are checked for having been saved.
+///
+/// The same 400ms the theme's settings file gets. What is being waited for is a
+/// keystroke, so this is the difference between a reload feeling instant and
+/// feeling like it happened - and a frame's worth of latency is invisible next
+/// to the time it takes to move a hand back to the mouse.
+const SCRIPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// An in-progress rename of the symbol at `offset`.
 #[derive(Debug, Clone)]
@@ -1158,6 +1168,7 @@ impl State {
             theme_doc,
             settings_mtime: settings::modified(),
             settings_poll: std::time::Instant::now(),
+            script_poll: std::time::Instant::now(),
             reparent: None,
             explorer,
             thumbnails,
@@ -1568,6 +1579,33 @@ impl State {
                 tracing::error!("pick failed: {err}");
                 None
             }
+        }
+    }
+
+    /// Notice a running script's file being saved.
+    ///
+    /// The same shape as [`poll_settings`](Self::poll_settings) below, and for
+    /// the same reasons: a few `stat` calls a couple of times a second cost
+    /// nothing, need no dependency, and behave the same on every platform.
+    ///
+    /// Deliberately not per frame. The answer changes when somebody presses
+    /// ctrl+S, which is a human-speed event; polling it sixty times a second
+    /// would be sixty times the syscalls for the same answer.
+    fn poll_scripts(&mut self) {
+        if !self.play.is_playing() {
+            return;
+        }
+        if self.script_poll.elapsed() < SCRIPT_POLL_INTERVAL {
+            return;
+        }
+        self.script_poll = std::time::Instant::now();
+        for path in self.play.changed_sources() {
+            let named = path
+                .strip_prefix(&self.project_dir)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            tracing::info!(target: "script", "{named} changed on disk");
         }
     }
 
@@ -6410,6 +6448,7 @@ impl State {
         // mouse against its own position is comparing two points in one space.
         let mouse = self.play_cursor_world().unwrap_or_default();
         self.play.set_input(self.keys.input(mouse));
+        self.poll_scripts();
         self.play.step(&mut self.project.scene, dt);
         self.drain_script_output();
         self.sync_inspector_to_game();
