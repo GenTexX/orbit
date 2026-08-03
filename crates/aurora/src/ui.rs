@@ -197,6 +197,12 @@ pub struct Ui {
     /// measure (the text wraps in what is left) and by accumulate (the text
     /// starts after it), so it has to be known before either runs.
     gutter_widths: SecondaryMap<WidgetId, f32>,
+    /// What each gutter's numbers were last shaped for: the line count, the
+    /// font size, and the face. The numbers derive from the count alone, so
+    /// this is the whole key - and without it every layout rebuilt the string
+    /// and re-shaped it, on every frame, for a buffer that changes only when a
+    /// line is added or removed.
+    gutter_shaped: SecondaryMap<WidgetId, (usize, u32, Face)>,
     /// A shaped check-glyph buffer per checkbox (its main buffer holds the label
     /// caption instead), produced during measure and drawn when checked.
     check_buffers: SecondaryMap<WidgetId, Buffer>,
@@ -285,6 +291,7 @@ impl Ui {
             reconciled_caret: SecondaryMap::new(),
             gutter_numbers: SecondaryMap::new(),
             gutter_widths: SecondaryMap::new(),
+            gutter_shaped: SecondaryMap::new(),
             check_buffers: SecondaryMap::new(),
             text_vscroll: SecondaryMap::new(),
             scroll_offsets: SecondaryMap::new(),
@@ -1321,8 +1328,16 @@ impl Ui {
 
         let buffers = &mut self.gutter_numbers;
         let widths = &mut self.gutter_widths;
+        let shaped = &mut self.gutter_shaped;
         let font_system = &mut self.font_system;
         for (id, numbers, font_size, face) in jobs {
+            // Nothing about the numbers can change without one of these
+            // changing, so a matching key means the buffer is already right.
+            let key = (numbers.len(), font_size.to_bits(), face);
+            if shaped.get(id) == Some(&key) && buffers.contains_key(id) {
+                continue;
+            }
+            shaped.insert(id, key);
             let metrics = text::metrics_for(font_size);
             if !buffers.contains_key(id) {
                 buffers.insert(id, Buffer::new(font_system, metrics));
@@ -8276,6 +8291,44 @@ three",
 
         assert_eq!(ui.drain_events(), vec![Event::Submitted(first)]);
         assert_eq!(ui.focused(), Some(second)); // advanced to the next field
+    }
+
+    #[test]
+    fn a_gutter_reshapes_its_numbers_only_when_the_line_count_changes() {
+        // layout() called shape_gutters unconditionally, rebuilding the string
+        // "1\n2\n...\nN" and re-shaping the whole thing every frame - for a
+        // buffer whose contents depend on nothing but the number of lines. It
+        // was invisible because last_measure_count does not count it.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().size(600.0, 400.0));
+        let field = ui.text_input(
+            root,
+            (0..300)
+                .map(|i| format!("let a{i} = 0.0;\n"))
+                .collect::<String>(),
+            Style::new()
+                .size(500.0, 300.0)
+                .multiline()
+                .monospace()
+                .gutter()
+                .no_wrap(),
+        );
+        ui.layout(Vec2::new(600.0, 400.0)).unwrap();
+        let first = ui.gutter_width(field);
+
+        // A second layout with nothing changed must not re-shape.
+        let before = ui.gutter_shaped.get(field).copied();
+        ui.layout(Vec2::new(600.0, 400.0)).unwrap();
+        assert_eq!(ui.gutter_shaped.get(field).copied(), before, "same key");
+        assert_eq!(ui.gutter_width(field), first, "and the same answer");
+
+        // Adding a line changes the count, so it does.
+        ui.set_text_input(field, "x\n".to_string() + &"y\n".repeat(2000));
+        ui.layout(Vec2::new(600.0, 400.0)).unwrap();
+        assert!(
+            ui.gutter_width(field) > first,
+            "four digits are wider than three"
+        );
     }
 
     #[test]
