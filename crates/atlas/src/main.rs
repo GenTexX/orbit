@@ -1674,14 +1674,26 @@ impl State {
             return;
         }
         self.settings_mtime = mtime;
-        if let Some(loaded) = settings::read()
-            && loaded.theme != self.theme_doc
-        {
+        let Some(loaded) = settings::read() else {
+            return;
+        };
+        // Everything the file says, not only the theme.
+        //
+        // Only `theme` was adopted, and then `persist_view_prefs` wrote the
+        // whole struct back from memory - so editing a view preference on disk
+        // (or in a second editor) was silently reverted by the next settings
+        // change here. A file that is read partially and written wholly is a
+        // file that quietly undoes people's edits.
+        self.show_grid = loaded.show_grid;
+        self.show_axes = loaded.show_axes;
+        self.tidy_on_save = loaded.tidy_on_save;
+        self.snap = loaded.snap;
+        if loaded.theme != self.theme_doc {
             self.theme_doc = loaded.theme;
             self.theme = theme::resolve(&self.theme_doc);
-            self.dirty = true;
             tracing::info!("reloaded theme from settings");
         }
+        self.dirty = true;
     }
 
     /// Set the active gizmo mode (from a toolbar click or a shortcut).

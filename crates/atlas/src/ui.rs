@@ -1237,10 +1237,14 @@ fn toolbar_button(
                     .background(background)
                     .corner_radius(theme.aurora.control_radius),
             );
+            // The theme's primary text colour when the mode is not active, not
+            // white: an icon at rest is chrome and should read like the text
+            // beside it. Hardcoding white made every toolbar icon invisible on
+            // a light theme, which is most of why one was not usable.
             let tint = if active {
                 theme.aurora.icon_active
             } else {
-                Color::WHITE
+                theme.aurora.heading
             };
             ui.image(
                 button,
@@ -1380,7 +1384,13 @@ pub fn build_modal(
         let close = ui.button(bar, "", Style::new().icon_button().padding(3.0));
         match icons {
             Some(icons) => {
-                ui.image(close, icons.get(Icon::Close), Style::new().size(16.0, 16.0));
+                ui.image(
+                    close,
+                    icons.get(Icon::Close),
+                    Style::new()
+                        .size(16.0, 16.0)
+                        .foreground(theme.aurora.heading),
+                );
             }
             None => {
                 ui.label(close, "x", Style::new().foreground(theme.aurora.heading));
@@ -1827,7 +1837,13 @@ fn add_tree_row(
     );
     if let Some(icons) = ctx.icons {
         let glyph = if visible { Icon::Eye } else { Icon::EyeOff };
-        ui.image(eye, icons.get(glyph), Style::new().size(TREE_EYE, TREE_EYE));
+        ui.image(
+            eye,
+            icons.get(glyph),
+            Style::new()
+                .size(TREE_EYE, TREE_EYE)
+                .foreground(theme.aurora.heading),
+        );
     }
     rows.eye_toggles.push((eye, node));
     rows.tree_rows.push((row, node));
@@ -2495,7 +2511,13 @@ fn asset_icon_button(
     match icons {
         Some(icons) => {
             let button = ui.button(parent, "", Style::new().icon_button().padding(4.0));
-            ui.image(button, icons.get(icon), Style::new().size(16.0, 16.0));
+            ui.image(
+                button,
+                icons.get(icon),
+                Style::new()
+                    .size(16.0, 16.0)
+                    .foreground(theme.aurora.heading),
+            );
             button
         }
         None => ui.button(
