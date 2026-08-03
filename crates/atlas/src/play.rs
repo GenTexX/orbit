@@ -34,6 +34,8 @@ pub struct Play {
     ///
     /// `Some` exactly while a game is running.
     authored: Option<Scene>,
+    /// What the next frame's scripts will read.
+    input: Input,
 }
 
 impl Play {
@@ -44,6 +46,7 @@ impl Play {
             root: root.into(),
             runtime: None,
             authored: None,
+            input: Input::default(),
         }
     }
 
@@ -157,9 +160,7 @@ impl Play {
     /// difference between a key that means "left" and a key that means the
     /// letter A. voyager holds the answer; atlas decides it.
     pub fn set_input(&mut self, input: Input) {
-        if let Some(runtime) = self.runtime.as_mut() {
-            *runtime.input_mut() = input;
-        }
+        self.input = input;
     }
 
     /// Run one frame, if a game is running.
@@ -168,6 +169,7 @@ impl Play {
             return;
         }
         if let Some(runtime) = self.runtime.as_mut() {
+            *runtime.input_mut() = self.input;
             runtime.step(scene, dt);
         }
     }
@@ -457,5 +459,135 @@ mod tests {
 
         assert_eq!(scene.to_ron().expect("the scene serializes"), before);
         assert_eq!(scene.node(node).transform.translation.x, 3.0);
+    }
+
+    #[test]
+    fn every_script_the_demo_project_ships_compiles() {
+        // Except the one that is wrong on purpose. These files are the first
+        // thing anybody reads, and a teaching script that does not compile
+        // teaches the wrong lesson - so this is the test that would catch a
+        // language change breaking the tour.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("demo_project/scripts");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("the scripts folder") {
+            let path = entry.expect("an entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("cmt") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .to_string();
+            let source = std::fs::read_to_string(&path).expect("readable");
+            let result = comet::compile(&source, helios::script_schema());
+            if name == "squiggles.cmt" {
+                assert!(result.is_err(), "squiggles.cmt is wrong on purpose");
+                checked += 1;
+                continue;
+            }
+            match result {
+                Ok(_) => checked += 1,
+                Err(diagnostics) => {
+                    let messages: Vec<&str> =
+                        diagnostics.iter().map(|d| d.message.as_str()).collect();
+                    panic!("{name} does not compile: {messages:?}");
+                }
+            }
+        }
+        assert!(checked >= 8, "the tour is still there: {checked} scripts");
+    }
+
+    #[test]
+    fn the_demo_project_is_a_game_you_can_drive() {
+        // The milestone's acceptance test, against the project a first launch
+        // opens. Before this the shipped scene ran a scratch file, had no
+        // Camera, and no script in the whole project contained the word
+        // `input` - so the three features M5 spent steps 10 to 12 on were all
+        // unreachable from the thing a new user sees.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("demo_project");
+        let project = helios::Project::load(&dir).expect("the demo project loads");
+        let mut scene = project.scene;
+
+        let root = scene.root();
+        let player = scene
+            .children(root)
+            .to_vec()
+            .into_iter()
+            .find(|&n| scene.node(n).name == "Player")
+            .expect("a Player");
+        let platform = scene
+            .children(root)
+            .to_vec()
+            .into_iter()
+            .find(|&n| scene.node(n).name == "Platform")
+            .expect("a Platform");
+
+        // The camera is a child of the player, which is the whole argument for
+        // a camera being a component: it follows with no code at all.
+        let (_, eye) = scene.active_camera().expect("the scene has a camera");
+        let start = scene.node(player).transform.translation;
+        assert!(
+            (eye - start).length() < 100.0,
+            "the camera is on the player: {eye} vs {start}"
+        );
+
+        let mut play = Play::new(&dir);
+        play.start(&mut scene);
+        assert!(play.is_playing());
+        let problems = play.take_problems();
+        assert!(problems.is_empty(), "everything compiled: {problems:?}");
+
+        // Fall to the floor.
+        for _ in 0..90 {
+            play.step(&mut scene, 0.016);
+        }
+        let landed = scene.node(player).transform.translation;
+        assert_eq!(landed.y, 420.0, "it fell and stopped on the floor");
+
+        // Walk right.
+        play.set_input(Input {
+            right: true,
+            ..Input::default()
+        });
+        for _ in 0..60 {
+            play.step(&mut scene, 0.016);
+        }
+        let walked = scene.node(player).transform.translation;
+        assert!(walked.x > landed.x + 100.0, "it walked: {walked}");
+
+        // And the camera came with it, because it is parented to the player.
+        let (_, eye) = scene.active_camera().expect("still a camera");
+        assert!(
+            (eye.x - walked.x).abs() < 1.0,
+            "the camera followed: {eye} vs {walked}"
+        );
+
+        // Jump.
+        play.set_input(Input {
+            jump: true,
+            ..Input::default()
+        });
+        play.step(&mut scene, 0.016);
+        assert!(
+            scene.node(player).transform.translation.y < 420.0,
+            "it left the ground"
+        );
+
+        // The platform slid, driven by the engine clock rather than by input.
+        assert_ne!(
+            scene.node(platform).transform.translation.x,
+            400.0,
+            "the platform moved on its own"
+        );
+
+        // And Stop puts the level back exactly as authored.
+        let before = helios::Project::load(&dir).expect("loads again").scene;
+        play.stop(&mut scene);
+        assert_eq!(
+            scene.to_ron().expect("ron"),
+            before.to_ron().expect("ron"),
+            "Stop restored the level"
+        );
     }
 }

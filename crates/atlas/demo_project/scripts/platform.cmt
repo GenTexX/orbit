@@ -1,0 +1,27 @@
+// A platform that slides back and forth, forever.
+//
+// It needs `start` to remember where it was placed, which is what `start` is
+// for - and a reload deliberately does not run it again, so saving this file
+// while the game runs does not teleport the platform back to its origin.
+
+@export
+@range(0.0, 600.0)
+@tooltip("how far from home it travels, each way")
+let travel: f32;
+
+@export
+@range(0.5, 10.0)
+@tooltip("seconds for one full sweep")
+let period: f32;
+
+let home = vec2(0.0, 0.0);
+
+func start() {
+    home = transform.position;
+}
+
+func update(dt: f32) {
+    // `time.elapsed` is the engine's clock. Keeping your own accumulator here
+    // would work too, and would be one more thing to get wrong.
+    transform.position.x = home.x + sin(time.elapsed / period) * travel;
+}

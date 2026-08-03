@@ -1,0 +1,52 @@
+// The player. Arrow keys or WASD to move, space to jump.
+//
+// This is the whole of a character: read the keyboard, add gravity, move, and
+// stop when you hit the floor. Every number it runs on is `@export`ed, so you
+// tune them in the inspector while the game runs rather than editing this file.
+
+@export
+@range(0.0, 600.0)
+@tooltip("pixels per second, sideways")
+let speed: f32;
+
+@export
+@range(0.0, 1500.0)
+@tooltip("how hard the jump pushes")
+let jump: f32;
+
+@export
+@range(0.0, 4000.0)
+let gravity: f32;
+
+@export
+@tooltip("the y this level's floor sits at")
+let floor: f32;
+
+// State. A top-level `let` keeps its value between frames.
+let vy = 0.0;
+let grounded = false;
+
+func update(dt: f32) {
+    // `input` is the engine's answer to what the player is doing. It is
+    // read-only: try assigning to it and the compiler will say so.
+    let vx = 0.0;
+    if input.left { vx -= speed; }
+    if input.right { vx += speed; }
+
+    // You can only jump from the ground, which is why `grounded` exists.
+    if input.jump && grounded {
+        vy = -jump;
+        grounded = false;
+    }
+
+    vy += gravity * dt;
+    transform.position.x += vx * dt;
+    transform.position.y += vy * dt;
+
+    // Y grows downward (ADR 0012), so "below the floor" is a greater y.
+    if transform.position.y > floor {
+        transform.position.y = floor;
+        vy = 0.0;
+        grounded = true;
+    }
+}

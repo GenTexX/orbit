@@ -1,0 +1,27 @@
+// A second script on the same node as the player.
+//
+// A node may run several scripts, and they run in the order they were added.
+// This one only watches - it never moves anything.
+
+@export
+@tooltip("where the goal is, in world coordinates")
+let at: Vec2;
+
+@export
+@range(4.0, 200.0)
+let radius: f32;
+
+let reached = false;
+
+func update(dt: f32) {
+    if reached {
+        return;
+    }
+    let to = at - transform.position;
+    // No `distance` yet, so compare squared lengths - which avoids a square
+    // root anyway.
+    if to.x * to.x + to.y * to.y < radius * radius {
+        reached = true;
+        print("reached the goal at " + str(at));
+    }
+}

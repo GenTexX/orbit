@@ -1,6 +1,7 @@
 (
+    version: 1,
     root: (
-        name: "Root",
+        name: "Level",
         transform: (
             translation: (0.0, 0.0),
             rotation: 0.0,
@@ -9,47 +10,9 @@
         components: [],
         children: [
             (
-                name: "Sprite",
+                name: "Player",
                 transform: (
-                    translation: (933.2738, -172.50577),
-                    rotation: -0.3926991,
-                    scale: (1.2, 1.2),
-                ),
-                components: [
-                    (
-                        kind: "Sprite",
-                        fields: [
-                            ("texture", Asset("assets/sprite.png")),
-                            ("tint", Color((0.2, 0.4, 0.3, 1.0))),
-                            ("size", Vec2((160.0, 160.0))),
-                        ],
-                    ),
-                ],
-                children: [],
-            ),
-            (
-                name: "Sprite 2",
-                transform: (
-                    translation: (500.80078, 500.0),
-                    rotation: 1.5707964,
-                    scale: (1.0, 1.0),
-                ),
-                components: [
-                    (
-                        kind: "Sprite",
-                        fields: [
-                            ("texture", Asset("assets/sprite.png")),
-                            ("tint", Color((1.0, 1.0, 1.0, 0.4))),
-                            ("size", Vec2((128.0, 128.0))),
-                        ],
-                    ),
-                ],
-                children: [],
-            ),
-            (
-                name: "Sprite 3",
-                transform: (
-                    translation: (-1.5148926, -1.187561),
+                    translation: (200.0, 300.0),
                     rotation: 0.0,
                     scale: (1.0, 1.0),
                 ),
@@ -58,16 +21,110 @@
                         kind: "Sprite",
                         fields: [
                             ("texture", Asset("assets/sprite.png")),
-                            ("tint", Color((1.0, 0.0, 0.0, 0.4))),
-                            ("size", Vec2((512.0, 512.0))),
+                            ("tint", Color((0.30, 0.65, 0.95, 1.0))),
+                            ("size", Vec2((48.0, 48.0))),
                         ],
                     ),
                     (
                         kind: "Script",
                         fields: [
-                            ("source", Asset("test.cmt")),
-                            ("speed", F32(1.0)),
-                            ("amp", F32(100.0)),
+                            ("source", Asset("scripts/player.cmt")),
+                            ("speed", F32(220.0)),
+                            ("jump", F32(560.0)),
+                            ("gravity", F32(1400.0)),
+                            ("floor", F32(420.0)),
+                        ],
+                    ),
+                    (
+                        kind: "Script",
+                        fields: [
+                            ("source", Asset("scripts/goal.cmt")),
+                            ("at", Vec2((620.0, 420.0))),
+                            ("radius", F32(40.0)),
+                        ],
+                    ),
+                ],
+                children: [
+                    (
+                        name: "Camera",
+                        transform: (
+                            translation: (0.0, -60.0),
+                            rotation: 0.0,
+                            scale: (1.0, 1.0),
+                        ),
+                        components: [
+                            (
+                                kind: "Camera",
+                                fields: [
+                                    ("active", Bool(true)),
+                                    ("zoom", F32(1.0)),
+                                ],
+                            ),
+                        ],
+                        children: [],
+                    ),
+                ],
+            ),
+            (
+                name: "Platform",
+                transform: (
+                    translation: (400.0, 340.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                components: [
+                    (
+                        kind: "Sprite",
+                        fields: [
+                            ("texture", Asset("assets/sprite.png")),
+                            ("tint", Color((0.45, 0.40, 0.55, 1.0))),
+                            ("size", Vec2((160.0, 24.0))),
+                        ],
+                    ),
+                    (
+                        kind: "Script",
+                        fields: [
+                            ("source", Asset("scripts/platform.cmt")),
+                            ("travel", F32(180.0)),
+                            ("period", F32(2.5)),
+                        ],
+                    ),
+                ],
+                children: [],
+            ),
+            (
+                name: "Ground",
+                transform: (
+                    translation: (400.0, 460.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                components: [
+                    (
+                        kind: "Sprite",
+                        fields: [
+                            ("texture", Asset("assets/sprite.png")),
+                            ("tint", Color((0.22, 0.26, 0.24, 1.0))),
+                            ("size", Vec2((900.0, 40.0))),
+                        ],
+                    ),
+                ],
+                children: [],
+            ),
+            (
+                name: "Goal",
+                transform: (
+                    translation: (620.0, 420.0),
+                    rotation: 0.0,
+                    scale: (1.0, 1.0),
+                ),
+                components: [
+                    (
+                        kind: "Sprite",
+                        fields: [
+                            ("texture", Asset("assets/sprite.png")),
+                            ("tint", Color((0.95, 0.75, 0.20, 1.0))),
+                            ("size", Vec2((32.0, 32.0))),
                         ],
                     ),
                 ],
