@@ -2042,7 +2042,6 @@ fn heap_after(script: &mut Script, rounds: usize) -> (i32, i32) {
 /// or two of the three turns a leak into a double free, which is strictly
 /// worse. See the codegen comment on FnGen's `owned` set.
 #[test]
-#[ignore = "struct ownership needs retain, release and discard to land together"]
 fn a_struct_that_owns_a_string_releases_it() {
     // FnGen's `owned` set had no Struct arm, so a struct local holding a String
     // was never walked on the way out and leaked one block per construction.
@@ -2160,4 +2159,42 @@ fn a_for_body_ending_in_an_expression_runs_it_before_the_counter_moves() {
     let mut script = Script::new("func update(dt: f32) { for i in 0..3 { print(str(i)); } }");
     script.update(0.016);
     assert_eq!(script.printed(), ["0", "1", "2"]);
+}
+
+#[test]
+fn a_struct_that_owns_something_survives_being_copied_and_taken_apart() {
+    // The three halves of struct ownership - release at exit, retain on read,
+    // and a field access letting go of what it did not ask for - are only
+    // correct together, so this exercises all of them at once. A missing retain
+    // shows up as a use-after-free or a trap; a missing release as growth.
+    let mut script = Script::new(
+        "struct Named { label: String, value: f32 }\n\
+         struct Pair { left: Named, right: Named }\n\
+         let kept: Named = Named { label: \"seed\", value: 0.0 };\n\
+         func build(v: f32) -> f32 {\n\
+             let a = Named { label: str(v), value: v };\n\
+             let b = a;\n\
+             let p = Pair { left: a, right: b };\n\
+             let shown = p.left.label + \"/\" + p.right.label;\n\
+             print(shown);\n\
+             p.right.value\n\
+         }\n\
+         func update(dt: f32) {\n\
+             let got = build(dt);\n\
+             kept = Named { label: str(dt) + \"k\", value: got };\n\
+             print(kept.label);\n\
+         }",
+    );
+    let (settled, after) = heap_after(&mut script, 300);
+    assert_eq!(after, settled, "300 rounds of copies and field reads");
+    assert!(script.printed().len() > 500, "and it never trapped");
+
+    // Every line still reads correctly - a premature free shows up here as
+    // garbage rather than as growth.
+    let printed = script.printed();
+    assert!(
+        printed.iter().all(|line| !line.is_empty()),
+        "no line came back empty: {:?}",
+        &printed[..8.min(printed.len())]
+    );
 }

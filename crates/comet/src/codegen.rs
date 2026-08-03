@@ -1051,7 +1051,15 @@ fn layouts(script: &TypedScript) -> Layouts<'_> {
 
 fn emit_init(script: &TypedScript, globals: &Globals, literals: &Literals) -> Function {
     let layouts = layouts(script);
-    let depth = script.state.iter().map(|s| expr_depth(&s.init)).max();
+    // Each initializer's own depth, plus what `store_global` takes: writing
+    // over a value that owns something parks the incoming one and walks the old
+    // one. Easy to forget here, because this function's statements are built
+    // rather than parsed - which is exactly how it was forgotten.
+    let depth = script
+        .state
+        .iter()
+        .map(|s| expr_depth(&s.init).max(place_depth(&Place::Global(s.slot))))
+        .max();
     let mut out = FnGen::new(&[], 0, depth.unwrap_or(0), layouts, globals, literals);
     for state in &script.state {
         out.expr(&state.init);
@@ -1185,6 +1193,15 @@ fn stmt_depth(stmt: &TypedStmt) -> usize {
 fn place_depth(place: &Place) -> usize {
     match place {
         Place::Element { array, index, .. } => 2 + expr_depth(array).max(expr_depth(index)),
+        // Writing over a value that owns something parks the incoming one and
+        // then walks the old one, and the walk nests: a struct global's enum
+        // field is copied into a scratch region, and releasing an array inside
+        // that takes another. Four, generously - a frame costs only locals the
+        // JIT drops, and the alternative is this number being one too small on
+        // a shape nobody wrote down. Counting frames by emitting once and
+        // taking the high-water mark would retire the whole class; see the
+        // 2026-08-03 review.
+        Place::Local(_) | Place::Global(_) => 4,
         _ => 0,
     }
 }
@@ -1339,22 +1356,15 @@ impl<'a> FnGen<'a> {
         // Slots whose release does something: a String, or an enum that can
         // hold one. Working this out here rather than at each release site is
         // what keeps the common enum - no payload owning anything - free.
-        // Slots whose release does something. A bare `struct` local is
-        // deliberately *not* here, and that is a known leak rather than an
-        // oversight: releasing one at exit is only correct if reading one
-        // retains, and retaining on read is only correct if a field access
-        // releases the slots it discards - which it cannot do slot by slot,
-        // because a parked struct's slots are split across the frame's i32 and
-        // f32 regions and are not contiguous. The three have to land together.
-        // Until they do, a struct that owns a reference leaks it once per
-        // construction, which is a leak and not a corruption.
+        //
+        // Struct ownership is three things that are only correct together:
+        // releasing one here, retaining one when it is read, and a field access
+        // releasing the parts it discards. Any one or two of them alone turns a
+        // leak into a double free.
         let owned = slot_types
             .iter()
             .enumerate()
-            .filter(|(_, ty)| match ty {
-                Type::Struct(_) => false,
-                other => owns_reference(**other, enums, structs),
-            })
+            .filter(|(_, ty)| owns_reference(**ty, enums, structs))
             .map(|(slot, _)| slot as u32)
             .collect();
 
@@ -1467,6 +1477,25 @@ impl<'a> FnGen<'a> {
                 F_ARRAY_RELEASE
             });
             self.ins().local_get(tmp);
+        }
+        // A struct global that owns something has the same problem and the same
+        // shape: park the incoming value first so `s = s` cannot free what it
+        // is about to store, then let go of what was there. Parked through
+        // `park_slot` rather than a flat region, because a struct's slots carry
+        // their own wasm types.
+        if let Type::Struct(index) = ty
+            && self.owns_reference(ty)
+        {
+            let whole = val_types(ty, self.enums, self.structs);
+            let frame = self.enter_frame();
+            for slot in (0..whole.len() as u32).rev() {
+                self.ins().local_set(Self::park_slot(&frame, &whole, slot));
+            }
+            self.release_struct(base, index, true);
+            for slot in 0..whole.len() as u32 {
+                self.ins().local_get(Self::park_slot(&frame, &whole, slot));
+            }
+            self.leave_frame();
         }
         let width = val_types(ty, self.enums, self.structs).len() as u32;
         for i in (0..width).rev() {
@@ -1701,6 +1730,135 @@ impl<'a> FnGen<'a> {
         }
     }
 
+    /// Retain what a struct owns, reading its slots from locals or from globals.
+    ///
+    /// A struct's slots keep their own wasm types, so the value cannot be parked
+    /// wholesale in the enum scratch region the way an enum can - that region is
+    /// all i32. It does not need to be: every part of a struct that *owns*
+    /// something is either a single i32 slot (a String or an array handle) or an
+    /// enum, whose slots are consecutive and all i32. So the walk goes to the
+    /// leaves and reads each one where it already lives.
+    fn retain_struct(&mut self, base: u32, index: u32, global: bool) {
+        let fields = self.structs[index as usize].fields.clone();
+        for field in fields {
+            if !self.owns_reference(field.ty) {
+                continue;
+            }
+            let at = base + field.offset;
+            match field.ty {
+                Type::Str | Type::Array(_) => {
+                    if global {
+                        self.ins().global_get(at);
+                    } else {
+                        self.ins().local_get(at);
+                    }
+                    self.ins().call(F_RETAIN);
+                }
+                Type::Struct(inner) => self.retain_struct(at, inner, global),
+                Type::Enum(inner) => {
+                    if global {
+                        // The tag dispatch reads locals, so copy the enum's
+                        // slots down first. They are contiguous and all i32.
+                        let width = 1 + self.enums[inner as usize].payload_slots as u32;
+                        let scratch = self.enter_frame().enum_base;
+                        for slot in 0..width {
+                            self.ins().global_get(at + slot).local_set(scratch + slot);
+                        }
+                        self.retain_enum_slots(scratch, inner);
+                        self.leave_frame();
+                    } else {
+                        self.retain_enum_slots(at, inner);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Release what a struct owns, reading its slots from locals or globals.
+    ///
+    /// The mirror of [`retain_struct`](Self::retain_struct), and written beside
+    /// it for the same reason `retain_slots` sits beside `release_slots`: a type
+    /// one walks and the other does not is either a leak or a double free.
+    fn release_struct(&mut self, base: u32, index: u32, global: bool) {
+        let fields = self.structs[index as usize].fields.clone();
+        for field in fields {
+            if !self.owns_reference(field.ty) {
+                continue;
+            }
+            let at = base + field.offset;
+            match field.ty {
+                Type::Str | Type::Array(_) => {
+                    // Through a local either way: release_slots reads one, and
+                    // an array's release needs the handle in a local anyway.
+                    let tmp = self.scratch().i32s[3];
+                    if global {
+                        self.ins().global_get(at);
+                    } else {
+                        self.ins().local_get(at);
+                    }
+                    self.ins().local_set(tmp);
+                    self.release_slots(tmp, field.ty);
+                }
+                Type::Struct(inner) => self.release_struct(at, inner, global),
+                Type::Enum(inner) => {
+                    if global {
+                        let width = 1 + self.enums[inner as usize].payload_slots as u32;
+                        let scratch = self.enter_frame().enum_base;
+                        for slot in 0..width {
+                            self.ins().global_get(at + slot).local_set(scratch + slot);
+                        }
+                        self.release_enum_slots(scratch, inner);
+                        self.leave_frame();
+                    } else {
+                        self.release_enum_slots(at, inner);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Release what a parked value owns, except the part being kept.
+    ///
+    /// `whole` is the layout the value was parked under, so a slot's home is
+    /// found through [`park_slot`](Self::park_slot) rather than by adding an
+    /// offset to a base - a parked struct's slots are split between the frame's
+    /// i32 and f32 regions and are not adjacent. Each *owning* part still is,
+    /// which is what makes this work at all.
+    fn release_parked_except(
+        &mut self,
+        frame: &Frame,
+        whole: &[ValType],
+        at: u32,
+        ty: Type,
+        keep: (u32, u32),
+    ) {
+        let width = val_types(ty, self.enums, self.structs).len() as u32;
+        // Entirely inside what the field access asked for: it leaves with the
+        // result and stays owned.
+        if at >= keep.0 && at + width <= keep.1 {
+            return;
+        }
+        // Entirely outside: nobody wants it, so release the whole thing.
+        if at + width <= keep.0 || at >= keep.1 {
+            if self.owns_reference(ty) {
+                let base = Self::park_slot(frame, whole, at);
+                self.release_slots(base, ty);
+            }
+            return;
+        }
+        // Straddling: only a struct can, because only a struct is asked for a
+        // part of a part. Recurse so the siblings of what was asked for are
+        // still let go of.
+        if let Type::Struct(index) = ty {
+            let fields = self.structs[index as usize].fields.clone();
+            for field in fields {
+                self.release_parked_except(frame, whole, at + field.offset, field.ty, keep);
+            }
+        }
+    }
+
     /// Take a reference to whatever the value starting at wasm local `base`
     /// owns. The mirror of [`release_slots`](Self::release_slots), and written
     /// as one so the two cannot drift: a type the release path walks and the
@@ -1902,6 +2060,24 @@ impl<'a> FnGen<'a> {
                     });
                     self.ins().local_get(tmp);
                 }
+                // A struct that owns something, same order for the same reason.
+                // Parked through `park_slot`, because its fields keep their own
+                // wasm types and cannot share one flat scratch region.
+                if let Type::Struct(index) = ty
+                    && self.owns_reference(ty)
+                {
+                    let whole = val_types(ty, self.enums, self.structs);
+                    let frame = self.enter_frame();
+                    for at in (0..whole.len() as u32).rev() {
+                        self.ins().local_set(Self::park_slot(&frame, &whole, at));
+                    }
+                    let base = self.slot_base[*slot as usize];
+                    self.release_struct(base, index, false);
+                    for at in 0..whole.len() as u32 {
+                        self.ins().local_get(Self::park_slot(&frame, &whole, at));
+                    }
+                    self.leave_frame();
+                }
                 self.store_slot(*slot);
             }
 
@@ -2032,15 +2208,31 @@ impl<'a> FnGen<'a> {
             }
 
             TypedExprKind::Local(slot) => {
-                self.load_slot(*slot);
                 // Reading a value that owns something makes the copy on the
-                // stack a second owner. `retain_value` covers both a String and
-                // an enum holding one, which the Str-only check did not.
-                self.retain_value(self.slot_types[*slot as usize]);
+                // stack a second owner. A struct is retained from where it
+                // already lives, before it is pushed: its fields keep their own
+                // wasm types, so the stack copy cannot be parked whole the way
+                // an enum can.
+                let ty = self.slot_types[*slot as usize];
+                if let Type::Struct(index) = ty {
+                    let base = self.slot_base[*slot as usize];
+                    self.retain_struct(base, index, false);
+                    self.load_slot(*slot);
+                } else {
+                    self.load_slot(*slot);
+                    self.retain_value(ty);
+                }
             }
             TypedExprKind::Global(slot) => {
-                self.load_global(*slot);
-                self.retain_value(self.globals.types[*slot as usize]);
+                let ty = self.globals.types[*slot as usize];
+                if let Type::Struct(index) = ty {
+                    let base = self.globals.base[*slot as usize];
+                    self.retain_struct(base, index, true);
+                    self.load_global(*slot);
+                } else {
+                    self.load_global(*slot);
+                    self.retain_value(ty);
+                }
             }
 
             TypedExprKind::HostField { field, ty } => {
@@ -2098,6 +2290,19 @@ impl<'a> FnGen<'a> {
                 let frame = self.enter_frame();
                 for slot in (0..whole.len() as u32).rev() {
                     self.ins().local_set(Self::park_slot(&frame, &whole, slot));
+                }
+                // The receiver arrived owned, and only the part being asked for
+                // leaves with the result - so everything else has to be let go
+                // of here. Without it, reading one field of a struct that holds
+                // a String leaked all the others.
+                if self.owns_reference(receiver.ty) {
+                    self.release_parked_except(
+                        &frame,
+                        &whole,
+                        0,
+                        receiver.ty,
+                        (*offset, *offset + width),
+                    );
                 }
                 for slot in *offset..*offset + width {
                     self.ins().local_get(Self::park_slot(&frame, &whole, slot));
