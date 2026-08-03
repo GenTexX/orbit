@@ -198,6 +198,12 @@ mod tests {
             texture: "player.png".into(),
             tint: [1.0, 0.5, 0.25, 1.0],
             size: Vec2::new(32.0, 48.0),
+            // A sheet cell, mirrored: the fields added for sprite sheets have
+            // to survive a save and a load like every other one.
+            uv_offset: Vec2::new(0.5, 0.0),
+            uv_size: Vec2::new(0.25, 0.5),
+            flip_x: true,
+            flip_y: false,
         };
         player.components.push(Component::Sprite(sprite));
         // Tuned exported values, deliberately: a Script whose `exports` is empty

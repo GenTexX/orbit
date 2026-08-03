@@ -44,6 +44,7 @@ pub fn open_or_create(dir: &Path) -> Result<Project> {
         texture: "assets/sprite.png".to_string(),
         tint: [1.0, 1.0, 1.0, 1.0],
         size: Vec2::new(160.0, 160.0),
+        ..Default::default()
     }));
     sprite.components.push(Component::Script(ScriptComponent {
         source: "scripts/bounce.cmt".to_string(),

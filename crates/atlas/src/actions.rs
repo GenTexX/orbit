@@ -33,6 +33,7 @@ pub fn spawn_sprite(
         texture: texture.to_string(),
         tint: [1.0, 1.0, 1.0, 1.0],
         size,
+        ..Default::default()
     }));
     history.add_node(scene, root, node)
 }

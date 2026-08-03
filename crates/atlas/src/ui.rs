@@ -4112,9 +4112,10 @@ mod tests {
             &EditorTheme::default(),
         );
 
-        // Three Vec2 fields (position, scale, sprite size) -> two axes each.
-        assert_eq!(rows.vec_inputs.len(), 6);
-        assert_eq!(rows.scrub_labels.len(), 6);
+        // Five Vec2 fields (position, scale, sprite size, and the sprite's
+        // texture region: offset and size) -> two axes each.
+        assert_eq!(rows.vec_inputs.len(), 10);
+        assert_eq!(rows.scrub_labels.len(), 10);
         // Position's x/y inputs reference the node's translation axes.
         let axes: Vec<Axis> = rows
             .vec_inputs
@@ -4853,6 +4854,7 @@ mod tests {
             texture: String::new(),
             tint: [1.0, 1.0, 1.0, 1.0],
             size: Vec2::splat(10.0),
+            ..Default::default()
         }));
         let id = scene.add_child(root, node);
 

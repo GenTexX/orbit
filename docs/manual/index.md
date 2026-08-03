@@ -34,7 +34,10 @@ with none is just a position in the tree with children hanging off it.
 
 Three component kinds exist:
 
-- **Sprite** draws a texture at the node's transform.
+- **Sprite** draws a texture at the node's transform. `uv_offset` and `uv_size`
+  pick out one cell of a sprite sheet, as a fraction of the texture - `(0.5, 0)`
+  and `(0.25, 0.5)` is the third cell of a 4x2 sheet - and `flip_x`/`flip_y`
+  mirror it, so walking the other way needs no second set of cells.
 - **Script** runs a `.cmt` file for the node.
 - **Camera** decides what the running game sees, centred on the node it is on.
 

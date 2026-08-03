@@ -1089,6 +1089,7 @@ mod tests {
                 texture: String::new(),
                 tint: [1.0; 4],
                 size: Vec2::splat(100.0),
+                ..Default::default()
             }));
             scene.add_child(root, node)
         };
@@ -1612,6 +1613,7 @@ mod tests {
             texture: String::new(),
             tint: [1.0; 4],
             size,
+            ..Default::default()
         }));
         let id = scene.add_child(root, node);
         (scene, id)

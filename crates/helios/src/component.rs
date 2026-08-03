@@ -71,6 +71,23 @@ pub struct SpriteComponent {
     pub tint: [f32; 4],
     /// The sprite's size in pixels, before the node's scale is applied.
     pub size: Vec2,
+    /// Which part of the texture to draw, as a fraction of it: the top-left
+    /// corner of the region, and its extent.
+    ///
+    /// `(0, 0)` and `(1, 1)` is the whole texture, which is what a sprite that
+    /// has never heard of sheets gets. A 4x2 sheet's third cell is an offset of
+    /// `(0.5, 0)` and a size of `(0.25, 0.5)`.
+    ///
+    /// A fraction rather than pixels because the component names a texture and
+    /// does not know how big it is - the size lives in whoever loaded it, and a
+    /// pixel rect here would be a number that means nothing until something
+    /// else is consulted.
+    pub uv_offset: Vec2,
+    pub uv_size: Vec2,
+    /// Draw the region mirrored. A character sheet is drawn facing one way and
+    /// walking the other way is this, not a second set of cells.
+    pub flip_x: bool,
+    pub flip_y: bool,
 }
 
 impl Default for SpriteComponent {
@@ -79,6 +96,10 @@ impl Default for SpriteComponent {
             texture: String::new(),
             tint: [1.0, 1.0, 1.0, 1.0],
             size: Vec2::splat(100.0),
+            uv_offset: Vec2::ZERO,
+            uv_size: Vec2::ONE,
+            flip_x: false,
+            flip_y: false,
         }
     }
 }
@@ -89,10 +110,18 @@ impl Reflect for SpriteComponent {
     }
 
     fn field_names(&self) -> Vec<String> {
-        ["texture", "tint", "size"]
-            .into_iter()
-            .map(String::from)
-            .collect()
+        [
+            "texture",
+            "tint",
+            "size",
+            "uv_offset",
+            "uv_size",
+            "flip_x",
+            "flip_y",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
     }
 
     fn get(&self, field: &str) -> Option<Value> {
@@ -100,6 +129,10 @@ impl Reflect for SpriteComponent {
             "texture" => Some(Value::Asset(self.texture.clone())),
             "tint" => Some(Value::Color(self.tint)),
             "size" => Some(Value::Vec2(self.size)),
+            "uv_offset" => Some(Value::Vec2(self.uv_offset)),
+            "uv_size" => Some(Value::Vec2(self.uv_size)),
+            "flip_x" => Some(Value::Bool(self.flip_x)),
+            "flip_y" => Some(Value::Bool(self.flip_y)),
             _ => None,
         }
     }
@@ -116,6 +149,22 @@ impl Reflect for SpriteComponent {
             }
             ("size", Value::Vec2(v)) => {
                 self.size = v;
+                true
+            }
+            ("uv_offset", Value::Vec2(v)) => {
+                self.uv_offset = v;
+                true
+            }
+            ("uv_size", Value::Vec2(v)) => {
+                self.uv_size = v;
+                true
+            }
+            ("flip_x", Value::Bool(b)) => {
+                self.flip_x = b;
+                true
+            }
+            ("flip_y", Value::Bool(b)) => {
+                self.flip_y = b;
                 true
             }
             _ => false,
@@ -557,7 +606,18 @@ mod tests {
     fn sprite_reflects_its_fields() {
         let mut sprite = SpriteComponent::default();
         assert_eq!(sprite.type_name(), "Sprite");
-        assert_eq!(sprite.field_names(), &["texture", "tint", "size"]);
+        assert_eq!(
+            sprite.field_names(),
+            &[
+                "texture",
+                "tint",
+                "size",
+                "uv_offset",
+                "uv_size",
+                "flip_x",
+                "flip_y"
+            ]
+        );
         assert_eq!(sprite.get("tint"), Some(Value::Color([1.0, 1.0, 1.0, 1.0])));
         assert_eq!(sprite.get("missing"), None);
 
@@ -568,6 +628,23 @@ mod tests {
         // A type mismatch and an unknown field are both rejected.
         assert!(!sprite.set("size", Value::F32(5.0)));
         assert!(!sprite.set("nope", Value::Bool(true)));
+
+        // The sheet fields go through the same door, which is what puts them in
+        // the inspector and in the saved file without either being told.
+        assert!(sprite.set("uv_size", Value::Vec2(Vec2::new(0.25, 0.5))));
+        assert!(sprite.set("flip_x", Value::Bool(true)));
+        assert_eq!(sprite.get("flip_x"), Some(Value::Bool(true)));
+        assert!(!sprite.set("flip_x", Value::F32(1.0)));
+    }
+
+    #[test]
+    fn a_sprite_draws_the_whole_texture_until_told_otherwise() {
+        // Every scene written before regions existed says nothing about them,
+        // and has to keep drawing what it drew.
+        let sprite = SpriteComponent::default();
+        assert_eq!(sprite.uv_offset, Vec2::ZERO);
+        assert_eq!(sprite.uv_size, Vec2::ONE);
+        assert!(!sprite.flip_x && !sprite.flip_y);
     }
 
     #[test]

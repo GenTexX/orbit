@@ -101,7 +101,37 @@ fn build_sprite(world: Affine2, sprite: &SpriteComponent) -> Sprite {
     let mut placed = Sprite::new(position, size);
     placed.rotation = angle;
     placed.tint = Color::new(r, g, b, a);
+    placed.uv_rect = uv_rect(sprite);
     placed
+}
+
+/// The texture region to sample, as photon wants it: `(min_u, min_v, max_u,
+/// max_v)`.
+///
+/// A flip is the corners swapped rather than a flag, because the shader mixes
+/// between them - so mirroring costs nothing and needs no second code path. A
+/// zero-sized region is left as the whole texture: it is what an unset field
+/// looks like in a scene written before regions existed, and drawing nothing at
+/// all would read as a broken sprite.
+fn uv_rect(sprite: &SpriteComponent) -> [f32; 4] {
+    let size = if sprite.uv_size.cmpgt(Vec2::ZERO).all() {
+        sprite.uv_size
+    } else {
+        Vec2::ONE
+    };
+    let min = sprite.uv_offset;
+    let max = min + size;
+    let (u0, u1) = if sprite.flip_x {
+        (max.x, min.x)
+    } else {
+        (min.x, max.x)
+    };
+    let (v0, v1) = if sprite.flip_y {
+        (max.y, min.y)
+    } else {
+        (min.y, max.y)
+    };
+    [u0, v0, u1, v1]
 }
 
 #[cfg(test)]
@@ -117,8 +147,61 @@ mod tests {
             texture: String::new(),
             tint,
             size,
+            ..Default::default()
         }));
         node
+    }
+
+    #[test]
+    fn a_sheet_cell_becomes_a_uv_rect() {
+        let mut node = sprite_node(Vec2::splat(32.0), [1.0; 4]);
+        let Component::Sprite(sprite) = &mut node.components[0] else {
+            panic!("a sprite");
+        };
+        // The third cell of a 4x2 sheet.
+        sprite.uv_offset = Vec2::new(0.5, 0.0);
+        sprite.uv_size = Vec2::new(0.25, 0.5);
+
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        scene.add_child(root, node);
+        let drawn = scene.sprites();
+        assert_eq!(drawn[0].uv_rect, [0.5, 0.0, 0.75, 0.5]);
+    }
+
+    #[test]
+    fn a_flip_swaps_the_corners_rather_than_needing_a_flag() {
+        let mut node = sprite_node(Vec2::splat(32.0), [1.0; 4]);
+        let Component::Sprite(sprite) = &mut node.components[0] else {
+            panic!("a sprite");
+        };
+        sprite.uv_offset = Vec2::new(0.25, 0.5);
+        sprite.uv_size = Vec2::new(0.25, 0.5);
+        sprite.flip_x = true;
+
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        scene.add_child(root, node);
+        // Same region, u ends where it began: the shader mixes between the
+        // corners, so mirroring is free and needs no second path.
+        assert_eq!(scene.sprites()[0].uv_rect, [0.5, 0.5, 0.25, 1.0]);
+    }
+
+    #[test]
+    fn a_region_with_no_extent_draws_the_whole_texture() {
+        // What an unset field looks like in a scene written before regions
+        // existed. Drawing nothing at all would read as a broken sprite, and
+        // the file would look fine.
+        let mut node = sprite_node(Vec2::splat(32.0), [1.0; 4]);
+        let Component::Sprite(sprite) = &mut node.components[0] else {
+            panic!("a sprite");
+        };
+        sprite.uv_size = Vec2::ZERO;
+
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        scene.add_child(root, node);
+        assert_eq!(scene.sprites()[0].uv_rect, [0.0, 0.0, 1.0, 1.0]);
     }
 
     #[test]
