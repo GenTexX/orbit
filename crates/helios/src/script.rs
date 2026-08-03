@@ -538,6 +538,64 @@ impl ScriptInstance {
         self.settle(result)
     }
 
+    /// Carry this script's plain top-level state over from `previous`.
+    ///
+    /// What a hot reload should feel like: your code changed and your game kept
+    /// going. Without it a reload re-runs every top-level initializer but not
+    /// `start` - the two places a script sets things up have opposite reload
+    /// semantics - so a script that assigns its velocity in `start` simply
+    /// stops when you save the file. That is the milestone's own verification
+    /// case producing a broken sprite.
+    ///
+    /// Only what comet exported as carryable, which is scalars: a reload builds
+    /// a whole new linear memory, so a `String` or an `Array` would arrive as a
+    /// pointer into a heap that no longer exists. Those restart cold, which is
+    /// what ADR 0008 says happens to heap object graphs.
+    ///
+    /// `owned` names the variables the component owns (ADR 0022) and is skipped:
+    /// the inspector's value has already been written in, and the running
+    /// module's copy must not win over it.
+    pub fn carry_state_from(&mut self, previous: &mut ScriptInstance, owned: &[String]) {
+        let skip: Vec<String> = owned
+            .iter()
+            .flat_map(|name| {
+                [
+                    format!("state.{name}"),
+                    format!("state.{name}.x"),
+                    format!("state.{name}.y"),
+                ]
+            })
+            .collect();
+        let names: Vec<String> = self
+            .instance
+            .exports(&mut self.store)
+            .filter(|export| export.name().starts_with("state."))
+            .map(|export| export.name().to_string())
+            .collect();
+        for name in names {
+            if skip.contains(&name) {
+                continue;
+            }
+            let Some(from) = previous.instance.get_global(&mut previous.store, &name) else {
+                continue;
+            };
+            let Some(into) = self.instance.get_global(&mut self.store, &name) else {
+                continue;
+            };
+            let value = from.get(&mut previous.store);
+            // A name that changed type between the two versions is a different
+            // variable wearing the same name, so it starts fresh rather than
+            // being forced.
+            if into
+                .ty(&self.store)
+                .content()
+                .matches(from.ty(&previous.store).content())
+            {
+                let _mismatch = into.set(&mut self.store, value);
+            }
+        }
+    }
+
     /// Read back what the running script currently holds for each of
     /// `declared`, in the same order.
     ///

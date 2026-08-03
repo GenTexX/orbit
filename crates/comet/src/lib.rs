@@ -46,7 +46,9 @@ pub use ast::{
     TypeName, UnaryOp,
 };
 pub use check::check;
-pub use codegen::{HOST_MODULE, MAX_PAGES, emit, exported_globals, format_f32, write_str};
+pub use codegen::{
+    HOST_MODULE, MAX_PAGES, carries_across_a_reload, emit, exported_globals, format_f32, write_str,
+};
 
 /// What an exported field starts at when it is first created, or reverted to.
 ///

@@ -7,9 +7,16 @@
 let home = transform.position;
 let velocity = vec2(0.0, 0.0);
 
+// `start()` runs once, before the first frame - and deliberately not again when
+// you save this file. A script that placed its node in `start` would otherwise
+// jump back to the beginning every time you pressed ctrl+S.
+//
+// Save this file while the game runs and watch: the node keeps going from
+// wherever it was, because plain state like `velocity` is carried across a
+// reload. Anything held on the heap - a String, an Array - starts fresh.
 func start() {
     velocity = vec2(120.0, 0.0);
-    print("off we go from " + str(home.x) + "," + str(home.y));
+    print("off we go from " + str(home));
 }
 
 // Functions declare their types. The last expression in a body, written with

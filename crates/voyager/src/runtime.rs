@@ -266,10 +266,22 @@ impl Runtime {
             .or_insert_with(|| modified(&path));
         self.attached.insert((node, component));
 
-        let instance = self
+        let mut instance = self
             .host
             .instantiate_file(&path, scene, node, &exports, begin)?;
         self.watched.insert(path.clone(), modified(&path));
+
+        // A reload keeps the game going rather than resetting it. Only the
+        // plain top-level state, and only the variables the component does not
+        // own - the inspector's values were written in a moment ago and ADR
+        // 0022 says they win.
+        if begin == Begin::Reload
+            && let Some(at) = self.index_of(node, component)
+        {
+            let owned: Vec<String> = exports.iter().map(|(name, _)| name.clone()).collect();
+            instance.carry_state_from(&mut self.running[at].script, &owned);
+        }
+
         let slot = Running {
             node,
             relative,
@@ -1594,5 +1606,91 @@ mod tests {
             Some("update"),
             "{problems:?}"
         );
+    }
+
+    #[test]
+    fn a_reload_keeps_the_game_going_rather_than_resetting_it() {
+        // The exact shape of bounce.cmt, which is the milestone's own
+        // verification case: a top-level `let` holding state, set up in `start`.
+        // A reload re-ran the initializer and did not re-run `start`, so the
+        // two init sites had opposite semantics and the sprite simply stopped.
+        let source = "let velocity = vec2(0.0, 0.0);
+                      func start() { velocity = vec2(120.0, 0.0); }
+                      func update(dt: f32) { transform.position += velocity * dt; }";
+        let (dir, mut scene, node) = project(source);
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        for _ in 0..10 {
+            runtime.step(&mut scene, 0.1);
+        }
+        let moved = x(&scene, node);
+        assert!(moved > 100.0, "it was moving: {moved}");
+
+        rewrite(dir.path(), "script.cmt", source);
+        for path in runtime.changed_sources() {
+            runtime.reload(&mut scene, &path);
+        }
+        runtime.step(&mut scene, 0.1);
+        assert!(
+            x(&scene, node) > moved + 10.0,
+            "and it kept moving after the save: {} then {}",
+            moved,
+            x(&scene, node)
+        );
+    }
+
+    #[test]
+    fn a_reload_does_not_carry_what_the_component_owns() {
+        // ADR 0022: the inspector owns an exported value, so a reload restores
+        // what the component holds - not what the running module had made of
+        // it. Carrying state across must not quietly reverse that.
+        let source = "@export let speed: f32;
+                      func update(dt: f32) { speed = speed + 1.0; transform.position.x = speed; }";
+        let (dir, mut scene, node) = project(source);
+        let Some(Component::Script(script)) = scene.node_mut(node).components.get_mut(0) else {
+            panic!("the fixture attaches a script");
+        };
+        script.exports = vec![("speed".to_string(), Value::F32(50.0))];
+
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        runtime.step(&mut scene, 0.016);
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, node), 52.0);
+
+        rewrite(dir.path(), "script.cmt", source);
+        for path in runtime.changed_sources() {
+            runtime.reload(&mut scene, &path);
+        }
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(
+            x(&scene, node),
+            51.0,
+            "back to the tuned 50, not on from 52"
+        );
+    }
+
+    #[test]
+    fn a_reload_restarts_heap_backed_state_cold() {
+        // A reload builds a whole new linear memory, so a `String` carried
+        // across would be a pointer into a heap that no longer exists. ADR 0008
+        // says heap object graphs restart cold, and comet decides what is safe
+        // to carry rather than the host guessing from a wasm type.
+        let source = "let log: Array<f32> = [];
+                      func update(dt: f32) { push(log, 1.0); transform.position.x = len(log); }";
+        let (dir, mut scene, node) = project(source);
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        for _ in 0..5 {
+            runtime.step(&mut scene, 0.016);
+        }
+        assert_eq!(x(&scene, node), 5.0);
+
+        rewrite(dir.path(), "script.cmt", source);
+        for path in runtime.changed_sources() {
+            runtime.reload(&mut scene, &path);
+        }
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, node), 1.0, "the array started empty again");
     }
 }

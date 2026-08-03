@@ -311,7 +311,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     // two, which is why the naming is derived rather than assumed - see
     // `exported_globals`.
     for state in &script.state {
-        if !state.exported {
+        if !state.exported && !carries_across_a_reload(state.ty) {
             continue;
         }
         let base = globals.base[state.slot as usize];
@@ -405,6 +405,22 @@ fn align4(value: u32) -> u32 {
 /// One for a scalar, two for a `Vec2`. The host never builds these itself: it
 /// asks, so the convention has one definition rather than two that agree until
 /// somebody changes one.
+/// Whether a top-level `let` of this type can be carried from one instance of
+/// this module to the next.
+///
+/// A hot reload builds a whole new instance with its own linear memory, so
+/// anything held as a pointer into the old heap would arrive dangling. Scalars
+/// are values and travel; a `String`, an `Array`, and any struct or enum that
+/// could contain one do not, and restart cold - which is what ADR 0008 says
+/// happens to heap object graphs.
+///
+/// Decided here rather than in the host, so the host can copy anything it finds
+/// exported and be right by construction. A wasm `i32` alone cannot tell an
+/// `int` from a pointer.
+pub fn carries_across_a_reload(ty: Type) -> bool {
+    matches!(ty, Type::F32 | Type::Int | Type::Bool | Type::Vec2)
+}
+
 pub fn exported_globals(name: &str, ty: Type) -> Vec<String> {
     match ty {
         Type::Vec2 => vec![format!("state.{name}.x"), format!("state.{name}.y")],
