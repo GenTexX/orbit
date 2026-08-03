@@ -5,6 +5,7 @@
 //! across panels and inspector edits committed through the undo history.
 
 mod actions;
+mod code;
 mod console;
 mod dock;
 mod editor_state;
@@ -40,6 +41,10 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use crate::code::{
+    coalesces, completion_anchor, join_block, narrowest_at, tidy_for_save, toggle_comment_block,
+    transposition, word_before, word_before_or_around,
+};
 use crate::dock::{DockNode, DropZone, Pane};
 use crate::icons::Icons;
 use crate::modal::ModalAction;
@@ -244,6 +249,11 @@ struct App {
 }
 
 struct State {
+    /// Everything the Code pane owns: the open file, its text and history, and
+    /// the popups that hang off it. Grouped because it is one pane's business
+    /// and none of the rest of the editor's - see the module for why that
+    /// matters more than the field count.
+    code: code::CodePane,
     window: Arc<Window>,
     gui: AuroraRenderer,
     engine: PhotonRenderer,
@@ -338,94 +348,12 @@ struct State {
     last_log_gen: u64,
     last_log_poll: std::time::Instant,
     console_follow: bool,
-    /// The script the Code pane shows: its project-relative path, its current
-    /// buffer, and whether that buffer differs from the file on disk. One script
-    /// at a time is milestone 4's cut, so this is single-valued editor state
-    /// rather than anything the dock knows about.
-    open_script: Option<String>,
-    script_text: String,
-    script_modified: bool,
-    /// The open script's diagnostics from the last service run, for the status
-    /// bar. The squiggles themselves are already on the Ui.
-    script_diagnostics: Vec<comet::Diagnostic>,
-    /// The open script's syntax colors from the last service run.
-    script_spans: Vec<aurora::TextSpan>,
-    /// Everything the language service knows about the current buffer, computed
-    /// once per edit rather than once per question.
-    analysis: comet::service::Analysis,
-    /// How the open script was encoded on disk, so a save writes it back the
-    /// same way.
-    script_encoding: TextEncoding,
     /// Set when the window should close - after the unsaved-changes question, if
     /// there was one. The event loop reads it once per frame.
     quit_requested: bool,
-    /// The open script's file was deleted or moved out from under the buffer.
-    /// The text stays; the header says so, and Save is unavailable until it is
-    /// opened somewhere real again.
-    script_orphaned: bool,
-    /// Focus the find bar's query field after the next rebuild, and select what
-    /// is in it. Consumed there, like `refocus_filter`.
-    focus_find: bool,
-    /// The diagnostic message currently shown as a tooltip, so the shell only
-    /// rebuilds when what is under the pointer changes.
-    diagnostic_tooltip: Option<String>,
-    /// Where the pointer was when it last moved, and when it stopped - a
-    /// tooltip belongs to a resting pointer, not a passing one.
-    tooltip_cursor: Vec2,
-    tooltip_rested: std::time::Instant,
-    /// The go-to-line box's contents while it is open.
-    go_to_line: Option<String>,
-    /// The go-to-symbol palette: what has been typed into it, and the list of
-    /// matching declarations. Open only over the Code pane.
-    symbol_palette: Option<(String, aurora::list::ListPopup)>,
-    /// Where the caret and the view were, per script, so reopening a file this
-    /// session puts you back where you left rather than at the top.
-    script_positions: std::collections::HashMap<String, (usize, f32)>,
-    /// The call the caret is inside, and where to draw the hint. Refreshed on
-    /// every edit and caret move, like the completion list.
-    signature: Option<(comet::service::SignatureHelp, Vec2)>,
     /// A transient line for the status bar - what a jump found, or why it did
     /// not go anywhere - and when it was set, so it fades rather than lingering.
     status_note: Option<(String, std::time::Instant)>,
-    /// An in-progress symbol rename: where in the buffer, the name being typed,
-    /// and why the last attempt was refused.
-    symbol_rename: Option<SymbolRename>,
-    /// Set when a script is opened: focus the editor after the next rebuild.
-    /// A file that appears with no caret swallows the first keystroke.
-    focus_editor: bool,
-    /// Set by ctrl+space: offer the list wherever the caret is, rather than only
-    /// where a name is being typed. Cleared as soon as it has been used.
-    force_completions: bool,
-    /// When the caret's blink phase last flipped, and what the caret was doing
-    /// then - so it holds solid while you type instead of blinking under you.
-    caret_phase: std::time::Instant,
-    caret_visible: bool,
-    caret_was: Option<usize>,
-    /// Text undo for the Code pane: snapshots of the buffer and where the caret
-    /// was, newest last.
-    ///
-    /// Here rather than in aurora because a rebuild swaps the whole Ui, and an
-    /// undo history that vanished whenever a node got selected would be worse
-    /// than none. atlas owns the document; aurora owns the widget showing it.
-    script_undo: Vec<(String, usize)>,
-    script_redo: Vec<(String, usize)>,
-    /// Where the caret was last time the buffer was read, so an undo step
-    /// records the position the edit started from rather than where it ended.
-    script_caret: usize,
-    /// Whether the last edit joined the open undo step. A run only continues a
-    /// run: without this, the first letter after a space would fold into the
-    /// space's step and one undo would swallow both.
-    script_coalescing: bool,
-    /// The autocomplete popup over the Code pane, while one is open, and the
-    /// byte range of the word it is completing.
-    ///
-    /// The range is held rather than re-read on accept, because pressing a row
-    /// moves focus to that row - a button is not a text input - and the caret is
-    /// a property of the focused widget, so by the time the click arrives there
-    /// is no caret to ask about.
-    completions: Option<(aurora::list::ListPopup, std::ops::Range<usize>)>,
-    /// The find bar over the Code pane, while one is open.
-    find: Option<aurora::find::FindBar>,
     /// Set when the per-project view state (dock, camera, tool, collapse) changed
     /// since the last editor-state save; a debounced save writes it out. Kept
     /// separate from `dirty` (the UI-rebuild flag). `editor_state_saved` is when
@@ -560,76 +488,6 @@ const CARET_BLINK: std::time::Duration = std::time::Duration::from_millis(530);
 /// How many text-undo steps the Code pane keeps. Deep enough that a session
 /// never notices, bounded so a long one cannot grow without limit.
 const MAX_TEXT_UNDO: usize = 200;
-
-/// Whether an edit from `before` to `after` should join the previous undo step
-/// rather than start a new one: a run of ordinary typing, so undo goes back a
-/// word at a time instead of a letter at a time. Whitespace ends a run, which is
-/// what makes "a word" the unit.
-fn coalesces(before: &str, after: &str) -> bool {
-    if after.len() != before.len() + 1 || !after.starts_with(before) {
-        return false;
-    }
-    after
-        .as_bytes()
-        .last()
-        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
-}
-
-/// Comment or uncomment a block of lines.
-///
-/// Uncomments only when every non-blank line is already commented, so a block
-/// where half is commented gets the rest commented rather than each line
-/// flipped and the same mess left inverted. The `//` goes at the shallowest
-/// indentation in the block, so the code keeps its shape, and uncommenting
-/// takes back the single space it added - a round trip is exact.
-fn toggle_comment_block(block: &str) -> String {
-    let lines: Vec<&str> = block.split('\n').collect();
-    let content: Vec<&str> = lines
-        .iter()
-        .copied()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    let all_commented =
-        !content.is_empty() && content.iter().all(|l| l.trim_start().starts_with("//"));
-    let indent = content
-        .iter()
-        .map(|l| l.len() - l.trim_start().len())
-        .min()
-        .unwrap_or(0);
-
-    lines
-        .iter()
-        .map(|line| {
-            if line.trim().is_empty() {
-                return (*line).to_string();
-            }
-            if all_commented {
-                let at = line.find("//").expect("every content line has one");
-                let rest = &line[at + 2..];
-                let rest = rest.strip_prefix(' ').unwrap_or(rest);
-                format!("{}{rest}", &line[..at])
-            } else {
-                format!("{}// {}", &line[..indent], &line[indent..])
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// The diagnostic covering `offset`, narrowest first.
-///
-/// Narrowest wins because a wide diagnostic - "this function must return f32",
-/// spanning a whole body - would otherwise hide the precise one inside it, and
-/// the precise one is the one that says what to change. A zero-width span (an
-/// unclosed brace, reported at the end of the file) is found at its own offset.
-fn narrowest_at(all: &[comet::Diagnostic], offset: usize) -> Option<&comet::Diagnostic> {
-    all.iter()
-        .filter(|d| {
-            let (lo, hi) = (d.span.start as usize, d.span.end as usize);
-            offset >= lo && (offset < hi || (lo == hi && offset == lo))
-        })
-        .min_by_key(|d| d.span.end - d.span.start)
-}
 
 /// How the open script's bytes were encoded on disk, so a save writes it back
 /// the way it came rather than quietly rewriting the whole file.
@@ -784,133 +642,6 @@ impl Case {
     }
 }
 
-/// Collapse `block` onto one line: trailing whitespace goes, the next line's
-/// indent goes, and the two are joined by a single space - or by nothing when
-/// one side is empty, so a blank line does not become a stray space.
-fn join_block(block: &str) -> String {
-    let mut out = String::with_capacity(block.len());
-    for line in block.split('\n') {
-        let piece = line.trim();
-        if piece.is_empty() {
-            continue;
-        }
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(piece);
-    }
-    // The first line keeps its indentation: joining is about the seam, not
-    // about moving the block to the margin.
-    let indent: String = block
-        .chars()
-        .take_while(|c| *c == ' ' || *c == '\t')
-        .collect();
-    format!("{indent}{out}")
-}
-
-/// The swap ctrl+t should make at `caret`: the range to replace and what to put
-/// there, or `None` when there is nothing to swap.
-///
-/// Characters, not bytes, so a multi-byte character is never split in half.
-fn transposition(text: &str, caret: usize) -> Option<(std::ops::Range<usize>, String)> {
-    let caret = caret.min(text.len());
-    if !text.is_char_boundary(caret) {
-        return None;
-    }
-    let line_start = text[..caret].rfind('\n').map_or(0, |at| at + 1);
-    let line_end = text[caret..].find('\n').map_or(text.len(), |at| caret + at);
-    let before = text[line_start..caret].chars().next_back()?;
-    // At the end of a line there is nothing after the caret to swap with, so
-    // take the two behind it - which is where the typo you just spotted is.
-    let after = text[caret..line_end].chars().next();
-    match after {
-        Some(after) => {
-            let start = caret - before.len_utf8();
-            let end = caret + after.len_utf8();
-            Some((start..end, format!("{after}{before}")))
-        }
-        None => {
-            let earlier = text[line_start..caret - before.len_utf8()]
-                .chars()
-                .next_back()?;
-            let start = caret - before.len_utf8() - earlier.len_utf8();
-            Some((start..caret, format!("{before}{earlier}")))
-        }
-    }
-}
-
-/// The word the caret is in or next to: where it starts, and its text.
-///
-/// Unlike [`word_before`], this reaches forward as well, so the caret sitting at
-/// the start of a name still finds that name.
-fn word_before_or_around(text: &str, caret: usize) -> (usize, &str) {
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
-    let caret = caret.min(text.len());
-    if !text.is_char_boundary(caret) {
-        return (caret, "");
-    }
-    let start = text[..caret]
-        .char_indices()
-        .rev()
-        .take_while(|(_, c)| is_word(*c))
-        .last()
-        .map_or(caret, |(i, _)| i);
-    let end = text[caret..]
-        .char_indices()
-        .take_while(|(_, c)| is_word(*c))
-        .last()
-        .map_or(caret, |(i, c)| caret + i + c.len_utf8());
-    (start, &text[start..end])
-}
-
-/// Strip trailing spaces and tabs from every line, and end the text with
-/// exactly one newline. Returns the result and where `caret` ended up.
-///
-/// The caret's own line is spared when it holds nothing but whitespace: that is
-/// a fresh auto-indent being typed into, and yanking it away on save would move
-/// the caret to the margin under someone's hands.
-///
-/// The caret is kept on the same character. It has to be: the tidy runs through
-/// the buffer, so the widget is rewritten under a caret that is still live.
-fn tidy_for_save(text: &str, caret: usize) -> (String, usize) {
-    let caret = caret.min(text.len());
-    let mut out = String::with_capacity(text.len());
-    let mut removed_before_caret = 0usize;
-    let mut at = 0usize;
-    for line in text.split_inclusive('\n') {
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let blank = !body.is_empty() && body.bytes().all(|b| b == b' ' || b == b'\t');
-        let caret_here = caret >= at && caret <= at + body.len();
-        let trimmed = if caret_here && blank {
-            body
-        } else {
-            body.trim_end_matches([' ', '\t'])
-        };
-        let cut_from = at + trimmed.len();
-        if caret >= at + body.len() {
-            removed_before_caret += body.len() - trimmed.len();
-        } else if caret > cut_from {
-            removed_before_caret += caret - cut_from;
-        }
-        out.push_str(trimmed);
-        if line.len() != body.len() {
-            out.push('\n');
-        }
-        at += line.len();
-    }
-    // One trailing newline, not none and not four. Files this editor writes get
-    // diffed and concatenated, and a missing final newline is a spurious
-    // one-line diff forever.
-    while out.ends_with("\n\n") {
-        out.pop();
-    }
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    let caret = caret.saturating_sub(removed_before_caret).min(out.len());
-    (out, caret)
-}
-
 /// Where ctrl+up / ctrl+down should put the caret, or `None` when there is no
 /// declaration that way.
 ///
@@ -930,37 +661,6 @@ fn step_symbol_target(
         symbols.iter().rev().find(|s| s.span.start < caret)
     };
     target.map(|s| s.span.start as usize)
-}
-
-/// Where a completion popup should be anchored for a caret at `caret`, or
-/// `None` if none should be open there.
-///
-/// One predicate, so "should there be a popup" has exactly one answer rather
-/// than being decided in pieces at each place that might close one. A popup is
-/// wanted while a name is being typed, and right after a `.` where the name has
-/// not been started yet - and nowhere else, which is what takes it down when
-/// the caret is clicked into whitespace eleven lines away.
-fn completion_anchor(text: &str, caret: usize) -> Option<usize> {
-    let (start, prefix) = word_before(text, caret);
-    if !prefix.is_empty() {
-        return Some(start);
-    }
-    // Right after a dot: field completions are the whole point of asking there.
-    let after_dot = start > 0 && text.as_bytes()[start - 1] == b'.';
-    after_dot.then_some(start)
-}
-
-/// The identifier the caret sits in or just after: where it starts, and its
-/// text. An empty name means the caret is not in one.
-///
-/// comet's, not a second copy: this decides what a completion replaces, so the
-/// language it is completing should be the one that says where a name begins.
-/// The copy that used to live here stepped one *byte* past the character it
-/// found, so a single non-ASCII character before the caret - an em dash pasted
-/// into a comment - sliced mid-character and took the editor down. This runs on
-/// every keystroke in the Code pane.
-fn word_before(text: &str, caret: usize) -> (usize, &str) {
-    comet::service::word_before(text, caret)
 }
 
 impl ApplicationHandler for App {
@@ -1330,6 +1030,36 @@ impl State {
         );
 
         Ok(Self {
+            code: code::CodePane {
+                open_script: None,
+                script_text: String::new(),
+                script_modified: false,
+                script_diagnostics: Vec::new(),
+                script_spans: Vec::new(),
+                analysis: comet::service::Analysis::default(),
+                script_encoding: TextEncoding::default(),
+                script_orphaned: false,
+                focus_find: false,
+                diagnostic_tooltip: None,
+                tooltip_cursor: Vec2::ZERO,
+                tooltip_rested: std::time::Instant::now(),
+                go_to_line: None,
+                symbol_palette: None,
+                script_positions: std::collections::HashMap::new(),
+                signature: None,
+                symbol_rename: None,
+                focus_editor: false,
+                force_completions: false,
+                caret_phase: std::time::Instant::now(),
+                caret_visible: true,
+                caret_was: None,
+                script_undo: Vec::new(),
+                script_redo: Vec::new(),
+                script_caret: 0,
+                script_coalescing: false,
+                completions: None,
+                find: None,
+            },
             window,
             gui,
             engine,
@@ -1374,36 +1104,8 @@ impl State {
             last_log_gen: 0,
             last_log_poll: std::time::Instant::now(),
             console_follow: true,
-            open_script: None,
-            script_text: String::new(),
-            script_modified: false,
-            script_diagnostics: Vec::new(),
-            script_spans: Vec::new(),
-            analysis: comet::service::Analysis::default(),
-            script_encoding: TextEncoding::default(),
             quit_requested: false,
-            script_orphaned: false,
-            focus_find: false,
-            diagnostic_tooltip: None,
-            tooltip_cursor: Vec2::ZERO,
-            tooltip_rested: std::time::Instant::now(),
-            go_to_line: None,
-            symbol_palette: None,
-            script_positions: std::collections::HashMap::new(),
-            focus_editor: false,
-            signature: None,
             status_note: None,
-            symbol_rename: None,
-            force_completions: false,
-            caret_phase: std::time::Instant::now(),
-            caret_visible: true,
-            caret_was: None,
-            script_undo: Vec::new(),
-            script_redo: Vec::new(),
-            script_caret: 0,
-            script_coalescing: false,
-            completions: None,
-            find: None,
             view_dirty: false,
             editor_state_saved: std::time::Instant::now(),
             context_menu: None,
@@ -2127,7 +1829,7 @@ impl State {
                     self.close_modal();
                     return;
                 }
-                self.script_modified = false;
+                self.code.script_modified = false;
                 self.proceed_with_pending();
             }
         }
@@ -2158,7 +1860,7 @@ impl State {
     /// still the user's, and losing it because a file was deleted in another
     /// pane would be worse than a header that says the file is missing.
     fn follow_open_script(&mut self, from: &std::path::Path, to: Option<&std::path::Path>) {
-        let Some(open) = self.open_script.clone() else {
+        let Some(open) = self.code.open_script.clone() else {
             return;
         };
         let current = self.project_dir.join(&open);
@@ -2166,12 +1868,12 @@ impl State {
             return;
         }
         match to.and_then(|p| self.explorer.project_relative(p)) {
-            Some(relative) => self.open_script = Some(relative),
+            Some(relative) => self.code.open_script = Some(relative),
             None => {
-                self.open_script = None;
-                self.script_orphaned = true;
+                self.code.open_script = None;
+                self.code.script_orphaned = true;
                 // The text is still unsaved work; keep it and say so.
-                self.script_modified = true;
+                self.code.script_modified = true;
             }
         }
         self.dirty = true;
@@ -2179,7 +1881,7 @@ impl State {
 
     /// Whether dropping the open buffer now would lose work.
     fn script_dirty(&self) -> bool {
-        self.open_script.is_some() && self.script_modified
+        self.code.open_script.is_some() && self.code.script_modified
     }
 
     /// Whether quitting right now would throw away unsaved work of any kind.
@@ -3164,7 +2866,7 @@ impl State {
         // scene: it is the file you are looking at. Only without shift, which
         // sorts the selected lines below.
         if c.eq_ignore_ascii_case("s") && !self.modifiers.shift_key() {
-            if self.ui.focused() == self.rows.code_editor && self.open_script.is_some() {
+            if self.ui.focused() == self.rows.code_editor && self.code.open_script.is_some() {
                 self.save_script();
             } else {
                 self.save_project();
@@ -3203,7 +2905,7 @@ impl State {
             && self.ui.focused() == Some(editor)
         {
             if let Some(at) = self.ui.caret_offset()
-                && let Some(partner) = self.analysis.bracket_at(at).and_then(|b| b.partner)
+                && let Some(partner) = self.code.analysis.bracket_at(at).and_then(|b| b.partner)
             {
                 self.ui.focus_caret(editor, partner.end as usize);
                 self.dirty = true;
@@ -3952,7 +3654,7 @@ impl State {
     fn open_script_file(&mut self, path: &std::path::Path) {
         // Replacing a buffer with unsaved edits would drop them silently.
         if self.script_dirty() {
-            let name = self.open_script.clone().unwrap_or_default();
+            let name = self.code.open_script.clone().unwrap_or_default();
             self.open_modal(modal::Modal::confirm(
                 format!("{name} has unsaved changes. Save them before opening another script?"),
                 modal::Pending::OpenScript(path.to_path_buf()),
@@ -3981,15 +3683,15 @@ impl State {
                 return;
             }
         };
-        self.script_encoding = encoding;
+        self.code.script_encoding = encoding;
         let relative = self
             .explorer
             .project_relative(path)
             .unwrap_or_else(|| path.display().to_string());
-        self.open_script = Some(relative);
-        self.script_orphaned = false;
-        self.script_text = text;
-        self.script_modified = false;
+        self.code.open_script = Some(relative);
+        self.code.script_orphaned = false;
+        self.code.script_text = text;
+        self.code.script_modified = false;
         self.adopt_open_script();
         self.dock.activate(dock::Pane::Code);
         self.dirty = true;
@@ -4010,24 +3712,26 @@ impl State {
     /// put that file's text into this one - and the next save would write it.
     fn adopt_open_script(&mut self) {
         if let Some(editor) = self.rows.code_editor {
-            self.ui.set_text_input(editor, self.script_text.clone());
+            self.ui
+                .set_text_input(editor, self.code.script_text.clone());
         }
-        self.script_undo.clear();
-        self.script_redo.clear();
+        self.code.script_undo.clear();
+        self.code.script_redo.clear();
         // Back where this file was left, if it has been open this session.
         let (caret, _) = self
+            .code
             .open_script
             .as_ref()
-            .and_then(|name| self.script_positions.get(name).copied())
+            .and_then(|name| self.code.script_positions.get(name).copied())
             .unwrap_or((0, 0.0));
-        self.script_caret = caret.min(self.script_text.len());
-        self.focus_editor = true;
-        self.script_coalescing = false;
+        self.code.script_caret = caret.min(self.code.script_text.len());
+        self.code.focus_editor = true;
+        self.code.script_coalescing = false;
         // A completion list and a find bar are both about the buffer that just
         // went away.
-        self.completions = None;
-        if let Some(find) = &mut self.find {
-            find.refresh(&self.script_text);
+        self.code.completions = None;
+        if let Some(find) = &mut self.code.find {
+            find.refresh(&self.code.script_text);
         }
         self.analyze_script();
     }
@@ -4091,17 +3795,17 @@ impl State {
     /// Write the Code pane's buffer back to its file, in the encoding it came
     /// in: the line endings it had, and its byte-order mark if it had one.
     fn save_script(&mut self) {
-        let Some(relative) = self.open_script.clone() else {
+        let Some(relative) = self.code.open_script.clone() else {
             return;
         };
         if self.tidy_on_save {
             self.tidy_script();
         }
         let path = self.project_dir.join(&relative);
-        let body = self.script_encoding.encode(&self.script_text);
+        let body = self.code.script_encoding.encode(&self.code.script_text);
         match write_atomic(&path, body.as_bytes()) {
             Ok(()) => {
-                self.script_modified = false;
+                self.code.script_modified = false;
                 recovery::forget_script();
                 // The file just changed, so what it exports may have too.
                 self.reconcile_script_exports();
@@ -4117,18 +3821,19 @@ impl State {
     /// leave the two disagreeing, and the modified mark would come straight
     /// back on the next sync.
     fn tidy_script(&mut self) {
-        let (tidied, caret) = tidy_for_save(&self.script_text, self.editor_caret());
-        if tidied == self.script_text {
+        let (tidied, caret) = tidy_for_save(&self.code.script_text, self.editor_caret());
+        if tidied == self.code.script_text {
             return;
         }
-        self.script_text = tidied;
+        self.code.script_text = tidied;
         if let Some(editor) = self.rows.code_editor {
-            self.ui.set_text_input(editor, self.script_text.clone());
+            self.ui
+                .set_text_input(editor, self.code.script_text.clone());
             if self.ui.focused() == Some(editor) {
                 self.ui.focus_caret(editor, caret);
             }
         }
-        self.script_caret = caret;
+        self.code.script_caret = caret;
         self.analyze_script();
     }
 
@@ -4391,9 +4096,9 @@ impl State {
             .replacement
             .and_then(|id| self.ui.text_of(id))
             .map(str::to_string);
-        let text = self.script_text.clone();
+        let text = self.code.script_text.clone();
         let caret = self.editor_caret();
-        if let Some(find) = &mut self.find {
+        if let Some(find) = &mut self.code.find {
             if let Some(query) = query {
                 find.set_query(query, &text, caret);
             }
@@ -4407,7 +4112,7 @@ impl State {
     /// wins, so a wide "this function must return" does not hide a precise
     /// type error inside it.
     fn diagnostic_at(&self, offset: usize) -> Option<&comet::Diagnostic> {
-        narrowest_at(&self.script_diagnostics, offset)
+        narrowest_at(&self.code.script_diagnostics, offset)
     }
 
     /// What to say about whatever the pointer is over in the Code pane: the
@@ -4422,7 +4127,7 @@ impl State {
         if let Some(d) = self.diagnostic_at(offset) {
             return Some(d.message.clone());
         }
-        comet::service::hover_at(&self.script_text, helios::script_schema(), offset)
+        comet::service::hover_at(&self.code.script_text, helios::script_schema(), offset)
     }
 
     /// Move the caret to the next problem after it, or the previous one before
@@ -4431,11 +4136,12 @@ impl State {
         let Some(editor) = self.rows.code_editor else {
             return;
         };
-        if self.script_diagnostics.is_empty() {
+        if self.code.script_diagnostics.is_empty() {
             return;
         }
         let caret = self.ui.caret_offset().unwrap_or(0);
         let mut spans: Vec<(usize, usize)> = self
+            .code
             .script_diagnostics
             .iter()
             .map(|d| (d.span.start as usize, d.span.end as usize))
@@ -4467,25 +4173,25 @@ impl State {
     /// while writing is a steady bar.
     fn tick_caret(&mut self) {
         let caret = self.ui.caret_offset();
-        if caret != self.caret_was {
+        if caret != self.code.caret_was {
             // The caret moving is also what makes an open completion popup
             // stale: it was offering names for a word the caret has left.
             // Refreshing closes it when there is no longer a word there.
-            if self.completions.is_some() {
+            if self.code.completions.is_some() {
                 self.refresh_completions();
             }
             // The signature hint follows the caret whether or not anything was
             // typed: clicking or arrowing into a call is how you come back to
             // an argument you left, and that is exactly when you want it.
             self.update_signature();
-            self.caret_was = caret;
-            self.caret_phase = std::time::Instant::now();
-            self.caret_visible = true;
-        } else if self.caret_phase.elapsed() >= CARET_BLINK {
-            self.caret_phase = std::time::Instant::now();
-            self.caret_visible = !self.caret_visible;
+            self.code.caret_was = caret;
+            self.code.caret_phase = std::time::Instant::now();
+            self.code.caret_visible = true;
+        } else if self.code.caret_phase.elapsed() >= CARET_BLINK {
+            self.code.caret_phase = std::time::Instant::now();
+            self.code.caret_visible = !self.code.caret_visible;
         }
-        self.ui.set_caret_on(self.caret_visible);
+        self.ui.set_caret_on(self.code.caret_visible);
     }
 
     /// Keep the hovered-diagnostic tooltip in step with the pointer.
@@ -4501,18 +4207,18 @@ impl State {
         // pointer has stopped, and anything the user does next - a key, a click,
         // a move - takes it away again. Without that it had no dismissal path at
         // all except moving off the word, and sat over the code indefinitely.
-        if self.cursor != self.tooltip_cursor {
-            self.tooltip_cursor = self.cursor;
-            self.tooltip_rested = std::time::Instant::now();
+        if self.cursor != self.code.tooltip_cursor {
+            self.code.tooltip_cursor = self.cursor;
+            self.code.tooltip_rested = std::time::Instant::now();
             self.hide_hover();
             return;
         }
-        if self.tooltip_rested.elapsed() < HOVER_DELAY {
+        if self.code.tooltip_rested.elapsed() < HOVER_DELAY {
             return;
         }
         let message = self.hover_under_pointer();
-        if message != self.diagnostic_tooltip {
-            self.diagnostic_tooltip = message;
+        if message != self.code.diagnostic_tooltip {
+            self.code.diagnostic_tooltip = message;
             self.dirty = true;
         }
     }
@@ -4522,7 +4228,7 @@ impl State {
     /// the click sits over whatever you clicked on.
     fn dismiss_code_popups(&mut self) {
         self.hide_hover();
-        if self.completions.is_none() {
+        if self.code.completions.is_none() {
             return;
         }
         let on_popup = self
@@ -4532,14 +4238,14 @@ impl State {
             .iter()
             .any(|(w, _)| self.ui.rect(*w).is_some_and(|r| r.contains(self.cursor)));
         if !on_popup {
-            self.completions = None;
+            self.code.completions = None;
             self.dirty = true;
         }
     }
 
     /// Take the hover tooltip down, if one is up.
     fn hide_hover(&mut self) {
-        if self.diagnostic_tooltip.take().is_some() {
+        if self.code.diagnostic_tooltip.take().is_some() {
             self.dirty = true;
         }
     }
@@ -4554,7 +4260,7 @@ impl State {
             return;
         };
         let line = self.ui.caret_line_column().map_or(1, |(line, _)| line);
-        self.go_to_line = Some(line.to_string());
+        self.code.go_to_line = Some(line.to_string());
         let _ = editor;
         self.dirty = true;
     }
@@ -4567,7 +4273,7 @@ impl State {
         let Some(editor) = self.rows.code_editor else {
             return;
         };
-        let len = self.script_text.len();
+        let len = self.code.script_text.len();
         self.ui.select_range(
             editor,
             (span.start as usize).min(len),
@@ -4593,11 +4299,11 @@ impl State {
             return;
         };
         let at = self.editor_caret();
-        match comet::service::definition_at(&self.script_text, helios::script_schema(), at) {
+        match comet::service::definition_at(&self.code.script_text, helios::script_schema(), at) {
             Some(found) if found.kind.is_in_source() => {
                 self.ui
                     .select_range(editor, found.span.start as usize, found.span.end as usize);
-                let line = self.script_text[..found.span.start as usize]
+                let line = self.code.script_text[..found.span.start as usize]
                     .matches('\n')
                     .count()
                     + 1;
@@ -4623,7 +4329,7 @@ impl State {
     fn start_symbol_rename(&mut self) {
         let at = self.editor_caret();
         let Some(found) =
-            comet::service::definition_at(&self.script_text, helios::script_schema(), at)
+            comet::service::definition_at(&self.code.script_text, helios::script_schema(), at)
         else {
             self.note("put the caret on a name to rename it");
             return;
@@ -4635,7 +4341,7 @@ impl State {
             ));
             return;
         }
-        self.symbol_rename = Some(SymbolRename {
+        self.code.symbol_rename = Some(SymbolRename {
             offset: at,
             draft: found.name,
             error: None,
@@ -4650,7 +4356,7 @@ impl State {
     /// buffer, so the whole rename is naturally one step - but the coalescing
     /// run has to be broken, or the next character typed folds into it.
     fn commit_symbol_rename(&mut self) {
-        let Some(rename) = self.symbol_rename.clone() else {
+        let Some(rename) = self.code.symbol_rename.clone() else {
             return;
         };
         let Some(editor) = self.rows.code_editor else {
@@ -4662,7 +4368,7 @@ impl State {
             return;
         }
         if !comet::service::rename_is_safe(
-            &self.script_text,
+            &self.code.script_text,
             helios::script_schema(),
             rename.offset,
             &name,
@@ -4670,9 +4376,11 @@ impl State {
             self.set_rename_error(format!("`{name}` already means something here"));
             return;
         }
-        let Some(mut spans) =
-            comet::service::rename_spans(&self.script_text, helios::script_schema(), rename.offset)
-        else {
+        let Some(mut spans) = comet::service::rename_spans(
+            &self.code.script_text,
+            helios::script_schema(),
+            rename.offset,
+        ) else {
             self.set_rename_error("nothing to rename");
             return;
         };
@@ -4682,15 +4390,15 @@ impl State {
             self.ui
                 .replace_range(editor, span.start as usize..span.end as usize, &name);
         }
-        self.script_coalescing = false;
-        self.symbol_rename = None;
+        self.code.script_coalescing = false;
+        self.code.symbol_rename = None;
         self.sync_script_buffer();
         self.note(format!("renamed {sites} occurrences"));
         self.dirty = true;
     }
 
     fn set_rename_error(&mut self, message: impl Into<String>) {
-        if let Some(rename) = &mut self.symbol_rename {
+        if let Some(rename) = &mut self.code.symbol_rename {
             rename.error = Some(message.into());
         }
         self.dirty = true;
@@ -4711,7 +4419,7 @@ impl State {
             .rect(editor)
             .map(|r| Vec2::new(r.pos.x + 40.0, r.pos.y + 6.0))
             .unwrap_or_default();
-        let items: Vec<aurora::list::ListItem> = comet::service::symbols(&self.script_text)
+        let items: Vec<aurora::list::ListItem> = comet::service::symbols(&self.code.script_text)
             .into_iter()
             .map(|symbol| {
                 let (label_color, detail_color) = match symbol.kind {
@@ -4732,7 +4440,7 @@ impl State {
         if items.is_empty() {
             return;
         }
-        self.symbol_palette = Some((
+        self.code.symbol_palette = Some((
             String::new(),
             aurora::list::ListPopup::new(items, Vec2::new(anchor.x, anchor.y + 34.0)),
         ));
@@ -4744,13 +4452,13 @@ impl State {
         let Some(editor) = self.rows.code_editor else {
             return;
         };
-        let Some(symbol) = comet::service::symbols(&self.script_text)
+        let Some(symbol) = comet::service::symbols(&self.code.script_text)
             .into_iter()
             .find(|symbol| symbol.name == name)
         else {
             return;
         };
-        self.symbol_palette = None;
+        self.code.symbol_palette = None;
         self.ui.focus_caret(editor, symbol.span.start as usize);
         self.dirty = true;
     }
@@ -4764,7 +4472,7 @@ impl State {
             return;
         };
         let caret = self.editor_caret();
-        let symbols = comet::service::symbols(&self.script_text);
+        let symbols = comet::service::symbols(&self.code.script_text);
         if let Some(at) = step_symbol_target(&symbols, caret, forward) {
             self.ui.focus_caret(editor, at);
             self.dirty = true;
@@ -4778,14 +4486,15 @@ impl State {
         };
         let line = line.max(1);
         let offset = self
+            .code
             .script_text
             .split_inclusive('\n')
             .take(line - 1)
             .map(str::len)
             .sum::<usize>()
-            .min(self.script_text.len());
+            .min(self.code.script_text.len());
         self.ui.focus_caret(editor, offset);
-        self.go_to_line = None;
+        self.code.go_to_line = None;
         self.dirty = true;
     }
 
@@ -4834,14 +4543,14 @@ impl State {
         let (range, block) = self.ui.selected_lines(editor);
         // One line selected means "join the one below onto this one", so the
         // block has to reach a line further than the selection does.
-        let end = self.script_text[range.end..]
+        let end = self.code.script_text[range.end..]
             .find('\n')
             .map(|at| range.end + 1 + at)
-            .unwrap_or(self.script_text.len());
+            .unwrap_or(self.code.script_text.len());
         let block = if block.contains('\n') {
             block
         } else {
-            self.script_text[range.start..end].to_string()
+            self.code.script_text[range.start..end].to_string()
         };
         let joined = join_block(&block);
         let range = range.start..range.start + block.len();
@@ -4863,7 +4572,7 @@ impl State {
             return;
         };
         let caret = self.editor_caret();
-        let Some((range, swapped)) = transposition(&self.script_text, caret) else {
+        let Some((range, swapped)) = transposition(&self.code.script_text, caret) else {
             return;
         };
         let end = range.start + swapped.len();
@@ -4886,14 +4595,14 @@ impl State {
             Some(range) => range,
             None => {
                 let caret = self.editor_caret();
-                let (start, word) = word_before_or_around(&self.script_text, caret);
+                let (start, word) = word_before_or_around(&self.code.script_text, caret);
                 if word.is_empty() {
                     return;
                 }
                 start..start + word.len()
             }
         };
-        let recased = case.apply(&self.script_text[range.clone()]);
+        let recased = case.apply(&self.code.script_text[range.clone()]);
         // to_uppercase can change the byte length, so the new end comes from the
         // replacement rather than from the range that was replaced.
         let start = range.start;
@@ -4931,7 +4640,7 @@ impl State {
         let (range, _) = self.ui.selected_lines(editor);
         // Take the newline that followed too, or deleting a line leaves a blank
         // one where it was.
-        let end = if self.script_text[range.end..].starts_with('\n') {
+        let end = if self.code.script_text[range.end..].starts_with('\n') {
             range.end + 1
         } else {
             range.end
@@ -4952,7 +4661,7 @@ impl State {
             return;
         };
         let (range, block) = self.ui.selected_lines(editor);
-        let text = self.script_text.clone();
+        let text = self.code.script_text.clone();
         if down {
             let Some(rest) = text.get(range.end..).filter(|r| r.starts_with('\n')) else {
                 return; // already the last line
@@ -5001,7 +4710,7 @@ impl State {
             return;
         };
         self.commit_find_fields();
-        let Some(find) = &mut self.find else {
+        let Some(find) = &mut self.code.find else {
             return;
         };
         match action {
@@ -5018,7 +4727,7 @@ impl State {
                 find.replace_all(&mut self.ui, editor);
             }
             FindAction::Close => {
-                self.find = None;
+                self.code.find = None;
                 self.dirty = true;
                 return;
             }
@@ -5033,7 +4742,7 @@ impl State {
     /// [`apply_script_marks`](Self::apply_script_marks), which
     /// owns the editor's decorations.
     fn reveal_find_match(&mut self) {
-        let (Some(find), Some(editor)) = (&self.find, self.rows.code_editor) else {
+        let (Some(find), Some(editor)) = (&self.code.find, self.rows.code_editor) else {
             return;
         };
         find.reveal(&mut self.ui, editor);
@@ -5042,7 +4751,7 @@ impl State {
     /// The completion label a click on `id` would insert.
     /// The symbol the palette row `id` stands for, if it is one.
     fn symbol_row(&self, id: aurora::WidgetId) -> Option<String> {
-        let (_, list) = self.symbol_palette.as_ref()?;
+        let (_, list) = self.code.symbol_palette.as_ref()?;
         let index = self
             .rows
             .symbol_rows
@@ -5054,7 +4763,7 @@ impl State {
     }
 
     fn completion_row(&self, id: aurora::WidgetId) -> Option<String> {
-        let (list, _) = self.completions.as_ref()?;
+        let (list, _) = self.code.completions.as_ref()?;
         let index = self
             .rows
             .completions
@@ -5071,23 +4780,24 @@ impl State {
             return false;
         };
         let (from, to) = if redo {
-            (&mut self.script_redo, &mut self.script_undo)
+            (&mut self.code.script_redo, &mut self.code.script_undo)
         } else {
-            (&mut self.script_undo, &mut self.script_redo)
+            (&mut self.code.script_undo, &mut self.code.script_redo)
         };
         let Some((text, caret)) = from.pop() else {
             return false;
         };
-        to.push((self.script_text.clone(), self.script_caret));
-        self.script_text = text;
+        to.push((self.code.script_text.clone(), self.code.script_caret));
+        self.code.script_text = text;
         // Straight onto the widget: going through the normal edit path would
         // record this as a fresh edit and undo would never make progress.
-        self.ui.set_text_input(editor, self.script_text.clone());
-        let caret = caret.min(self.script_text.len());
+        self.ui
+            .set_text_input(editor, self.code.script_text.clone());
+        let caret = caret.min(self.code.script_text.len());
         self.ui.focus_caret(editor, caret);
-        self.script_caret = caret;
-        self.script_modified = true;
-        self.script_coalescing = false;
+        self.code.script_caret = caret;
+        self.code.script_modified = true;
+        self.code.script_coalescing = false;
         self.analyze_script();
         self.dirty = true;
         true
@@ -5100,12 +4810,13 @@ impl State {
     /// restoring only the caret leaves the view to be re-derived from it, which
     /// parks the caret's line at the bottom of the pane.
     fn remember_script_position(&mut self) {
-        let (Some(name), Some(editor)) = (self.open_script.clone(), self.rows.code_editor) else {
+        let (Some(name), Some(editor)) = (self.code.open_script.clone(), self.rows.code_editor)
+        else {
             return;
         };
         let caret = self.editor_caret();
         let scroll = self.ui.text_scroll(editor).map_or(0.0, |(y, _)| y);
-        self.script_positions.insert(name, (caret, scroll));
+        self.code.script_positions.insert(name, (caret, scroll));
     }
 
     /// Where the caret is in the script, or 0 when the editor is not focused.
@@ -5119,7 +4830,7 @@ impl State {
             .code_editor
             .filter(|&editor| self.ui.focused() == Some(editor))
             .and_then(|_| self.ui.caret_offset())
-            .unwrap_or(self.script_caret)
+            .unwrap_or(self.code.script_caret)
     }
 
     /// Whether focus is in the code editor or in the find bar over it - the
@@ -5134,11 +4845,11 @@ impl State {
 
     /// Open the find bar over the Code pane, or close it if it is already there.
     fn toggle_find(&mut self) {
-        if self.find.is_some() {
+        if self.code.find.is_some() {
             // ctrl+f with the bar already open re-focuses and re-selects the
             // query, which is what every editor does - closing it would fight
             // the reflex of pressing it again to search for something else.
-            self.focus_find = true;
+            self.code.focus_find = true;
             self.dirty = true;
             return;
         }
@@ -5155,12 +4866,12 @@ impl State {
         // the match nearest the caret rather than the one at the top of the file.
         let caret = self.editor_caret();
         if let Some(selected) = self.ui.selected_text() {
-            find.set_query(selected, &self.script_text, caret);
+            find.set_query(selected, &self.code.script_text, caret);
         }
-        self.find = Some(find);
+        self.code.find = Some(find);
         // The point of ctrl+f is to type a query. Without this the caret stays
         // in the source file and the query is typed into the code.
-        self.focus_find = true;
+        self.code.focus_find = true;
         self.dirty = true;
     }
 
@@ -5176,9 +4887,9 @@ impl State {
             && event.logical_key == WinitKey::Named(NamedKey::Space)
             && self.ui.focused() == self.rows.code_editor
         {
-            self.force_completions = true;
+            self.code.force_completions = true;
             self.refresh_completions();
-            self.force_completions = false;
+            self.code.force_completions = false;
             return true;
         }
         let WinitKey::Named(named) = &event.logical_key else {
@@ -5196,11 +4907,11 @@ impl State {
             // Commit what is in the field first, so Enter searches for what you
             // just typed rather than for the last committed query.
             self.commit_find_fields();
-            if let Some(find) = &mut self.find
+            if let Some(find) = &mut self.code.find
                 && find.key(aurora::Key::Enter, shift) == aurora::find::FindKey::Stepped
             {
                 self.reveal_find_match();
-                self.focus_find = true;
+                self.code.focus_find = true;
                 self.dirty = true;
             }
             return true;
@@ -5225,9 +4936,9 @@ impl State {
             return true;
         }
         // F3 steps find matches without the bar being focused; shift+F3 back.
-        if *named == NamedKey::F3 && self.find.is_some() {
+        if *named == NamedKey::F3 && self.code.find.is_some() {
             let back = self.modifiers.shift_key();
-            if let Some(find) = &mut self.find {
+            if let Some(find) = &mut self.code.find {
                 if back {
                     find.find_previous();
                 } else {
@@ -5252,7 +4963,7 @@ impl State {
             }
         }
         if *named == NamedKey::Enter
-            && self.symbol_rename.is_some()
+            && self.code.symbol_rename.is_some()
             && self.ui.focused() == self.rows.symbol_rename
         {
             self.sync_symbol_rename();
@@ -5266,7 +4977,7 @@ impl State {
             return true;
         }
         if *named == NamedKey::Enter
-            && self.go_to_line.is_some()
+            && self.code.go_to_line.is_some()
             && self.ui.focused() == self.rows.go_to_line
         {
             let typed = self
@@ -5276,7 +4987,7 @@ impl State {
                 .and_then(|t| t.trim().parse::<usize>().ok());
             match typed {
                 Some(line) => self.go_to_line_number(line),
-                None => self.go_to_line = None,
+                None => self.code.go_to_line = None,
             }
             self.dirty = true;
             return true;
@@ -5284,19 +4995,19 @@ impl State {
         // Escape closes what is open, innermost first.
         if *named == NamedKey::Escape {
             // A rename in progress leaves the buffer untouched.
-            if self.symbol_rename.take().is_some() {
+            if self.code.symbol_rename.take().is_some() {
                 self.dirty = true;
                 return true;
             }
-            if self.symbol_palette.take().is_some() {
+            if self.code.symbol_palette.take().is_some() {
                 self.dirty = true;
                 return true;
             }
-            if self.go_to_line.take().is_some() {
+            if self.code.go_to_line.take().is_some() {
                 self.dirty = true;
                 return true;
             }
-            if self.completions.take().is_some() || self.find.take().is_some() {
+            if self.code.completions.take().is_some() || self.code.find.take().is_some() {
                 self.dirty = true;
                 return true;
             }
@@ -5309,7 +5020,7 @@ impl State {
             return false;
         }
         // The symbol palette owns the arrows and Enter while it is open.
-        if let Some((_, list)) = &mut self.symbol_palette {
+        if let Some((_, list)) = &mut self.code.symbol_palette {
             let key = match named {
                 NamedKey::ArrowDown => aurora::Key::Down,
                 NamedKey::ArrowUp => aurora::Key::Up,
@@ -5336,7 +5047,7 @@ impl State {
         if self.modifiers.control_key() && *named == NamedKey::Enter {
             return false;
         }
-        let Some((list, _)) = &mut self.completions else {
+        let Some((list, _)) = &mut self.code.completions else {
             return false;
         };
         let key = match named {
@@ -5365,48 +5076,48 @@ impl State {
     /// Open, refresh, or close the completion popup for the word the caret is
     /// in. Called after every edit, so the offered set follows what is typed.
     fn refresh_completions(&mut self) {
-        let was_open = self.completions.is_some();
+        let was_open = self.code.completions.is_some();
         self.refresh_completions_inner();
         self.update_signature();
         // Every exit from here has to mark the shell dirty when the popup's
         // presence changed. Five of them used to just clear the state and
-        // return, so the popup vanished from `self.completions` but the old Ui
+        // return, so the popup vanished from `self.code.completions` but the old Ui
         // kept drawing it - which is the whole of "sometimes it does not
         // disappear". It only ever went away when something else happened to
         // ask for a rebuild that frame.
-        if self.completions.is_some() != was_open {
+        if self.code.completions.is_some() != was_open {
             self.dirty = true;
         }
     }
 
     /// Decide what the popup should be, without worrying about redraws.
     fn refresh_completions_inner(&mut self) {
-        let (Some(editor), true) = (self.rows.code_editor, self.open_script.is_some()) else {
-            self.completions = None;
+        let (Some(editor), true) = (self.rows.code_editor, self.code.open_script.is_some()) else {
+            self.code.completions = None;
             return;
         };
         if self.ui.focused() != Some(editor) {
-            self.completions = None;
+            self.code.completions = None;
             return;
         }
         let Some(caret) = self.ui.caret_offset() else {
-            self.completions = None;
+            self.code.completions = None;
             return;
         };
         // ctrl+space asks for the list wherever the caret is, even on an empty
         // prefix; otherwise it appears only where a name is being typed.
-        let anchor = match completion_anchor(&self.script_text, caret) {
+        let anchor = match completion_anchor(&self.code.script_text, caret) {
             Some(start) => start,
-            None if self.force_completions => caret,
+            None if self.code.force_completions => caret,
             None => {
-                self.completions = None;
+                self.code.completions = None;
                 return;
             }
         };
-        let (_, prefix) = word_before(&self.script_text, caret);
+        let (_, prefix) = word_before(&self.code.script_text, caret);
         let theme = &self.theme;
         let items: Vec<aurora::list::ListItem> =
-            comet::service::completions_at(&self.script_text, helios::script_schema(), caret)
+            comet::service::completions_at(&self.code.script_text, helios::script_schema(), caret)
                 .into_iter()
                 .map(|item| {
                     let (label, detail) = completion_colors(item.kind, theme);
@@ -5418,7 +5129,7 @@ impl State {
         // re-shaped, so the caret has no on-screen position yet - asking for one
         // returns None, and defaulting to zero put the popup in the corner of
         // the window. update_completion_anchor sets it after layout instead.
-        match &mut self.completions {
+        match &mut self.code.completions {
             Some((list, at)) => {
                 *at = anchor..caret;
                 list.set_items(items);
@@ -5427,12 +5138,17 @@ impl State {
             None => {
                 let mut list = aurora::list::ListPopup::new(items, self.completion_anchor_now());
                 list.set_filter(prefix);
-                self.completions = Some((list, anchor..caret));
+                self.code.completions = Some((list, anchor..caret));
             }
         }
         // Nothing left to offer is the same as nothing to show.
-        if self.completions.as_ref().is_some_and(|(l, _)| l.is_empty()) {
-            self.completions = None;
+        if self
+            .code
+            .completions
+            .as_ref()
+            .is_some_and(|(l, _)| l.is_empty())
+        {
+            self.code.completions = None;
         }
         self.dirty = true;
     }
@@ -5446,6 +5162,7 @@ impl State {
     /// waits a frame.
     fn completion_anchor_now(&self) -> Vec2 {
         let previous = self
+            .code
             .completions
             .as_ref()
             .map(|(list, _)| list.anchor())
@@ -5462,23 +5179,23 @@ impl State {
     /// popups in the same place is worse than either. The completion list is
     /// what you are acting on; the signature is reference.
     fn update_signature(&mut self) {
-        let was = self.signature.is_some();
+        let was = self.code.signature.is_some();
         let editor = self.rows.code_editor;
         let focused = editor.is_some() && self.ui.focused() == editor;
-        let help = (focused && self.completions.is_none())
-            .then(|| comet::service::signature_at(&self.script_text, self.editor_caret()))
+        let help = (focused && self.code.completions.is_none())
+            .then(|| comet::service::signature_at(&self.code.script_text, self.editor_caret()))
             .flatten();
-        self.signature = help.map(|help| {
+        self.code.signature = help.map(|help| {
             let anchor = editor
                 .and_then(|editor| self.ui.caret_rect(editor))
                 .map(|r| r.pos + Vec2::new(0.0, r.size.y + 2.0))
-                .or_else(|| self.signature.as_ref().map(|(_, at)| *at))
+                .or_else(|| self.code.signature.as_ref().map(|(_, at)| *at))
                 .unwrap_or_default();
             (help, anchor)
         });
         // Same rule as the completion popup: a change in whether it is there at
         // all has to reach the shell, or the old Ui keeps drawing it.
-        if self.signature.is_some() != was {
+        if self.code.signature.is_some() != was {
             self.dirty = true;
         }
     }
@@ -5487,7 +5204,7 @@ impl State {
     /// position. Also the backstop that takes it down when the editor is no
     /// longer the focused widget - clicking away should not leave it floating.
     fn update_completion_anchor(&mut self) {
-        if self.completions.is_none() {
+        if self.code.completions.is_none() {
             return;
         }
         // Not while the pointer is down: a press on a row moves focus to that
@@ -5496,12 +5213,12 @@ impl State {
         if !self.pointer_down
             && (self.ui.focused() != self.rows.code_editor || self.rows.code_editor.is_none())
         {
-            self.completions = None;
+            self.code.completions = None;
             self.dirty = true;
             return;
         }
         let anchor = self.completion_anchor_now();
-        if let Some((list, _)) = &mut self.completions
+        if let Some((list, _)) = &mut self.code.completions
             && list.anchor() != anchor
         {
             list.set_anchor(anchor);
@@ -5519,7 +5236,7 @@ impl State {
             return;
         };
         let anchor = rect.pos + Vec2::new(0.0, rect.size.y + 2.0);
-        if let Some((_, at)) = &mut self.signature
+        if let Some((_, at)) = &mut self.code.signature
             && *at != anchor
         {
             *at = anchor;
@@ -5529,7 +5246,8 @@ impl State {
 
     /// Replace the word the popup was completing with `label`.
     fn accept_completion(&mut self, label: &str) {
-        let (Some(editor), Some((_, range))) = (self.rows.code_editor, self.completions.as_ref())
+        let (Some(editor), Some((_, range))) =
+            (self.rows.code_editor, self.code.completions.as_ref())
         else {
             return;
         };
@@ -5539,11 +5257,14 @@ impl State {
         // kind comes from asking the service rather than from state kept beside
         // the popup, which is one fewer thing that can drift - and it costs one
         // pipeline run per acceptance, not per keystroke.
-        let kind =
-            comet::service::completions_at(&self.script_text, helios::script_schema(), range.start)
-                .into_iter()
-                .find(|item| item.label == label)
-                .map(|item| item.kind);
+        let kind = comet::service::completions_at(
+            &self.code.script_text,
+            helios::script_schema(),
+            range.start,
+        )
+        .into_iter()
+        .find(|item| item.label == label)
+        .map(|item| item.kind);
         let is_call = kind == Some(comet::service::CompletionKind::Function);
         // A generic type is never written without its argument, so accepting one
         // brings the brackets and leaves the caret between them - the same
@@ -5551,8 +5272,12 @@ impl State {
         let is_generic = kind == Some(comet::service::CompletionKind::GenericType);
         // Unless there is already one there, in which case adding another is
         // how you end up with `print(())`.
-        let has_parens = self.script_text[range.end..].trim_start().starts_with('(');
-        let has_args = self.script_text[range.end..].trim_start().starts_with('<');
+        let has_parens = self.code.script_text[range.end..]
+            .trim_start()
+            .starts_with('(');
+        let has_args = self.code.script_text[range.end..]
+            .trim_start()
+            .starts_with('<');
         let insertion = if is_call && !has_parens {
             format!("{label}()")
         } else if is_generic && !has_args {
@@ -5568,7 +5293,7 @@ impl State {
             self.ui
                 .focus_caret(editor, range.start + insertion.len() - 1);
         }
-        self.completions = None;
+        self.code.completions = None;
         self.sync_script_buffer();
         self.dirty = true;
     }
@@ -5579,17 +5304,19 @@ impl State {
     /// a script-sized file, but re-lexing it sixty times a second to learn
     /// nothing new is still work nobody asked for.
     fn analyze_script(&mut self) {
-        if self.open_script.is_none() && !self.script_orphaned {
-            self.analysis = comet::service::Analysis::default();
-            self.script_spans.clear();
-            self.script_diagnostics.clear();
+        if self.code.open_script.is_none() && !self.code.script_orphaned {
+            self.code.analysis = comet::service::Analysis::default();
+            self.code.script_spans.clear();
+            self.code.script_diagnostics.clear();
             return;
         }
         // One pass for everything: diagnostics, syntax classes and brackets all
         // come out of the same lex and parse rather than three of each.
-        self.analysis = comet::service::Analysis::new(&self.script_text, helios::script_schema());
+        self.code.analysis =
+            comet::service::Analysis::new(&self.code.script_text, helios::script_schema());
         let theme = &self.theme;
-        self.script_spans = self
+        self.code.script_spans = self
+            .code
             .analysis
             .tokens
             .iter()
@@ -5614,7 +5341,7 @@ impl State {
                 })
             })
             .collect();
-        self.script_diagnostics = self.analysis.diagnostics.clone();
+        self.code.script_diagnostics = self.code.analysis.diagnostics.clone();
     }
 
     /// Push the cached syntax colors and diagnostics onto the live Ui, along
@@ -5628,13 +5355,15 @@ impl State {
         let Some(editor) = self.rows.code_editor else {
             return;
         };
-        self.ui.set_text_spans(editor, self.script_spans.clone());
+        self.ui
+            .set_text_spans(editor, self.code.script_spans.clone());
         let theme = &self.theme;
-        let diagnostics = &self.script_diagnostics;
+        let diagnostics = &self.code.script_diagnostics;
         // One owner for the editor's decorations, set fresh each frame: find
         // matches behind (they fill), squiggles over them. Two callers each
         // setting their own would mean whichever ran last erased the other.
         let mut decorations: Vec<aurora::Decoration> = self
+            .code
             .find
             .as_ref()
             .map(|find| find.decorations(&theme.aurora))
@@ -5654,7 +5383,7 @@ impl State {
             && let Some(at) = self.ui.caret_offset()
         {
             decorations.extend(
-                comet::service::occurrences_at(&self.script_text, at)
+                comet::service::occurrences_at(&self.code.script_text, at)
                     .iter()
                     .map(|span| aurora::Decoration {
                         range: span.start as usize..span.end as usize,
@@ -5669,7 +5398,7 @@ impl State {
         // only way to pair a `}` with its `{`.
         if self.ui.focused() == Some(editor)
             && let Some(at) = self.ui.caret_offset()
-            && let Some(bracket) = self.analysis.bracket_at(at)
+            && let Some(bracket) = self.code.analysis.bracket_at(at)
         {
             let (color, style) = match bracket.partner {
                 Some(_) => (theme.code_function, aurora::DecorationStyle::Highlight),
@@ -5691,13 +5420,14 @@ impl State {
         // Where the problems are in a file you cannot see all of. Positions are
         // by line rather than by byte, so a long line does not read as a big
         // stretch of trouble.
-        let lines = self.script_text.split('\n').count().max(1) as f32;
+        let lines = self.code.script_text.split('\n').count().max(1) as f32;
         let marks = self
+            .code
             .script_diagnostics
             .iter()
             .map(|d| {
-                let at = (d.span.start as usize).min(self.script_text.len());
-                let line = self.script_text[..at].matches('\n').count() as f32;
+                let at = (d.span.start as usize).min(self.code.script_text.len());
+                let line = self.code.script_text[..at].matches('\n').count() as f32;
                 let color = match d.severity {
                     comet::Severity::Error => theme.code_error,
                     comet::Severity::Warning => theme.code_warning,
@@ -5711,9 +5441,9 @@ impl State {
         // error on a line wins over a warning: the line cannot compile either
         // way, and the more serious colour is the useful one.
         let mut gutter: Vec<(usize, aurora::Color)> = Vec::new();
-        for d in &self.script_diagnostics {
-            let at = (d.span.start as usize).min(self.script_text.len());
-            let line = self.script_text[..at].matches('\n').count();
+        for d in &self.code.script_diagnostics {
+            let at = (d.span.start as usize).min(self.code.script_text.len());
+            let line = self.code.script_text[..at].matches('\n').count();
             let color = match d.severity {
                 comet::Severity::Error => theme.code_error,
                 comet::Severity::Warning => theme.code_warning,
@@ -5736,7 +5466,7 @@ impl State {
         let Some(shown) = self.rows.code_editor.and_then(|id| self.ui.text_of(id)) else {
             return;
         };
-        if shown != self.script_text {
+        if shown != self.code.script_text {
             // Logged rather than asserted: this fires in a session someone is
             // using, and a crash is a worse way to learn about it than a line
             // in the Console pane. If it ever appears, an edit was about to be
@@ -5744,7 +5474,7 @@ impl State {
             tracing::error!(
                 "code editor and script_text disagree {when} ({} vs {} bytes)",
                 shown.len(),
-                self.script_text.len()
+                self.code.script_text.len()
             );
         }
     }
@@ -5763,38 +5493,41 @@ impl State {
         let Some(text) = self.ui.text_of(editor) else {
             return;
         };
-        if text == self.script_text {
+        if text == self.code.script_text {
             return;
         }
         let text = text.to_string();
-        let caret_before = self.script_caret.min(self.script_text.len());
+        let caret_before = self.code.script_caret.min(self.code.script_text.len());
         let text = text.as_str();
         // Snapshot what it was before adopting the change, so undo has somewhere
         // to go back to. A run of ordinary typing collapses into one step -
         // undoing a word at a time, not a letter at a time.
-        let previous = std::mem::replace(&mut self.script_text, text.to_string());
-        let joins = coalesces(&previous, &self.script_text) && self.script_coalescing;
-        self.script_coalescing = coalesces(&previous, &self.script_text);
+        let previous = std::mem::replace(&mut self.code.script_text, text.to_string());
+        let joins = coalesces(&previous, &self.code.script_text) && self.code.script_coalescing;
+        self.code.script_coalescing = coalesces(&previous, &self.code.script_text);
         if !joins {
-            self.script_undo.push((previous, caret_before));
-            if self.script_undo.len() > MAX_TEXT_UNDO {
-                self.script_undo.remove(0);
+            self.code.script_undo.push((previous, caret_before));
+            if self.code.script_undo.len() > MAX_TEXT_UNDO {
+                self.code.script_undo.remove(0);
             }
         }
-        self.script_redo.clear();
-        if let Some(open) = &self.open_script {
-            recovery::record_script(open, &self.script_text);
+        self.code.script_redo.clear();
+        if let Some(open) = &self.code.open_script {
+            recovery::record_script(open, &self.code.script_text);
         }
         self.analyze_script();
-        self.script_caret = self.ui.caret_offset().unwrap_or(self.script_text.len());
-        if !self.script_modified {
-            self.script_modified = true;
+        self.code.script_caret = self
+            .ui
+            .caret_offset()
+            .unwrap_or(self.code.script_text.len());
+        if !self.code.script_modified {
+            self.code.script_modified = true;
             self.dirty = true;
         }
         self.refresh_completions();
         // A find bar over a buffer that just changed is showing stale matches.
-        if let Some(find) = &mut self.find {
-            find.refresh(&self.script_text);
+        if let Some(find) = &mut self.code.find {
+            find.refresh(&self.code.script_text);
             self.dirty = true;
         }
     }
@@ -5811,7 +5544,7 @@ impl State {
         let Some(text) = self.ui.text_of(field).map(str::to_string) else {
             return;
         };
-        let Some((query, list)) = &mut self.symbol_palette else {
+        let Some((query, list)) = &mut self.code.symbol_palette else {
             return;
         };
         if *query == text {
@@ -5830,7 +5563,7 @@ impl State {
         let Some(text) = self.ui.text_of(field).map(str::to_string) else {
             return;
         };
-        let Some(rename) = &mut self.symbol_rename else {
+        let Some(rename) = &mut self.code.symbol_rename else {
             return;
         };
         if rename.draft == text {
@@ -5848,9 +5581,9 @@ impl State {
         let Some(text) = self.ui.text_of(query_id).map(str::to_string) else {
             return;
         };
-        let script = self.script_text.clone();
+        let script = self.code.script_text.clone();
         let caret = self.editor_caret();
-        let Some(find) = &mut self.find else {
+        let Some(find) = &mut self.code.find else {
             return;
         };
         if find.query() == text {
@@ -5932,7 +5665,7 @@ impl State {
                             .and_then(|at| self.diagnostic_at(at))
                             .map(|d| d.message.clone())
                     })
-                    .unwrap_or_else(|| match self.script_diagnostics.len() {
+                    .unwrap_or_else(|| match self.code.script_diagnostics.len() {
                         0 => String::new(),
                         // Not on one, but the file has some: say how many, so a
                         // broken file never looks clean.
@@ -5976,7 +5709,7 @@ impl State {
         let fstart = std::time::Instant::now();
         self.flush_pointer();
         // BEFORE anything that can set `dirty`. A rebuild reconstructs the code
-        // editor from `self.script_text`, so that has to already hold what the
+        // editor from `self.code.script_text`, so that has to already hold what the
         // user typed into the old Ui - otherwise the rebuild puts the stale text
         // back and the edit is gone. That was the bug behind "backspace
         // sometimes just moves the cursor back": the character was deleted in
@@ -6077,11 +5810,11 @@ impl State {
                 &self.inspector_view(),
                 &logs,
                 self.console_follow,
-                self.open_script.as_deref(),
-                &self.script_text,
-                self.script_modified,
-                self.script_orphaned,
-                &self.script_diagnostics,
+                self.code.open_script.as_deref(),
+                &self.code.script_text,
+                self.code.script_modified,
+                self.code.script_orphaned,
+                &self.code.script_diagnostics,
                 &self.tab_bars,
                 &self.theme,
             );
@@ -6093,16 +5826,16 @@ impl State {
             if let Some(open) = &self.picker {
                 self.rows.picker = open.picker.build(&mut self.ui, &self.theme.aurora);
             }
-            if let Some((list, _)) = &self.completions {
+            if let Some((list, _)) = &self.code.completions {
                 self.rows.completions = list.build(&mut self.ui, &self.theme.aurora);
             }
-            if let Some((help, anchor)) = &self.signature {
+            if let Some((help, anchor)) = &self.code.signature {
                 ui::add_signature_hint(&mut self.ui, *anchor, help, &self.theme);
             }
-            if let Some(find) = &self.find {
+            if let Some(find) = &self.code.find {
                 self.rows.find = find.build(&mut self.ui, &self.theme.aurora);
             }
-            if let Some(rename) = &self.symbol_rename
+            if let Some(rename) = &self.code.symbol_rename
                 && let Some(editor) = self.rows.code_editor
                 && let Some(rect) = self.ui.rect(editor)
             {
@@ -6121,7 +5854,7 @@ impl State {
                     self.ui.focus_selection(field, 0, len);
                 }
             }
-            if let Some((query, list)) = &self.symbol_palette
+            if let Some((query, list)) = &self.code.symbol_palette
                 && let Some(editor) = self.rows.code_editor
                 && let Some(rect) = self.ui.rect(editor)
             {
@@ -6138,7 +5871,7 @@ impl State {
                     self.ui.focus_selection(field, len, len);
                 }
             }
-            if let Some(value) = self.go_to_line.clone()
+            if let Some(value) = self.code.go_to_line.clone()
                 && let Some(editor) = self.rows.code_editor
                 && let Some(rect) = self.ui.rect(editor)
             {
@@ -6207,24 +5940,25 @@ impl State {
             // was left. Ahead of the ordinary caret restore below, which only
             // fires when the editor already had focus - which, on the frame a
             // file is opened from the explorer, it did not.
-            if self.focus_editor
+            if self.code.focus_editor
                 && let Some(editor) = self.rows.code_editor
             {
                 let (caret, scroll) = self
+                    .code
                     .open_script
                     .as_ref()
-                    .and_then(|name| self.script_positions.get(name).copied())
+                    .and_then(|name| self.code.script_positions.get(name).copied())
                     .unwrap_or((0, 0.0));
                 self.ui
-                    .focus_caret(editor, caret.min(self.script_text.len()));
+                    .focus_caret(editor, caret.min(self.code.script_text.len()));
                 self.ui.set_text_scroll(editor, scroll);
-                self.focus_editor = false;
-            } else if self.focus_find
+                self.code.focus_editor = false;
+            } else if self.code.focus_find
                 && let Some(query) = self.rows.find.query
             {
                 let len = self.ui.text_of(query).map_or(0, str::len);
                 self.ui.focus_selection(query, 0, len);
-                self.focus_find = false;
+                self.code.focus_find = false;
             } else if let (Some(offset), Some(editor)) = (code_caret, self.rows.code_editor) {
                 // Restore the selection, not only the caret: a rebuild used to
                 // silently empty it, so ctrl+c after one copied nothing.
@@ -6259,7 +5993,7 @@ impl State {
         // A squiggle's message, near the pointer. The whole reason diagnostics
         // are worth drawing: a red line with no text anywhere tells you that
         // something is wrong and nothing about what.
-        if rebuilt && let Some(message) = self.diagnostic_tooltip.clone() {
+        if rebuilt && let Some(message) = self.code.diagnostic_tooltip.clone() {
             ui::add_diagnostic_tooltip(&mut self.ui, self.cursor, window, &message, &self.theme);
             self.ui.layout(window)?;
         }
@@ -6534,14 +6268,14 @@ impl State {
                 AuroraEvent::Submitted(id) if Some(id) == self.rows.find.query => {
                     let text = self.ui.text_of(id).unwrap_or_default().to_string();
                     let caret = self.editor_caret();
-                    if let Some(find) = &mut self.find {
-                        find.set_query(text, &self.script_text, caret);
+                    if let Some(find) = &mut self.code.find {
+                        find.set_query(text, &self.code.script_text, caret);
                         self.reveal_find_match();
                     }
                 }
                 AuroraEvent::Submitted(id) if Some(id) == self.rows.find.replacement => {
                     let text = self.ui.text_of(id).unwrap_or_default().to_string();
-                    if let Some(find) = &mut self.find {
+                    if let Some(find) = &mut self.code.find {
                         find.set_replacement(text);
                     }
                 }
@@ -6568,14 +6302,14 @@ impl State {
                     }
                 }
                 AuroraEvent::Toggled { id, checked } if Some(id) == self.rows.find.match_case => {
-                    if let Some(find) = &mut self.find {
-                        find.set_match_case(checked, &self.script_text);
+                    if let Some(find) = &mut self.code.find {
+                        find.set_match_case(checked, &self.code.script_text);
                         self.reveal_find_match();
                     }
                 }
                 AuroraEvent::Toggled { id, checked } if Some(id) == self.rows.find.whole_word => {
-                    if let Some(find) = &mut self.find {
-                        find.set_whole_word(checked, &self.script_text);
+                    if let Some(find) = &mut self.code.find {
+                        find.set_whole_word(checked, &self.code.script_text);
                         self.reveal_find_match();
                     }
                 }
