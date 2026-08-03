@@ -4,3 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# The runtime steps a scene of script instances, so it needs the scene and the
+# script host. It depends on helios and nothing else on purpose: stepping a
+# scene is not drawing one, so photon stays out (ADR 0002 - the editor links
+# this library, and so does a shipped game).
+helios = { version = "0.1.0", path = "../helios" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

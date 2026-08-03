@@ -10,6 +10,7 @@
 mod command;
 mod component;
 mod error;
+mod input;
 mod project;
 mod reflect;
 mod render;
@@ -21,6 +22,7 @@ mod transform;
 pub use command::{Edit, History};
 pub use component::{Component, ScriptComponent, SpriteComponent};
 pub use error::HeliosError;
+pub use input::Input;
 pub use project::{Manifest, Project, write_atomic};
 pub use reflect::{Reflect, Value};
 pub use render::SpriteDraw;
