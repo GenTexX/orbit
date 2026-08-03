@@ -35,7 +35,10 @@ use std::time::Duration;
 
 use glam::Vec2;
 use thiserror::Error;
-use wasmtime::{Caller, Config, Engine, Extern, Instance, Linker, Module, Store, TypedFunc, Val};
+use wasmtime::{
+    Caller, Config, Engine, Extern, Instance, Linker, Module, Store, StoreLimits,
+    StoreLimitsBuilder, TypedFunc, Val,
+};
 
 use crate::reflect::Value;
 use crate::scene::{NodeId, Scene};
@@ -150,6 +153,21 @@ const TICK: Duration = Duration::from_millis(10);
 fn budget_ticks() -> u64 {
     (FRAME_BUDGET.as_nanos() / TICK.as_nanos().max(1)).max(1) as u64
 }
+
+/// The most memory one script may occupy.
+///
+/// The same number comet declares as its module's maximum, deliberately: the
+/// module's limit is what the compiler promises and this is what the host
+/// enforces, and they agree so that neither fires before the other. A script
+/// that reaches it gets comet's trap, which names the function that allocated;
+/// a module from somewhere else, or a comet that later raises its own maximum,
+/// still stops here.
+///
+/// Time and memory are the same argument (ADR 0002 runs the game in the
+/// editor's process), but not the same failure: a loop with no exit costs a
+/// session, while an allocation with no bound costs whatever else the machine
+/// was doing.
+pub const MAX_SCRIPT_MEMORY: usize = comet::MAX_PAGES as usize * 64 * 1024;
 
 /// The engine and compiled-module cache shared by every script in a project.
 ///
@@ -299,8 +317,15 @@ impl ScriptHost {
             ScriptState {
                 transform: scene.node(node).transform,
                 printed: Vec::new(),
+                limits: StoreLimitsBuilder::new()
+                    .memory_size(MAX_SCRIPT_MEMORY)
+                    .build(),
             },
         );
+        // Only memory is capped. Table and instance counts are fixed by what
+        // comet emits, so a limit on them could only ever be tripped by a
+        // change to the compiler - which is a bug to fix, not a script to stop.
+        store.limiter(|state| &mut state.limits);
         // Armed before anything runs, because instantiation itself runs code:
         // the module's wasm start function is where a script's state
         // initializers evaluate, and with epoch interruption on, a store whose
@@ -418,35 +443,26 @@ impl ScriptInstance {
         self.store.set_epoch_deadline(budget_ticks());
     }
 
-    /// Record whether a call trapped, and dress an interruption up as the
-    /// sentence a person can act on.
+    /// Record whether a call trapped, and dress a limit up as the sentence a
+    /// person can act on.
     fn settle(&mut self, result: Result<(), wasmtime::Error>) -> Result<(), ScriptError> {
         let Err(err) = result else {
             return Ok(());
         };
         self.stopped = true;
-        let interrupted = err
-            .downcast_ref::<wasmtime::Trap>()
-            .is_some_and(|trap| *trap == wasmtime::Trap::Interrupt);
+        let limit = Limit::behind(&err);
         let error = ScriptError::trap(err);
-        if !interrupted {
+        // Everything else is the script's own mistake, and wasmtime's wording
+        // for those - "integer divide by zero" - is already the right one.
+        let Some(limit) = limit else {
             return Err(error);
-        }
-        // "wasm trap: interrupt" says nothing to somebody who has just written
-        // a loop with no exit, which is what this almost always is.
-        let budget = FRAME_BUDGET.as_millis();
+        };
         Err(match error.trapped_in() {
             Some(function) => ScriptError::Trapped {
                 function: function.to_string(),
-                message: format!(
-                    "still running after {budget}ms and was stopped - is there a loop \
-                     with no way out?"
-                ),
+                message: limit.sentence(),
             },
-            None => ScriptError::Runtime(format!(
-                "a script was still running after {budget}ms and was stopped - is there \
-                 a loop with no way out?"
-            )),
+            None => ScriptError::Runtime(format!("a script {}", limit.sentence())),
         })
     }
 
@@ -500,11 +516,63 @@ impl ScriptInstance {
     }
 }
 
+/// Which limit stopped a script, as opposed to the script stopping itself.
+///
+/// Both of these arrive as traps, and both of wasmtime's words for them -
+/// "interrupt", "unreachable" - describe the mechanism rather than the
+/// mistake. Naming the two cases is what lets the message describe the mistake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Limit {
+    /// [`FRAME_BUDGET`] ran out: the epoch deadline passed mid-call.
+    Time,
+    /// [`MAX_SCRIPT_MEMORY`] ran out: `memory.grow` was refused, so comet's
+    /// allocator trapped rather than hand back a pointer to nothing.
+    Memory,
+}
+
+impl Limit {
+    /// Which limit an error is, if it is one.
+    fn behind(err: &wasmtime::Error) -> Option<Self> {
+        match err.downcast_ref::<wasmtime::Trap>()? {
+            wasmtime::Trap::Interrupt => Some(Limit::Time),
+            // An `unreachable` is only out of memory when it is the one inside
+            // `comet_alloc`. The innermost frame is what tells them apart -
+            // every other `unreachable` comet emits is a bounds check or a
+            // `match` that ran out of arms, and those are the script's.
+            wasmtime::Trap::UnreachableCodeReached => err
+                .downcast_ref::<wasmtime::WasmBacktrace>()
+                .and_then(|backtrace| backtrace.frames().first()?.func_name())
+                .is_some_and(|name| name == "comet_alloc")
+                .then_some(Limit::Memory),
+            _ => None,
+        }
+    }
+
+    /// What happened, phrased so it reads both on its own after "a script" and
+    /// with "(in `update`)" behind it.
+    fn sentence(self) -> String {
+        match self {
+            Limit::Time => format!(
+                "ran for more than {}ms and was stopped - is there a loop with no way out?",
+                FRAME_BUDGET.as_millis()
+            ),
+            Limit::Memory => format!(
+                "ran out of memory after {}MB and was stopped - is something being added \
+                 to in a loop?",
+                MAX_SCRIPT_MEMORY / (1024 * 1024)
+            ),
+        }
+    }
+}
+
 /// What a running script can see and touch.
 #[derive(Debug)]
 struct ScriptState {
     transform: Transform,
     printed: Vec<String>,
+    /// Read through the store's limiter, so it has to live where the store can
+    /// hand out a mutable reference to it.
+    limits: StoreLimits,
 }
 
 /// Write the component's stored values into the module's exported globals.
@@ -1393,6 +1461,75 @@ mod tests {
             .update(&mut scene, node, 0.016)
             .expect("a stopped instance is a no-op, not an error");
         assert!(second.elapsed() < FRAME_BUDGET, "and returns immediately");
+    }
+
+    #[test]
+    fn a_script_that_allocates_without_bound_is_stopped_and_says_so() {
+        // The other half of the same argument as the runaway loop above. That
+        // one costs the session; this one costs whatever else the machine was
+        // doing, because ADR 0002 puts the script's allocator and the editor's
+        // in one process.
+        //
+        // Doubling a string reaches the cap in about two dozen allocations, so
+        // memory runs out long before the frame budget does - which is what
+        // makes this a test of the memory limit rather than a race with the
+        // time limit.
+        let source = "
+            let text: String = \"x\";
+            func update(dt: f32) { while true { text = text + text; } }
+        ";
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate(source, &mut scene, node)
+            .expect("it compiles and starts");
+
+        let started = std::time::Instant::now();
+        let err = script
+            .update(&mut scene, node, 0.016)
+            .expect_err("it must not allocate forever");
+        assert!(
+            started.elapsed() < FRAME_BUDGET,
+            "memory ran out first, so this is not the time limit in disguise"
+        );
+
+        let message = err.to_string();
+        assert!(
+            message.contains("ran out of memory"),
+            "the message says what happened, not `wasm trap: unreachable`: {message}"
+        );
+        assert!(
+            message.contains("added to in a loop"),
+            "and what to look for: {message}"
+        );
+        assert_eq!(err.trapped_in(), Some("update"), "and where to look");
+        assert!(script.is_stopped(), "and it is not called again");
+    }
+
+    #[test]
+    fn a_trap_that_is_the_scripts_own_mistake_keeps_wasmtimes_words() {
+        // The out-of-memory message is only right when the trap came from the
+        // allocator. comet emits `unreachable` for a bounds check too, and
+        // reporting that one as "ran out of memory" would send a learner to
+        // look for a leak that is not there.
+        let source = "
+            let a: Array<f32> = [1.0];
+            func update(dt: f32) { let x: f32 = a[3]; }
+        ";
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate(source, &mut scene, node)
+            .expect("it compiles and starts");
+
+        let message = script
+            .update(&mut scene, node, 0.016)
+            .expect_err("reading past the end traps")
+            .to_string();
+        assert!(
+            !message.contains("ran out of memory"),
+            "an index out of range is not the memory limit: {message}"
+        );
     }
 
     #[test]

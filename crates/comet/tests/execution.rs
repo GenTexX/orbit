@@ -252,6 +252,16 @@ impl Script {
         self.call::<i32, i32>("comet_alloc", payload)
     }
 
+    /// Allocate, letting the trap through instead of panicking on it - the one
+    /// call in this file that is expected to fail.
+    fn try_alloc(&mut self, payload: i32) -> Result<i32, Error> {
+        let func = self
+            .instance
+            .get_typed_func::<i32, i32>(&mut self.store, "comet_alloc")
+            .expect("every comet module exports its allocator");
+        func.call(&mut self.store, payload)
+    }
+
     fn release(&mut self, ptr: i32) {
         self.call::<i32, ()>("comet_release", ptr);
     }
@@ -2275,4 +2285,40 @@ fn reading_a_struct_out_of_an_array_takes_a_reference_to_it() {
     );
     let (settled, after) = both(&source("get(a, 0)"));
     assert_eq!(after, settled, "and get(a, i) agrees");
+}
+
+/// A script that allocates without bound must fail as a script.
+///
+/// The module declares a memory maximum, so `memory.grow` is refused rather
+/// than granted, and comet's allocator traps rather than handing back a pointer
+/// to memory it does not have. Without the maximum, growth stops when the
+/// host's allocator gives up - which, under ADR 0002, is the editor's allocator
+/// with the user's unsaved scene in it.
+#[test]
+fn allocating_without_bound_traps_at_the_declared_maximum() {
+    let mut script = Script::new("func update(dt: f32) { }");
+    let cap = comet::MAX_PAGES as usize * 64 * 1024;
+
+    // A megabyte at a time, and more attempts than the cap allows, so the
+    // only way to leave this loop without a trap is for the cap not to exist.
+    let mut trapped = None;
+    for _ in 0..(cap / (1 << 20)) * 2 {
+        if let Err(err) = script.try_alloc(1 << 20) {
+            trapped = Some(err);
+            break;
+        }
+    }
+
+    let err = trapped.expect("the allocator must refuse rather than grow forever");
+    assert!(
+        format!("{err:#}").contains("unreachable"),
+        "and refuse by trapping, which is what a host can report: {err:#}"
+    );
+    // It really did grow up to the cap first, rather than stopping early for
+    // some other reason - and it did not go past it.
+    let grown = script.memory_bytes();
+    assert!(
+        grown > cap - (2 << 20) && grown <= cap,
+        "grew to {grown} bytes, expected to stop just under {cap}"
+    );
 }

@@ -114,6 +114,21 @@ const ARRAY_HANDLE: i32 = 12;
 const DATA_BASE: u32 = 16;
 const PAGE: u32 = 65536;
 
+/// The most memory a script may grow to, in 64KB pages - 16MB.
+///
+/// Declared in the module rather than left to the host, because it is a
+/// property of the language's memory model: comet's allocator traps when
+/// `memory.grow` refuses, so a script that allocates without bound fails as a
+/// script, with a backtrace naming the function that did it. Left unbounded, it
+/// instead grew until the host allocator failed - and ADR 0002 puts the host in
+/// the same process as the editor and the user's unsaved scene.
+///
+/// 16MB is far above anything a script in this language plausibly wants (an
+/// array of a hundred thousand floats is 400KB) and far below anything that
+/// troubles a desktop. helios sets a matching limit of its own; see
+/// `MAX_SCRIPT_MEMORY` there.
+pub const MAX_PAGES: u32 = 256;
+
 // Function indices. Imports come first in wasm's index space, then everything
 // the module defines, so these are fixed for every module comet emits.
 /// The host property accessors. Every one takes the property's schema id, so
@@ -267,7 +282,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     let mut memories = MemorySection::new();
     memories.memory(MemoryType {
         minimum: pages as u64,
-        maximum: None,
+        maximum: Some(MAX_PAGES.max(pages) as u64),
         memory64: false,
         shared: false,
         page_size_log2: None,
