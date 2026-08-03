@@ -3830,6 +3830,14 @@ impl Ui {
                 .map(|&(_, color)| color)
         };
 
+        // Every number's run, once. `layout_runs()` is a forward-only iterator
+        // with no `nth` override, so asking it for line N inside a loop over
+        // every line was quadratic in document length: measured 22 ms per
+        // draw_list at 2000 lines and 79 ms at 4000, paid on every frame the
+        // Code tab is fronted. Nothing counted it either - the re-shape counter
+        // reports 0, because none of this re-shapes.
+        let numbered: Vec<_> = numbers.layout_runs().collect();
+
         let mut last_line = None;
         for run in buffer.layout_runs() {
             // The current-line band spans the whole field, gutter included, so
@@ -3863,7 +3871,7 @@ impl Ui {
                     color,
                 });
             }
-            let Some(number) = numbers.layout_runs().nth(run.line_i) else {
+            let Some(number) = numbered.get(run.line_i) else {
                 continue;
             };
             let x0 = right - number.line_w;
@@ -8268,6 +8276,52 @@ three",
 
         assert_eq!(ui.drain_events(), vec![Event::Submitted(first)]);
         assert_eq!(ui.focused(), Some(second)); // advanced to the next field
+    }
+
+    #[test]
+    fn a_gutter_does_not_cost_more_per_line_as_the_file_grows() {
+        // A ratio, not a timing: absolute numbers are machine-dependent but the
+        // *shape* is not. Eight times the lines costs about eight times the
+        // work when the per-line lookup is constant, and sixty-four times when
+        // it is a scan from the top - which is what this was.
+        //
+        // A draw-list *length* assertion would not have caught it. The command
+        // count was always linear; the cost was hidden inside how each command
+        // was found, which is the kind of thing only counted or timed work can
+        // see. Chosen deliberately after checking that the length version
+        // passed with the bug reintroduced.
+        let cost = |lines: usize| {
+            let text: String = (0..lines).map(|i| format!("let a{i} = {i}.0;\n")).collect();
+            let mut ui = Ui::new();
+            let root = ui.root_panel(Style::new().size(600.0, 400.0));
+            ui.text_input(
+                root,
+                text,
+                Style::new()
+                    .size(500.0, 300.0)
+                    .multiline()
+                    .monospace()
+                    .gutter()
+                    .no_wrap(),
+            );
+            ui.layout(Vec2::new(600.0, 400.0)).unwrap();
+            // Warm anything lazy, then measure the steady-state draw.
+            ui.draw_list();
+            let start = std::time::Instant::now();
+            for _ in 0..5 {
+                ui.draw_list();
+            }
+            start.elapsed().as_secs_f64() / 5.0
+        };
+        let small = cost(200);
+        let large = cost(1600);
+        // 8x the lines. Linear lands near 8, quadratic near 64; 24 leaves room
+        // for a noisy machine without leaving room for a scan.
+        assert!(
+            large < small * 24.0,
+            "8x the lines cost {:.1}x the draw ({small:.6}s -> {large:.6}s)",
+            large / small
+        );
     }
 
     #[test]
