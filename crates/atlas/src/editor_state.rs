@@ -83,6 +83,19 @@ pub struct EditorState {
     pub explorer_selected: Option<String>,
     /// The file-explorer's view mode (list or grid).
     pub explorer_view: FileView,
+    /// The script open in the Code pane, project-relative.
+    ///
+    /// Coming back to a project used to mean an empty Code pane and no
+    /// selection, whatever you were in the middle of - so the first thing every
+    /// session did was find its way back to where it left off. The dock layout
+    /// was remembered and what was *in* it was not.
+    pub open_script: Option<String>,
+    /// The selected nodes, as child-index paths (like [`collapsed`](Self::collapsed)).
+    ///
+    /// In order, and the last one is the primary - the same rule the live
+    /// selection uses. Storing the primary separately would let the file say
+    /// something the editor has no way to be in.
+    pub selected: Vec<Vec<usize>>,
 }
 
 impl Default for EditorState {
@@ -96,6 +109,8 @@ impl Default for EditorState {
             explorer_expanded: Vec::new(),
             explorer_selected: None,
             explorer_view: FileView::default(),
+            open_script: None,
+            selected: Vec::new(),
         }
     }
 }
@@ -169,6 +184,27 @@ pub fn decode_collapsed(scene: &Scene, paths: &[Vec<usize>]) -> HashSet<NodeId> 
         .collect()
 }
 
+/// Encode a selection as child-index paths, in order.
+///
+/// Ordered, unlike [`encode_collapsed`], because a selection has a primary and
+/// the primary is stored as an index into this list. Sorting it would point at
+/// a different node.
+pub fn encode_selection(scene: &Scene, nodes: &[NodeId]) -> Vec<Vec<usize>> {
+    nodes
+        .iter()
+        .filter_map(|&node| node_path(scene, node))
+        .collect()
+}
+
+/// Resolve a saved selection, in order, dropping paths that no longer point at
+/// a node.
+pub fn decode_selection(scene: &Scene, paths: &[Vec<usize>]) -> Vec<NodeId> {
+    paths
+        .iter()
+        .filter_map(|path| resolve_path(scene, path))
+        .collect()
+}
+
 fn resolve_path(scene: &Scene, path: &[usize]) -> Option<NodeId> {
     let mut node = scene.root();
     for &idx in path {
@@ -196,6 +232,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_selection_survives_a_restart_in_order() {
+        // Order matters here in a way it does not for collapsed nodes: the last
+        // one is the primary, the one the inspector shows. A sorted round trip
+        // would come back pointing at a different node.
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        let a = scene.add_child(root, helios::Node::new("a"));
+        let b = scene.add_child(root, helios::Node::new("b"));
+        let under_a = scene.add_child(a, helios::Node::new("deep"));
+
+        let selection = vec![b, under_a, a];
+        let paths = encode_selection(&scene, &selection);
+        assert_eq!(decode_selection(&scene, &paths), selection);
+        assert_eq!(paths, vec![vec![1], vec![0, 0], vec![0]]);
+    }
+
+    #[test]
+    fn a_node_that_is_gone_drops_out_of_the_selection() {
+        // The scene is edited between sessions - by another branch, by another
+        // person - and a path that no longer resolves has to disappear rather
+        // than resolve to whatever is at that index now.
+        let mut scene = Scene::new("root");
+        let root = scene.root();
+        let a = scene.add_child(root, helios::Node::new("a"));
+        let paths = encode_selection(&scene, &[a, a]);
+
+        let smaller = Scene::new("root");
+        assert!(decode_selection(&smaller, &paths).is_empty());
+    }
+
+    #[test]
+    fn an_older_state_file_still_loads() {
+        // The fields added since are optional in practice because the struct is
+        // `#[serde(default)]`; a file written by yesterday's build must not cost
+        // somebody their dock layout.
+        let old = "(camera: (pan: (4.0, 5.0), zoom: 1.5), gizmo_mode: Scale)";
+        let state: EditorState = ron::from_str(old).expect("an older file still loads");
+        assert_eq!(state.camera.zoom, 1.5);
+        assert_eq!(state.open_script, None);
+        assert!(state.selected.is_empty());
+    }
+
+    #[test]
     fn editor_state_round_trips_through_ron() {
         let state = EditorState {
             dock: DockNode::default_layout(),
@@ -209,6 +288,8 @@ mod tests {
             explorer_expanded: vec!["assets".to_string(), "assets/ui".to_string()],
             explorer_selected: Some("scenes".to_string()),
             explorer_view: FileView::Grid,
+            open_script: Some("scripts/player.cmt".to_string()),
+            selected: vec![vec![1], vec![0, 2]],
         };
         let text = ron::ser::to_string_pretty(&state, ron::ser::PrettyConfig::default()).unwrap();
         let back: EditorState = ron::from_str(&text).unwrap();

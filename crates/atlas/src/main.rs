@@ -401,6 +401,9 @@ struct State {
     panning: bool,
     /// The last cursor position, in window pixels.
     cursor: Vec2,
+    /// The open script and selection as of the last editor-state save, so a
+    /// change to either can be noticed without a flag at every call site.
+    saved_session: (Option<String>, Vec<NodeId>),
     /// The display's pixel scale, from the window.
     ///
     /// Everything downstream of here is in physical pixels - aurora lays out in
@@ -1188,7 +1191,7 @@ impl State {
             scale,
         );
 
-        Ok(Self {
+        let mut state = Self {
             code: code::CodePane {
                 open_script: None,
                 script_text: String::new(),
@@ -1246,6 +1249,7 @@ impl State {
             drag: None,
             panning: false,
             cursor: Vec2::ZERO,
+            saved_session: (None, Vec::new()),
             scale,
             modifiers: ModifiersState::default(),
             texture_size: Vec2::new(w as f32, h as f32),
@@ -1310,7 +1314,49 @@ impl State {
             carrying: None,
             carry_grab: Vec2::ZERO,
             arriving: None,
-        })
+        };
+        if let Some(saved) = &saved {
+            state.resume(saved);
+        }
+        // What was just put back is what is on disk, so the debounce has nothing
+        // to notice until something actually changes.
+        state.saved_session = state.session();
+        Ok(state)
+    }
+
+    /// Put back what was open and what was selected last time.
+    ///
+    /// The dock layout was remembered and what was *in* it was not, so every
+    /// session began by finding its way back: opening the same script, clicking
+    /// the same node.
+    ///
+    /// Quietly, unlike opening a script by hand: no modal for a file that has
+    /// been renamed since, and no `dock.activate` - the saved layout already
+    /// says which tab was in front, and forcing the Code pane forward would
+    /// overrule it.
+    fn resume(&mut self, saved: &editor_state::EditorState) {
+        self.selection.nodes = editor_state::decode_selection(&self.project.scene, &saved.selected);
+        self.selection.anchor = self.selection.nodes.last().copied();
+
+        let Some(relative) = saved.open_script.as_deref() else {
+            return;
+        };
+        let path = self.project_dir.join(relative);
+        let Ok(raw) = std::fs::read(&path) else {
+            tracing::info!("the script open last time is gone: {}", path.display());
+            return;
+        };
+        let Some((text, encoding)) = TextEncoding::decode(&raw) else {
+            tracing::warn!("the script open last time is not UTF-8: {}", path.display());
+            return;
+        };
+        self.code.script_encoding = encoding;
+        self.code.open_script = Some(relative.to_string());
+        self.code.script_text = text;
+        self.code.script_modified = false;
+        self.code.script_orphaned = false;
+        self.adopt_open_script();
+        self.dirty = true;
     }
 
     /// Take a new display scale, rebuilding the shell at the new size.
@@ -3936,6 +3982,8 @@ impl State {
             explorer_expanded: self.explorer.expanded_rel(),
             explorer_selected: self.explorer.selected_rel(),
             explorer_view: self.explorer.view(),
+            open_script: self.code.open_script.clone(),
+            selected: editor_state::encode_selection(&self.project.scene, &self.selection.nodes),
         }
     }
 
@@ -3947,16 +3995,29 @@ impl State {
             tracing::warn!("could not save editor state: {err}");
         }
         self.view_dirty = false;
+        self.saved_session = self.session();
         self.editor_state_saved = std::time::Instant::now();
     }
 
     /// A debounced editor-state save: writes ~2s after the last view change, so a
     /// continuous pan or resize does not hit the disk every frame.
+    ///
+    /// The selection and the open script are noticed by comparison rather than
+    /// by a flag. Every place that selects a node would have had to remember to
+    /// set one, there are a dozen of them, and the one that forgot would lose
+    /// its selection on the next launch with nothing to show for it.
     fn maybe_save_editor_state(&mut self) {
-        if self.view_dirty && self.editor_state_saved.elapsed() > std::time::Duration::from_secs(2)
-        {
+        if self.editor_state_saved.elapsed() <= std::time::Duration::from_secs(2) {
+            return;
+        }
+        if self.view_dirty || self.session() != self.saved_session {
             self.save_editor_state();
         }
+    }
+
+    /// What `resume` puts back: the open script and the selection.
+    fn session(&self) -> (Option<String>, Vec<NodeId>) {
+        (self.code.open_script.clone(), self.selection.nodes.clone())
     }
 
     /// Write the current viewport view toggles back to the global settings file
