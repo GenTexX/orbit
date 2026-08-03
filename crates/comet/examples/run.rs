@@ -170,6 +170,21 @@ struct Host {
     printed: Vec<String>,
 }
 
+/// Allocate a `String` in the module's heap and write `text` into it, the way
+/// every `str` binding has to.
+fn write_string(c: &mut Caller<'_, Host>, text: &str) -> Result<i32, Error> {
+    let Some(Extern::Func(alloc)) = c.get_export("comet_alloc") else {
+        return Err(Error::msg("every comet module exports comet_alloc"));
+    };
+    let alloc = alloc.typed::<i32, i32>(&*c)?;
+    let ptr = alloc.call(&mut *c, text.len() as i32)?;
+    let Some(Extern::Memory(memory)) = c.get_export("memory") else {
+        return Err(Error::msg("every comet module exports its memory"));
+    };
+    comet::write_str(memory.data_mut(&mut *c), ptr, text);
+    Ok(ptr)
+}
+
 struct Runner {
     store: Store<Host>,
     instance: Instance,
@@ -295,6 +310,26 @@ impl Runner {
                     };
                     comet::write_str(memory.data_mut(&mut c), ptr, &text);
                     Ok(ptr)
+                },
+            )
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "str_bool",
+                |mut c: Caller<'_, Host>, value: i32| -> Result<i32, Error> {
+                    let text = if value != 0 { "true" } else { "false" };
+                    write_string(&mut c, text)
+                },
+            )
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "str_vec2",
+                |mut c: Caller<'_, Host>, x: f32, y: f32| -> Result<i32, Error> {
+                    let text = format!("({}, {})", comet::format_f32(x), comet::format_f32(y));
+                    write_string(&mut c, &text)
                 },
             )
             .expect("host binding");

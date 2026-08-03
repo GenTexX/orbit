@@ -929,6 +929,30 @@ fn property(id: i32) -> Option<Property> {
         .map(|(.., property)| *property)
 }
 
+/// Allocate a `String` in the module's heap and write `text` into it.
+///
+/// The one host function shape that allocates: it calls back into the module
+/// rather than reserving memory of its own, so what it returns is an ordinary
+/// refcounted block the script releases like any other String. Shared by all
+/// four `str` bindings, because four copies of it would be four places to get
+/// the ownership wrong.
+fn make_string(c: &mut Caller<'_, ScriptState>, text: &str) -> Result<i32, wasmtime::Error> {
+    let Some(Extern::Func(alloc)) = c.get_export("comet_alloc") else {
+        return Err(wasmtime::Error::msg(
+            "every comet module exports comet_alloc",
+        ));
+    };
+    let alloc = alloc.typed::<i32, i32>(&*c)?;
+    let ptr = alloc.call(&mut *c, text.len() as i32)?;
+    let Some(Extern::Memory(memory)) = c.get_export("memory") else {
+        return Err(wasmtime::Error::msg(
+            "every comet module exports its memory",
+        ));
+    };
+    comet::write_str(memory.data_mut(&mut *c), ptr, text);
+    Ok(ptr)
+}
+
 /// Bind the functions every comet module imports (see `comet::HOST_MODULE`
 /// - the import list is fixed, so one binding table serves every script).
 fn bind_host(linker: &mut Linker<ScriptState>) -> Result<(), ScriptError> {
@@ -994,25 +1018,7 @@ fn bind_host(linker: &mut Linker<ScriptState>) -> Result<(), ScriptError> {
             host,
             "str",
             |mut c: Caller<'_, ScriptState>, value: f32| -> Result<i32, wasmtime::Error> {
-                // The one host function that allocates. It calls back into the
-                // module rather than reserving memory of its own, so what it
-                // returns is an ordinary refcounted block the script releases
-                // like any other String.
-                let text = comet::format_f32(value);
-                let Some(Extern::Func(alloc)) = c.get_export("comet_alloc") else {
-                    return Err(wasmtime::Error::msg(
-                        "every comet module exports comet_alloc",
-                    ));
-                };
-                let alloc = alloc.typed::<i32, i32>(&c)?;
-                let ptr = alloc.call(&mut c, text.len() as i32)?;
-                let Some(Extern::Memory(memory)) = c.get_export("memory") else {
-                    return Err(wasmtime::Error::msg(
-                        "every comet module exports its memory",
-                    ));
-                };
-                comet::write_str(memory.data_mut(&mut c), ptr, &text);
-                Ok(ptr)
+                make_string(&mut c, &comet::format_f32(value))
             },
         )
         .map_err(ScriptError::runtime)?;
@@ -1023,21 +1029,31 @@ fn bind_host(linker: &mut Linker<ScriptState>) -> Result<(), ScriptError> {
             |mut c: Caller<'_, ScriptState>, value: i32| -> Result<i32, wasmtime::Error> {
                 // Whole numbers print whole. Widening to f32 first would round
                 // past 2^24, silently, in the one function used to see a value.
-                let text = value.to_string();
-                let Some(Extern::Func(alloc)) = c.get_export("comet_alloc") else {
-                    return Err(wasmtime::Error::msg(
-                        "every comet module exports comet_alloc",
-                    ));
-                };
-                let alloc = alloc.typed::<i32, i32>(&c)?;
-                let ptr = alloc.call(&mut c, text.len() as i32)?;
-                let Some(Extern::Memory(memory)) = c.get_export("memory") else {
-                    return Err(wasmtime::Error::msg(
-                        "every comet module exports its memory",
-                    ));
-                };
-                comet::write_str(memory.data_mut(&mut c), ptr, &text);
-                Ok(ptr)
+                make_string(&mut c, &value.to_string())
+            },
+        )
+        .map_err(ScriptError::runtime)?;
+    linker
+        .func_wrap(
+            host,
+            "str_bool",
+            |mut c: Caller<'_, ScriptState>, value: i32| -> Result<i32, wasmtime::Error> {
+                // The words a script would write, so `str(flag)` reads back as
+                // what the source says rather than as 1 and 0.
+                make_string(&mut c, if value != 0 { "true" } else { "false" })
+            },
+        )
+        .map_err(ScriptError::runtime)?;
+    linker
+        .func_wrap(
+            host,
+            "str_vec2",
+            |mut c: Caller<'_, ScriptState>, x: f32, y: f32| -> Result<i32, wasmtime::Error> {
+                // Parenthesised, unlike the inspector's bare "x, y": this ends
+                // up inside a printed sentence, where two bare numbers separated
+                // by a comma cannot be told from two separate values.
+                let text = format!("({}, {})", comet::format_f32(x), comet::format_f32(y));
+                make_string(&mut c, &text)
             },
         )
         .map_err(ScriptError::runtime)?;

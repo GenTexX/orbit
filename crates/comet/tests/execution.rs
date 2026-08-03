@@ -38,6 +38,21 @@ struct Host {
     printed: Vec<String>,
 }
 
+/// Allocate a `String` in the module's heap and write `text` into it, the way
+/// every `str` binding has to.
+fn write_string(c: &mut Caller<'_, Host>, text: &str) -> Result<i32, Error> {
+    let Some(Extern::Func(alloc)) = c.get_export("comet_alloc") else {
+        return Err(Error::msg("every comet module exports comet_alloc"));
+    };
+    let alloc = alloc.typed::<i32, i32>(&*c)?;
+    let ptr = alloc.call(&mut *c, text.len() as i32)?;
+    let Some(Extern::Memory(memory)) = c.get_export("memory") else {
+        return Err(Error::msg("every comet module exports its memory"));
+    };
+    comet::write_str(memory.data_mut(&mut *c), ptr, text);
+    Ok(ptr)
+}
+
 struct Script {
     store: Store<Host>,
     instance: Instance,
@@ -166,6 +181,26 @@ impl Script {
                     };
                     comet::write_str(memory.data_mut(&mut c), ptr, &text);
                     Ok(ptr)
+                },
+            )
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "str_bool",
+                |mut c: Caller<'_, Host>, value: i32| -> Result<i32, Error> {
+                    let text = if value != 0 { "true" } else { "false" };
+                    write_string(&mut c, text)
+                },
+            )
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "str_vec2",
+                |mut c: Caller<'_, Host>, x: f32, y: f32| -> Result<i32, Error> {
+                    let text = format!("({}, {})", comet::format_f32(x), comet::format_f32(y));
+                    write_string(&mut c, &text)
                 },
             )
             .expect("host binding");
@@ -2508,6 +2543,82 @@ fn breaking_out_of_a_loop_still_releases_what_it_allocated() {
                  if i > 2.0 { break; }
                  i += 1.0;
              }
+             transform.position.x = 1.0;
+         }",
+    );
+    script.update(0.016);
+    let settled = script.heap_used();
+    for _ in 0..50 {
+        script.update(0.016);
+    }
+    assert_eq!(script.heap_used(), settled, "fifty frames leaked nothing");
+}
+
+/// Comparing a payload-free enum, which is what a state machine is made of.
+///
+/// Refusing this is what forced the idiomatic form to be written as a `match`
+/// whose arms are all `true` and `false`. A payload-free enum is one i32 - its
+/// tag - so the emitted code was always going to be right; only the checker
+/// was in the way.
+#[test]
+fn payload_free_enums_compare_by_their_tag() {
+    let mut script = Script::new(
+        "enum Mood { Calm, Restless, Panicked }
+         let mood = Mood::Restless;
+         func update(dt: f32) {
+             if mood == Mood::Restless { transform.position.x += 1.0; }
+             if mood == Mood::Calm { transform.position.x += 100.0; }
+             if mood != Mood::Panicked { transform.position.y += 1.0; }
+         }",
+    );
+    script.update(0.016);
+    assert_eq!(script.position(), (1.0, 1.0));
+    // And it tracks a change of state rather than being folded at compile time.
+    let mut script = Script::new(
+        "enum Mood { Calm, Restless }
+         let mood = Mood::Calm;
+         func update(dt: f32) {
+             if mood == Mood::Calm { transform.position.x += 1.0; mood = Mood::Restless; }
+         }",
+    );
+    script.update(0.016);
+    script.update(0.016);
+    script.update(0.016);
+    assert_eq!(
+        script.position().0,
+        1.0,
+        "it only matched on the first frame"
+    );
+}
+
+/// `str` of a bool and of a vector.
+///
+/// `print` is the whole of a script's observability since Play shipped, and
+/// `print("grounded: " + str(grounded))` - the first debug line anybody writes -
+/// used to be "expected `f32`, found `bool`". The workaround needed a helper
+/// function with an early return, because `if` was not an expression either.
+#[test]
+fn str_covers_the_types_a_debug_line_actually_holds() {
+    let mut script = Script::new(
+        "func update(dt: f32) {
+             let grounded = true;
+             print(\"grounded: \" + str(grounded));
+             print(\"falling: \" + str(false));
+             print(\"at \" + str(vec2(1.5, -2.0)));
+         }",
+    );
+    script.update(0.016);
+    assert_eq!(
+        script.printed(),
+        ["grounded: true", "falling: false", "at (1.5, -2)"]
+    );
+}
+
+#[test]
+fn a_str_of_a_bool_is_released_like_any_other_string() {
+    let mut script = Script::new(
+        "func update(dt: f32) {
+             let line = \"flag: \" + str(dt > 0.0);
              transform.position.x = 1.0;
          }",
     );

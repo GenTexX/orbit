@@ -455,6 +455,11 @@ pub enum Host {
     Cos,
     Atan2,
     Pow,
+    /// `str(bool) -> String` and `str(Vec2) -> String`. `print` is the whole of
+    /// a script's observability, so the first debug line anybody writes -
+    /// `print("grounded: " + str(grounded))` - has to be one they can write.
+    StrBool,
+    StrVec2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

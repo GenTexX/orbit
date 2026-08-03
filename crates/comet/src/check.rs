@@ -2742,6 +2742,18 @@ impl Checker<'_> {
                 Type::Str,
             );
         }
+        // `str` of a bool or a vector. Beside the `int` case above rather than
+        // in the builtin table, because that table is one signature per name.
+        if callee == "str" && args.len() == 1 {
+            let host = match args[0].ty {
+                Type::Bool => Some(Host::StrBool),
+                Type::Vec2 => Some(Host::StrVec2),
+                _ => None,
+            };
+            if let Some(host) = host {
+                return (TypedExprKind::HostCall { host, args }, Type::Str);
+            }
+        }
         if let Some((builtin, params, ret)) = builtin(callee) {
             self.check_args(callee, &mut args, params, span);
             let ok = args.len() == params.len() && args.iter().zip(params).all(|(a, p)| a.ty == *p);
@@ -2993,16 +3005,29 @@ impl Checker<'_> {
                     self.expect_type(lhs.ty, rhs.ty, rhs.span);
                     return (TypedExprKind::Error, Type::Error);
                 }
-                // Comparing strings needs a host call or a memcmp helper, which
-                // v1 does not emit; keep it an error rather than a silent
-                // pointer comparison that would look like it worked.
-                if !matches!(lhs.ty, Type::Bool) {
+                // A payload-free enum is laid out as exactly one i32 - its tag -
+                // and `Eq` already emits `i32.eq` for anything that is not an
+                // f32, so this needs nothing from codegen. Refusing it was what
+                // forced the idiomatic state machine to be written as a `match`
+                // whose arms are all `true` and `false`.
+                let comparable = matches!(lhs.ty, Type::Bool)
+                    || matches!(lhs.ty, Type::Enum(index)
+                        if self.enums[index as usize].payload_slots == 0);
+                if !comparable {
+                    // Vec2 would be two comparisons and an `and`, which the
+                    // binary path cannot express without parking both sides;
+                    // String needs a `comet_str_eq` beside `comet_alloc`. Both
+                    // are refused with the shape that does work rather than
+                    // with a flat no.
+                    let name = self.name_of(lhs.ty);
+                    let hint = match lhs.ty {
+                        Type::Vec2 => " - compare `.x` and `.y`",
+                        Type::Str => " - there is no string comparison yet",
+                        _ => "",
+                    };
                     self.error(
                         lhs.span.to(rhs.span),
-                        format!(
-                            "`{}` values cannot be compared in this version",
-                            lhs.ty.name()
-                        ),
+                        format!("`{name}` values cannot be compared{hint}"),
                     );
                     return (TypedExprKind::Error, Type::Error);
                 }
@@ -4801,6 +4826,31 @@ mod tests {
                  }"
             ),
             ["`break` is only meaningful inside a loop, and this is not"]
+        );
+    }
+
+    #[test]
+    fn an_enum_that_carries_something_is_still_not_comparable() {
+        // Its layout is a tag plus a payload, so `i32.eq` on the tag alone
+        // would answer a different question than the one that was asked.
+        assert_eq!(
+            messages(
+                "enum Hit { Miss, Wall(f32) }
+                 func update(dt: f32) { let a = Hit::Miss; if a == Hit::Miss { } }"
+            ),
+            ["`Hit` values cannot be compared"]
+        );
+    }
+
+    #[test]
+    fn what_cannot_be_compared_says_what_would_work() {
+        assert_eq!(
+            messages("func update(dt: f32) { let a = vec2(1.0, 2.0); if a == a { } }"),
+            ["`Vec2` values cannot be compared - compare `.x` and `.y`"]
+        );
+        assert_eq!(
+            messages("func update(dt: f32) { if \"a\" == \"b\" { } }"),
+            ["`String` values cannot be compared - there is no string comparison yet"]
         );
     }
 }

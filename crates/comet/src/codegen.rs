@@ -157,23 +157,28 @@ const F_SIN: u32 = 10;
 const F_COS: u32 = 11;
 const F_ATAN2: u32 = 12;
 const F_POW: u32 = 13;
-const F_ALLOC: u32 = 14;
-const F_RETAIN: u32 = 15;
-const F_RELEASE: u32 = 16;
+/// `str(bool)` and `str(Vec2)`. Formatting lives with the other `str` calls
+/// rather than being emitted, for the same reason: one host binding beats a
+/// branch over string literals in every module.
+const F_STR_BOOL: u32 = 14;
+const F_STR_VEC2: u32 = 15;
+const F_ALLOC: u32 = 16;
+const F_RETAIN: u32 = 17;
+const F_RELEASE: u32 = 18;
 /// The array runtime. Two blocks per array - a handle and its elements - so
 /// growing is invisible to every other name for the same array.
-const F_ARRAY_NEW: u32 = 17;
-const F_ARRAY_AT: u32 = 18;
-const F_ARRAY_PUSH: u32 = 19;
-const F_ARRAY_RELEASE: u32 = 20;
-const F_ARRAY_COPY: u32 = 21;
+const F_ARRAY_NEW: u32 = 19;
+const F_ARRAY_AT: u32 = 20;
+const F_ARRAY_PUSH: u32 = 21;
+const F_ARRAY_RELEASE: u32 = 22;
+const F_ARRAY_COPY: u32 = 23;
 /// `comet_heap_used() -> bytes`: what the heap has handed out and not taken
 /// back. Exported so a test has an exact leak oracle rather than watching
 /// `memory.size`, which cannot see a kilobyte leaked inside a 64KB page - the
 /// coarseness that let four ownership bugs ship in 4.5 and 4.6.
-const F_HEAP_USED: u32 = 22;
+const F_HEAP_USED: u32 = 24;
 /// The first script-defined function's index.
-const USER_BASE: u32 = 23;
+const USER_BASE: u32 = 25;
 
 /// Emit a WebAssembly module for `script`.
 ///
@@ -201,6 +206,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     let t_str = types.get(vec![ValType::F32], vec![ValType::I32]);
     let t_unary = types.get(vec![ValType::F32], vec![ValType::F32]);
     let t_binary = types.get(vec![ValType::F32, ValType::F32], vec![ValType::F32]);
+    let t_str_vec2 = types.get(vec![ValType::F32, ValType::F32], vec![ValType::I32]);
     let t_alloc = types.get(vec![ValType::I32], vec![ValType::I32]);
     let t_rc = types.get(vec![ValType::I32], vec![]);
     let t_heap_used = types.get(vec![], vec![ValType::I32]);
@@ -221,6 +227,8 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     imports.import(HOST_MODULE, "cos", EntityType::Function(t_unary));
     imports.import(HOST_MODULE, "atan2", EntityType::Function(t_binary));
     imports.import(HOST_MODULE, "pow", EntityType::Function(t_binary));
+    imports.import(HOST_MODULE, "str_bool", EntityType::Function(t_get_bool));
+    imports.import(HOST_MODULE, "str_vec2", EntityType::Function(t_str_vec2));
 
     let t_array_new = types.get(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
     let t_array_at = types.get(
@@ -347,6 +355,8 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     names.append(F_COS, "orbit::cos");
     names.append(F_ATAN2, "orbit::atan2");
     names.append(F_POW, "orbit::pow");
+    names.append(F_STR_BOOL, "orbit::str_bool");
+    names.append(F_STR_VEC2, "orbit::str_vec2");
     names.append(F_ARRAY_NEW, "comet_array_new");
     names.append(F_ARRAY_AT, "comet_array_at");
     names.append(F_ARRAY_PUSH, "comet_array_push");
@@ -2300,6 +2310,16 @@ impl<'a> FnGen<'a> {
                     self.expr(&args[0]);
                     self.ins().call(F_STR_INT);
                 }
+                Host::StrBool => {
+                    self.expr(&args[0]);
+                    self.ins().call(F_STR_BOOL);
+                }
+                // A Vec2 is two f32s on the stack, which is exactly the two
+                // arguments this import takes.
+                Host::StrVec2 => {
+                    self.expr(&args[0]);
+                    self.ins().call(F_STR_VEC2);
+                }
                 // The transcendentals are ordinary calls: arguments on the
                 // stack, one import, a result.
                 Host::Sin | Host::Cos | Host::Atan2 | Host::Pow => {
@@ -3267,6 +3287,8 @@ mod tests {
             "cos",
             "atan2",
             "pow",
+            "str_bool",
+            "str_vec2",
         ]
         .iter()
         .map(|name| (HOST_MODULE.to_string(), name.to_string()))
