@@ -11,7 +11,7 @@
             (
                 name: "Sprite",
                 transform: (
-                    translation: (375.0, 330.0),
+                    translation: (933.2738, -172.50577),
                     rotation: -0.3926991,
                     scale: (1.2, 1.2),
                 ),
@@ -49,8 +49,8 @@
             (
                 name: "Sprite 3",
                 transform: (
-                    translation: (370.0, 530.0),
-                    rotation: 3.1415927,
+                    translation: (-1.5148926, -1.187561),
+                    rotation: 0.0,
                     scale: (1.0, 1.0),
                 ),
                 components: [
@@ -65,10 +65,9 @@
                     (
                         kind: "Script",
                         fields: [
-                            ("source", Asset("scripts/tunable.cmt")),
-                            ("speed", F32(45.0)),
-                            ("direction", Vec2((16.945313, 0.0))),
-                            ("travelled", F32(0.0)),
+                            ("source", Asset("test.cmt")),
+                            ("speed", F32(1.0)),
+                            ("amp", F32(100.0)),
                         ],
                     ),
                 ],

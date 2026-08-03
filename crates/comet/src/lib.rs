@@ -145,7 +145,7 @@ fn const_value(expr: &TypedExpr) -> Option<ExportDefault> {
 pub use diagnostic::{Diagnostic, Severity};
 pub use lexer::{Token, TokenKind, lex, lex_with_comments};
 pub use parser::parse;
-pub use schema::{FieldRef, HostField, HostObject, HostSchema, HostType, example_schema};
+pub use schema::{Access, FieldRef, HostField, HostObject, HostSchema, HostType, example_schema};
 pub use span::Span;
 pub use tir::{
     Axis, Hint, Host, Place, Type, TypedBlock, TypedExpr, TypedExprKind, TypedFn, TypedScript,

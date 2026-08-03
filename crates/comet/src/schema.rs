@@ -38,11 +38,52 @@ impl HostType {
     }
 }
 
-/// One property: the name a script writes, and its type.
+/// Whether a script may assign to a property, or only read it.
+///
+/// Most of what a host will ever expose is read-only - the mouse, elapsed time,
+/// a parent's world position - so a schema that can only describe writable
+/// scalars can only describe the first few properties honestly. Without this,
+/// `input.jump = true` compiles, emits a `set_bool`, and the host drops it on
+/// the floor: no diagnostic, no effect, and no way for a learner to find out
+/// why. That is the worst shape a gap can take in a teaching tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Access {
+    /// A script may read it and assign to it.
+    #[default]
+    ReadWrite,
+    /// The engine sets it; a script may only read it.
+    ReadOnly,
+}
+
+/// One property: the name a script writes, its type, and whether it can be
+/// assigned to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostField {
     pub name: String,
     pub ty: HostType,
+    pub access: Access,
+}
+
+/// A writable property, which is the common case and the one every existing
+/// caller declares.
+impl From<(&'static str, HostType)> for HostField {
+    fn from((name, ty): (&'static str, HostType)) -> Self {
+        HostField {
+            name: name.to_string(),
+            ty,
+            access: Access::ReadWrite,
+        }
+    }
+}
+
+impl From<(&'static str, HostType, Access)> for HostField {
+    fn from((name, ty, access): (&'static str, HostType, Access)) -> Self {
+        HostField {
+            name: name.to_string(),
+            ty,
+            access,
+        }
+    }
 }
 
 /// A named group of properties - `transform`, or a component.
@@ -68,6 +109,7 @@ pub struct FieldRef {
     /// The property's index, flat across the whole schema. What codegen emits.
     pub id: u32,
     pub ty: HostType,
+    pub access: Access,
 }
 
 impl HostSchema {
@@ -81,7 +123,7 @@ impl HostSchema {
     pub fn object(
         mut self,
         name: impl Into<String>,
-        fields: impl IntoIterator<Item = (&'static str, HostType)>,
+        fields: impl IntoIterator<Item = impl Into<HostField>>,
     ) -> Self {
         let name = name.into();
         if self.objects.iter().any(|o| o.name == name) {
@@ -89,13 +131,7 @@ impl HostSchema {
         }
         self.objects.push(HostObject {
             name,
-            fields: fields
-                .into_iter()
-                .map(|(name, ty)| HostField {
-                    name: name.to_string(),
-                    ty,
-                })
-                .collect(),
+            fields: fields.into_iter().map(Into::into).collect(),
         });
         self
     }
@@ -127,6 +163,7 @@ impl HostSchema {
                     return Some(FieldRef {
                         id,
                         ty: property.ty,
+                        access: property.access,
                     });
                 }
                 id += 1;

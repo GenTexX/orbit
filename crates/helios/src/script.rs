@@ -729,38 +729,71 @@ enum Property {
 /// comet compiles against the schema this produces and never learns what a
 /// `Transform` is. Adding a property here makes it scriptable - with
 /// completions and hover - without touching the compiler.
-const PROPERTIES: &[(&str, &str, comet::HostType, Property)] = &[
+/// Shorthands, so a row stays one line and the table stays readable.
+const RW: comet::Access = comet::Access::ReadWrite;
+const RO: comet::Access = comet::Access::ReadOnly;
+
+const PROPERTIES: &[(&str, &str, comet::HostType, comet::Access, Property)] = &[
     (
         "transform",
         "position",
         comet::HostType::Vec2,
+        RW,
         Property::Position,
     ),
     (
         "transform",
         "rotation",
         comet::HostType::F32,
+        RW,
         Property::Rotation,
     ),
-    ("transform", "scale", comet::HostType::Vec2, Property::Scale),
-    // Input. Read-only in practice - a script assigning to `input.jump` is
-    // ignored rather than refused, because the schema has no way to say
-    // read-only and inventing one is a change to the compiler. Worth fixing;
-    // not worth blocking input on.
-    ("input", "left", comet::HostType::Bool, Property::InputLeft),
+    (
+        "transform",
+        "scale",
+        comet::HostType::Vec2,
+        RW,
+        Property::Scale,
+    ),
+    // Input is read-only: it is the engine's answer to what the player is
+    // doing, so a script assigning to it would be telling the keyboard what was
+    // pressed. Declared rather than merely ignored - the checker now refuses it
+    // with a sentence, where before it compiled, emitted a setter, and was
+    // silently dropped here.
+    (
+        "input",
+        "left",
+        comet::HostType::Bool,
+        RO,
+        Property::InputLeft,
+    ),
     (
         "input",
         "right",
         comet::HostType::Bool,
+        RO,
         Property::InputRight,
     ),
-    ("input", "up", comet::HostType::Bool, Property::InputUp),
-    ("input", "down", comet::HostType::Bool, Property::InputDown),
-    ("input", "jump", comet::HostType::Bool, Property::InputJump),
+    ("input", "up", comet::HostType::Bool, RO, Property::InputUp),
+    (
+        "input",
+        "down",
+        comet::HostType::Bool,
+        RO,
+        Property::InputDown,
+    ),
+    (
+        "input",
+        "jump",
+        comet::HostType::Bool,
+        RO,
+        Property::InputJump,
+    ),
     (
         "input",
         "mouse",
         comet::HostType::Vec2,
+        RO,
         Property::InputMouse,
     ),
 ];
@@ -875,10 +908,10 @@ fn build_schema() -> comet::HostSchema {
     let mut at = 0;
     while at < PROPERTIES.len() {
         let object = PROPERTIES[at].0;
-        let fields: Vec<(&'static str, comet::HostType)> = PROPERTIES[at..]
+        let fields: Vec<(&'static str, comet::HostType, comet::Access)> = PROPERTIES[at..]
             .iter()
             .take_while(|(o, ..)| *o == object)
-            .map(|(_, field, ty, _)| (*field, *ty))
+            .map(|(_, field, ty, access, _)| (*field, *ty, *access))
             .collect();
         at += fields.len();
         schema = schema.object(object, fields);
@@ -1554,13 +1587,13 @@ mod tests {
         // the wrong field - so this checks they are still derived from one
         // another rather than maintained in parallel.
         let schema = schema();
-        for (id, (object, field, ty, _)) in PROPERTIES.iter().enumerate() {
+        for (id, (object, field, ty, _, _)) in PROPERTIES.iter().enumerate() {
             let found = schema
                 .resolve(object, field)
                 .unwrap_or_else(|| panic!("{object}.{field} is missing from the schema"));
             assert_eq!(found.id as usize, id, "{object}.{field} is numbered wrong");
             assert_eq!(found.ty, *ty);
-            assert_eq!(property(id as i32), Some(PROPERTIES[id].3));
+            assert_eq!(property(id as i32), Some(PROPERTIES[id].4));
         }
         assert_eq!(schema.properties().count(), PROPERTIES.len());
         assert_eq!(property(PROPERTIES.len() as i32), None, "and no further");

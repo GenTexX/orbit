@@ -2064,6 +2064,20 @@ impl Checker<'_> {
                 self.unknown_property(name, property, property_span);
                 return (Place::Error, Type::Error);
             };
+            // A read-only property is the engine telling the script something,
+            // so assigning to one is a mistake about which way the information
+            // flows. It used to compile, emit a setter, and be dropped by the
+            // host without a word.
+            if found.access == crate::schema::Access::ReadOnly {
+                self.error(
+                    target.span(),
+                    format!(
+                        "`{name}.{property}` is read-only - the engine sets it and a script \
+                         reads it"
+                    ),
+                );
+                return (Place::Error, Type::Error);
+            }
             return match path.len() {
                 1 => (
                     Place::Host {
@@ -3157,6 +3171,22 @@ mod tests {
             "fixture should parse clean: {parse_diagnostics:?}"
         );
         check(&script, &crate::schema::example_schema())
+    }
+
+    /// Check against a schema of the test's own, for rules about the host
+    /// surface rather than about the language.
+    fn errors_against(source: &str, schema: &crate::schema::HostSchema) -> Vec<String> {
+        let (script, parse_diagnostics) = parse(source);
+        assert!(
+            parse_diagnostics.is_empty(),
+            "fixture should parse clean: {parse_diagnostics:?}"
+        );
+        check(&script, schema)
+            .1
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.message)
+            .collect()
     }
 
     /// The error messages a script produces. Warnings are advisory and have
@@ -4532,6 +4562,68 @@ mod tests {
         assert_eq!(
             listed[0].hints,
             vec![Hint::Range(0.0, 10.0), Hint::Tooltip("speed".into())]
+        );
+    }
+
+    /// A schema with one writable property and one read-only one.
+    fn schema_with_a_read_only_property() -> crate::schema::HostSchema {
+        use crate::schema::{Access, HostType};
+        crate::schema::HostSchema::new()
+            .object("transform", [("rotation", HostType::F32)])
+            .object(
+                "input",
+                [
+                    ("jump", HostType::Bool, Access::ReadOnly),
+                    ("mouse", HostType::Vec2, Access::ReadOnly),
+                ],
+            )
+    }
+
+    #[test]
+    fn a_read_only_property_can_be_read() {
+        let schema = schema_with_a_read_only_property();
+        assert_eq!(
+            errors_against(
+                "func update(dt: f32) { if input.jump { transform.rotation = input.mouse.x; } }",
+                &schema
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_read_only_property_cannot_be_assigned_to() {
+        // It used to compile, emit a `set_bool`, and be dropped by the host
+        // without a word - no diagnostic, no effect, and no way for a learner
+        // to find out why. That is the worst shape a gap can take in a tool
+        // whose job is to teach.
+        let schema = schema_with_a_read_only_property();
+        assert_eq!(
+            errors_against("func update(dt: f32) { input.jump = true; }", &schema),
+            ["`input.jump` is read-only - the engine sets it and a script reads it"]
+        );
+        // Through a field of one, too - `input.mouse.x = 3.0` is the same
+        // mistake one level down.
+        assert_eq!(
+            errors_against("func update(dt: f32) { input.mouse.x = 3.0; }", &schema),
+            ["`input.mouse` is read-only - the engine sets it and a script reads it"]
+        );
+        // And a compound assignment, which is a read and a write.
+        assert_eq!(
+            errors_against("func update(dt: f32) { input.mouse.x += 3.0; }", &schema),
+            ["`input.mouse` is read-only - the engine sets it and a script reads it"]
+        );
+    }
+
+    #[test]
+    fn a_writable_property_beside_a_read_only_one_still_writes() {
+        let schema = schema_with_a_read_only_property();
+        assert_eq!(
+            errors_against(
+                "func update(dt: f32) { transform.rotation = 1.0; }",
+                &schema
+            ),
+            Vec::<String>::new()
         );
     }
 }

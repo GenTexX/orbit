@@ -1,17 +1,17 @@
-// Bounces the node along X between -200 and 200.
-let speed = 120.0;
-let direction = 1.0;
+
+@export
+let speed: f32;
+
+@export
+let amp: f32;
+
+let i: f32;
 
 func update(dt: f32) {
-    
-    print("Hello Comet!");
-    
-    transform.position.x += speed * direction * dt;
 
-    if transform.position.x > 200.0 {
-        direction = -1.0;
-    }
-    if transform.position.x < -200.0 {
-        direction = 1.0;
-    }
+    transform.position.x = sin(i * speed) * amp * 2;
+    transform.position.y = cos(i * speed) * amp * 4;
+
+    i += 0.001;
+
 }

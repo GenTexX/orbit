@@ -969,9 +969,12 @@ mod tests {
     }
 
     #[test]
-    fn a_script_cannot_write_to_the_input_it_is_given() {
-        // The input is the host's answer to "what is the player doing". A
+    fn a_script_that_writes_to_its_input_is_refused_rather_than_ignored() {
+        // The input is the host's answer to what the player is doing, so a
         // script writing to it would be telling the keyboard what was pressed.
+        // This used to compile, emit a setter, and be dropped by the host
+        // without a word - the schema now says read-only and the checker says
+        // so out loud.
         let (dir, mut scene, node) = project(
             "func update(dt: f32) {
                  input.jump = true;
@@ -979,9 +982,14 @@ mod tests {
              }",
         );
         let mut runtime = Runtime::new(dir.path()).expect("a runtime");
-        runtime.attach(&mut scene, node, 0).expect("it compiles");
-        runtime.step(&mut scene, 0.016);
-        assert_eq!(x(&scene, node), 0.0, "the write did not take");
+        let err = runtime
+            .attach(&mut scene, node, 0)
+            .expect_err("it must not compile");
+        assert!(
+            err.to_string().contains("read-only"),
+            "and it says why: {err}"
+        );
+        assert_eq!(x(&scene, node), 0.0, "nothing ran");
     }
 
     #[test]
