@@ -29,10 +29,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use glam::Vec2;
 use thiserror::Error;
-use wasmtime::{Caller, Engine, Extern, Instance, Linker, Module, Store, TypedFunc, Val};
+use wasmtime::{Caller, Config, Engine, Extern, Instance, Linker, Module, Store, TypedFunc, Val};
 
 use crate::reflect::Value;
 use crate::scene::{NodeId, Scene};
@@ -129,6 +132,25 @@ fn describe_diagnostics(diagnostics: &[comet::Diagnostic]) -> String {
     }
 }
 
+/// How long one call into a script may run before it is interrupted.
+///
+/// Generous on purpose. A frame is 16ms and a script that needs a tenth of a
+/// second for one `update` is already a performance problem, but this is not a
+/// performance tool - it is the difference between a mistake costing a frame
+/// and a mistake costing the session, so it is set where nothing correct can
+/// reach it and every runaway loop does.
+pub const FRAME_BUDGET: Duration = Duration::from_millis(100);
+
+/// How often the epoch advances. The deadline is counted in ticks, so this is
+/// also the granularity of [`FRAME_BUDGET`]: a script overruns by up to one
+/// tick before it is stopped.
+const TICK: Duration = Duration::from_millis(10);
+
+/// [`FRAME_BUDGET`] in epoch ticks, which is the unit a deadline is set in.
+fn budget_ticks() -> u64 {
+    (FRAME_BUDGET.as_nanos() / TICK.as_nanos().max(1)).max(1) as u64
+}
+
 /// The engine and compiled-module cache shared by every script in a project.
 ///
 /// One of these per editor or game: an [`Engine`] is expensive to build and
@@ -137,18 +159,66 @@ pub struct ScriptHost {
     engine: Engine,
     linker: Linker<ScriptState>,
     modules: HashMap<PathBuf, Module>,
+    /// Tells the ticker thread to stop when this host goes away.
+    ticking: Arc<AtomicBool>,
+}
+
+impl Drop for ScriptHost {
+    fn drop(&mut self) {
+        self.ticking.store(false, Ordering::Relaxed);
+    }
 }
 
 impl ScriptHost {
-    /// A host with the four comet imports bound.
+    /// A host with the comet imports bound and a budget on every call.
+    ///
+    /// ## Why a thread
+    ///
+    /// `while true { }` compiles cleanly, and `while` is comet's only loop, so
+    /// forgetting the increment is one keystroke. ADR 0002 runs the game in the
+    /// editor's own process, which means an uninterruptible script is not a
+    /// hung script - it is a hung editor, holding the user's unsaved scene.
+    ///
+    /// wasmtime offers two ways to interrupt one. Fuel counts instructions,
+    /// which is deterministic but taxes every block and needs recalibrating per
+    /// machine. Epochs cost nothing at all until the deadline is checked, and
+    /// the question being asked here is a wall-clock one - "has this frame gone
+    /// on too long" - so epochs are the honest fit.
+    ///
+    /// The catch is that an epoch only advances when somebody advances it, and
+    /// the somebody cannot be the frame loop: if a script is spinning, the frame
+    /// loop is exactly what is not running. So the host owns a thread that does
+    /// nothing but tick, and it is the first thread in this workspace. It sleeps
+    /// more than 99% of the time and touches one atomic.
     pub fn new() -> Result<Self, ScriptError> {
-        let engine = Engine::default();
+        let mut config = Config::new();
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config).map_err(ScriptError::runtime)?;
         let mut linker = Linker::new(&engine);
         bind_host(&mut linker)?;
+
+        let ticking = Arc::new(AtomicBool::new(true));
+        std::thread::Builder::new()
+            .name("comet-epoch".to_string())
+            .spawn({
+                // A clone of the engine handle, not of the engine: dropping the
+                // host clears the flag and this exits within one tick.
+                let engine = engine.clone();
+                let ticking = Arc::clone(&ticking);
+                move || {
+                    while ticking.load(Ordering::Relaxed) {
+                        std::thread::sleep(TICK);
+                        engine.increment_epoch();
+                    }
+                }
+            })
+            .map_err(ScriptError::runtime)?;
+
         Ok(Self {
             engine,
             linker,
             modules: HashMap::new(),
+            ticking,
         })
     }
 
@@ -231,6 +301,11 @@ impl ScriptHost {
                 printed: Vec::new(),
             },
         );
+        // Armed before anything runs, because instantiation itself runs code:
+        // the module's wasm start function is where a script's state
+        // initializers evaluate, and with epoch interruption on, a store whose
+        // deadline nobody set traps on the first instruction.
+        store.set_epoch_deadline(budget_ticks());
         // Instantiation runs the module's start function, which is where a
         // script's state initializers evaluate.
         let instance = self
@@ -247,7 +322,13 @@ impl ScriptHost {
             .get_typed_func::<(), ()>(&mut store, ON_DESTROY)
             .ok();
         // Before the write-back, so a `start` that moves the node is seen.
+        //
+        // Budgeted like every other call: a loop with no exit in `start` would
+        // otherwise hang the editor at the moment a script is attached, which
+        // is worse than hanging it at Play - the user has not pressed anything
+        // yet.
         if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, START) {
+            store.set_epoch_deadline(budget_ticks());
             start.call(&mut store, ()).map_err(ScriptError::trap)?;
         }
         scene.node_mut(node).transform = store.data().transform;
@@ -256,6 +337,7 @@ impl ScriptHost {
             update,
             on_destroy,
             label: scene.node(node).name.clone(),
+            stopped: false,
         })
     }
 }
@@ -269,6 +351,15 @@ pub struct ScriptInstance {
     on_destroy: Option<TypedFunc<(), ()>>,
     /// What this instance's printed output is tagged with.
     label: String,
+    /// Set when a call trapped. A trapped instance is not called again.
+    ///
+    /// Without this the caller gets the same error every frame forever, which
+    /// is sixty identical console lines a second and no way to read the first
+    /// one - and the first one is the only one that says anything. A wasm trap
+    /// also leaves the store's memory in whatever state the trap found it, so
+    /// continuing to call in would be running a script whose state is
+    /// arbitrary. Stopping is both kinder and more honest.
+    stopped: bool,
 }
 
 /// Neither a wasmtime `Store` nor a `TypedFunc` is `Debug`, so this reports what
@@ -298,12 +389,65 @@ impl ScriptInstance {
         let Some(update) = self.update.clone() else {
             return Ok(());
         };
+        if self.stopped {
+            return Ok(());
+        }
         self.store.data_mut().transform = scene.node(node).transform;
-        update
-            .call(&mut self.store, dt)
-            .map_err(ScriptError::trap)?;
+        self.arm();
+        let result = update.call(&mut self.store, dt);
+        // Written back even when the call trapped: whatever the script managed
+        // before it ran out of time is where the node actually is, and throwing
+        // that away would make a trapped frame look like a frame that never ran.
         scene.node_mut(node).transform = self.store.data().transform;
-        Ok(())
+        self.settle(result)
+    }
+
+    /// Whether this instance trapped and is no longer being called.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// Let it run again after a trap - what a hot reload does, since the new
+    /// module gets a fresh store and deserves a fresh chance.
+    pub fn resume(&mut self) {
+        self.stopped = false;
+    }
+
+    /// Give the next call its budget.
+    fn arm(&mut self) {
+        self.store.set_epoch_deadline(budget_ticks());
+    }
+
+    /// Record whether a call trapped, and dress an interruption up as the
+    /// sentence a person can act on.
+    fn settle(&mut self, result: Result<(), wasmtime::Error>) -> Result<(), ScriptError> {
+        let Err(err) = result else {
+            return Ok(());
+        };
+        self.stopped = true;
+        let interrupted = err
+            .downcast_ref::<wasmtime::Trap>()
+            .is_some_and(|trap| *trap == wasmtime::Trap::Interrupt);
+        let error = ScriptError::trap(err);
+        if !interrupted {
+            return Err(error);
+        }
+        // "wasm trap: interrupt" says nothing to somebody who has just written
+        // a loop with no exit, which is what this almost always is.
+        let budget = FRAME_BUDGET.as_millis();
+        Err(match error.trapped_in() {
+            Some(function) => ScriptError::Trapped {
+                function: function.to_string(),
+                message: format!(
+                    "still running after {budget}ms and was stopped - is there a loop \
+                     with no way out?"
+                ),
+            },
+            None => ScriptError::Runtime(format!(
+                "a script was still running after {budget}ms and was stopped - is there \
+                 a loop with no way out?"
+            )),
+        })
     }
 
     /// Run `on_destroy()`, if the script defines one, because the node or the
@@ -318,12 +462,14 @@ impl ScriptInstance {
         let Some(on_destroy) = self.on_destroy.take() else {
             return Ok(());
         };
+        // Runs even on a stopped instance: a trap earlier is no reason to skip
+        // the hook that gives a script its last word, and it gets its own
+        // budget so a loop in the hook cannot hang the teardown either.
         self.store.data_mut().transform = scene.node(node).transform;
-        on_destroy
-            .call(&mut self.store, ())
-            .map_err(ScriptError::trap)?;
+        self.arm();
+        let result = on_destroy.call(&mut self.store, ());
         scene.node_mut(node).transform = self.store.data().transform;
-        Ok(())
+        self.settle(result)
     }
 
     /// Take the lines this script printed since the last call, leaving it empty.
@@ -1204,6 +1350,93 @@ mod tests {
         b.update(&mut scene, slow, 1.0).expect("one frame");
         assert_eq!(position(&scene, fast).x, 100.0);
         assert_eq!(position(&scene, slow).x, 10.0);
+    }
+
+    #[test]
+    fn a_runaway_script_is_stopped_and_not_called_again() {
+        // `while` is comet's only loop and forgetting the increment is one
+        // keystroke. ADR 0002 runs the game in the editor's process, so before
+        // this the first learner to write one lost their session - the call
+        // never returned and there was nothing to interrupt it.
+        let source = "
+            func update(dt: f32) { while true { } }
+        ";
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate(source, &mut scene, node)
+            .expect("it compiles and starts");
+
+        let started = std::time::Instant::now();
+        let err = script
+            .update(&mut scene, node, 0.016)
+            .expect_err("it must not run forever");
+        let took = started.elapsed();
+
+        // It came back, and it came back for the reason we asked for.
+        assert!(
+            took < FRAME_BUDGET * 4,
+            "stopped near the budget, took {took:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("loop with no way out"),
+            "the message says what to look for: {message}"
+        );
+        assert_eq!(err.trapped_in(), Some("update"), "and where to look");
+
+        // And it is not called again. Sixty identical console lines a second
+        // would bury the one line that says anything.
+        assert!(script.is_stopped());
+        let second = std::time::Instant::now();
+        script
+            .update(&mut scene, node, 0.016)
+            .expect("a stopped instance is a no-op, not an error");
+        assert!(second.elapsed() < FRAME_BUDGET, "and returns immediately");
+    }
+
+    #[test]
+    fn a_script_that_finishes_is_never_interrupted() {
+        // The budget must be invisible to correct code. This runs the busiest
+        // loop a demo script plausibly has, many times over, and none of it
+        // comes near a tenth of a second.
+        let source = "
+            let total = 0.0;
+            func update(dt: f32) {
+                for i in 0..2000 { total += dt; }
+            }
+        ";
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate(source, &mut scene, node)
+            .expect("it compiles");
+        for _ in 0..200 {
+            script.update(&mut scene, node, 0.016).expect("no trap");
+        }
+        assert!(!script.is_stopped());
+    }
+
+    #[test]
+    fn a_loop_in_start_cannot_hang_the_editor_either() {
+        // A script is attached before anything is pressed, and instantiation
+        // runs both the state initializers and `start` - so an unbudgeted one
+        // hangs at the moment of attaching, which is worse than hanging at Play.
+        let source = "
+            func start() { while true { } }
+            func update(dt: f32) { }
+        ";
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let started = std::time::Instant::now();
+        let err = host
+            .instantiate(source, &mut scene, node)
+            .expect_err("it must not hang");
+        assert!(
+            started.elapsed() < FRAME_BUDGET * 4,
+            "stopped near the budget"
+        );
+        assert_eq!(err.trapped_in(), Some("start"));
     }
 
     #[test]
