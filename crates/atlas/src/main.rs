@@ -13,6 +13,7 @@ mod explorer;
 mod file_ops;
 mod icons;
 mod modal;
+mod play;
 mod project;
 mod recovery;
 mod settings;
@@ -264,6 +265,9 @@ struct State {
     white: Texture,
     project: Project,
     project_dir: PathBuf,
+    /// The play session: the runtime, and the authored scene it will be put
+    /// back to. In-process, in this window, on this scene (ADR 0002).
+    play: play::Play,
     history: History,
     selection: Selection,
     /// The node being inline-renamed in the tree, if any.
@@ -1066,6 +1070,7 @@ impl State {
             textures,
             white,
             project,
+            play: play::Play::new(&project_dir),
             project_dir,
             history: History::new(),
             selection: Selection::default(),
@@ -1286,6 +1291,13 @@ impl State {
     /// moving it), else clear the selection.
     fn viewport_press(&mut self) {
         if self.ui.hit_test(self.cursor) != self.rows.viewport {
+            return;
+        }
+        // Grabbing a gizmo or picking a sprite both start an edit, so both are
+        // refused while a game is running. Panning and zooming are not edits and
+        // are deliberately still allowed: watching the game from somewhere else
+        // is exactly what you want to do while it runs.
+        if self.scene_edits_blocked() {
             return;
         }
         // Interacting with the viewport moves keyboard focus off the explorer.
@@ -1712,6 +1724,9 @@ impl State {
             MenuAction::DuplicateSelection => self.duplicate_selection(),
             MenuAction::RenameNode(node) => self.start_rename(node),
             MenuAction::AddSpriteAt(world) => {
+                if self.scene_edits_blocked() {
+                    return;
+                }
                 let node = actions::spawn_sprite(
                     &mut self.project.scene,
                     &mut self.history,
@@ -1950,6 +1965,9 @@ impl State {
     /// the sprite both refresh. A no-op if the value is unchanged or the field is
     /// not an asset.
     fn commit_asset_field(&mut self, node: NodeId, component: usize, field: &str, path: String) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         let old = self
             .project
             .scene
@@ -2006,6 +2024,9 @@ impl State {
     /// Delete every selected node (each with its subtree), as one undo step.
     /// The scene root is never deleted. Clears the selection afterward.
     fn delete_selection(&mut self) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         let targets = self.actionable_selection();
         if targets.is_empty() {
             return;
@@ -2024,6 +2045,9 @@ impl State {
     /// Deep-duplicate every selected node beside its original, as one undo step,
     /// and select the new copies (the last becomes primary).
     fn duplicate_selection(&mut self) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         let targets = self.actionable_selection();
         if targets.is_empty() {
             return;
@@ -2062,6 +2086,9 @@ impl State {
     /// sibling after it), or under the scene root when nothing is selected.
     /// Selects the pasted roots. One undo step.
     fn paste_clipboard(&mut self) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         if self.node_clip.is_empty() {
             return;
         }
@@ -2128,6 +2155,9 @@ impl State {
     /// then leave rename mode. Empty or whitespace-only names are rejected (the
     /// edit is cancelled, keeping the old name).
     fn commit_rename(&mut self, node: NodeId, name: String) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         let name = name.trim().to_string();
         if !name.is_empty() {
             self.history.set_name(&mut self.project.scene, node, name);
@@ -2161,6 +2191,9 @@ impl State {
     /// Begin a drag-scrub if the press landed on an inspector axis label.
     /// Returns whether it did (so the caller can consume the press).
     fn begin_scrub(&mut self) -> bool {
+        if self.scene_edits_blocked() {
+            return false;
+        }
         let hit = self.ui.hit_test(self.cursor);
         let Some((_, field, axis)) =
             hit.and_then(|id| self.rows.scrub_labels.iter().find(|(w, ..)| *w == id))
@@ -2206,6 +2239,9 @@ impl State {
     /// commit the final one through the history, so the whole drag is one undo
     /// step rather than one per pixel.
     fn end_slider_drag(&mut self) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         let Some(drag) = self.slider_drag.take() else {
             return;
         };
@@ -2245,6 +2281,9 @@ impl State {
 
     /// Commit a Vec2 field value through the undo history.
     fn commit_field_vec2(&mut self, field: FieldRef, v: Vec2) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         let scene = &mut self.project.scene;
         match field {
             FieldRef::Position(n) => {
@@ -2624,6 +2663,9 @@ impl State {
     /// A press on a tree row arms a reparent drag (a plain click still selects
     /// via the row's Clicked event; only a drag onto another row reparents).
     fn begin_reparent(&mut self) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         if let Some(source) = self.tree_row_at_cursor() {
             self.reparent = Some(ReparentDrag {
                 source,
@@ -2676,6 +2718,9 @@ impl State {
     /// On release, apply the drop spot (reparent / reorder) through the history
     /// as one undo step.
     fn finish_reparent(&mut self) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         let Some(drag) = self.reparent.take() else {
             return;
         };
@@ -2710,6 +2755,9 @@ impl State {
         if self.modal.is_some() {
             return;
         }
+        if self.scene_edits_blocked() {
+            return;
+        }
         let original = field_color(&self.project.scene, &target);
         self.picker = Some(ColorPicker {
             target,
@@ -2723,6 +2771,9 @@ impl State {
     /// Close the picker, committing its final color as one undo step (rewind to
     /// the open-time color, then set the final through the history).
     fn close_color_picker(&mut self) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         let Some(picker) = self.picker.take() else {
             return;
         };
@@ -3005,6 +3056,15 @@ impl State {
             }
         }
         // No field focused: ctrl combos act on the scene and the selection.
+        // The scene shortcuts, all refused while a game is running. Undo in
+        // particular: the history describes the authored scene, and applying a
+        // step of it to a scene the game is halfway through leaves a document
+        // that never existed.
+        if matches!(c.to_ascii_lowercase().as_str(), "z" | "y" | "d" | "x" | "v")
+            && self.scene_edits_blocked()
+        {
+            return true;
+        }
         if c.eq_ignore_ascii_case("z") {
             let changed = if self.modifiers.shift_key() {
                 self.history.redo(&mut self.project.scene)
@@ -3056,6 +3116,14 @@ impl State {
             return false;
         };
         match named {
+            // Deliberately not guarded on focus: F5 is the one key you press
+            // with your hands already on the keyboard, and having it do nothing
+            // because a text field somewhere still has focus is the kind of
+            // thing that gets blamed on the game.
+            NamedKey::F5 => {
+                self.toggle_play();
+                true
+            }
             NamedKey::Escape => {
                 if self.explorer.renaming().is_some() {
                     self.cancel_file_rename();
@@ -3203,6 +3271,9 @@ impl State {
     /// An image dropped on the viewport spawns a sprite there; dropped on an
     /// image asset field, it sets that field.
     fn drop_image(&mut self, path: String, target: Option<aurora::WidgetId>) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         if target == self.rows.viewport {
             let Some(world) = self.cursor_world() else {
                 return;
@@ -3228,6 +3299,9 @@ impl State {
     /// script. Dropped anywhere else it does nothing: a script with no node to
     /// move has nothing to be.
     fn drop_script(&mut self, path: String, target: Option<aurora::WidgetId>) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         if let Some((node, component, field)) =
             self.asset_field_at(target, modal::AssetKind::Script)
         {
@@ -3311,6 +3385,9 @@ impl State {
     /// has none. One undo step either way, so dropping a script on a bare node
     /// undoes in one press rather than leaving an empty component behind.
     fn set_node_script(&mut self, node: NodeId, path: String) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         self.history.begin_group();
         // An empty script component is a slot waiting for a file; anything else
         // gets its own, because a node may run several.
@@ -3346,6 +3423,9 @@ impl State {
 
     /// The toolbar's Add Sprite: spawn at the center of the current view.
     fn add_sprite_action(&mut self) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         let Some(rect) = self.viewport_rect() else {
             return;
         };
@@ -3364,6 +3444,9 @@ impl State {
     /// `.cmt` file is chosen afterwards in the inspector, the same way a
     /// sprite's texture is - so this needs a selection, not a viewport point.
     fn add_script_action(&mut self) {
+        if self.scene_edits_blocked() {
+            return;
+        }
         let Some(node) = self.selection.primary() else {
             return;
         };
@@ -3451,6 +3534,16 @@ impl State {
     }
 
     fn save_project(&mut self) {
+        // Saving while the game runs would write out the scene the *game* is
+        // in, not the one that was authored - a sprite halfway across the
+        // screen, saved over the file, with nothing on screen to say so. There
+        // is nothing to lose by refusing: no edit since Play was pressed got
+        // through the gates, so what is unsaved is what Stop is about to
+        // restore anyway.
+        if self.play.is_playing() {
+            self.note("stop the game to save the scene");
+            return;
+        }
         // The scene in memory is a stand-in for one that would not load, so
         // writing it out would replace the real file with an empty room. Ask
         // first; the answer is the user's, and it is not the obvious one.
@@ -3482,6 +3575,11 @@ impl State {
     /// cleared too: its edits hold NodeIds from the old scene's arena, which
     /// mean nothing (or worse, the wrong node) in the freshly loaded one.
     fn load_project(&mut self) {
+        // Not refused, unlike saving: replacing the document is a legitimate
+        // thing to want, and the running game belongs to the document being
+        // replaced. Stopping first also means the restore lands on the old
+        // scene rather than on the new one, which no longer has those nodes.
+        self.play.stop(&mut self.project.scene);
         match Project::load(&self.project_dir) {
             Ok(project) => {
                 self.project = project;
@@ -4286,6 +4384,59 @@ impl State {
     /// Say something in the status bar for a few seconds.
     fn note(&mut self, text: impl Into<String>) {
         self.status_note = Some((text.into(), std::time::Instant::now()));
+    }
+
+    /// Start the game, or stop it and put the scene back.
+    ///
+    /// The open script is saved first, because the runtime reads `.cmt` files
+    /// from disk: pressing Play with unsaved edits would otherwise run the
+    /// version you stopped looking at ten minutes ago, and nothing on screen
+    /// would say so.
+    fn toggle_play(&mut self) {
+        if self.play.is_playing() {
+            self.play.stop(&mut self.project.scene);
+            self.note("stopped");
+        } else {
+            if self.code.open_script.is_some() && self.code.script_modified {
+                self.save_script();
+            }
+            // Anything half-done is finished first, against the scene about to
+            // be snapshotted. A drag still in flight would otherwise commit on
+            // release into the game's scene - where the gates below stop it,
+            // and Stop would throw the work away either way. Landing it as an
+            // ordinary edit is what the user meant by it.
+            self.end_drag();
+            self.end_scrub();
+            self.end_slider_drag();
+            self.close_color_picker();
+            self.reparent = None;
+            self.play.start(&mut self.project.scene);
+            self.note("playing");
+        }
+        // The mode changes what the shell draws and what the inspector shows,
+        // so this one is a rebuild rather than a redraw.
+        self.dirty = true;
+    }
+
+    /// Whether an edit to the scene must be refused because a game is running.
+    ///
+    /// In-process Play (ADR 0002) leaves the whole editing UI live and
+    /// clickable, and Stop restores the scene to what it was before Play. Every
+    /// edit made in between would therefore be silently thrown away - the worst
+    /// shape a bug can take, because it looks like it worked until it does not.
+    /// Refusing is the honest answer, and saying so is part of refusing: a click
+    /// that does nothing and says nothing is indistinguishable from a broken
+    /// editor.
+    ///
+    /// This gates edits to the *scene*, not to files. Typing in the Code pane,
+    /// saving a script, and moving files around are all still fine - the reload
+    /// path is Part E and none of them is undone by Stop.
+    fn scene_edits_blocked(&mut self) -> bool {
+        if !self.play.is_playing() {
+            return false;
+        }
+        self.note("stop the game to edit the scene");
+        true
     }
 
     /// Jump to what declares the name at the caret, or say why there is nowhere
@@ -6035,6 +6186,13 @@ impl State {
         // after a reorder (and keep a dragged tab pinned under the pointer).
         let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
         self.last_frame = std::time::Instant::now();
+        // The game's frame, if one is running. Here because it must land after
+        // the shell has settled and before the scene is read into sprites just
+        // below, so a script that moves a node is drawn in the same frame it
+        // moved it. `dt` is the editor's own, clamped: a script that has just
+        // been paused on a breakpoint - or an editor that spent 400ms opening a
+        // file - must not hand a game a step it can tunnel through walls with.
+        self.play.step(&mut self.project.scene, dt);
         self.tick_tab_bars(dt);
         if let Some(id) = self.rows.carried_tab {
             // The carried tab sits under the pointer at the same point it was
@@ -6242,7 +6400,8 @@ impl State {
                 // what makes the whole drag one undo step - the same shape the
                 // inspector's label scrub uses.
                 AuroraEvent::SliderChanged { id, value }
-                    if self.rows.field_sliders.iter().any(|(w, ..)| *w == id) =>
+                    if self.rows.field_sliders.iter().any(|(w, ..)| *w == id)
+                        && !self.scene_edits_blocked() =>
                 {
                     let (node, component, field) = self
                         .rows
@@ -6306,7 +6465,8 @@ impl State {
                 // history: a checkbox has no half-typed state to protect, so
                 // there is nothing to defer to a focus-out.
                 AuroraEvent::Toggled { id, checked }
-                    if self.rows.field_checkboxes.iter().any(|(w, ..)| *w == id) =>
+                    if self.rows.field_checkboxes.iter().any(|(w, ..)| *w == id)
+                        && !self.scene_edits_blocked() =>
                 {
                     if let Some((_, node, component, field)) = self
                         .rows
@@ -6337,7 +6497,8 @@ impl State {
                     }
                 }
                 AuroraEvent::Clicked(id)
-                    if self.rows.component_removes.iter().any(|(w, ..)| *w == id) =>
+                    if self.rows.component_removes.iter().any(|(w, ..)| *w == id)
+                        && !self.scene_edits_blocked() =>
                 {
                     let (node, index) = self
                         .rows
@@ -6620,10 +6781,14 @@ impl State {
                         }
                         continue;
                     }
-                    self.commit_field(id);
-                    self.commit_transform_field(id);
-                    self.commit_vec_input(id);
-                    self.commit_picker_hex(id);
+                    // Every inspector commit at once: they are only ever
+                    // reached from here, so one gate covers all four.
+                    if !self.scene_edits_blocked() {
+                        self.commit_field(id);
+                        self.commit_transform_field(id);
+                        self.commit_vec_input(id);
+                        self.commit_picker_hex(id);
+                    }
                 }
                 AuroraEvent::Dropped { source, target } => {
                     // Tab drags are routed by the tab bar, not by Aurora's
