@@ -595,8 +595,13 @@ pub fn build_editor_ui(
     diagnostics: &[comet::Diagnostic],
     tab_bars: &[TabBar],
     theme: &EditorTheme,
+    // The display's pixel scale (see `Ui::set_scale`).
+    scale: f32,
 ) -> (Ui, EditorRows) {
     let mut ui = Ui::new();
+    // Before anything is added: a widget bakes its sizes into taffy when it is
+    // created, so the scale has to be in place first.
+    ui.set_scale(scale);
     ui.set_theme(theme.aurora);
     let mut rows = EditorRows::default();
 
@@ -3663,6 +3668,7 @@ mod tests {
             &[],
             &[],
             theme,
+            1.0,
         )
     }
 
@@ -3680,6 +3686,59 @@ mod tests {
         let mut registry: slotmap::SlotMap<ImageHandle, ()> = slotmap::SlotMap::with_key();
         let handle = registry.insert(());
         (scene, handle)
+    }
+
+    #[test]
+    fn the_whole_shell_is_built_bigger_on_a_hidpi_display() {
+        // The end of the chain the scale travels down: window -> State ->
+        // build_editor_ui -> Ui -> every widget. Checking a status-bar readout
+        // rather than something this test styles itself, because its size comes
+        // from a font size deep inside the shell.
+        let build = |scale: f32| {
+            let (scene, handle) = demo_scene();
+            let explorer = test_explorer();
+            let thumbnails = Thumbnails::new();
+            let dock = DockNode::default_layout();
+            let (mut ui, rows) = build_editor_ui(
+                &scene,
+                &HashSet::new(),
+                None,
+                handle,
+                &explorer,
+                &thumbnails,
+                3,
+                &dock,
+                &HashMap::new(),
+                None,
+                GizmoMode::Move,
+                true,
+                true,
+                false,
+                false,
+                None,
+                &TreeView::default(),
+                "",
+                None,
+                &InspectorView::default(),
+                &[],
+                false,
+                None,
+                "",
+                false,
+                false,
+                &[],
+                &[],
+                &EditorTheme::default(),
+                scale,
+            );
+            ui.layout(Vec2::new(1200.0 * scale, 800.0 * scale)).unwrap();
+            ui.rect(rows.status_cursor.expect("a status readout"))
+                .unwrap()
+                .size
+        };
+        let small = build(1.0);
+        let big = build(2.0);
+        assert!(big.y > small.y * 1.8, "{small:?} -> {big:?}");
     }
 
     #[test]
@@ -3725,6 +3784,7 @@ mod tests {
             &[],
             &[],
             &EditorTheme::default(),
+            1.0,
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
@@ -4129,6 +4189,7 @@ mod tests {
             &[],
             &[],
             &EditorTheme::default(),
+            1.0,
         )
     }
 
@@ -4170,6 +4231,7 @@ mod tests {
             &[],
             &[],
             &EditorTheme::default(),
+            1.0,
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
         let editor = rows.code_editor.expect("a code editor");
@@ -4287,6 +4349,7 @@ mod tests {
             &[],
             &[],
             &EditorTheme::default(),
+            1.0,
         );
         assert!(rows.console_panel.is_some());
         assert!(rows.pane_scrolls.iter().any(|(p, _)| *p == Pane::Console));
@@ -4342,6 +4405,7 @@ mod tests {
             &[],
             &[],
             &EditorTheme::default(),
+            1.0,
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
@@ -4523,6 +4587,7 @@ mod tests {
             &[],
             &[],
             &EditorTheme::default(),
+            1.0,
         );
         ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
         (ui, rows)

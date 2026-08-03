@@ -316,6 +316,14 @@ struct State {
     panning: bool,
     /// The last cursor position, in window pixels.
     cursor: Vec2,
+    /// The display's pixel scale, from the window.
+    ///
+    /// Everything downstream of here is in physical pixels - aurora lays out in
+    /// them, winit reports the cursor in them, photon renders into them - so
+    /// this is not a coordinate conversion, it is how big to build the UI. A
+    /// 2x display gets a UI with twice as many pixels in it rather than a
+    /// half-size one.
+    scale: f32,
     /// The keyboard as the running game sees it. Fed from winit directly,
     /// because aurora's input model has no key release to route this through.
     keys: keys::GameKeys,
@@ -742,6 +750,13 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Resized(size) => state.resize((size.width, size.height)),
+            // Dragging the window to a second monitor with a different DPI. The
+            // whole shell has to be built again, because a widget's sizes are
+            // baked into taffy when it is created - so this cannot be applied
+            // to the tree that is already up.
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                state.set_scale(scale_factor as f32);
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 // Record only; draw() applies the newest position once per frame
                 // (see flush_pointer). A mouse reports far faster than the editor
@@ -944,6 +959,7 @@ impl State {
                 .context("create window")?,
         );
         let size = window.inner_size();
+        let scale = window.scale_factor() as f32;
 
         // One instance, one adapter, one device: photon (the scene) and
         // aurora-wgpu (the chrome) both render on it (ADR 0018).
@@ -1080,6 +1096,7 @@ impl State {
             &[],
             &[],
             &theme,
+            scale,
         );
 
         Ok(Self {
@@ -1140,6 +1157,7 @@ impl State {
             drag: None,
             panning: false,
             cursor: Vec2::ZERO,
+            scale,
             modifiers: ModifiersState::default(),
             texture_size: Vec2::new(w as f32, h as f32),
             frames: 0,
@@ -1204,6 +1222,19 @@ impl State {
             carry_grab: Vec2::ZERO,
             arriving: None,
         })
+    }
+
+    /// Take a new display scale, rebuilding the shell at the new size.
+    ///
+    /// Nothing else is touched: the scene renders into the viewport widget's
+    /// rect, which the rebuild recomputes, and every stored coordinate (scroll
+    /// offsets, the cursor) is already in physical pixels.
+    fn set_scale(&mut self, scale: f32) {
+        if (scale - self.scale).abs() < f32::EPSILON {
+            return;
+        }
+        self.scale = scale;
+        self.dirty = true;
     }
 
     fn resize(&mut self, size: (u32, u32)) {
@@ -6574,6 +6605,7 @@ impl State {
                 &self.code.script_diagnostics,
                 &self.tab_bars,
                 &self.theme,
+                self.scale,
             );
             self.ui = ui;
             self.rows = rows;

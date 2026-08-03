@@ -105,6 +105,68 @@ pub struct Style {
     pub accepts: u32,
 }
 
+impl Style {
+    /// Multiply every pixel length in this style by `scale`.
+    ///
+    /// Every length taffy lays out with, so a UI built at 2x is twice the size
+    /// rather than twice the size in some places. Percentages and `auto` are
+    /// deliberately untouched: they are already relative, and scaling them
+    /// would compound with the parent that was scaled.
+    pub(crate) fn scale_lengths(&mut self, scale: f32) {
+        if scale == 1.0 {
+            return;
+        }
+        let dim = |d: &mut taffy::Dimension| {
+            if let Some(v) = d.into_option() {
+                *d = taffy::Dimension::length(v * scale);
+            }
+        };
+        let lp = |d: &mut taffy::LengthPercentage| {
+            if let taffy::CompactLength::LENGTH_TAG = d.into_raw().tag() {
+                *d = taffy::LengthPercentage::length(d.into_raw().value() * scale);
+            }
+        };
+        let lpa = |d: &mut taffy::LengthPercentageAuto| {
+            if let taffy::CompactLength::LENGTH_TAG = d.into_raw().tag() {
+                *d = taffy::LengthPercentageAuto::length(d.into_raw().value() * scale);
+            }
+        };
+        let l = &mut self.layout;
+        for d in [&mut l.size, &mut l.min_size, &mut l.max_size] {
+            dim(&mut d.width);
+            dim(&mut d.height);
+        }
+        dim(&mut l.flex_basis);
+        for r in [&mut l.padding, &mut l.border] {
+            for v in [&mut r.left, &mut r.right, &mut r.top, &mut r.bottom] {
+                lp(v);
+            }
+        }
+        for v in [
+            &mut l.margin.left,
+            &mut l.margin.right,
+            &mut l.margin.top,
+            &mut l.margin.bottom,
+            &mut l.inset.left,
+            &mut l.inset.right,
+            &mut l.inset.top,
+            &mut l.inset.bottom,
+        ] {
+            lpa(v);
+        }
+        lp(&mut l.gap.width);
+        lp(&mut l.gap.height);
+
+        self.corner_radii = self.corner_radii.map(|r| r * scale);
+        self.border_width *= scale;
+        self.border_bottom_width *= scale;
+        self.translate *= scale;
+        if let Some(size) = self.font_size.as_mut() {
+            *size *= scale;
+        }
+    }
+}
+
 impl Default for Style {
     fn default() -> Self {
         Self {

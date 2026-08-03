@@ -142,6 +142,18 @@ impl EllipsisFit {
 /// [`draw_list`](Self::draw_list). A backend renders that draw list, borrowing
 /// [`font_system_mut`](Self::font_system_mut) to rasterize glyphs.
 pub struct Ui {
+    /// How many physical pixels one UI pixel is, from the window's DPI scale.
+    ///
+    /// Everything in aurora is in physical pixels - layout, hit-testing, glyph
+    /// rasterization - so a HiDPI display is handled by *building the UI
+    /// bigger*, not by drawing a small one and stretching it. Text stays as
+    /// crisp as the display allows because it is shaped and rasterized at the
+    /// size it is drawn at.
+    ///
+    /// Applied where a caller's pixel value enters the tree ([`Ui::add`]) and
+    /// at the handful of internal metrics, so callers keep writing the numbers
+    /// they mean at 1x.
+    scale: f32,
     widgets: SlotMap<WidgetId, Widget>,
     taffy: TaffyTree<WidgetId>,
     root: Option<WidgetId>,
@@ -281,6 +293,7 @@ impl Ui {
     /// Create an empty UI (with the bundled font loaded).
     pub fn new() -> Self {
         Self {
+            scale: 1.0,
             widgets: SlotMap::with_key(),
             taffy: TaffyTree::new(),
             root: None,
@@ -326,6 +339,31 @@ impl Ui {
             theme: Theme::default(),
             last_measure_count: 0,
         }
+    }
+
+    /// Set the display's pixel scale, before building the tree.
+    ///
+    /// A widget already added keeps the scale it was built with, because its
+    /// sizes are baked into taffy when it is created. That is not a limitation
+    /// in practice - a scale change is a display change, and an app answers it
+    /// by rebuilding - but it does mean this belongs at the top of a build,
+    /// not in the middle of one.
+    ///
+    /// Clamped to something sane: a zero or negative scale collapses every
+    /// widget to nothing, and the window that reported it is not going to give
+    /// the user anything to click on to fix it.
+    pub fn set_scale(&mut self, scale: f32) {
+        self.scale = scale.clamp(0.25, 8.0);
+    }
+
+    /// The display's pixel scale (see [`set_scale`](Self::set_scale)).
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// `v` UI pixels in physical pixels.
+    fn px(&self, v: f32) -> f32 {
+        v * self.scale
     }
 
     /// Replace the color theme the built-in widgets draw with. Takes effect on
@@ -1272,8 +1310,12 @@ impl Ui {
 
     /// Insert a widget, create its taffy node, and link it under `parent`. taffy
     /// calls only fail on internal misuse, so they are treated as bugs.
-    fn add(&mut self, kind: WidgetKind, style: Style, parent: Option<WidgetId>) -> WidgetId {
-        let mut layout = style.layout;
+    fn add(&mut self, kind: WidgetKind, mut style: Style, parent: Option<WidgetId>) -> WidgetId {
+        // Every pixel a caller wrote becomes a physical pixel here, once, at the
+        // one door into the tree - so a widget is laid out, hit-tested and drawn
+        // at one size rather than at two that have to be kept in step.
+        style.scale_lengths(self.scale);
+        let mut layout = style.layout.clone();
         // Children of a scroll container keep their natural size: flex would
         // otherwise shrink them to fit and nothing would ever overflow.
         if let Some(p) = parent
@@ -1297,7 +1339,7 @@ impl Ui {
             scroll: style.scroll,
             mask: style.mask,
             placeholder: style.placeholder.unwrap_or_default(),
-            font_size: style.font_size.unwrap_or(text::FONT_SIZE),
+            font_size: style.font_size.unwrap_or(self.px(text::FONT_SIZE)),
             font_weight: style.font_weight,
             font_family: style.font_family,
             gutter: style.gutter,
@@ -1371,6 +1413,7 @@ impl Ui {
         let shape_cache = &mut self.shape_cache;
         let ellipsized = &mut self.ellipsized;
         let gutter_widths = &self.gutter_widths;
+        let scale = self.scale;
         // Counts actual cosmic-text re-shapes (cache misses), not measure calls,
         // so it reflects the work done - see `last_measure_count`.
         let mut reshapes = 0u32;
@@ -1392,6 +1435,7 @@ impl Ui {
                     shape_cache,
                     ellipsized,
                     gutter_widths,
+                    scale,
                     &mut reshapes,
                 )
             },
@@ -1470,6 +1514,7 @@ impl Ui {
             })
             .collect();
 
+        let pad = self.px(theme::GUTTER_PAD);
         let buffers = &mut self.gutter_numbers;
         let widths = &mut self.gutter_widths;
         let shaped = &mut self.gutter_shaped;
@@ -1496,7 +1541,7 @@ impl Ui {
                 .layout_runs()
                 .map(|r| r.line_w)
                 .fold(0.0f32, f32::max);
-            widths.insert(id, (widest + theme::GUTTER_PAD * 2.0).ceil());
+            widths.insert(id, (widest + pad * 2.0).ceil());
             reshaped += 1;
         }
         reshaped
@@ -1796,17 +1841,17 @@ impl Ui {
             return None;
         }
         let track = rect.size.y - 2.0 * theme::SCROLLBAR_INSET;
-        let thumb_h = (track * view / content).max(theme::SCROLLBAR_MIN_THUMB);
+        let thumb_h = (track * view / content).max(self.px(theme::SCROLLBAR_MIN_THUMB));
         let travel = (track - thumb_h).max(0.0);
         let max_offset = content - view;
         let t = (self.scrollable_offset(id) / max_offset).clamp(0.0, 1.0);
         let track_top = rect.pos.y + theme::SCROLLBAR_INSET;
         let thumb = Rect::new(
             Vec2::new(
-                rect.max().x - theme::SCROLLBAR_INSET - theme::SCROLLBAR_WIDTH,
+                rect.max().x - self.px(theme::SCROLLBAR_INSET) - self.px(theme::SCROLLBAR_WIDTH),
                 track_top + t * travel,
             ),
-            Vec2::new(theme::SCROLLBAR_WIDTH, thumb_h),
+            Vec2::new(self.px(theme::SCROLLBAR_WIDTH), thumb_h),
         );
         Some((thumb, track_top, travel))
     }
@@ -1825,7 +1870,8 @@ impl Ui {
         let container = self.scrollbar_owner_at(point)?;
         let (thumb, ..) = self.scrollbar_metrics(container)?;
         let rect = self.rect(container)?;
-        let column_left = rect.max().x - theme::SCROLLBAR_INSET - theme::SCROLLBAR_WIDTH;
+        let column_left =
+            rect.max().x - self.px(theme::SCROLLBAR_INSET) - self.px(theme::SCROLLBAR_WIDTH);
         let in_column = point.x >= column_left
             && point.x <= rect.max().x
             && point.y >= rect.pos.y
@@ -1873,7 +1919,10 @@ impl Ui {
                 list.commands.push(DrawCommand::FillRect {
                     rect: Rect::new(
                         Vec2::new(thumb.pos.x, y),
-                        Vec2::new(theme::SCROLLBAR_WIDTH, theme::SCROLLBAR_MARK_H),
+                        Vec2::new(
+                            self.px(theme::SCROLLBAR_WIDTH),
+                            self.px(theme::SCROLLBAR_MARK_H),
+                        ),
                     ),
                     color: *color,
                 });
@@ -1889,7 +1938,7 @@ impl Ui {
         list.commands.push(DrawCommand::RoundedRect {
             rect: thumb,
             color,
-            radius: [theme::SCROLLBAR_WIDTH * 0.5; 4],
+            radius: [self.px(theme::SCROLLBAR_WIDTH) * 0.5; 4],
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
             border_sides: [true; 4],
@@ -2208,7 +2257,7 @@ impl Ui {
             Orientation::Horizontal => (delta.y, rect.size.y),
         };
         let base = self.splitter_size.unwrap_or(current);
-        let size = (base + axis_delta * sign).max(theme::SPLITTER_MIN_TARGET);
+        let size = (base + axis_delta * sign).max(self.px(theme::SPLITTER_MIN_TARGET));
         self.splitter_size = Some(size);
         match orientation {
             Orientation::Vertical => self.set_width(target, size),
@@ -3295,7 +3344,7 @@ impl Ui {
             // clip its ancestors impose; the point has to fall inside it.
             if let WidgetKind::Splitter { orientation, .. } = widget.kind
                 && let Some(rect) = self.rect(id)
-                && inflate_splitter(rect, orientation).contains(point)
+                && inflate_splitter(rect, orientation, self.scale).contains(point)
                 && self.clip_for(id).is_none_or(|c| c.contains(point))
             {
                 return Some(id);
@@ -3733,7 +3782,7 @@ impl Ui {
         // A fixed, slightly-rounded square box at the left, vertically centered
         // in the widget's rect (which may be taller when it stretches in a row) -
         // so the box always reads square, not stretched.
-        let size = theme::CHECKBOX_SIZE;
+        let size = self.px(theme::CHECKBOX_SIZE);
         let box_rect = Rect::new(
             Vec2::new(rect.pos.x, rect.pos.y + (rect.size.y - size) * 0.5),
             Vec2::splat(size),
@@ -3741,7 +3790,7 @@ impl Ui {
         list.commands.push(DrawCommand::RoundedRect {
             rect: box_rect,
             color: box_color,
-            radius: [theme::CHECKBOX_RADIUS; 4],
+            radius: [self.px(theme::CHECKBOX_RADIUS); 4],
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
             border_sides: [true; 4],
@@ -3762,7 +3811,7 @@ impl Ui {
         if let Some(buffer) = self.buffers.get(id) {
             let line_h = text::metrics_for(widget.font_size).line_height;
             let origin = Vec2::new(
-                box_rect.max().x + theme::CHECKBOX_GAP,
+                box_rect.max().x + self.px(theme::CHECKBOX_GAP),
                 rect.pos.y + (rect.size.y - line_h) * 0.5,
             );
             self.emit_buffer(buffer, origin, widget.foreground, None, list);
@@ -4012,7 +4061,7 @@ impl Ui {
         } else {
             theme::GUTTER_CURRENT_FADE * 0.45
         });
-        let right = origin.x - theme::GUTTER_PAD;
+        let right = origin.x - self.px(theme::GUTTER_PAD);
         let marks = self.gutter_marks.get(id);
         let mark_of = |line: usize| {
             marks
@@ -4053,10 +4102,13 @@ impl Ui {
                 list.commands.push(DrawCommand::FillRect {
                     rect: Rect::new(
                         Vec2::new(
-                            rect.pos.x + theme::GUTTER_PAD,
+                            rect.pos.x + self.px(theme::GUTTER_PAD),
                             origin.y + run.line_top + 3.0,
                         ),
-                        Vec2::new(theme::GUTTER_MARK_WIDTH, (run.line_height - 6.0).max(1.0)),
+                        Vec2::new(
+                            self.px(theme::GUTTER_MARK_WIDTH),
+                            (run.line_height - 6.0).max(1.0),
+                        ),
                     ),
                     color,
                 });
@@ -4323,8 +4375,8 @@ fn color_at(spans: &[TextSpan], offset: usize) -> Option<Color> {
 
 /// A splitter's grab rectangle: its visual rect expanded along the drag axis
 /// (the thin one) by [`theme::SPLITTER_GRAB_EXTRA`] per side.
-fn inflate_splitter(rect: Rect, orientation: Orientation) -> Rect {
-    let extra = theme::SPLITTER_GRAB_EXTRA;
+fn inflate_splitter(rect: Rect, orientation: Orientation, scale: f32) -> Rect {
+    let extra = theme::SPLITTER_GRAB_EXTRA * scale;
     match orientation {
         Orientation::Vertical => Rect::new(
             rect.pos - Vec2::new(extra, 0.0),
@@ -4610,6 +4662,9 @@ fn measure_widget(
     shape_cache: &mut SecondaryMap<WidgetId, ShapeCacheEntry>,
     ellipsized: &mut SecondaryMap<WidgetId, EllipsisFit>,
     gutter_widths: &SecondaryMap<WidgetId, f32>,
+    // The display scale the tree was built at: a checkbox's box is a fixed
+    // metric rather than a caller's style, so it scales here.
+    scale: f32,
     reshapes: &mut u32,
 ) -> Size<f32> {
     let Some(&mut id) = ctx else {
@@ -4621,7 +4676,8 @@ fn measure_widget(
         // glyph is a constant, shaped once at first sight; the caption is shaped
         // (and its width cached) like any other text below.
         WidgetKind::Checkbox { label, .. } => {
-            let box_metrics = text::checkmark_metrics(theme::CHECKBOX_SIZE);
+            let box_size = theme::CHECKBOX_SIZE * scale;
+            let box_metrics = text::checkmark_metrics(box_size);
             if !check_buffers.contains_key(id) {
                 check_buffers.insert(id, Buffer::new(font_system, box_metrics));
                 let mut borrowed = check_buffers[id].borrow_with(font_system);
@@ -4636,7 +4692,7 @@ fn measure_widget(
                 borrowed.shape_until_scroll(false);
             }
             let metrics = text::metrics_for(widgets[id].font_size);
-            let line_h = theme::CHECKBOX_SIZE.max(metrics.line_height);
+            let line_h = box_size.max(metrics.line_height);
             let face = widgets[id].face();
             let font_bits = widgets[id].font_size.to_bits();
             // Cache the caption shape + resulting box size on the label text (the
@@ -4660,9 +4716,9 @@ fn measure_widget(
                 *reshapes += 1;
                 label_w = borrowed.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
             }
-            let width = theme::CHECKBOX_SIZE
+            let width = box_size
                 + if label_w > 0.0 {
-                    theme::CHECKBOX_GAP + label_w.ceil()
+                    theme::CHECKBOX_GAP * scale + label_w.ceil()
                 } else {
                     0.0
                 };
@@ -4842,6 +4898,98 @@ mod tests {
         let r = ui.rect(root).unwrap();
         assert_eq!(r.pos, Vec2::ZERO);
         assert_eq!(r.size, Vec2::new(200.0, 100.0));
+    }
+
+    #[test]
+    fn a_hidpi_ui_is_built_bigger_rather_than_stretched() {
+        // The whole approach: aurora works in physical pixels, so a 2x display
+        // is answered by making everything twice as many pixels - which is what
+        // keeps text as crisp as the display allows, because it is shaped and
+        // rasterized at the size it is drawn at.
+        let mut ui = Ui::new();
+        ui.set_scale(2.0);
+        let root = ui.root_panel(Style::new().size(200.0, 100.0).padding(10.0));
+        let child = ui.panel(root, Style::new().size(50.0, 20.0));
+        ui.layout(Vec2::new(800.0, 600.0)).unwrap();
+
+        assert_eq!(ui.rect(root).unwrap().size, Vec2::new(400.0, 200.0));
+        let child = ui.rect(child).unwrap();
+        assert_eq!(child.size, Vec2::new(100.0, 40.0));
+        assert_eq!(child.pos, Vec2::splat(20.0), "the padding scaled too");
+    }
+
+    #[test]
+    fn a_percentage_is_not_scaled_on_top_of_its_parent() {
+        // A relative length is already relative: scaling it as well would
+        // compound with the parent that was scaled, and a half-width child
+        // would run off the end of a 2x window.
+        let mut ui = Ui::new();
+        ui.set_scale(2.0);
+        let root = ui.root_panel(Style::new().size(200.0, 100.0));
+        let mut style = Style::new().height(10.0);
+        style.layout.size.width = taffy::prelude::percent(0.5_f32);
+        let half = ui.panel(root, style);
+        ui.layout(Vec2::new(800.0, 600.0)).unwrap();
+        assert_eq!(ui.rect(half).unwrap().size.x, 200.0);
+    }
+
+    #[test]
+    fn text_grows_with_the_display() {
+        // Text that did not scale would be the failure this whole thing exists
+        // to fix: a UI twice the size with the same tiny 14px labels in it.
+        let mut ui = Ui::new();
+        let plain = ui.root_panel(Style::new().column());
+        let plain_label = ui.label(plain, "Hello", Style::new());
+        ui.layout(Vec2::new(800.0, 600.0)).unwrap();
+        let small = ui.rect(plain_label).unwrap().size;
+
+        let mut ui = Ui::new();
+        ui.set_scale(2.0);
+        let root = ui.root_panel(Style::new().column());
+        let label = ui.label(root, "Hello", Style::new());
+        ui.layout(Vec2::new(1600.0, 1200.0)).unwrap();
+        let big = ui.rect(label).unwrap().size;
+
+        assert!(
+            big.x > small.x * 1.8 && big.y > small.y * 1.8,
+            "{small:?} -> {big:?}"
+        );
+    }
+
+    #[test]
+    fn a_checkbox_scales_even_though_its_box_is_a_constant() {
+        // The box size is an internal metric rather than a caller's style, and
+        // it is measured in a taffy callback that has no `self` - the one place
+        // a scale is easy to forget.
+        //
+        // With no caption, so the box is the whole width - a captioned one is
+        // as wide as its text, which scales through the font size and would
+        // pass this whether or not the box did.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column());
+        let plain = ui.checkbox(root, false, "", Style::new());
+        ui.layout(Vec2::new(800.0, 600.0)).unwrap();
+        let small = ui.rect(plain).unwrap().size;
+
+        let mut ui = Ui::new();
+        ui.set_scale(2.0);
+        let root = ui.root_panel(Style::new().column());
+        let big = ui.checkbox(root, false, "", Style::new());
+        ui.layout(Vec2::new(1600.0, 1200.0)).unwrap();
+        let big = ui.rect(big).unwrap().size;
+
+        assert!((big.x - small.x * 2.0).abs() < 0.01, "{small:?} -> {big:?}");
+    }
+
+    #[test]
+    fn an_impossible_scale_is_clamped_rather_than_believed() {
+        // A zero scale collapses every widget to nothing, and the window that
+        // reported it is not going to give the user anything to click on.
+        let mut ui = Ui::new();
+        ui.set_scale(0.0);
+        assert!(ui.scale() > 0.0);
+        ui.set_scale(f32::INFINITY);
+        assert!(ui.scale().is_finite());
     }
 
     #[test]
