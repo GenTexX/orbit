@@ -30,6 +30,8 @@ pub enum TokenKind {
     Struct,
     Match,
     Return,
+    Break,
+    Continue,
     True,
     False,
 
@@ -307,6 +309,8 @@ impl<'src> Lexer<'src> {
             "for" => TokenKind::For,
             "in" => TokenKind::In,
             "return" => TokenKind::Return,
+            "break" => TokenKind::Break,
+            "continue" => TokenKind::Continue,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             _ => TokenKind::Ident(text.to_string()),

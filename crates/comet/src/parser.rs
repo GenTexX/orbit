@@ -563,6 +563,18 @@ impl Parser {
             // works. Deciding by what follows rather than by what it contains
             // keeps `if c { a; } more();` a statement even when its branches
             // happen to end in a value.
+            TokenKind::Break | TokenKind::Continue => {
+                let is_break = matches!(self.peek(), TokenKind::Break);
+                self.advance();
+                let end = self.peek_span();
+                let word = if is_break { "break" } else { "continue" };
+                self.expect(&TokenKind::Semicolon, &format!("`;` after `{word}`"));
+                let span = start.to(end);
+                StmtOrTail::Stmt(match is_break {
+                    true => Stmt::Break { span },
+                    false => Stmt::Continue { span },
+                })
+            }
             TokenKind::If => {
                 let if_stmt = self.if_stmt();
                 // The block's value, if it is the last thing here and it looks

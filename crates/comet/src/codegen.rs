@@ -571,6 +571,8 @@ fn collect_block(block: &TypedBlock, out: &mut Literals) {
     for stmt in &block.stmts {
         match stmt {
             TypedStmt::Let { init, .. } => collect_expr(init, out),
+            // Neither carries an expression, so neither can carry a literal.
+            TypedStmt::Break | TypedStmt::Continue => {}
             TypedStmt::Assign { place, value } => {
                 // A place can hold expressions too: `a[i] = v` has both.
                 if let Place::Element { array, index, .. } = place {
@@ -1223,6 +1225,14 @@ struct FnGen<'a> {
     /// The deepest frame this function actually reached, which is what the
     /// locals list is sized from on the second pass.
     high_water: usize,
+    /// How many structured wasm blocks are open at this point. A `br` counts
+    /// outward from where it stands, so a `break` five `if`s deep inside a loop
+    /// is a different number from one directly in the body - this is what makes
+    /// that number computable.
+    labels: u32,
+    /// `labels` as it was at the start of each enclosing loop's body, innermost
+    /// last. The difference is the branch depth.
+    loops: Vec<u32>,
     globals: &'a Globals,
     literals: &'a Literals,
 }
@@ -1304,6 +1314,8 @@ impl<'a> FnGen<'a> {
             spare,
             frame: 0,
             high_water: 0,
+            labels: 0,
+            loops: Vec::new(),
             globals,
             literals,
         }
@@ -1508,7 +1520,7 @@ impl<'a> FnGen<'a> {
         let slots = frame.enum_base;
 
         self.ins().local_get(base).i32_eqz();
-        self.ins().if_(BlockType::Empty);
+        self.open_if(BlockType::Empty);
         self.ins().else_();
         // Only the last owner drops the contents.
         self.ins()
@@ -1516,10 +1528,10 @@ impl<'a> FnGen<'a> {
             .i32_load(mem(OFF_RC))
             .i32_const(1)
             .i32_eq();
-        self.ins().if_(BlockType::Empty);
+        self.open_if(BlockType::Empty);
         self.ins().i32_const(0).local_set(at);
-        self.ins().block(BlockType::Empty);
-        self.ins().loop_(BlockType::Empty);
+        self.open_block();
+        self.open_loop();
         self.ins()
             .local_get(at)
             .local_get(base)
@@ -1549,10 +1561,10 @@ impl<'a> FnGen<'a> {
             .i32_add()
             .local_set(at);
         self.ins().br(0);
-        self.ins().end();
-        self.ins().end();
-        self.ins().end();
-        self.ins().end();
+        self.close();
+        self.close();
+        self.close();
+        self.close();
         self.ins().local_get(base).call(F_ARRAY_RELEASE);
         self.leave_frame();
     }
@@ -1575,8 +1587,8 @@ impl<'a> FnGen<'a> {
         let slots = frame.enum_base;
 
         self.ins().i32_const(0).local_set(at);
-        self.ins().block(BlockType::Empty);
-        self.ins().loop_(BlockType::Empty);
+        self.open_block();
+        self.open_loop();
         self.ins()
             .local_get(at)
             .local_get(base)
@@ -1606,8 +1618,8 @@ impl<'a> FnGen<'a> {
             .i32_add()
             .local_set(at);
         self.ins().br(0);
-        self.ins().end();
-        self.ins().end();
+        self.close();
+        self.close();
         self.leave_frame();
     }
 
@@ -1636,11 +1648,11 @@ impl<'a> FnGen<'a> {
                 continue;
             }
             self.ins().local_get(base).i32_const(tag as i32).i32_eq();
-            self.ins().if_(BlockType::Empty);
+            self.open_if(BlockType::Empty);
             for (offset, ty) in owned {
                 self.release_slots(base + offset, ty);
             }
-            self.ins().end();
+            self.close();
         }
     }
 
@@ -1846,11 +1858,11 @@ impl<'a> FnGen<'a> {
                 continue;
             }
             self.ins().local_get(base).i32_const(tag as i32).i32_eq();
-            self.ins().if_(BlockType::Empty);
+            self.open_if(BlockType::Empty);
             for (offset, ty) in owned {
                 self.retain_slots(base + offset, ty);
             }
-            self.ins().end();
+            self.close();
         }
     }
 
@@ -1925,24 +1937,42 @@ impl<'a> FnGen<'a> {
                 otherwise,
             } => {
                 self.expr(cond);
-                self.ins().if_(BlockType::Empty);
+                self.open_if(BlockType::Empty);
                 self.block_as_stmt(then);
                 if let Some(otherwise) = otherwise {
                     self.ins().else_();
                     self.block_as_stmt(otherwise);
                 }
-                self.ins().end();
+                self.close();
             }
 
             TypedStmt::While { cond, body } => {
-                self.ins().block(BlockType::Empty);
-                self.ins().loop_(BlockType::Empty);
+                self.open_block();
+                self.open_loop();
+                // Where a `break` and a `continue` in this body count from, so
+                // a branch five `if`s deep aims at the same place as one
+                // written directly here.
+                self.loops.push(self.labels);
                 self.expr(cond);
                 self.ins().i32_eqz().br_if(1);
                 self.block_as_stmt(body);
                 self.ins().br(0);
-                self.ins().end();
-                self.ins().end();
+                self.loops.pop();
+                self.close();
+                self.close();
+            }
+
+            // The checker has already refused these outside a loop, so there is
+            // always somewhere to aim.
+            TypedStmt::Break => {
+                if let Some(depth) = self.branch_depth() {
+                    self.ins().br(depth + 1);
+                }
+            }
+            TypedStmt::Continue => {
+                if let Some(depth) = self.branch_depth() {
+                    self.ins().br(depth);
+                }
             }
 
             TypedStmt::Return { value } => {
@@ -2438,7 +2468,7 @@ impl<'a> FnGen<'a> {
                 self.ins().local_get(handle).i32_load(mem(OFF_ARRAY_LEN));
                 self.ins().i32_lt_s();
                 self.ins().i32_and();
-                self.ins().if_(BlockType::Empty);
+                self.open_if(BlockType::Empty);
                 self.ins().i32_const(*some as i32).local_set(res);
                 self.ins().local_get(handle);
                 self.ins().local_get(idx);
@@ -2455,7 +2485,7 @@ impl<'a> FnGen<'a> {
                 self.retain_slots(res + 1, *element);
                 self.ins().else_();
                 self.ins().i32_const(*none as i32).local_set(res);
-                self.ins().end();
+                self.close();
                 // Whatever the live variant did not fill: wasm has no undefined
                 // value, and a `match` on the result never reads these.
                 for slot in width..payload_slots {
@@ -2712,11 +2742,11 @@ impl<'a> FnGen<'a> {
         let width = val_types(ty, self.enums, self.structs).len() as u32;
 
         self.expr(cond);
-        self.ins().if_(BlockType::Empty);
+        self.open_if(BlockType::Empty);
         self.branch_into(then, result_base);
         self.ins().else_();
         self.branch_into(otherwise, result_base);
-        self.ins().end();
+        self.close();
 
         for slot in 0..width {
             self.ins().local_get(result_base + slot);
@@ -2734,6 +2764,40 @@ impl<'a> FnGen<'a> {
         }
     }
 
+    /// How many blocks stand between here and the innermost loop's body.
+    ///
+    /// `continue` branches that far - back to the `loop` - and `break` one
+    /// further, out through the `block` wrapped around it.
+    fn branch_depth(&self) -> Option<u32> {
+        self.loops.last().map(|start| self.labels - start)
+    }
+
+    /// Open a structured block, counting it so a `br` can be aimed.
+    ///
+    /// Every structured instruction this emitter opens goes through one of
+    /// these three, and every close goes through `close`. That is the whole
+    /// mechanism: a `break` needs to know how many blocks stand between it and
+    /// its loop, and nothing else in the emitter tracks nesting.
+    fn open_block(&mut self) {
+        self.ins().block(BlockType::Empty);
+        self.labels += 1;
+    }
+
+    fn open_loop(&mut self) {
+        self.ins().loop_(BlockType::Empty);
+        self.labels += 1;
+    }
+
+    fn open_if(&mut self, ty: BlockType) {
+        self.ins().if_(ty);
+        self.labels += 1;
+    }
+
+    fn close(&mut self) {
+        self.ins().end();
+        self.labels -= 1;
+    }
+
     /// The tag chain, one `if` per arm bar the last.
     fn emit_arms(
         &mut self,
@@ -2746,7 +2810,7 @@ impl<'a> FnGen<'a> {
         let last = at + 1 == arms.len();
         if !last {
             self.ins().local_get(base).i32_const(at as i32).i32_eq();
-            self.ins().if_(BlockType::Empty);
+            self.open_if(BlockType::Empty);
         }
         self.unpack_bindings(base, enum_index, at, &arms[at]);
         self.expr(&arms[at].body);
@@ -2759,7 +2823,7 @@ impl<'a> FnGen<'a> {
         if !last {
             self.ins().else_();
             self.emit_arms(base, result_base, enum_index, arms, at + 1);
-            self.ins().end();
+            self.close();
         }
     }
 
@@ -2789,17 +2853,18 @@ impl<'a> FnGen<'a> {
         match op {
             BinaryOp::And => {
                 self.expr(lhs);
-                self.ins().if_(BlockType::Result(ValType::I32));
+                self.open_if(BlockType::Result(ValType::I32));
                 self.expr(rhs);
-                self.ins().else_().i32_const(0).end();
+                self.ins().else_().i32_const(0);
+                self.close();
                 return;
             }
             BinaryOp::Or => {
                 self.expr(lhs);
-                self.ins().if_(BlockType::Result(ValType::I32));
+                self.open_if(BlockType::Result(ValType::I32));
                 self.ins().i32_const(1).else_();
                 self.expr(rhs);
-                self.ins().end();
+                self.close();
                 return;
             }
             _ => {}

@@ -2425,3 +2425,96 @@ fn an_if_expression_only_runs_the_branch_it_takes() {
         "fifty frames leaked nothing, so only one branch ever allocated"
     );
 }
+
+/// `break` leaves the loop, from however deep inside it.
+///
+/// The depth is the whole difficulty: a `br` counts blocks outward from where
+/// it stands, so a `break` nested in two `if`s is a different number from one
+/// written directly in the body. Nothing but running it proves the arithmetic.
+#[test]
+fn break_leaves_the_loop_from_any_depth() {
+    let mut script = Script::new(
+        "func first_over(limit: f32) -> f32 {
+             let i = 0.0;
+             let found = -1.0;
+             while i < 100.0 {
+                 if i > limit {
+                     if i > 0.0 {
+                         found = i;
+                         break;
+                     }
+                 }
+                 i += 1.0;
+             }
+             found
+         }
+         func update(dt: f32) { transform.position.x = first_over(7.0); }",
+    );
+    script.update(0.016);
+    assert_eq!(script.position().0, 8.0);
+}
+
+#[test]
+fn continue_skips_the_rest_of_the_iteration() {
+    let mut script = Script::new(
+        "func update(dt: f32) {
+             let i = 0.0;
+             let total = 0.0;
+             while i < 10.0 {
+                 i += 1.0;
+                 if i < 5.0 { continue; }
+                 total += i;
+             }
+             transform.position.x = total;
+         }",
+    );
+    script.update(0.016);
+    // 5 + 6 + 7 + 8 + 9 + 10
+    assert_eq!(script.position().0, 45.0);
+}
+
+#[test]
+fn break_leaves_only_the_innermost_loop() {
+    let mut script = Script::new(
+        "func update(dt: f32) {
+             let outer = 0.0;
+             let hits = 0.0;
+             while outer < 3.0 {
+                 let inner = 0.0;
+                 while inner < 10.0 {
+                     if inner > 1.0 { break; }
+                     hits += 1.0;
+                     inner += 1.0;
+                 }
+                 outer += 1.0;
+             }
+             transform.position.x = hits;
+         }",
+    );
+    script.update(0.016);
+    // Two hits per outer pass, three passes - so the outer loop kept going.
+    assert_eq!(script.position().0, 6.0);
+}
+
+#[test]
+fn breaking_out_of_a_loop_still_releases_what_it_allocated() {
+    // The ownership question a `br` raises: a value taken inside the loop has
+    // to be let go even on the path that jumps out of it.
+    let mut script = Script::new(
+        "func update(dt: f32) {
+             let i = 0.0;
+             while i < 10.0 {
+                 let s = \"x\" + str(i);
+                 if i > 2.0 { break; }
+                 i += 1.0;
+             }
+             transform.position.x = 1.0;
+         }",
+    );
+    script.update(0.016);
+    let settled = script.heap_used();
+    for _ in 0..50 {
+        script.update(0.016);
+    }
+    assert_eq!(script.heap_used(), settled, "fifty frames leaked nothing");
+}

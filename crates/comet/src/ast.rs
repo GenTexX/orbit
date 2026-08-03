@@ -186,6 +186,14 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    /// Leave the innermost loop.
+    Break {
+        span: Span,
+    },
+    /// Go straight to the innermost loop's next iteration.
+    Continue {
+        span: Span,
+    },
     Return {
         value: Option<Expr>,
         span: Span,
@@ -341,6 +349,8 @@ impl Stmt {
             | Stmt::While { span, .. }
             | Stmt::For { span, .. }
             | Stmt::Return { span, .. }
+            | Stmt::Break { span }
+            | Stmt::Continue { span }
             | Stmt::Expr { span, .. } => *span,
             Stmt::If(if_stmt) => if_stmt.span,
         }

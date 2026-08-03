@@ -228,6 +228,10 @@ pub enum TypedStmt {
         cond: TypedExpr,
         body: TypedBlock,
     },
+    /// Leave the innermost loop. The checker has already proved there is one.
+    Break,
+    /// Go to the innermost loop's next iteration.
+    Continue,
     Return {
         value: Option<TypedExpr>,
     },

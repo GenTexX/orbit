@@ -1470,7 +1470,11 @@ fn visit_lets(block: &Block, offset: usize, out: &mut impl FnMut(&str, Option<&s
                 }
                 visit_lets(body, offset, out);
             }
-            Stmt::Assign { .. } | Stmt::Return { .. } | Stmt::Expr { .. } => {}
+            Stmt::Assign { .. }
+            | Stmt::Return { .. }
+            | Stmt::Break { .. }
+            | Stmt::Continue { .. }
+            | Stmt::Expr { .. } => {}
         }
     }
 }

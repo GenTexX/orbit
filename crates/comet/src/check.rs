@@ -22,6 +22,7 @@ use crate::tir::*;
 /// diagnostics still yields a tree - the bad parts are [`Type::Error`].
 pub fn check(script: &ast::Script, schema: &HostSchema) -> (TypedScript, Vec<Diagnostic>) {
     let mut checker = Checker {
+        loops: 0,
         templates: Vec::new(),
         structs: Vec::new(),
         arrays: Vec::new(),
@@ -64,6 +65,11 @@ struct Checker<'a> {
     arrays: Vec<Type>,
     /// State declared `const`, by name. Assigning to one is an error.
     constants: std::collections::HashSet<String>,
+    /// How many loops enclose the statement being checked. `break` and
+    /// `continue` outside one have nothing to act on, and saying so is the
+    /// checker's job - by the time codegen sees a `br` there is no source left
+    /// to blame.
+    loops: u32,
     /// Which functions something calls, by index.
     called: std::collections::HashSet<usize>,
     /// Concrete enums, in the order they were first needed. `Type::Enum`
@@ -1927,6 +1933,26 @@ impl Checker<'_> {
                 }
             }
 
+            ast::Stmt::Break { span } | ast::Stmt::Continue { span } => {
+                let is_break = matches!(stmt, ast::Stmt::Break { .. });
+                let word = if is_break { "break" } else { "continue" };
+                if self.loops == 0 {
+                    self.error(
+                        *span,
+                        format!("`{word}` is only meaningful inside a loop, and this is not"),
+                    );
+                    return TypedStmt::Expr(TypedExpr {
+                        kind: TypedExprKind::Error,
+                        ty: Type::Error,
+                        span: *span,
+                    });
+                }
+                match is_break {
+                    true => TypedStmt::Break,
+                    false => TypedStmt::Continue,
+                }
+            }
+
             ast::Stmt::If(if_stmt) => self.if_stmt(if_stmt),
 
             ast::Stmt::For { .. } => {
@@ -1936,10 +1962,10 @@ impl Checker<'_> {
             ast::Stmt::While { cond, body, .. } => {
                 let cond = self.expr(cond);
                 self.expect_type(Type::Bool, cond.ty, cond.span);
-                TypedStmt::While {
-                    cond,
-                    body: self.block(body),
-                }
+                self.loops += 1;
+                let body = self.block(body);
+                self.loops -= 1;
+                TypedStmt::While { cond, body }
             }
 
             ast::Stmt::Return { value, span } => {
@@ -4730,6 +4756,51 @@ mod tests {
                 &schema
             ),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn break_outside_a_loop_says_so_instead_of_blaming_a_variable() {
+        // Before `break` was a keyword it lexed as an identifier, so writing
+        // one reported "cannot find `break` in this scope" - a message that
+        // tells a learner they misspelled a variable.
+        assert_eq!(
+            messages("func update(dt: f32) { break; }"),
+            ["`break` is only meaningful inside a loop, and this is not"]
+        );
+        assert_eq!(
+            messages("func update(dt: f32) { continue; }"),
+            ["`continue` is only meaningful inside a loop, and this is not"]
+        );
+    }
+
+    #[test]
+    fn break_and_continue_are_fine_inside_a_loop_however_deep() {
+        check_clean(
+            "func update(dt: f32) {
+                 let i = 0.0;
+                 while i < 3.0 {
+                     i += 1.0;
+                     if i > 1.0 { if i > 2.0 { break; } continue; }
+                 }
+             }",
+        );
+    }
+
+    #[test]
+    fn a_loop_that_has_ended_does_not_leave_its_branches_behind() {
+        // The depth is tracked while emitting, so a `break` after a loop has
+        // closed has nothing to aim at - and the checker is what refuses it,
+        // not codegen.
+        assert_eq!(
+            messages(
+                "func update(dt: f32) {
+                     let i = 0.0;
+                     while i < 3.0 { i += 1.0; }
+                     break;
+                 }"
+            ),
+            ["`break` is only meaningful inside a loop, and this is not"]
         );
     }
 }
