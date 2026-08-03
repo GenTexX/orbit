@@ -45,6 +45,13 @@ pub struct Runtime {
     /// error, it is news. The frame carries on, the other scripts still run,
     /// and the host decides when to read this.
     problems: Vec<String>,
+    /// Lines printed by instances that no longer exist.
+    ///
+    /// A script's `on_destroy` is its last word, and it is said into a store
+    /// this drops moments later. Without somewhere for those lines to wait,
+    /// the one message a teardown prints is the one message nobody ever sees.
+    output: Vec<String>,
+    playing: bool,
 }
 
 impl Runtime {
@@ -59,6 +66,8 @@ impl Runtime {
             running: Vec::new(),
             input: Input::default(),
             problems: Vec::new(),
+            output: Vec::new(),
+            playing: false,
         })
     }
 
@@ -152,10 +161,11 @@ impl Runtime {
     /// script printed it - since `print("hi")` from two nodes is otherwise two
     /// identical lines.
     pub fn take_output(&mut self) -> Vec<String> {
-        self.running
-            .iter_mut()
-            .flat_map(|running| running.script.take_printed_tagged())
-            .collect()
+        let mut lines = std::mem::take(&mut self.output);
+        for running in &mut self.running {
+            lines.extend(running.script.take_printed_tagged());
+        }
+        lines
     }
 
     /// Take what has gone wrong since this was last called.
@@ -163,11 +173,95 @@ impl Runtime {
         std::mem::take(&mut self.problems)
     }
 
+    /// Whether a play session is running.
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    /// Start every script in the scene, in scene pre-order.
+    ///
+    /// Pre-order because it is the order the scene tree is written, read and
+    /// drawn in, so it is the order a person predicts. A parent runs before its
+    /// children, and siblings run in the order they appear in the panel. There
+    /// is no dependency between scripts to honour in Milestone 5 - nothing can
+    /// see another node - so the rule is chosen for how legible it is rather
+    /// than forced, and it is picked now because changing it later would change
+    /// what existing games do.
+    ///
+    /// A script that will not compile is reported and skipped. Never fatal:
+    /// one broken file in a scene of twenty must leave nineteen playable, or a
+    /// typo stops being a mistake and starts being an outage. The same goes for
+    /// a source file that has been moved or deleted since it was attached.
+    ///
+    /// Calling this while already playing does nothing. In-process Play leaves
+    /// the editing UI live and clickable, so pressing the button twice is a
+    /// thing that happens, and the honest answer to "start what is already
+    /// started" is nothing - certainly not silently restarting a game somebody
+    /// is in the middle of.
+    pub fn play(&mut self, scene: &mut Scene) {
+        if self.playing {
+            return;
+        }
+        self.playing = true;
+        for (node, component, source) in scripts_in_pre_order(scene) {
+            if let Err(err) = self.attach(scene, node, component) {
+                self.problems.push(format!("[{source}] {err}"));
+            }
+        }
+    }
+
+    /// End the session: every script's `on_destroy`, then nothing is running.
+    ///
+    /// In the same order they update in. Nothing in a scene can observe another
+    /// node yet, so no teardown order is forced, and one rule is easier to hold
+    /// in your head than two.
+    ///
+    /// Restoring the scene to what it was before Play is not done here. That is
+    /// the editor's to do, because it is the editor that has a document to put
+    /// back; a shipped game stopping is a game exiting.
+    pub fn stop(&mut self, scene: &mut Scene) {
+        if !self.playing {
+            return;
+        }
+        self.playing = false;
+        for mut running in std::mem::take(&mut self.running) {
+            if let Err(err) = running.script.destroy(scene, running.node) {
+                self.problems
+                    .push(format!("[{}] {err}", running.script.label()));
+            }
+            // Said into a store that is about to be dropped, so it is taken
+            // here or it is lost.
+            self.output.extend(running.script.take_printed_tagged());
+        }
+    }
+
     fn index_of(&self, node: NodeId, component: usize) -> Option<usize> {
         self.running
             .iter()
             .position(|running| running.node == node && running.component == component)
     }
+}
+
+/// Every script component in the scene, in pre-order: a node before its
+/// children, siblings left to right, and a node's own components in the order
+/// they were added.
+///
+/// Collected rather than walked lazily because starting a script takes the
+/// scene mutably - a state initializer can move the node it runs for - so the
+/// walk has to be finished before the first instantiation begins.
+fn scripts_in_pre_order(scene: &Scene) -> Vec<(NodeId, usize, String)> {
+    let mut found = Vec::new();
+    let mut stack = vec![scene.root()];
+    while let Some(node) = stack.pop() {
+        for (component, kind) in scene.node(node).components.iter().enumerate() {
+            if let Component::Script(script) = kind {
+                found.push((node, component, script.source.clone()));
+            }
+        }
+        // Reversed, because the stack hands them back in the order it pops.
+        stack.extend(scene.children(node).iter().rev().copied());
+    }
+    found
 }
 
 #[cfg(test)]
@@ -196,6 +290,40 @@ mod tests {
 
     fn x(scene: &Scene, node: NodeId) -> f32 {
         scene.node(node).transform.translation.x
+    }
+
+    /// Attach a script component naming `source` to `node`.
+    fn attach_script(scene: &mut Scene, node: NodeId, source: &str) {
+        scene
+            .node_mut(node)
+            .components
+            .push(Component::Script(ScriptComponent {
+                source: source.to_string(),
+                ..ScriptComponent::default()
+            }));
+    }
+
+    /// Write a script that prints `name` every frame.
+    fn announcer(dir: &Path, name: &str) -> String {
+        let file = format!("{name}.cmt");
+        std::fs::write(
+            dir.join(&file),
+            format!("func update(dt: f32) {{ print(\"{name}\"); }}"),
+        )
+        .expect("writing a script");
+        file
+    }
+
+    /// The names in the order they were printed, with the `[file]` tag off.
+    fn spoken(runtime: &mut Runtime) -> Vec<String> {
+        runtime
+            .take_output()
+            .iter()
+            .map(|line| {
+                line.rsplit_once("] ")
+                    .map_or(line.clone(), |(_, said)| said.to_string())
+            })
+            .collect()
     }
 
     #[test]
@@ -383,5 +511,170 @@ mod tests {
             2.0,
             "and it is still the one that runs first"
         );
+    }
+
+    #[test]
+    fn play_starts_every_script_in_scene_pre_order() {
+        // The order a person predicts is the order the panel shows: a parent
+        // before its children, siblings top to bottom, and a node's own
+        // components in the order they were added. Nothing in M5 depends on
+        // one script running before another, which is exactly why the rule has
+        // to be picked and pinned now - once a game relies on it, changing it
+        // breaks that game silently.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut scene = Scene::new("root");
+        let a = scene.add_child(scene.root(), Node::new("a"));
+        let child = scene.add_child(a, Node::new("a-child"));
+        let b = scene.add_child(scene.root(), Node::new("b"));
+
+        // The root carries one too: it is a node like any other.
+        let root = scene.root();
+        attach_script(&mut scene, root, &announcer(dir.path(), "root"));
+        // Two on one node, because a node may run several scripts.
+        attach_script(&mut scene, a, &announcer(dir.path(), "a-first"));
+        attach_script(&mut scene, a, &announcer(dir.path(), "a-second"));
+        attach_script(&mut scene, child, &announcer(dir.path(), "a-child"));
+        attach_script(&mut scene, b, &announcer(dir.path(), "b"));
+
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.play(&mut scene);
+        assert!(runtime.is_playing());
+        assert_eq!(runtime.len(), 5, "every script, including the root's");
+
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(
+            spoken(&mut runtime),
+            ["root", "a-first", "a-second", "a-child", "b"],
+            "depth first, siblings in order, components in order"
+        );
+    }
+
+    #[test]
+    fn a_script_that_will_not_compile_is_reported_and_the_rest_still_play() {
+        // One broken file in a scene of twenty has to leave nineteen playable,
+        // or a typo stops being a mistake and becomes an outage.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            dir.path().join("broken.cmt"),
+            "func update(dt: f32) { $$$ }",
+        )
+        .expect("writing the broken script");
+
+        let mut scene = Scene::new("root");
+        let broken = scene.add_child(scene.root(), Node::new("broken"));
+        let fine = scene.add_child(scene.root(), Node::new("fine"));
+        attach_script(&mut scene, broken, "broken.cmt");
+        attach_script(&mut scene, fine, &announcer(dir.path(), "fine"));
+
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.play(&mut scene);
+
+        assert_eq!(runtime.len(), 1, "the broken one is skipped, not fatal");
+        let problems = runtime.take_problems();
+        assert_eq!(problems.len(), 1, "and reported: {problems:?}");
+        assert!(
+            problems[0].contains("broken.cmt"),
+            "naming the file, since the message is about a file: {problems:?}"
+        );
+
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(spoken(&mut runtime), ["fine"], "the good one plays");
+    }
+
+    #[test]
+    fn a_source_file_that_is_gone_is_reported_rather_than_fatal() {
+        // Same policy, different failure: the component still names a file the
+        // project no longer has. Deleting a script in the explorer must not
+        // make Play unusable.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut scene = Scene::new("root");
+        let node = scene.add_child(scene.root(), Node::new("ghost"));
+        attach_script(&mut scene, node, "vanished.cmt");
+
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.play(&mut scene);
+
+        assert!(runtime.is_playing(), "the session still started");
+        assert!(runtime.is_empty());
+        let problems = runtime.take_problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("vanished.cmt"), "{problems:?}");
+    }
+
+    #[test]
+    fn stop_runs_on_destroy_and_keeps_its_last_words() {
+        // `on_destroy` is a script's last word and it is said into a store that
+        // is dropped moments later. Without somewhere for the line to wait, the
+        // one message a teardown prints is the one nobody ever sees.
+        let (dir, mut scene, _node) = project(
+            "func update(dt: f32) { transform.position.x += 1.0; }
+             func on_destroy() { print(\"bye\"); }",
+        );
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+
+        runtime.play(&mut scene);
+        runtime.step(&mut scene, 0.016);
+        assert!(
+            spoken(&mut runtime).is_empty(),
+            "nothing said while running"
+        );
+
+        runtime.stop(&mut scene);
+        assert!(!runtime.is_playing());
+        assert!(runtime.is_empty(), "and nothing is left running");
+        assert_eq!(spoken(&mut runtime), ["bye"]);
+    }
+
+    #[test]
+    fn stopping_and_playing_again_is_a_fresh_run() {
+        // Play is a rehearsal that can be run twice. The second one gets new
+        // instances, so `start` runs again and whatever the first run
+        // accumulated is gone.
+        let (dir, mut scene, node) = project(
+            "let count = 0.0;
+             func start() { count = 0.0; }
+             func update(dt: f32) { count += 1.0; transform.position.x = count; }",
+        );
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+
+        runtime.play(&mut scene);
+        for _ in 0..3 {
+            runtime.step(&mut scene, 0.016);
+        }
+        assert_eq!(x(&scene, node), 3.0);
+
+        runtime.stop(&mut scene);
+        runtime.play(&mut scene);
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, node), 1.0, "counting from the start again");
+    }
+
+    #[test]
+    fn pressing_play_while_playing_does_nothing() {
+        // In-process Play leaves the editing UI live and clickable, so this
+        // happens. Silently restarting a game somebody is in the middle of is
+        // the wrong answer to it.
+        let (dir, mut scene, node) = project(
+            "let count = 0.0;
+             func update(dt: f32) { count += 1.0; transform.position.x = count; }",
+        );
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+
+        runtime.play(&mut scene);
+        runtime.step(&mut scene, 0.016);
+        runtime.play(&mut scene);
+        runtime.step(&mut scene, 0.016);
+
+        assert_eq!(runtime.len(), 1, "one instance, not two");
+        assert_eq!(x(&scene, node), 2.0, "and it kept counting");
+    }
+
+    #[test]
+    fn stopping_when_nothing_is_playing_does_nothing() {
+        let (dir, mut scene, _node) = project("func on_destroy() { print(\"bye\"); }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.stop(&mut scene);
+        assert!(!runtime.is_playing());
+        assert!(spoken(&mut runtime).is_empty(), "nothing to tear down");
     }
 }
