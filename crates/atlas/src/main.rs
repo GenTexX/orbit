@@ -1017,6 +1017,7 @@ impl State {
             settings.show_grid,
             settings.show_axes,
             settings.snap.enabled,
+            false,
             Some(&icons),
             &TreeView::default(),
             "",
@@ -5967,6 +5968,7 @@ impl State {
                 self.show_grid,
                 self.show_axes,
                 self.snap.enabled,
+                self.play.is_playing(),
                 Some(&self.icons),
                 &self.tree_view(),
                 &self.tree_filter,
@@ -6510,6 +6512,9 @@ impl State {
                     self.history
                         .remove_component(&mut self.project.scene, node, index);
                     self.dirty = true;
+                }
+                AuroraEvent::Clicked(id) if Some(id) == self.rows.play_button => {
+                    self.toggle_play();
                 }
                 AuroraEvent::Clicked(id) if Some(id) == self.rows.settings_button => {
                     self.open_settings_modal();

@@ -86,6 +86,10 @@ pub enum Icon {
     Close,
     /// A gear/cog (opens the settings dialog).
     Settings,
+    /// A right-pointing triangle (start the game).
+    Play,
+    /// A filled square (stop the game and restore the scene).
+    Stop,
 }
 
 /// An icon's coverage predicate over the normalized `[0, 1]` square.
@@ -119,6 +123,8 @@ const SPECS: &[(Icon, Predicate)] = &[
     (Icon::ViewGrid, icon_view_grid),
     (Icon::Close, icon_close),
     (Icon::Settings, icon_settings),
+    (Icon::Play, icon_play),
+    (Icon::Stop, icon_stop),
 ];
 
 /// The registered icon images, looked up by [`Icon`].
@@ -586,6 +592,17 @@ fn icon_settings(x: f32, y: f32) -> bool {
     false
 }
 
+/// A right-pointing triangle: start the game.
+fn icon_play(x: f32, y: f32) -> bool {
+    tri(x, y, (0.26, 0.16), (0.26, 0.84), (0.82, 0.5))
+}
+
+/// A filled square: stop the game. Deliberately not a second triangle or a
+/// pause bar - Stop puts the scene back, and a shape that reads as "pause"
+/// would promise a resume that does not exist.
+fn icon_stop(x: f32, y: f32) -> bool {
+    rect(x, y, 0.24, 0.24, 0.76, 0.76)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

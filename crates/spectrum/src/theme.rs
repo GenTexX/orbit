@@ -158,6 +158,12 @@ pub const TOKENS: &[Token] = &[
         "Active gizmo-mode / toggled toolbar button",
     ),
     t(
+        "playing",
+        C,
+        "Accents",
+        "A game is running: the Stop button and the viewport's border",
+    ),
+    t(
         "axis_x",
         C,
         "Accents",

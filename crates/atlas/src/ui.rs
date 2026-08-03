@@ -44,6 +44,11 @@ pub struct EditorTheme {
     pub row_drop: Color,
     /// The active gizmo-mode toolbar button's background.
     pub mode_active: Color,
+    /// The colour that means a game is running: the Stop button's background
+    /// and the border around the viewport. Distinct from every other accent on
+    /// purpose - it has to read as a *mode* at a glance, from across the room,
+    /// because every scene edit is refused while it is showing.
+    pub playing: Color,
     /// Engine axis palette (X red, Y green) for the inspector's Vec2 labels.
     pub axis_x: Color,
     pub axis_y: Color,
@@ -90,6 +95,7 @@ impl EditorTheme {
             aurora: Theme::dark(),
             row_drop: Color::rgb(0.18, 0.40, 0.30),
             mode_active: Color::rgb(0.22, 0.38, 0.60),
+            playing: Color::rgb(0.85, 0.45, 0.15),
             axis_x: Color::rgb(0.90, 0.32, 0.32),
             axis_y: Color::rgb(0.35, 0.70, 0.38),
             console_warn: default_console_warn(),
@@ -120,6 +126,7 @@ impl EditorTheme {
             aurora: Theme::light(),
             row_drop: Color::rgb(0.55, 0.82, 0.66),
             mode_active: Color::rgb(0.62, 0.76, 0.96),
+            playing: Color::rgb(0.92, 0.55, 0.20),
             axis_x: Color::rgb(0.85, 0.30, 0.30),
             axis_y: Color::rgb(0.28, 0.62, 0.34),
             console_warn: Color::rgb(0.72, 0.55, 0.10),
@@ -425,6 +432,9 @@ pub struct EditorRows {
     pub snap: Option<WidgetId>,
     /// The toolbar's settings gear (opens the settings modal).
     pub settings_button: Option<WidgetId>,
+    /// The toolbar's Play/Stop button - the same widget in both states, since
+    /// it is one control with two labels rather than two controls.
+    pub play_button: Option<WidgetId>,
     /// The toolbar's gizmo-mode buttons, each mapped to the mode it selects.
     pub mode_buttons: Vec<(WidgetId, GizmoMode)>,
     /// Numeric inputs for the x/y components of a Vec2 field: submitting one
@@ -560,6 +570,7 @@ pub fn build_editor_ui(
     show_grid: bool,
     show_axes: bool,
     snap_enabled: bool,
+    playing: bool,
     icons: Option<&Icons>,
     tree: &TreeView,
     filter: &str,
@@ -602,6 +613,7 @@ pub fn build_editor_ui(
         show_grid,
         show_axes,
         snap_enabled,
+        playing,
         icons,
         viewport_handle,
         explorer,
@@ -645,6 +657,9 @@ struct PaneCtx<'a> {
     show_grid: bool,
     show_axes: bool,
     snap_enabled: bool,
+    /// Whether a game is running: the toolbar shows Stop and the viewport
+    /// wears a border, because every scene edit is refused while it is.
+    playing: bool,
     icons: Option<&'a Icons>,
     viewport_handle: ImageHandle,
     explorer: &'a FileExplorer,
@@ -1085,13 +1100,29 @@ fn build_viewport_pane(ui: &mut Ui, parent: WidgetId, ctx: &PaneCtx, rows: &mut 
         ctx.show_grid,
         ctx.show_axes,
         ctx.snap_enabled,
+        ctx.playing,
         ctx.icons,
         ctx.theme,
         rows,
     );
+    // While a game runs the scene view is framed in the playing color. A
+    // toolbar button alone is not enough: in-process Play leaves the editor
+    // fully clickable, so a drag that quietly does nothing has to be explained
+    // by something in the place the eye already is.
+    let frame = ui.panel(
+        col,
+        match ctx.playing {
+            true => Style::new()
+                .column()
+                .grow(1.0)
+                .clip()
+                .border(2.0, ctx.theme.playing),
+            false => Style::new().column().grow(1.0).clip(),
+        },
+    );
     // A drop target so a PNG dragged from the file explorer can land here.
     let viewport = ui.image(
-        col,
+        frame,
         ctx.viewport_handle,
         Style::new().grow(1.0).drop_target().accepts(DRAG_IMAGE),
     );
@@ -1142,6 +1173,7 @@ fn build_toolbar(
     show_grid: bool,
     show_axes: bool,
     snap_enabled: bool,
+    playing: bool,
     icons: Option<&Icons>,
     theme: &EditorTheme,
     rows: &mut EditorRows,
@@ -1157,6 +1189,27 @@ fn build_toolbar(
             .border_bottom(theme.aurora.border_width, theme.aurora.panel_border),
     );
     let icon = |id: Icon| icons.map(|i| i.get(id));
+
+    // Play first, and on its own. It is not a tool and not a view toggle - it
+    // changes what the whole editor is doing - so it sits ahead of the run
+    // rather than inside it, and it is highlighted while running so the mode
+    // reads from the button as well as from the viewport.
+    let play = toolbar_button(
+        ui,
+        bar,
+        if playing { "Stop" } else { "Play" },
+        icon(if playing { Icon::Stop } else { Icon::Play }),
+        playing,
+        theme,
+    );
+    if playing {
+        // The playing colour rather than the toggled-button one. A gizmo mode
+        // and a running game are both "on", but only one of them changes what
+        // every other click in the editor does, and they should not look alike.
+        ui.set_background(play, theme.playing);
+    }
+    rows.play_button = Some(play);
+    toolbar_separator(ui, bar, theme);
 
     // What the pointer is doing: select, then the three transforms. First
     // because it is what a hand reaches for most, and the active one is
@@ -3500,6 +3553,7 @@ mod tests {
             true,
             true,
             false,
+            false,
             icons,
             tree,
             "",
@@ -3560,6 +3614,7 @@ mod tests {
             GizmoMode::Select,
             true,
             true,
+            false,
             false,
             None,
             &TreeView::default(),
@@ -3964,6 +4019,7 @@ mod tests {
             true,
             true,
             false,
+            false,
             None,
             &TreeView::default(),
             "",
@@ -4003,6 +4059,7 @@ mod tests {
             GizmoMode::Select,
             true,
             true,
+            false,
             false,
             None,
             &TreeView::default(),
@@ -4120,6 +4177,7 @@ mod tests {
             true,
             true,
             false,
+            false,
             None,
             &TreeView::default(),
             "",
@@ -4173,6 +4231,7 @@ mod tests {
             GizmoMode::Select,
             true,
             true,
+            false,
             false,
             None,
             &TreeView::default(),
@@ -4332,6 +4391,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Build the shell with the game running or stopped, and lay it out.
+    fn build_at_play(playing: bool) -> (Ui, EditorRows) {
+        let (scene, handle) = demo_scene();
+        let explorer = test_explorer();
+        let thumbnails = Thumbnails::new();
+        let (mut ui, rows) = build_editor_ui(
+            &scene,
+            &HashSet::new(),
+            None,
+            handle,
+            &explorer,
+            &thumbnails,
+            3,
+            &DockNode::default_layout(),
+            &HashMap::new(),
+            None,
+            GizmoMode::Select,
+            true,
+            true,
+            false,
+            playing,
+            None,
+            &TreeView::default(),
+            "",
+            None,
+            &InspectorView::default(),
+            &[],
+            true,
+            None,
+            "",
+            false,
+            false,
+            &[],
+            &[],
+            &EditorTheme::default(),
+        );
+        ui.layout(Vec2::new(1200.0, 800.0)).unwrap();
+        (ui, rows)
+    }
+
+    #[test]
+    fn the_play_button_is_one_control_with_two_states() {
+        // The same widget both ways round: Play when stopped, Stop when
+        // running, highlighted while running. Two separate buttons would let
+        // both be showing at once, which is a state that means nothing.
+        let theme = EditorTheme::default();
+
+        let (ui, rows) = build_at_play(false);
+        let button = rows.play_button.expect("the toolbar has a play button");
+        let aurora::WidgetKind::Button(label) = ui.kind(button) else {
+            panic!("it is a button");
+        };
+        assert_eq!(label, "Play");
+        assert_eq!(
+            ui.background(button),
+            theme.aurora.panel_bg,
+            "and it blends into the toolbar when nothing is running"
+        );
+
+        let (ui, rows) = build_at_play(true);
+        let button = rows.play_button.expect("the toolbar has a play button");
+        let aurora::WidgetKind::Button(label) = ui.kind(button) else {
+            panic!("it is a button");
+        };
+        assert_eq!(label, "Stop");
+        assert_eq!(
+            ui.background(button),
+            theme.playing,
+            "and it wears the playing colour while a game runs"
+        );
+    }
+
+    #[test]
+    fn the_viewport_is_framed_while_a_game_runs() {
+        // The button alone is not enough. In-process Play (ADR 0002) leaves the
+        // whole editor clickable while every scene edit is refused, so the mode
+        // has to be visible where the eye already is - which is the scene.
+        let theme = EditorTheme::default();
+
+        let (ui, rows) = build_at_play(false);
+        let frame = ui
+            .parent(rows.viewport.expect("a viewport"))
+            .expect("it is inside a frame");
+        assert_eq!(ui.border(frame).0, 0.0, "no frame when nothing is running");
+
+        let (ui, rows) = build_at_play(true);
+        let frame = ui
+            .parent(rows.viewport.expect("a viewport"))
+            .expect("it is inside a frame");
+        let (width, color) = ui.border(frame);
+        assert!(width > 0.0, "the scene view is framed while a game runs");
+        assert_eq!(color, theme.playing, "in the colour that means playing");
     }
 
     #[test]

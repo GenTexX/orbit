@@ -622,6 +622,14 @@ impl Ui {
         self.widgets[id].background
     }
 
+    /// A widget's border, as `(width, color)`. The companion to
+    /// [`background`](Self::background), and for the same reason: an app that
+    /// draws state as a border needs a way to assert it drew one.
+    pub fn border(&self, id: WidgetId) -> (f32, Color) {
+        let widget = &self.widgets[id];
+        (widget.border_width, widget.border_color)
+    }
+
     /// Replace a label's text. It is re-shaped and re-measured on the next
     /// [`layout`](Self::layout); a no-op on non-label widgets, and a no-op (no
     /// layout invalidation) when the text is unchanged - so an app that re-sets a

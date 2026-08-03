@@ -121,6 +121,7 @@ theme_tokens! {
     "field_border": Color => aurora.field_border,
     "tab_border": Color => aurora.tab_border,
     "mode_active": Color => mode_active,
+    "playing": Color => playing,
     "axis_x": Color => axis_x,
     "axis_y": Color => axis_y,
     "console_warn": Color => console_warn,
