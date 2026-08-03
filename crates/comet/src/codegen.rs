@@ -2597,6 +2597,40 @@ mod tests {
         bytes
     }
 
+    #[test]
+    fn an_enum_payload_is_measured_after_struct_fields_are_known() {
+        // Non-generic enums used to be laid out before struct fields were
+        // resolved, so a struct payload measured zero slots and the enum
+        // carried a region too small for what emission wrote into it. The
+        // checker was happy; wasmparser was not - which is why this test lives
+        // here and validates rather than only checking diagnostics.
+        compile_valid(
+            "struct P { x: f32, y: f32 }\nenum E { None, At(P) }\n\
+             func update(dt: f32) { let e = E::At(P { x: 1.0, y: 2.0 }); \
+             let got = match e { None => 0.0, At(p) => p.y }; print(str(got)); }",
+        );
+        // Declaration order must not matter.
+        compile_valid(
+            "enum E { None, At(P) }\nstruct P { x: f32, y: f32 }\n\
+             func update(dt: f32) { let e = E::At(P { x: 1.0, y: 2.0 }); \
+             let got = match e { None => 0.0, At(p) => p.y }; print(str(got)); }",
+        );
+        // A one-field struct payload standing alone: the case where nothing
+        // else is wide enough to hide the zero.
+        compile_valid(
+            "struct One { v: f32 }\nenum W { Only(One) }\n\
+             func update(dt: f32) { let w = W::Only(One { v: 3.0 }); \
+             let got = match w { Only(o) => o.v }; print(str(got)); }",
+        );
+        // And a generic instantiated *during* the struct pass, before the
+        // struct it names has its fields - which is what the re-measure covers.
+        compile_valid(
+            "struct S { maybe: Option<P> }\nstruct P { x: f32, y: f32 }\n\
+             func update(dt: f32) { let s = S { maybe: Option::Some(P { x: 1.0, y: 2.0 }) }; \
+             let got = match s.maybe { None => 0.0, Some(p) => p.y }; print(str(got)); }",
+        );
+    }
+
     /// A script touching every emission path: all four arithmetic ops, all six
     /// comparisons, both logical ops, unary minus and not, if/else, while, a
     /// user call, a Vec2 return, Vec2 field reads off a local, both axis writes

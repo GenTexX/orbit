@@ -841,6 +841,93 @@ impl Checker<'_> {
 
     /// How many wasm slots a value of this type occupies. The checker needs it
     /// only to size an enum's payload; codegen has the authoritative version.
+    /// Report every struct that can reach itself through its fields, and cut
+    /// the field that closes the loop so the layout walks below terminate.
+    ///
+    /// Cutting matters as much as reporting: the script already has an error so
+    /// nothing will be emitted, but `slots` and `default_value` are called
+    /// again on the way to collecting the *rest* of the diagnostics, and a
+    /// checker that overflows the stack reports nothing at all.
+    fn break_struct_cycles(&mut self, script: &ast::Script) {
+        let mut cut = Vec::new();
+        for index in 0..self.structs.len() {
+            for (field, decl) in self.structs[index].fields.iter().zip(
+                script
+                    .structs
+                    .get(index)
+                    .map(|d| d.fields.as_slice())
+                    .unwrap_or(&[]),
+            ) {
+                let mut seen = Vec::new();
+                if self.reaches_struct(field.ty, index as u32, &mut seen) {
+                    cut.push((index, field.name.clone(), decl.span));
+                }
+            }
+        }
+        for (index, field, span) in cut {
+            let name = self.structs[index].name.clone();
+            self.error(
+                span,
+                format!(
+                    "`{name}` contains itself through `{field}`, so it has no size - a value \
+                     cannot hold one of its own type",
+                ),
+            );
+            if let Some(f) = self.structs[index]
+                .fields
+                .iter_mut()
+                .find(|f| f.name == field)
+            {
+                f.ty = Type::Error;
+            }
+        }
+    }
+
+    /// Whether `ty` can reach struct `target` by walking fields and enum
+    /// payloads - the two things that are laid out inline. An `Array<T>` is a
+    /// reference and one slot wide whatever it holds, so it ends the walk: a
+    /// struct may hold an array of itself.
+    fn reaches_struct(&self, ty: Type, target: u32, seen: &mut Vec<u32>) -> bool {
+        match ty {
+            Type::Struct(index) => {
+                if index == target {
+                    return true;
+                }
+                if seen.contains(&index) {
+                    return false;
+                }
+                seen.push(index);
+                self.structs[index as usize]
+                    .fields
+                    .clone()
+                    .iter()
+                    .any(|f| self.reaches_struct(f.ty, target, seen))
+            }
+            Type::Enum(index) => self.enums[index as usize]
+                .variants
+                .clone()
+                .iter()
+                .flat_map(|v| v.payload.clone())
+                .any(|p| self.reaches_struct(p, target, seen)),
+            _ => false,
+        }
+    }
+
+    /// Re-measure every enum instance's payload region, now that struct field
+    /// lists are filled in.
+    fn resize_enum_payloads(&mut self) {
+        for index in 0..self.enums.len() {
+            let widest = self.enums[index]
+                .variants
+                .clone()
+                .iter()
+                .map(|v| v.payload.iter().map(|t| self.slots(*t)).sum::<usize>())
+                .max()
+                .unwrap_or(0);
+            self.enums[index].payload_slots = widest;
+        }
+    }
+
     fn slots(&self, ty: Type) -> usize {
         match ty {
             Type::Vec2 => 2,
@@ -1201,15 +1288,6 @@ impl Checker<'_> {
             });
         }
 
-        // A non-generic enum has exactly one layout, so it is built now and its
-        // name resolves like any other type's.
-        for index in 0..self.templates.len() {
-            if self.templates[index].params.is_empty() {
-                let span = self.templates[index].span;
-                self.instantiate(index, &[], span);
-            }
-        }
-
         // Then their fields, and the offset each sits at.
         for (index, decl) in script.structs.iter().enumerate() {
             let mut fields: Vec<TypedField> = Vec::new();
@@ -1237,6 +1315,33 @@ impl Checker<'_> {
             }
             self.structs[index].fields = fields;
         }
+
+        // A struct that contains itself has no finite layout, the same rule ADR
+        // 0024 states and `instantiate` has always enforced for enums. Nothing
+        // enforced it here, and both `slots` and `default_value` recurse through
+        // fields, so `struct A { b: A }` overflowed the stack - taking the
+        // editor with it, since the checker runs on the live buffer.
+        self.break_struct_cycles(script);
+
+        // A non-generic enum has exactly one layout, so it is built now and its
+        // name resolves like any other type's.
+        //
+        // After the struct pass, not before it: an enum's payload width is the
+        // widest variant, and measuring a struct variant while that struct's
+        // field list was still empty made it zero. The enum then carried a
+        // payload region too small for what codegen wrote into it, and the
+        // module failed wasmparser rather than the checker - unless another
+        // variant happened to be at least as wide, which hid it.
+        for index in 0..self.templates.len() {
+            if self.templates[index].params.is_empty() {
+                let span = self.templates[index].span;
+                self.instantiate(index, &[], span);
+            }
+        }
+        // Any enum built on demand *during* the struct pass measured the same
+        // empty fields, so every instance is re-measured now that they are
+        // known. Cheap, and it means no arrival order can leave a stale width.
+        self.resize_enum_payloads();
 
         // Signatures first, so a function can call one defined later and a
         // global initializer can call any of them.
@@ -4194,6 +4299,36 @@ mod tests {
             messages("struct P { }"),
             ["a struct needs at least one field"]
         );
+    }
+
+    #[test]
+    fn a_struct_that_contains_itself_is_reported_not_a_stack_overflow() {
+        // ADR 0024 says a struct cannot contain itself; nothing enforced it, and
+        // both `slots` and `default_value` recurse through fields, so this used
+        // to abort the process rather than produce a diagnostic.
+        assert_eq!(
+            messages("struct A { b: A }\nlet x: A;"),
+            [
+                "`A` contains itself through `b`, so it has no size - a value cannot hold one of \
+              its own type"
+            ]
+        );
+        // Mutually, too - the cycle is not always one hop.
+        assert!(
+            messages("struct A { b: B }\nstruct B { a: A }\nfunc f(a: A) { }")
+                .iter()
+                .any(|m| m.contains("contains itself")),
+        );
+        // And through an enum payload, which is laid out inline just as a field
+        // is. Neither of these should hang or overflow.
+        assert!(
+            messages("struct S { e: E }\nenum E { N, V(S) }\nfunc f(s: S) { }")
+                .iter()
+                .any(|m| m.contains("contains itself") || m.contains("has no size")),
+        );
+        // An array is a reference and one slot wide whatever it holds, so a
+        // struct may hold an array of itself. That is not a cycle.
+        check_clean("struct Tree { kids: Array<Tree>, value: f32 }\nlet x: Tree;");
     }
 
     #[test]
