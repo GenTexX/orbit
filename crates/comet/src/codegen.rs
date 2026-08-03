@@ -1023,7 +1023,24 @@ fn emit_function(
     globals: &Globals,
     literals: &Literals,
 ) -> Function {
-    let depth = block_depth(&f.body);
+    // Emit once to find out how deep this body actually nests, then emit for
+    // real with exactly that many frames declared.
+    //
+    // The alternative - a parallel tree walk predicting what the emitter does -
+    // was wrong four separate times on 2026-08-03 alone, and each time it was
+    // wrong the compiler panicked with an index out of bounds, no diagnostic
+    // and no source location. It could not be otherwise: the walk and the
+    // emitter are two descriptions of one thing, kept in step by hand. The
+    // emitter cannot disagree with itself.
+    //
+    // The probe's output is thrown away, so the only cost is emitting twice,
+    // and a comet function is small next to what Cranelift then does with it.
+    let depth = {
+        let mut probe = FnGen::new(&f.locals, f.param_count, 0, layouts, globals, literals);
+        probe.block(&f.body);
+        probe.release_owned();
+        probe.high_water
+    };
     let mut out = FnGen::new(&f.locals, f.param_count, depth, layouts, globals, literals);
     // A tail expression is the return value. It stays on the stack while the
     // locals it may have been read from are released - it already holds its own
@@ -1055,12 +1072,18 @@ fn emit_init(script: &TypedScript, globals: &Globals, literals: &Literals) -> Fu
     // over a value that owns something parks the incoming one and walks the old
     // one. Easy to forget here, because this function's statements are built
     // rather than parsed - which is exactly how it was forgotten.
-    let depth = script
-        .state
-        .iter()
-        .map(|s| expr_depth(&s.init).max(place_depth(&Place::Global(s.slot))))
-        .max();
-    let mut out = FnGen::new(&[], 0, depth.unwrap_or(0), layouts, globals, literals);
+    // Same two passes as `emit_function`, and this one is why: its statements
+    // are built rather than parsed, so the walk that used to predict its depth
+    // never saw them and every store_global here was one frame short.
+    let depth = {
+        let mut probe = FnGen::new(&[], 0, 0, layouts, globals, literals);
+        for state in &script.state {
+            probe.expr(&state.init);
+            probe.store_global(state.slot);
+        }
+        probe.high_water
+    };
+    let mut out = FnGen::new(&[], 0, depth, layouts, globals, literals);
     for state in &script.state {
         out.expr(&state.init);
         out.store_global(state.slot);
@@ -1152,128 +1175,6 @@ fn spare_width(enums: &[TypedEnum], structs: &[TypedStruct]) -> u32 {
     widest_enum.max(widest_struct).max(2)
 }
 
-/// The greatest number of [`Frame`]s a block can need at once.
-fn block_depth(block: &TypedBlock) -> usize {
-    let stmts = block.stmts.iter().map(stmt_depth);
-    let tail = block.tail.iter().map(expr_depth);
-    stmts.chain(tail).max().unwrap_or(0)
-}
-
-fn stmt_depth(stmt: &TypedStmt) -> usize {
-    match stmt {
-        TypedStmt::Let { init, .. } => expr_depth(init),
-        // An assignment's depth is its place's, with the value evaluated
-        // *inside* it rather than beside it. Taking the max of the two was
-        // wrong for `a[i] = v`: `assign` enters a frame for the element and
-        // `store_element` enters a second, and only then is the value
-        // evaluated - so an ordinary expression on the right ran off the end of
-        // the frame table and panicked the compiler with no source location.
-        TypedStmt::Assign { place, value } => match place {
-            Place::Element { array, index, .. } => {
-                2 + expr_depth(array)
-                    .max(expr_depth(index))
-                    .max(expr_depth(value))
-            }
-            other => expr_depth(value).max(place_depth(other)),
-        },
-        TypedStmt::If {
-            cond,
-            then,
-            otherwise,
-        } => expr_depth(cond)
-            .max(block_depth(then))
-            .max(otherwise.as_ref().map_or(0, block_depth)),
-        TypedStmt::While { cond, body } => expr_depth(cond).max(block_depth(body)),
-        TypedStmt::Return { value } => value.as_ref().map_or(0, expr_depth),
-        TypedStmt::Expr(e) => expr_depth(e),
-    }
-}
-
-/// How many frames writing to `place` needs.
-fn place_depth(place: &Place) -> usize {
-    match place {
-        Place::Element { array, index, .. } => 2 + expr_depth(array).max(expr_depth(index)),
-        // Writing over a value that owns something parks the incoming one and
-        // then walks the old one, and the walk nests: a struct global's enum
-        // field is copied into a scratch region, and releasing an array inside
-        // that takes another. Four, generously - a frame costs only locals the
-        // JIT drops, and the alternative is this number being one too small on
-        // a shape nobody wrote down. Counting frames by emitting once and
-        // taking the high-water mark would retire the whole class; see the
-        // 2026-08-03 review.
-        Place::Local(_) | Place::Global(_) => 4,
-        _ => 0,
-    }
-}
-
-/// Whether emitting `expr` needs a frame of its own, and how deep the ones
-/// inside it go.
-fn expr_depth(expr: &TypedExpr) -> usize {
-    use TypedExprKind as K;
-    let (mine, children): (usize, Vec<&TypedExpr>) = match &expr.kind {
-        K::Binary { op, lhs, rhs } => {
-            let parks = matches!(
-                op,
-                BinaryOp::RemF32
-                    | BinaryOp::ConcatStr
-                    | BinaryOp::AddVec2
-                    | BinaryOp::SubVec2
-                    | BinaryOp::MulVec2F32
-                    | BinaryOp::MulF32Vec2
-                    | BinaryOp::DivVec2F32
-            );
-            (usize::from(parks), vec![lhs, rhs])
-        }
-        // Print parks the string to release it after the call.
-        K::HostCall { host, args } => (
-            usize::from(*host == Host::Print),
-            args.iter().collect::<Vec<_>>(),
-        ),
-        K::Unary { op, operand } => (usize::from(*op == UnaryOp::NegVec2), vec![operand]),
-        K::MakeVec2 { x, y } => (0, vec![x, y]),
-        K::Call { args, .. } => (0, args.iter().collect()),
-        K::Widen(inner) | K::Narrow(inner) => (0, vec![inner]),
-        K::MakeVariant { args, .. } => (0, args.iter().collect()),
-        K::MakeStruct { fields, .. } => (0, fields.iter().collect()),
-        // Building an array parks the handle, and writing each element parks
-        // the address and the value - two levels, not one.
-        K::MakeArray { elements, .. } => (2, elements.iter().collect()),
-        // Indexing parks the address while the element is read out of it.
-        K::Index { array, index, .. } => (1, vec![array, index]),
-        // `get` parks the handle, the index and the result it is building.
-        K::ArrayGet { array, index, .. } => (1, vec![array, index]),
-        // `push` parks the handle and then writes an element, which parks
-        // again. `len` and `copy` need one, and taking the larger costs a
-        // couple of locals the JIT drops.
-        K::ArrayOp { array, value, .. } => (
-            2,
-            std::iter::once(array.as_ref())
-                .chain(value.as_deref())
-                .collect(),
-        ),
-        // Picking a field out of a value parks the whole of it first.
-        K::Field { receiver, .. } => (1, vec![receiver]),
-        // A match parks its scrutinee to read the tag and then unpack from it.
-        K::Match {
-            scrutinee, arms, ..
-        } => (
-            1,
-            std::iter::once(scrutinee.as_ref())
-                .chain(arms.iter().map(|a| &a.body))
-                .collect(),
-        ),
-        K::Number(_)
-        | K::Int(_)
-        | K::Bool(_)
-        | K::Str(_)
-        | K::Local(_)
-        | K::Global(_)
-        | K::HostField { .. }
-        | K::Error => (0, Vec::new()),
-    };
-    mine + children.into_iter().map(expr_depth).max().unwrap_or(0)
-}
-
 struct FnGen<'a> {
     func: Function,
     /// Logical slot -> its first wasm local index.
@@ -1287,10 +1188,16 @@ struct FnGen<'a> {
     structs: &'a [TypedStruct],
     /// The element type of each array type the script uses.
     arrays: &'a [Type],
-    /// One set of scratch locals per level of nesting that needs them, and a
-    /// cursor into it. See [`FnGen::enter_frame`].
-    frames: Vec<Frame>,
+    /// Where the first frame's locals start, and how wide one frame is. A
+    /// frame is computed from these rather than looked up, so there is no table
+    /// to run off the end of. See [`FnGen::enter_frame`].
+    frame_base: u32,
+    frame_width: u32,
+    spare: u32,
     frame: usize,
+    /// The deepest frame this function actually reached, which is what the
+    /// locals list is sized from on the second pass.
+    high_water: usize,
     globals: &'a Globals,
     literals: &'a Literals,
 }
@@ -1318,23 +1225,14 @@ impl<'a> FnGen<'a> {
         // Scratch locals come in frames, one per level of nesting that needs
         // them. A single shared set would be wrong: the outer `%` in
         // `(a % b) % (c % d)` parks its left operand, then evaluates a right
-        // operand that parks its own - and would overwrite it. wasm-encoder
-        // wants the local list before the first instruction, so the depth is
-        // measured up front rather than discovered while emitting.
+        // operand that parks its own - and would overwrite it.
+        //
+        // `depth` sizes the *declared* locals and nothing else. Frames are
+        // arithmetic, so asking for one deeper than that is not a panic - it is
+        // just a local index, and the second pass declares enough of them. See
+        // `emit_function`.
         let spare = spare_width(enums, structs);
         let frame_width = FRAME_SCRATCH + spare * 3;
-        let frames: Vec<Frame> = (0..depth + 1)
-            .map(|i| {
-                let base = next + (i as u32) * frame_width;
-                Frame {
-                    f32s: [base, base + 1, base + 2],
-                    i32s: [base + 3, base + 4, base + 5, base + 6],
-                    enum_base: base + FRAME_SCRATCH,
-                    result_base: base + FRAME_SCRATCH + spare,
-                    spare_f32: base + FRAME_SCRATCH + spare * 2,
-                }
-            })
-            .collect();
 
         let declared: Vec<ValType> = slot_types[param_count..]
             .iter()
@@ -1342,7 +1240,7 @@ impl<'a> FnGen<'a> {
             // Three f32 scratches, then the i32 regions - four scratches, the
             // parked enum, the match result - then an f32 region for parking a
             // value whose slots are floats.
-            .chain(frames.iter().flat_map(|_| {
+            .chain((0..depth + 1).flat_map(|_| {
                 [ValType::F32; 3]
                     .into_iter()
                     .chain(std::iter::repeat_n(
@@ -1376,8 +1274,11 @@ impl<'a> FnGen<'a> {
             enums,
             structs,
             arrays,
-            frames,
+            frame_base: next,
+            frame_width,
+            spare,
             frame: 0,
+            high_water: 0,
             globals,
             literals,
         }
@@ -1387,8 +1288,9 @@ impl<'a> FnGen<'a> {
     /// evaluated inside gets a different set. Returns the frame by value, which
     /// is what keeps the borrow checker from letting two levels share one.
     fn enter_frame(&mut self) -> Frame {
-        let frame = self.frames[self.frame];
+        let frame = self.frame_at(self.frame);
         self.frame += 1;
+        self.high_water = self.high_water.max(self.frame);
         frame
     }
 
@@ -1400,7 +1302,22 @@ impl<'a> FnGen<'a> {
     /// write a scratch local and read it back with nothing evaluated in
     /// between - which is every user except `%`, `+` on strings, and `print`.
     fn scratch(&self) -> Frame {
-        self.frames[self.frame]
+        self.frame_at(self.frame)
+    }
+
+    /// Where level `index`'s scratch locals live. Arithmetic, not a lookup:
+    /// asking for a level deeper than the locals list currently covers yields a
+    /// perfectly good index, and the emitter's own high-water mark is what
+    /// decides how many to declare.
+    fn frame_at(&self, index: usize) -> Frame {
+        let base = self.frame_base + index as u32 * self.frame_width;
+        Frame {
+            f32s: [base, base + 1, base + 2],
+            i32s: [base + 3, base + 4, base + 5, base + 6],
+            enum_base: base + FRAME_SCRATCH,
+            result_base: base + FRAME_SCRATCH + self.spare,
+            spare_f32: base + FRAME_SCRATCH + self.spare * 2,
+        }
     }
 
     fn finish(mut self) -> Function {
@@ -2973,6 +2890,53 @@ mod tests {
             .expect("fixture should compile clean");
         wasmparser::validate(&bytes).expect("emitted module must validate");
         bytes
+    }
+
+    #[test]
+    fn nesting_of_any_shape_emits_rather_than_panicking() {
+        // The frame count comes from emitting the body once and taking the
+        // high-water mark, so it cannot disagree with what emission does. This
+        // is the shape of test that a hand-maintained pre-pass kept failing:
+        // each of these was a separate "index out of bounds" panic in the
+        // compiler, with no diagnostic and no source location.
+        for body in [
+            // Assignment places, which nest the value inside the place.
+            "a[0] = a[0] + a[1];",
+            "a[0] = b[c[0]];",
+            "a[0] = (a[0] + a[0]) * dt;",
+            "a[0] = dt % (dt % 2.0);",
+            "s = str(dt) + (str(dt) + str(dt));",
+            // Modulo, which parks its left operand while the right is built.
+            "let m = (dt % 2.0) % (dt % 3.0);",
+            "let m = ((dt % 2.0) % (dt % 3.0)) % ((dt % 4.0) % (dt % 5.0));",
+            // Field access parks the whole receiver first.
+            "let v = p.left.value + p.right.value;",
+            "q = Pair { left: p.right, right: p.left };",
+            // A match parks its scrutinee, and an arm can do it again.
+            "let g = match o { None => 0.0, Some(n) => match o { None => n, Some(k) => k + n } };",
+            // Arrays park the handle, the address and the value.
+            "push(a, a[0] + a[1]);",
+            "let c2 = copy(a); push(c2, c2[0] % (dt % 2.0));",
+            // Strings, which allocate and park.
+            "print(str(dt) + \"/\" + str(dt) + \"/\" + str(dt));",
+        ] {
+            compile_valid(&format!(
+                "struct Named {{ label: String, value: f32 }}\n\
+                 struct Pair {{ left: Named, right: Named }}\n\
+                 let s: String = \"\";\n\
+                 let q: Pair = Pair {{ left: Named {{ label: \"a\", value: 0.0 }}, \
+                 right: Named {{ label: \"b\", value: 0.0 }} }};\n\
+                 func update(dt: f32) {{\n\
+                   let a = [1.0, 2.0];\n\
+                   let b = [3.0, 4.0];\n\
+                   let c = [0, 1];\n\
+                   let p = Pair {{ left: Named {{ label: \"l\", value: 1.0 }}, \
+                   right: Named {{ label: \"r\", value: 2.0 }} }};\n\
+                   let o = get(a, 0);\n\
+                   {body}\n\
+                 }}"
+            ));
+        }
     }
 
     #[test]
