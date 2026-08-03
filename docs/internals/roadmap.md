@@ -56,6 +56,7 @@ After Milestone 4 the [Comet language design record](comet-language-design.md) t
 **Done when:** you attach a Comet script to a node, press Play, the game runs *in the viewport*, and **saving the script reloads it** while preserving reflected field values.
 **Proves:** the killer feature and the reason the whole architecture is shaped this way - in-process runtime, reflection driving both inspector and hot-reload migration, input feeding the running game.
 **Brings online:** `voyager` as a library embedded by the editor; the hot-reload field-migration path.
+**Plan:** [Milestone 5 - Play & Hot Reload](plans/milestone-5-play.md) (ADRs 0002, 0008, 0016, 0020, 0022).
 
 **"Hot reload" here means the file changed on disk and the game noticed** - decided 2026-08-03, after the review found that the original sentence was compatible with two different milestones. The trigger is a save or an external edit, found by an mtime poll modelled on the theme's; the reload path recompiles and swaps the instance and never writes into the Code pane's buffer. *Typing in the Code pane while the game runs in the same window* is deliberately **not** M5: it makes the in-place inspector refresh, console-output-without-a-rebuild, and the input seam into prerequisites rather than polish, and roughly doubles the milestone. It becomes its own iteration afterwards.
 
