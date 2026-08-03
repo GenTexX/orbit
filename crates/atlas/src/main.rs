@@ -718,6 +718,26 @@ fn completion_colors(
 /// The value an exported variable of this type starts at, as the inspector's
 /// `Value`. `None` for a type that cannot be stored on a component - the
 /// checker refuses those, so this is the same rule seen from the other side.
+/// What an exported field starts at: the script's own initializer when it wrote
+/// a literal one, and the type's zero otherwise.
+///
+/// ADR 0022 says the initializer is "the default used when the field is first
+/// created", the component's doc comment says it, and the warning a person
+/// reads when they write one says it. It was not true - the value was thrown
+/// away and every field started at zero, so the very first thing anyone does
+/// with a tunable script produced a node that did not move.
+fn default_of(exported: &comet::Exported) -> Option<helios::Value> {
+    match exported.default {
+        Some(comet::ExportDefault::F32(v)) => Some(helios::Value::F32(v)),
+        Some(comet::ExportDefault::Int(v)) => Some(helios::Value::Int(v)),
+        Some(comet::ExportDefault::Bool(v)) => Some(helios::Value::Bool(v)),
+        Some(comet::ExportDefault::Vec2(x, y)) => Some(helios::Value::Vec2(Vec2::new(x, y))),
+        // Not a literal - a call, or a read of something else. It has no value
+        // until the module runs, and guessing is worse than the type's zero.
+        None => default_for(exported.ty),
+    }
+}
+
 fn default_for(ty: comet::Type) -> Option<helios::Value> {
     Some(match ty {
         comet::Type::F32 => helios::Value::F32(0.0),
@@ -4053,7 +4073,7 @@ impl State {
                 .collect();
             let declared: Vec<(String, helios::Value)> = exported
                 .into_iter()
-                .filter_map(|e| Some((e.name, default_for(e.ty)?)))
+                .filter_map(|e| Some((e.name.clone(), default_of(&e)?)))
                 .collect();
             let helios::Component::Script(script) =
                 &mut self.project.scene.node_mut(node).components[index]
