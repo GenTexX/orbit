@@ -3157,8 +3157,14 @@ pub fn value_to_text(value: &Value) -> String {
 /// field's type, since text alone does not). `None` on anything that does not
 /// parse, so a bad edit leaves the field's prior value untouched.
 pub fn parse_value(text: &str, like: &Value) -> Option<Value> {
+    // Rust's f32 parser accepts `nan`, `inf` and `-inf`, and every one of them
+    // is poison in a scene: a NaN scale propagates through the world affine
+    // into a child's translation, which then serializes as NaN and cannot be
+    // dragged back. One door, one rule - the viewport's own drags already
+    // refuse these, and the inspector used to let them straight past.
+    let finite = |x: f32| x.is_finite().then_some(x);
     match like {
-        Value::F32(_) => text.trim().parse().ok().map(Value::F32),
+        Value::F32(_) => text.trim().parse().ok().and_then(finite).map(Value::F32),
         // A whole number only: `3.5` typed into an int field is refused rather
         // than truncated, so the value shown is always the value that runs.
         Value::Int(_) => text.trim().parse().ok().map(Value::Int),
@@ -3167,14 +3173,15 @@ pub fn parse_value(text: &str, like: &Value) -> Option<Value> {
         Value::Asset(_) => Some(Value::Asset(text.to_string())),
         Value::Vec2(_) => {
             let mut parts = text.split(',').map(|p| p.trim().parse::<f32>());
-            let x = parts.next()?.ok()?;
-            let y = parts.next()?.ok()?;
+            let x = finite(parts.next()?.ok()?)?;
+            let y = finite(parts.next()?.ok()?)?;
             Some(Value::Vec2(Vec2::new(x, y)))
         }
         Value::Color(_) => {
             let nums: Vec<f32> = text
                 .split(',')
                 .filter_map(|p| p.trim().parse::<f32>().ok())
+                .filter(|x| x.is_finite())
                 .collect();
             (nums.len() == 4).then(|| Value::Color([nums[0], nums[1], nums[2], nums[3]]))
         }
@@ -4282,6 +4289,25 @@ mod tests {
             parse_value("hero.png", &Value::Asset(String::new())),
             Some(Value::Asset("hero.png".into()))
         );
+    }
+
+    #[test]
+    fn a_field_refuses_a_value_that_is_not_a_number() {
+        // Rust's f32 parser takes all of these, and every one of them poisons a
+        // scene: a NaN scale makes the world affine singular, so dragging a
+        // child produces a NaN translation that serializes and cannot be
+        // dragged back. The viewport's own drags already refuse them.
+        for text in ["nan", "NaN", "inf", "-inf", "infinity"] {
+            assert_eq!(parse_value(text, &Value::F32(0.0)), None, "{text}");
+            assert_eq!(parse_value(text, &Value::Vec2(Vec2::ZERO)), None, "{text}");
+            let pair = format!("1.0, {text}");
+            assert_eq!(parse_value(&pair, &Value::Vec2(Vec2::ZERO)), None, "{pair}");
+            let quad = format!("0.1, 0.2, {text}, 1.0");
+            assert_eq!(parse_value(&quad, &Value::Color([0.0; 4])), None, "{quad}");
+        }
+        // An int field takes whole numbers and nothing else.
+        assert_eq!(parse_value("7", &Value::Int(0)), Some(Value::Int(7)));
+        assert_eq!(parse_value("7.5", &Value::Int(0)), None);
     }
 
     #[test]

@@ -3334,6 +3334,12 @@ impl State {
         {
             self.selection.anchor = self.selection.primary();
         }
+        // An undo or redo can put a Script component back, and `Edit::AddComponent`
+        // stores the component as it was when it was pushed - before reconciliation
+        // filled in the exported fields. So a redone attach came back showing a
+        // path and nothing else. Cheap: this only walks Script components, and
+        // it only runs when the history actually moved.
+        self.reconcile_script_exports();
         self.dirty = true;
     }
 
@@ -4073,7 +4079,16 @@ impl State {
                 file_ops::copy_into(src, &dst)
             };
             match result {
-                Ok(path) => pasted.push(path),
+                Ok(path) => {
+                    // A cut moves the file, and the Code pane may be holding it
+                    // open. Rename and delete both follow it; paste did not, so
+                    // the buffer stayed pointed at a path that no longer exists
+                    // and the next save recreated the file where it used to be.
+                    if cut {
+                        self.follow_open_script(src, Some(&path));
+                    }
+                    pasted.push(path);
+                }
                 Err(err) => {
                     tracing::warn!("paste {} failed: {err}", src.display());
                     first_err.get_or_insert(err);
@@ -6802,8 +6817,16 @@ impl State {
                 },
                 _ => t,
             }),
+            // Floored per axis at the same 0.05 the gizmo's own scaling
+            // enforces. A zero scale makes the world affine singular, and
+            // inverting it - which is what dragging a child does - produces a
+            // NaN translation that then serializes into the scene. The two
+            // routes to a scale should not disagree about what a legal one is.
             "scale" => parse_value(&text, &Value::Vec2(t.scale)).map(|v| match v {
-                Value::Vec2(s) => Transform { scale: s, ..t },
+                Value::Vec2(s) => Transform {
+                    scale: Vec2::new(s.x.abs().max(0.05), s.y.abs().max(0.05)),
+                    ..t
+                },
                 _ => t,
             }),
             _ => None,
@@ -6850,6 +6873,14 @@ impl State {
             // No rebuild - see commit_vec_input's note on keeping focus.
             self.history
                 .set_field(&mut self.project.scene, node, component, &field, new);
+            // Typing a path into a Script's `source` points it at a different
+            // file, and its exported fields are that file's. The drop, chooser
+            // and clear paths all reconcile; this one is the same edit reached
+            // by typing, and it did not - so the rows stayed the old script's.
+            if field == "source" {
+                self.reconcile_script_exports();
+                self.dirty = true;
+            }
         }
     }
 }
