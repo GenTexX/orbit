@@ -467,4 +467,44 @@ mod tests {
         let component = Component::Sprite(SpriteComponent::default());
         assert_eq!(component.as_reflect().type_name(), "Sprite");
     }
+
+    #[test]
+    fn reconcile_is_derived_state_and_says_the_same_thing_twice() {
+        // The editor runs this outside the undo history and outside its
+        // modified flag, which is only defensible if what it writes is a
+        // function of the file on disk. Running it again must therefore change
+        // nothing - otherwise "losing it costs nothing" would be false.
+        let declared = [
+            ("speed".to_string(), Value::F32(0.0)),
+            ("jump".to_string(), Value::F32(0.0)),
+        ];
+        let mut script = ScriptComponent {
+            source: "player.cmt".to_string(),
+            exports: vec![
+                ("speed".to_string(), Value::F32(220.0)),
+                ("gone".to_string(), Value::F32(9.0)),
+            ],
+            hints: Vec::new(),
+        };
+        script.reconcile(&declared);
+        let once = script.exports.clone();
+        assert_eq!(
+            once,
+            vec![
+                ("speed".to_string(), Value::F32(220.0)),
+                ("jump".to_string(), Value::F32(0.0)),
+            ],
+            "tuning kept, a new field defaulted, and the one that is gone dropped"
+        );
+
+        script.reconcile(&declared);
+        assert_eq!(script.exports, once, "and again changes nothing");
+
+        // The loss that is real and has no undo: `gone` took its 9.0 with it.
+        // ADR 0008 says drop what is gone, and keeping orphans would
+        // accumulate dead data in every scene file forever - but a misspelled
+        // export name costs somebody their tuned number, and that is worth
+        // knowing rather than discovering.
+        assert!(!script.exports.iter().any(|(name, _)| name == "gone"));
+    }
 }

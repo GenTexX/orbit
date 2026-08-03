@@ -302,11 +302,18 @@ impl Runtime {
     /// itself as stopped, so this reports it once rather than sixty times a
     /// second.
     pub fn step(&mut self, scene: &mut Scene, dt: f32) {
+        self.reconcile(scene);
         let deadline = Instant::now() + FRAME_LIMIT;
         let mut skipped = 0usize;
         for running in &mut self.running {
             if Instant::now() >= deadline {
                 skipped += 1;
+                continue;
+            }
+            // A node switched off in the tree is switched off, not merely
+            // invisible. Before this an enemy you hid kept moving, and there
+            // was no way to pause one script or pool an object.
+            if !scene.node(running.node).visible {
                 continue;
             }
             // Every script sees the same input this frame, set before the call
@@ -327,6 +334,52 @@ impl Runtime {
                 "this frame ran out of its {budget}ms before {skipped} more scripts \
                  could run - something in this scene is far too slow"
             )));
+        }
+    }
+
+    /// Bring the instance list back into line with the scene's shape.
+    ///
+    /// `play` walked the tree once and nothing looked at it again, which was
+    /// hidden rather than harmless: a node deleted mid-game would keep running,
+    /// because `Scene`'s delete detaches rather than removes - so the `NodeId`
+    /// stays valid and the instance goes on writing a transform into a node
+    /// nobody draws. A zombie rather than a crash, which is worse.
+    ///
+    /// Both directions, because both will happen: a script component that
+    /// appears gets started, and an instance whose node has left the tree gets
+    /// its `on_destroy` and is dropped.
+    fn reconcile(&mut self, scene: &mut Scene) {
+        // A detached node is one that is not the root and has no parent - the
+        // shape `unlink` leaves behind.
+        let root = scene.root();
+        let gone: Vec<(NodeId, usize)> = self
+            .running
+            .iter()
+            .filter(|running| running.node != root && scene.parent(running.node).is_none())
+            .map(|running| (running.node, running.component))
+            .collect();
+        for (node, component) in gone {
+            let Some(at) = self.index_of(node, component) else {
+                continue;
+            };
+            let mut running = self.running.remove(at);
+            if let Err(err) = running.script.destroy(scene, node) {
+                self.problems
+                    .push(Problem::from_error(&running.relative, &err));
+            }
+            self.output.extend(running.script.take_printed_tagged());
+            self.attached.remove(&(node, component));
+        }
+
+        // And anything new. Cheap when nothing changed: one walk of a tree the
+        // renderer already walks every frame.
+        for (node, component, source) in scripts_in_pre_order(scene) {
+            if self.index_of(node, component).is_some() {
+                continue;
+            }
+            if let Err(err) = self.attach(scene, node, component) {
+                self.problems.push(Problem::from_error(&source, &err));
+            }
         }
     }
 
@@ -1712,5 +1765,68 @@ mod tests {
         }
         runtime.step(&mut scene, 0.016);
         assert_eq!(x(&scene, node), 1.0, "the array started empty again");
+    }
+
+    #[test]
+    fn a_node_hidden_in_the_tree_stops_running() {
+        // `visible` was documented as render-only and `step` never looked at
+        // it, so an enemy you switched off kept moving invisibly - and there
+        // was no way to pause one script or pool an object.
+        let (dir, mut scene, node) =
+            project("func update(dt: f32) { transform.position.x += 1.0; }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.play(&mut scene);
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, node), 1.0);
+
+        scene.node_mut(node).visible = false;
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, node), 1.0, "switched off means switched off");
+
+        // And back on again, from where it was rather than from the start.
+        scene.node_mut(node).visible = true;
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(x(&scene, node), 2.0);
+    }
+
+    #[test]
+    fn a_node_that_appears_mid_game_starts_running() {
+        let (dir, mut scene, first) =
+            project("func update(dt: f32) { transform.position.x += 1.0; }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.play(&mut scene);
+        assert_eq!(runtime.len(), 1);
+
+        let later = scene.add_child(scene.root(), Node::new("later"));
+        attach_script(&mut scene, later, "script.cmt");
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(runtime.len(), 2, "it was picked up");
+        assert_eq!(x(&scene, later), 1.0, "and ran the same frame");
+        assert_eq!(x(&scene, first), 1.0);
+    }
+
+    #[test]
+    fn a_node_deleted_mid_game_stops_and_gets_its_last_word() {
+        // Delete detaches rather than removes, so the id stays valid and the
+        // instance went on writing a transform into a node nobody draws - a
+        // zombie rather than a crash, which is worse.
+        let (dir, mut scene, node) = project(
+            "func update(dt: f32) { transform.position.x += 1.0; }
+             func on_destroy() { print(\"gone\"); }",
+        );
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.play(&mut scene);
+        runtime.step(&mut scene, 0.016);
+        assert_eq!(runtime.len(), 1);
+
+        let root = scene.root();
+        let mut history = helios::History::new();
+        history.remove_node(&mut scene, node);
+        runtime.step(&mut scene, 0.016);
+
+        assert_eq!(runtime.len(), 0, "the instance went with the node");
+        let said = runtime.take_output().join(" ");
+        assert!(said.contains("gone"), "and got its last word: {said}");
+        let _ = root;
     }
 }

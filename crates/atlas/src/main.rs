@@ -4081,10 +4081,24 @@ impl State {
     /// source now exports: keep what is still declared at the same type, drop
     /// what is gone, add what is new at its default.
     ///
-    /// Called when a script's path changes and when a script is saved, rather
-    /// than watched continuously - a live file watcher is M5's, along with the
-    /// reload it would drive. Returns whether anything changed, so a caller can
+    /// Called when a script's path changes, when a script is saved, and on
+    /// every hot-reload poll. Returns whether anything changed, so a caller can
     /// decide whether the shell needs rebuilding.
+    ///
+    /// **Deliberately outside the undo history and outside `is_modified`.** It
+    /// writes through `node_mut` rather than through `History`, so undo cannot
+    /// reverse it and quitting does not warn about it - and that is the right
+    /// answer rather than a hole, because what it writes is derived: the set of
+    /// fields a component carries is a function of the `.cmt` file on disk, and
+    /// running it again on a freshly loaded project produces the same answer.
+    /// Losing it costs nothing, which is why nothing guards it.
+    ///
+    /// One real loss is worth naming: a field that disappears from the source
+    /// takes its tuned value with it, and no undo brings that back. That is
+    /// ADR 0008's migration rule doing what it says - keep what is still
+    /// declared, drop what is gone - and keeping orphans instead would
+    /// accumulate dead data in every scene file forever. Misspell an export
+    /// name and save, and the number you tuned is gone.
     fn reconcile_script_exports(&mut self) -> bool {
         fn collect(
             scene: &helios::Scene,
