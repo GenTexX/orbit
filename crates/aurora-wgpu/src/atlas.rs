@@ -31,11 +31,30 @@ pub(crate) struct GlyphEntry {
 /// Split out from [`Atlas`] because it is arithmetic and nothing else - the
 /// rest of that type needs a GPU to exist, which is why the one part of it that
 /// can be wrong in an interesting way had no test.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Shelf {
     x: u32,
     y: u32,
     height: u32,
+}
+
+/// A shelf starts *below* the reserved white block, never at the origin.
+///
+/// Written as `Default` rather than a named constructor so there is no
+/// zero-valued shelf to reach for by accident. The origin belongs to the white
+/// block that every solid fill samples: a shelf starting at (0, 0) packs the
+/// first glyph over it, and then every filled rect in the application samples
+/// whatever that glyph has at its centre - which is often nothing, and the
+/// fills come out transparent. That is a whole-application symptom from one
+/// wrong initializer, and it happened.
+impl Default for Shelf {
+    fn default() -> Self {
+        Self {
+            x: 0,
+            y: WHITE + PAD,
+            height: 0,
+        }
+    }
 }
 
 impl Shelf {
@@ -116,7 +135,6 @@ impl Atlas {
             view,
             swash: SwashCache::new(),
             glyphs: HashMap::new(),
-            // Start packing on a fresh shelf below the white block.
             shelf: Shelf::default(),
             white_uv: [
                 (WHITE as f32 / 2.0) / ATLAS_SIZE as f32,
@@ -221,6 +239,8 @@ impl Atlas {
     /// frame.
     fn reset(&mut self) {
         self.glyphs.clear();
+        // Below the white block again, not at the origin: clearing the shelf
+        // does not clear the texture, and the block is still where it was.
         self.shelf = Shelf::default();
     }
 }
@@ -236,8 +256,13 @@ mod tests {
         // handler turns into a process abort - so a full glyph atlas took the
         // editor with it.
         let mut shelf = Shelf::default();
-        assert_eq!(shelf.place(10, 10), Some((0, 0)));
-        assert_eq!(shelf.place(10, 10), Some((10 + PAD, 0)), "along the row");
+        let top = WHITE + PAD;
+        assert_eq!(
+            shelf.place(10, 10),
+            Some((0, top)),
+            "clear of the white block"
+        );
+        assert_eq!(shelf.place(10, 10), Some((10 + PAD, top)), "along the row");
 
         // Fill it. Tall rows so this does not take thousands of iterations.
         let tall = 256;
@@ -249,10 +274,32 @@ mod tests {
         // Everything it did hand out was inside the texture.
         assert!(shelf.y + tall > ATLAS_SIZE, "it stopped at the bottom edge");
 
-        // And starting again from the top is what makes a full atlas a hitch
-        // rather than a crash.
+        // And starting again is what makes a full atlas a hitch rather than a
+        // crash - starting again *below the white block*, because clearing the
+        // shelf does not clear the texture and the block is still there.
         let mut fresh = Shelf::default();
-        assert_eq!(fresh.place(10, 10), Some((0, 0)));
+        assert_eq!(fresh.place(10, 10), Some((0, WHITE + PAD)));
+    }
+
+    #[test]
+    fn nothing_is_ever_packed_over_the_white_block() {
+        // Every solid fill in the application samples one point - the centre of
+        // the 4x4 white block at the atlas origin - so a glyph packed on top of
+        // it makes every filled rect sample that glyph instead. Depending on
+        // what landed there, fills come out faint or invisible, which is what
+        // "the popup is transparent" looked like. Worth a test rather than a
+        // constant, because the shelf is now built in two places.
+        let mut shelf = Shelf::default();
+        let mut placed = 0;
+        while let Some((x, y)) = shelf.place(7, 9) {
+            assert!(
+                y >= WHITE + PAD || x >= WHITE + PAD,
+                "packed at ({x}, {y}), which is inside the white block"
+            );
+            placed += 1;
+            assert!(placed < 100_000, "it should fill up, not run forever");
+        }
+        assert!(placed > 100, "it packed a realistic number of glyphs");
     }
 
     #[test]

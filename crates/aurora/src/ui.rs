@@ -1096,6 +1096,33 @@ impl Ui {
         Some((self.vscroll_of(id), (content_h - view_h).max(0.0)))
     }
 
+    /// The caret the focused text area's view was last reconciled against, if
+    /// it has been. See [`restore_text_scroll`](Self::restore_text_scroll).
+    pub fn reconciled_caret(&self, id: WidgetId) -> Option<usize> {
+        self.reconciled_caret.get(id).copied()
+    }
+
+    /// Put a text area's scroll back after the shell threw its `Ui` away, along
+    /// with the caret that view was last reconciled against.
+    ///
+    /// Both halves matter, and the second is the subtle one. A fresh `Ui` has
+    /// no reconciled caret, so the first layout after a rebuild decides the
+    /// caret "moved" and chases it - which is why hovering a word or pressing
+    /// Enter used to yank a scrolled-down Code pane back to the caret. Carrying
+    /// the marker across is what keeps "nothing moved, leave the view alone"
+    /// distinguishable from "the caret really did move, follow it".
+    ///
+    /// Unlike [`set_text_scroll`](Self::set_text_scroll) this does not need a
+    /// layout to have happened yet - there is no extent to clamp against on the
+    /// frame the Ui is rebuilt, and both readers clamp anyway.
+    pub fn restore_text_scroll(&mut self, id: WidgetId, offset: f32, reconciled: Option<usize>) {
+        self.text_vscroll.insert(id, offset);
+        match reconciled {
+            Some(caret) => self.reconciled_caret.insert(id, caret),
+            None => self.reconciled_caret.remove(id),
+        };
+    }
+
     /// Scroll a text area to `offset` pixels, clamped to its content.
     ///
     /// This counts as reconciled: the view stays where it is put until the caret
@@ -8431,6 +8458,66 @@ three",
         );
         ui.handle_input(InputEvent::Scroll(96.0));
         println!("PROBE vscroll {}", ui.vscroll_of(field));
+    }
+
+    #[test]
+    fn a_scrolled_text_area_stays_put_across_a_rebuild() {
+        // What a shell does on any change: throw the Ui away and build another.
+        // The new one has no scroll and no reconciled caret, so its first
+        // layout decided the caret had "moved" and chased it - which is why a
+        // scrolled-down Code pane jumped to the caret when a hover tooltip or a
+        // console line caused a rebuild that had nothing to do with it.
+        let build = || {
+            let mut ui = Ui::new();
+            let root = ui.root_panel(Style::new().size(600.0, 400.0));
+            let field = ui.text_input(
+                root,
+                (0..300)
+                    .map(|i| format!("let a{i} = 0.0;\n"))
+                    .collect::<String>(),
+                Style::new()
+                    .size(500.0, 300.0)
+                    .multiline()
+                    .monospace()
+                    .no_wrap(),
+            );
+            (ui, field)
+        };
+
+        let (mut ui, field) = build();
+        ui.layout(Vec2::new(600.0, 400.0)).unwrap();
+        ui.focus_caret(field, 0);
+        ui.layout(Vec2::new(600.0, 400.0)).unwrap();
+        let r = ui.rect(field).unwrap();
+        ui.handle_input(InputEvent::PointerMoved(r.pos + r.size * 0.5));
+        for _ in 0..10 {
+            ui.handle_input(InputEvent::Scroll(96.0));
+        }
+        let (scrolled, _) = ui.text_scroll(field).expect("a text area");
+        let reconciled = ui.reconciled_caret(field);
+        assert!(scrolled > 0.0, "we scrolled somewhere");
+
+        // Rebuild, put it back, lay out - the caret has not moved, so nothing
+        // should chase it.
+        let (mut ui, field) = build();
+        ui.focus_caret(field, 0);
+        ui.restore_text_scroll(field, scrolled, reconciled);
+        ui.layout(Vec2::new(600.0, 400.0)).unwrap();
+        assert_eq!(
+            ui.text_scroll(field).map(|(y, _)| y),
+            Some(scrolled),
+            "the view stayed where it was put"
+        );
+
+        // But a caret that really moves is still followed: put it at the end
+        // and the view has to go there, or typing at the bottom types offscreen.
+        let end = ui.text_of(field).map_or(0, str::len);
+        ui.focus_caret(field, end);
+        ui.layout(Vec2::new(600.0, 400.0)).unwrap();
+        assert!(
+            ui.text_scroll(field).map(|(y, _)| y) > Some(scrolled),
+            "a real caret move still pulls the view along"
+        );
     }
 
     #[test]

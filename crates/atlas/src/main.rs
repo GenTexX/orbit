@@ -5770,6 +5770,19 @@ impl State {
             let in_code = self.ui.focused() == self.rows.code_editor;
             let code_caret = in_code.then(|| self.ui.caret_offset()).flatten();
             let code_anchor = in_code.then(|| self.ui.selection_anchor()).flatten();
+            // And where the pane was scrolled to, whether or not it has focus.
+            // A rebuild happens for reasons that have nothing to do with the
+            // Code pane - a hover tooltip, a console line, a thumbnail arriving
+            // - and a fresh Ui has neither the scroll nor the marker that says
+            // the caret has not moved, so it went back to the top and then
+            // chased the caret. Scrolled down to read something, hover a word,
+            // and the pane jumped.
+            let code_view = self.rows.code_editor.map(|editor| {
+                (
+                    self.ui.text_scroll(editor).map_or(0.0, |(y, _)| y),
+                    self.ui.reconciled_caret(editor),
+                )
+            });
             // Snapshot the log ring for the console pane (brief lock), recording
             // the generation so the poll below only rebuilds when it changes.
             // While a tab is being carried out of its bar, the shell is built
@@ -5936,6 +5949,9 @@ impl State {
                 self.ui.focus_caret(field, offset);
                 self.refocus_filter = false;
             }
+            // Opening a file sets its own scroll from the remembered position;
+            // every other rebuild puts back the one that was there.
+            let mut code_view_restored = false;
             // A freshly opened script takes the keyboard, at the position it
             // was left. Ahead of the ordinary caret restore below, which only
             // fires when the editor already had focus - which, on the frame a
@@ -5953,6 +5969,7 @@ impl State {
                     .focus_caret(editor, caret.min(self.code.script_text.len()));
                 self.ui.set_text_scroll(editor, scroll);
                 self.code.focus_editor = false;
+                code_view_restored = true;
             } else if self.code.focus_find
                 && let Some(query) = self.rows.find.query
             {
@@ -5966,6 +5983,12 @@ impl State {
                     Some(anchor) => self.ui.focus_selection(editor, anchor, offset),
                     None => self.ui.focus_caret(editor, offset),
                 }
+            }
+            if !code_view_restored
+                && let (Some(editor), Some((scroll, reconciled))) =
+                    (self.rows.code_editor, code_view)
+            {
+                self.ui.restore_text_scroll(editor, scroll, reconciled);
             }
         }
         let t_rebuild = phase.elapsed();
