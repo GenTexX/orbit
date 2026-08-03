@@ -848,6 +848,12 @@ impl Ui {
         if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
             return;
         }
+        // A disabled field takes no focus, however it is asked. The flag is
+        // inherited from the parent at build time, so this also covers a live
+        // input inside a container that was disabled as a whole.
+        if self.widgets[id].disabled {
+            return;
+        }
         let text = self.text_of(id).unwrap_or_default();
         let (anchor, caret) = (
             snap_boundary(text, anchor.min(len)),
@@ -890,6 +896,12 @@ impl Ui {
         if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
             return;
         }
+        // A disabled field takes no focus, however it is asked. The flag is
+        // inherited from the parent at build time, so this also covers a live
+        // input inside a container that was disabled as a whole.
+        if self.widgets[id].disabled {
+            return;
+        }
         self.set_focused(Some(id));
         self.focused_hscroll = 0.0;
         self.selection_anchor = Some(0);
@@ -902,6 +914,12 @@ impl Ui {
     /// rebuilds) on every keystroke. A no-op on a non-input widget.
     pub fn focus_caret(&mut self, id: WidgetId, offset: usize) {
         if !matches!(self.widgets[id].kind, WidgetKind::TextInput(_)) {
+            return;
+        }
+        // A disabled field takes no focus, however it is asked. The flag is
+        // inherited from the parent at build time, so this also covers a live
+        // input inside a container that was disabled as a whole.
+        if self.widgets[id].disabled {
             return;
         }
         self.set_focused(Some(id));
@@ -1200,7 +1218,15 @@ impl Ui {
             accepts: style.accepts,
             flat: style.flat,
             hit_transparent: style.hit_transparent,
-            disabled: style.disabled,
+            // Inherited, not just copied. `Style::disabled()` on a container
+            // used to dim its subtree and change nothing about input, so an
+            // enabled Button inside a disabled Panel stayed hoverable,
+            // clickable, focusable and tab-reachable. Computed here because a
+            // parent is always built before its children, which makes this the
+            // one place that needs to know - `interactive_ancestor`, the focus
+            // check, the tab ring and the splitter grab zone all read the flag
+            // and now all agree.
+            disabled: style.disabled || parent.is_some_and(|p| self.widgets[p].disabled),
             hover_self_only: style.hover_self_only,
         });
         if grabby {
@@ -8444,6 +8470,45 @@ three",
             "8x the lines cost {:.1}x the draw ({small:.6}s -> {large:.6}s)",
             large / small
         );
+    }
+
+    #[test]
+    fn disabling_a_container_disables_what_is_inside_it() {
+        use crate::ui::Interaction;
+        // It dimmed the subtree and changed nothing about input, so an enabled
+        // control inside a disabled panel stayed hoverable, clickable, focusable
+        // and reachable by Tab - looking inert and behaving live.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().fill());
+        let off = ui.panel(root, Style::new().size(200.0, 100.0).column().disabled());
+        let button = ui.button(off, "no", Style::new().size(100.0, 20.0));
+        let field = ui.text_input(off, "x".to_string(), Style::new().size(100.0, 20.0));
+        let on = ui.panel(root, Style::new().size(200.0, 100.0).column());
+        let live = ui.button(on, "yes", Style::new().size(100.0, 20.0));
+        ui.layout(Vec2::new(400.0, 400.0)).unwrap();
+
+        let point_at = |ui: &mut Ui, id| {
+            let r = ui.rect(id).unwrap();
+            ui.handle_input(InputEvent::PointerMoved(r.pos + r.size * 0.5));
+        };
+        point_at(&mut ui, button);
+        assert_eq!(ui.interaction(button), Interaction::Idle, "not hovered");
+        ui.handle_input(InputEvent::PointerPressed);
+        ui.handle_input(InputEvent::PointerReleased);
+        assert!(
+            !ui.drain_events()
+                .iter()
+                .any(|e| matches!(e, Event::Clicked(id) if *id == button)),
+            "and not clickable"
+        );
+
+        // Focus refuses it, and Tab does not stop there.
+        ui.focus(field);
+        assert_ne!(ui.focused(), Some(field), "a disabled input takes no focus");
+
+        // The enabled sibling is untouched.
+        point_at(&mut ui, live);
+        assert_eq!(ui.interaction(live), Interaction::Hovered);
     }
 
     #[test]

@@ -156,9 +156,17 @@ fn locate(source: &str, offset: usize) -> (usize, usize, &str) {
 
 // --- the toy host ---
 
+/// The property ids `comet::example_schema()` assigns, in its declaration
+/// order. The same table the execution tests use.
+const POSITION: i32 = 0;
+const ROTATION: i32 = 1;
+const SCALE: i32 = 2;
+
 #[derive(Default)]
 struct Host {
     position: (f32, f32),
+    rotation: f32,
+    scale: (f32, f32),
     printed: Vec<String>,
 }
 
@@ -174,20 +182,77 @@ impl Runner {
         let mut linker = Linker::new(&engine);
         let host = comet::HOST_MODULE;
 
+        // The property accessors ADR 0020 replaced the old
+        // get_position_x/get_position_y/set_position trio with. Every one takes
+        // the property's schema id, so this table is the same size whatever the
+        // schema says - which is the point of numbering properties rather than
+        // importing one function per property.
+        //
+        // The ids are the declaration order of `comet::example_schema()`. A real
+        // host derives them by walking the schema; an example is allowed to know
+        // them, and this way the example is a readable model of what a host does.
         linker
-            .func_wrap(host, "get_position_x", |c: Caller<'_, Host>| {
-                c.data().position.0
+            .func_wrap(host, "get_f32", |c: Caller<'_, Host>, id: i32| {
+                if id == ROTATION {
+                    c.data().rotation
+                } else {
+                    0.0
+                }
             })
             .expect("host binding");
         linker
-            .func_wrap(host, "get_position_y", |c: Caller<'_, Host>| {
-                c.data().position.1
-            })
+            .func_wrap(
+                host,
+                "set_f32",
+                |mut c: Caller<'_, Host>, id: i32, v: f32| {
+                    if id == ROTATION {
+                        c.data_mut().rotation = v;
+                    }
+                },
+            )
             .expect("host binding");
         linker
-            .func_wrap(host, "set_position", |mut c: Caller<'_, Host>, x, y| {
-                c.data_mut().position = (x, y);
-            })
+            .func_wrap(host, "get_bool", |_: Caller<'_, Host>, _id: i32| 0i32)
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "set_bool",
+                |_: Caller<'_, Host>, _id: i32, _v: i32| {},
+            )
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "get_vec2_x",
+                |c: Caller<'_, Host>, id: i32| match id {
+                    POSITION => c.data().position.0,
+                    SCALE => c.data().scale.0,
+                    _ => 0.0,
+                },
+            )
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "get_vec2_y",
+                |c: Caller<'_, Host>, id: i32| match id {
+                    POSITION => c.data().position.1,
+                    SCALE => c.data().scale.1,
+                    _ => 0.0,
+                },
+            )
+            .expect("host binding");
+        linker
+            .func_wrap(
+                host,
+                "set_vec2",
+                |mut c: Caller<'_, Host>, id: i32, x: f32, y: f32| match id {
+                    POSITION => c.data_mut().position = (x, y),
+                    SCALE => c.data_mut().scale = (x, y),
+                    _ => {}
+                },
+            )
             .expect("host binding");
         linker
             .func_wrap(
@@ -269,7 +334,8 @@ impl Runner {
             &engine,
             Host {
                 position: start,
-                printed: Vec::new(),
+                scale: (1.0, 1.0),
+                ..Host::default()
             },
         );
         let instance = linker

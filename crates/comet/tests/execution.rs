@@ -2198,3 +2198,38 @@ fn a_struct_that_owns_something_survives_being_copied_and_taken_apart() {
         &printed[..8.min(printed.len())]
     );
 }
+
+/// The `run` example must actually run.
+///
+/// It had been broken since ADR 0020 deleted the get_position_x/get_position_y/
+/// set_position imports it binds: every script failed at instantiation with
+/// "unknown import", behind an `expect` that blamed the script's own state
+/// initializers. Nothing could see it, because an example is compiled by CI and
+/// never executed - and the roadmap names this example as the way to feel the
+/// language before the editor exists.
+#[test]
+fn the_run_example_still_runs_a_script() {
+    let example = env!("CARGO_MANIFEST_DIR");
+    let output = std::process::Command::new(env!("CARGO"))
+        .args([
+            "run",
+            "--quiet",
+            "--example",
+            "run",
+            "--",
+            "tests/fixtures/bounce.cmt",
+        ])
+        .current_dir(example)
+        .output()
+        .expect("cargo run");
+    assert!(
+        output.status.success(),
+        "the example failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("of WebAssembly") && text.lines().count() > 10,
+        "it compiled and stepped the script: {text}"
+    );
+}
