@@ -382,7 +382,13 @@ fn kind_of_type(name: &str) -> CompletionKind {
 const TYPES: &[&str] = &["f32", "int", "bool", "Vec2", "String", "Option", "Array"];
 /// The engine-provided functions, with what each one is, for completion detail
 /// and hover. Kept beside the checker's table by a test that compares the two.
-const BUILTINS: &[(&str, &str)] = &[
+/// Every builtin and its signature, in the order completion offers them.
+///
+/// Public because the manual is generated from it: a reference written by hand
+/// beside a table maintained in code is a reference that drifts, and this one
+/// already had - `get` was in the checker, in its did-you-mean list and in the
+/// demo scripts, and absent here.
+pub const BUILTINS: &[(&str, &str)] = &[
     ("print", "func print(s: String)"),
     ("vec2", "func vec2(x: f32, y: f32) -> Vec2"),
     ("abs", "func abs(a: f32) -> f32"),

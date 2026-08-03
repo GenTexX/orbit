@@ -13,6 +13,10 @@ mod explorer;
 mod file_ops;
 mod icons;
 mod keys;
+// The reference generator runs from a test - `ORBIT_WRITE_MANUAL=1 cargo test
+// -p atlas manual` rewrites the page - so it is not part of the editor binary.
+#[cfg(test)]
+mod manual;
 mod modal;
 mod play;
 mod project;

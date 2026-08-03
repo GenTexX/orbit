@@ -34,5 +34,6 @@ pub use render::SpriteDraw;
 pub use scene::{Node, NodeId, Scene};
 pub use script::{
     Begin, FRAME_BUDGET, ScriptError, ScriptHost, ScriptInstance, schema as script_schema,
+    script_properties,
 };
 pub use transform::Transform;

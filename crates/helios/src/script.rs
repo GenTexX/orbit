@@ -1058,6 +1058,19 @@ fn write_vec2(state: &mut ScriptState, property: Property, value: Vec2) {
     }
 }
 
+/// Every scriptable property: its object, its name, its type, and whether a
+/// script may assign to it.
+///
+/// Public because the manual is generated from it. Three tables describe the
+/// whole of what a script can say, and a reference written by hand beside them
+/// is a reference that drifts.
+pub fn script_properties() -> Vec<(&'static str, &'static str, comet::HostType, comet::Access)> {
+    PROPERTIES
+        .iter()
+        .map(|(object, field, ty, access, _)| (*object, *field, *ty, *access))
+        .collect()
+}
+
 /// The host surface every script in this engine is compiled against.
 ///
 /// The editor asks for this too, so its squiggles and completions describe the

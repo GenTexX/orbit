@@ -46,6 +46,15 @@ pub use ast::{
     TypeName, UnaryOp,
 };
 pub use check::check;
+
+/// The functions the engine calls, as they should be written.
+///
+/// Public because the manual is generated from it. Three tables describe the
+/// whole of what a script can say - these, the builtins, and the host schema -
+/// and a reference written by hand beside them is a reference that drifts.
+pub fn lifecycle_hooks() -> Vec<&'static str> {
+    check::HOOKS.iter().map(|hook| hook.written).collect()
+}
 pub use codegen::{
     HOST_MODULE, MAX_PAGES, carries_across_a_reload, emit, exported_globals, format_f32, write_str,
 };

@@ -30,6 +30,18 @@ const BINDINGS: &[(&str, &[KeyCode])] = &[
     ("jump", &[KeyCode::Space]),
 ];
 
+/// Every action and the keys bound to it, for the generated manual.
+#[cfg(test)]
+pub fn bindings() -> Vec<(&'static str, String)> {
+    BINDINGS
+        .iter()
+        .map(|(action, codes)| {
+            let keys: Vec<String> = codes.iter().map(|code| format!("{code:?}")).collect();
+            (*action, keys.join(" or "))
+        })
+        .collect()
+}
+
 /// The keys currently held down.
 ///
 /// The held set is the truth and [`Input`] is derived from it, rather than the

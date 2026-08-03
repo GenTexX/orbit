@@ -3221,20 +3221,20 @@ fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 /// A function the engine looks up by name, and the shape it must have.
-struct Hook {
-    name: &'static str,
+pub(crate) struct Hook {
+    pub(crate) name: &'static str,
     params: &'static [Type],
     ret: Type,
     /// The declaration as it should be written, for the diagnostic. Held rather
     /// than rendered from the types above because a parameter name is part of
     /// what a person needs to be shown and is not in the signature.
-    written: &'static str,
+    pub(crate) written: &'static str,
 }
 
 /// The three names helios looks up. A name is listed here only once the engine
 /// actually calls it - rejecting a signature nothing looks up would invent a
 /// contract the engine does not have.
-const HOOKS: &[Hook] = &[
+pub(crate) const HOOKS: &[Hook] = &[
     Hook {
         name: "update",
         params: &[Type::F32],
