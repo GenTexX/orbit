@@ -63,6 +63,9 @@ const CAMERA_BODY_HALF_PX: f32 = 11.0;
 const CAMERA_LENS_PX: f32 = 9.0;
 /// How translucent an inactive camera's frame is against the active one's.
 const CAMERA_IDLE_ALPHA: f32 = 0.35;
+/// The letterbox bars. Black rather than themed: a bar is the absence of the
+/// game, and a themed one reads as a panel the game is sitting in.
+const LETTERBOX: Color = Color::new(0.0, 0.0, 0.0, 1.0);
 /// Radius of the wedge drawn during a rotate drag, and how translucent it is.
 const ROTATE_FEEDBACK_PX: f32 = 44.0;
 const ROTATE_FEEDBACK_ALPHA: f32 = 0.30;
@@ -320,6 +323,51 @@ impl Gizmo {
     }
 }
 
+/// The bars that cover everything the pane shows outside the game's frame.
+///
+/// The play camera is widened to the pane's shape rather than clipped to the
+/// game's, so the world beside a 16:9 game in a 4:3 pane is really being drawn.
+/// These four quads are what makes it a letterbox instead of a wider level -
+/// and they are the difference between "the player sees this" and "you happen
+/// to have a wide pane open".
+///
+/// Four quads and not two, because either axis can be the one with room, and a
+/// pane can be off-shape in both at once while a drag is in flight.
+pub fn letterbox_sprites(
+    camera: &CameraComponent,
+    at: Vec2,
+    pane_px: Vec2,
+    resolution: Vec2,
+) -> Vec<Sprite> {
+    let (frame_min, frame) = camera.framed(at, resolution);
+    let frame_max = frame_min + frame;
+    // What has to be covered is exactly what the camera being used shows - so
+    // it is asked, rather than recomputed here where it could drift.
+    let view = camera.letterboxed(at, pane_px, resolution);
+    let seen_min = view.position;
+    let seen_max = view.position + view.viewport;
+
+    let bar = |min: Vec2, max: Vec2| {
+        let size = max - min;
+        (size.x > 0.0 && size.y > 0.0).then(|| shapes::rect(min, size, LETTERBOX))
+    };
+    [
+        bar(seen_min, Vec2::new(seen_max.x, frame_min.y)),
+        bar(Vec2::new(seen_min.x, frame_max.y), seen_max),
+        bar(
+            Vec2::new(seen_min.x, frame_min.y),
+            Vec2::new(frame_min.x, frame_max.y),
+        ),
+        bar(
+            Vec2::new(frame_max.x, frame_min.y),
+            Vec2::new(seen_max.x, frame_max.y),
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// Every camera in the scene, in pre-order, with its component and the world
 /// position of the node carrying it.
 fn cameras(scene: &Scene) -> Vec<(NodeId, &CameraComponent, Vec2)> {
@@ -343,17 +391,16 @@ fn cameras(scene: &Scene) -> Vec<(NodeId, &CameraComponent, Vec2)> {
 /// numbers, and found out what it framed by pressing Play. The frame is the
 /// answer to "what will the player see", drawn where the answer is.
 ///
-/// `viewport_px` is the size of the render target, because that is what the
-/// camera's own [`view`](CameraComponent::view) is a function of - a camera does
-/// not carry a resolution of its own yet, so a wider pane genuinely does show
-/// more world.
+/// `resolution` is the project's, not the pane's: the frame is what the player
+/// will see, which is a property of the game rather than of the window somebody
+/// is editing it in.
 ///
 /// The inactive ones are drawn too, dimmed. A scene with three cameras and one
 /// active is a normal thing to be building, and the two that are off are still
 /// where you left them.
 pub fn camera_sprites(
     scene: &Scene,
-    viewport_px: Vec2,
+    resolution: Vec2,
     zoom: f32,
     selected: Option<NodeId>,
     pal: &Palette,
@@ -383,8 +430,8 @@ pub fn camera_sprites(
             Color::new(base.r, base.g, base.b, base.a * CAMERA_IDLE_ALPHA)
         };
 
-        let extent = viewport_px / camera.zoom.max(CameraComponent::MIN_ZOOM);
-        out.extend(shapes::rect_outline(at - extent * 0.5, extent, t, color));
+        let (min, extent) = camera.framed(at, resolution);
+        out.extend(shapes::rect_outline(min, extent, t, color));
         // The body: a box with a lens pointing the way a camera looks, which is
         // out of the screen - so it points up, the direction "toward the
         // viewer" is drawn in every diagram ever.
@@ -1078,18 +1125,77 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_of_the_wrong_shape_gets_bars_on_one_axis() {
+        let camera = CameraComponent {
+            active: true,
+            zoom: 1.0,
+        };
+        let resolution = Vec2::new(960.0, 540.0);
+
+        // A pane twice as wide as the game's shape: bars on the left and right,
+        // and nothing above or below.
+        let bars = letterbox_sprites(&camera, Vec2::ZERO, Vec2::new(1920.0, 540.0), resolution);
+        assert_eq!(bars.len(), 2);
+        for bar in &bars {
+            assert!(bar.size.y >= 540.0, "full height: {:?}", bar.size);
+            assert!(bar.size.x > 0.0);
+        }
+
+        // A pane of the game's own shape has nothing to cover.
+        assert!(
+            letterbox_sprites(&camera, Vec2::ZERO, Vec2::new(1920.0, 1080.0), resolution)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_bars_cover_everything_outside_the_frame() {
+        // What is left uncovered is world the player was never meant to see -
+        // a level's off-screen scaffolding, showing because somebody widened a
+        // pane.
+        let camera = CameraComponent {
+            active: true,
+            zoom: 1.0,
+        };
+        let resolution = Vec2::new(960.0, 540.0);
+        let at = Vec2::new(120.0, -30.0);
+        let pane = Vec2::new(700.0, 900.0);
+        let bars = letterbox_sprites(&camera, at, pane, resolution);
+        let view = camera.letterboxed(at, pane, resolution);
+        let (frame_min, frame) = camera.framed(at, resolution);
+        let frame_max = frame_min + frame;
+
+        // Sample the whole visible rectangle: every point outside the frame is
+        // under some bar, and no bar reaches inside it.
+        for i in 0..40 {
+            for j in 0..40 {
+                let p = view.position
+                    + Vec2::new(
+                        view.viewport.x * (i as f32 + 0.5) / 40.0,
+                        view.viewport.y * (j as f32 + 0.5) / 40.0,
+                    );
+                let inside_frame = p.cmpge(frame_min).all() && p.cmple(frame_max).all();
+                let covered = bars
+                    .iter()
+                    .any(|b| p.cmpge(b.position).all() && p.cmple(b.position + b.size).all());
+                assert_eq!(covered, !inside_frame, "at {p:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_camera_frames_what_it_will_show() {
         let (scene, _) = scene_with_camera(Vec2::new(100.0, 40.0), true, 1.0);
-        let viewport = Vec2::new(800.0, 600.0);
-        let sprites = camera_sprites(&scene, viewport, 1.0, None, &Palette::DEFAULT);
+        let resolution = Vec2::new(800.0, 600.0);
+        let sprites = camera_sprites(&scene, resolution, 1.0, None, &Palette::DEFAULT);
         assert!(!sprites.is_empty());
 
-        // The frame is centred on the node, and is the size the camera's own
-        // `view` gives for this viewport - which is what makes it an answer to
-        // "what will the player see" rather than a decoration.
+        // The frame is centred on the node and is the size the camera shows at
+        // the project's resolution - which is what makes it an answer to "what
+        // will the player see" rather than a decoration.
         let (min, max) = bounds(&sprites);
         let frame = max - min;
-        assert!((frame - viewport).length() < 4.0, "{frame:?}");
+        assert!((frame - resolution).length() < 4.0, "{frame:?}");
         let center = (min + max) * 0.5;
         assert!(
             (center - Vec2::new(100.0, 40.0)).length() < 2.0,

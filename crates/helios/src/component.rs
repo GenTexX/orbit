@@ -170,6 +170,42 @@ impl CameraComponent {
         let extent = viewport / self.zoom.max(Self::MIN_ZOOM);
         photon::Camera::new(center - extent * 0.5, extent)
     }
+
+    /// The world rectangle the player sees at `resolution`, as `(min, size)`.
+    ///
+    /// The game's view, independent of the pane it is being shown in. This is
+    /// what "what will the player see" means once a project has a resolution:
+    /// the same rectangle on a laptop and on a projector.
+    pub fn framed(&self, center: Vec2, resolution: Vec2) -> (Vec2, Vec2) {
+        let extent = resolution / self.zoom.max(Self::MIN_ZOOM);
+        (center - extent * 0.5, extent)
+    }
+
+    /// The view for a `pane`-sized target showing a `resolution`-sized game.
+    ///
+    /// The game is scaled up as far as it fits without changing shape, and the
+    /// camera is widened to match the pane - so the world outside the game's
+    /// rectangle is *visible* rather than clipped, and the host paints bars over
+    /// it. Widening rather than clipping is what keeps this one camera: the
+    /// alternative is a second render target the size of the resolution, blitted
+    /// into the pane, which is a real thing to want and costs a pass.
+    pub fn letterboxed(&self, center: Vec2, pane: Vec2, resolution: Vec2) -> photon::Camera {
+        self.view(center, pane / letterbox_scale(pane, resolution))
+    }
+}
+
+/// How far a `resolution`-sized game is scaled to fit inside `pane`.
+///
+/// The smaller of the two ratios, so the whole game fits and the leftover is on
+/// one axis only. Never above zero-guarded: a pane with no area (a collapsed
+/// splitter) would otherwise scale by zero and put an infinity in the camera.
+pub fn letterbox_scale(pane: Vec2, resolution: Vec2) -> f32 {
+    if resolution.x <= 0.0 || resolution.y <= 0.0 {
+        return 1.0;
+    }
+    (pane.x / resolution.x)
+        .min(pane.y / resolution.y)
+        .max(1.0e-4)
 }
 
 impl Reflect for CameraComponent {
@@ -333,6 +369,67 @@ impl Reflect for ScriptComponent {
         // the source afterwards and drops any name the script does not declare.
         self.exports.push((field.to_string(), value));
         true
+    }
+}
+
+#[cfg(test)]
+mod letterbox_tests {
+    use super::*;
+
+    const CAMERA: CameraComponent = CameraComponent {
+        active: true,
+        zoom: 1.0,
+    };
+
+    #[test]
+    fn the_game_sees_its_resolution_whatever_the_pane_is() {
+        // The whole point: dragging a splitter must not change how much world
+        // the player can see, because that is a gameplay change made with a
+        // mouse.
+        let resolution = Vec2::new(960.0, 540.0);
+        let narrow = CAMERA.framed(Vec2::ZERO, resolution);
+        assert_eq!(narrow.1, resolution);
+        assert_eq!(narrow.0, -resolution * 0.5, "centred on the node");
+
+        // And zoom is the one thing that is allowed to change it.
+        let zoomed = CameraComponent {
+            zoom: 2.0,
+            ..CAMERA
+        };
+        assert_eq!(zoomed.framed(Vec2::ZERO, resolution).1, resolution * 0.5);
+    }
+
+    #[test]
+    fn a_pane_of_the_same_shape_needs_no_bars() {
+        // 16:9 game in a 16:9 pane: the widened camera is exactly the frame, so
+        // there is nothing outside it to cover.
+        let resolution = Vec2::new(960.0, 540.0);
+        let view = CAMERA.letterboxed(Vec2::ZERO, Vec2::new(1920.0, 1080.0), resolution);
+        assert!((view.viewport - resolution).length() < 0.01, "{view:?}");
+    }
+
+    #[test]
+    fn a_wider_pane_shows_more_world_sideways_only() {
+        let resolution = Vec2::new(960.0, 540.0);
+        // Twice as wide as it is tall relative to the game: the height fits
+        // exactly and the width has room left over.
+        let view = CAMERA.letterboxed(Vec2::ZERO, Vec2::new(1920.0, 540.0), resolution);
+        assert!((view.viewport.y - resolution.y).abs() < 0.01, "{view:?}");
+        assert!(
+            (view.viewport.x - resolution.x * 2.0).abs() < 0.01,
+            "{view:?}"
+        );
+        assert!(view.position.y < 0.0 && view.position.x < view.position.y);
+    }
+
+    #[test]
+    fn a_collapsed_pane_does_not_put_an_infinity_in_the_camera() {
+        // A splitter dragged shut is a pane with no area, and a scale of zero
+        // makes the extent infinite - which reaches the GPU as a matrix full of
+        // NaN and takes the whole draw with it.
+        let view = CAMERA.letterboxed(Vec2::ZERO, Vec2::ZERO, Vec2::new(960.0, 540.0));
+        assert!(view.viewport.is_finite(), "{view:?}");
+        assert!(letterbox_scale(Vec2::ZERO, Vec2::ZERO) > 0.0);
     }
 }
 

@@ -25,7 +25,9 @@ mod transform;
 pub use glam::Vec2;
 
 pub use command::{Edit, History};
-pub use component::{CameraComponent, Component, ScriptComponent, SpriteComponent};
+pub use component::{
+    CameraComponent, Component, ScriptComponent, SpriteComponent, letterbox_scale,
+};
 pub use error::HeliosError;
 pub use input::Input;
 pub use project::{Manifest, Project, write_atomic};

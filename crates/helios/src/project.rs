@@ -21,6 +21,23 @@ pub struct Manifest {
     pub name: String,
     /// The main scene file, relative to the project directory.
     pub main_scene: String,
+    /// The size the game is designed for, in pixels.
+    ///
+    /// A game has a resolution and a pane does not. Without one, the camera's
+    /// extent came from whatever the viewport happened to be, so dragging a
+    /// splitter changed how much of the world the player could see - a gameplay
+    /// change made with a mouse, and one that made "is this jump possible"
+    /// depend on the window.
+    ///
+    /// Defaulted rather than required, so an `orbit.toml` written before this
+    /// existed still loads.
+    #[serde(default = "default_resolution")]
+    pub resolution: [u32; 2],
+}
+
+/// 960x540: 16:9, and an exact half of 1920x1080.
+fn default_resolution() -> [u32; 2] {
+    [960, 540]
 }
 
 /// Write `bytes` to `path` without ever leaving it half-written: a temp sibling
@@ -57,6 +74,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub struct Project {
     pub name: String,
     pub scene: Scene,
+    /// The size the game is designed for, in pixels (see [`Manifest`]).
+    pub resolution: [u32; 2],
     /// Where the scene lives, relative to the project directory.
     ///
     /// Remembered from the manifest rather than assumed, because `save` used to
@@ -74,6 +93,7 @@ impl Project {
         Self {
             name: name.into(),
             scene,
+            resolution: default_resolution(),
             scene_path: MAIN_SCENE.to_string(),
         }
     }
@@ -91,6 +111,7 @@ impl Project {
         let manifest = Manifest {
             name: self.name.clone(),
             main_scene: self.scene_path.clone(),
+            resolution: self.resolution,
         };
         let manifest_text =
             toml::to_string_pretty(&manifest).map_err(|e| HeliosError::Manifest(e.to_string()))?;
@@ -123,6 +144,7 @@ impl Project {
         Ok(Project {
             name: manifest.name,
             scene_path: manifest.main_scene,
+            resolution: manifest.resolution,
             scene,
         })
     }

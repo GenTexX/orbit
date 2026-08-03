@@ -4828,9 +4828,15 @@ impl State {
         if self.play.is_playing()
             && let Some((camera, at)) = self.project.scene.active_camera()
         {
-            return camera.view(at, viewport);
+            return camera.letterboxed(at, viewport, self.game_resolution());
         }
         self.camera.camera(viewport)
+    }
+
+    /// The size the game is designed for, from the manifest.
+    fn game_resolution(&self) -> Vec2 {
+        let [w, h] = self.project.resolution;
+        Vec2::new(w as f32, h as f32)
     }
 
     /// Say what a previous run left behind, once, on the first frame that can
@@ -6878,6 +6884,20 @@ impl State {
         // with the tintable white texture: the grid+axes first (furthest back),
         // then the axis guide line, then the selection outline and gizmo handles.
         let mut overlay = Vec::new();
+        // The letterbox bars, before anything else so the editor's own overlays
+        // (which are all inside the frame) sit on top of them. Not gated on
+        // "not playing" like the rest: this is not an editor overlay, it is the
+        // edge of the screen the player is looking at.
+        if self.play.is_playing()
+            && let Some((camera, at)) = self.project.scene.active_camera()
+        {
+            overlay.extend(viewport::letterbox_sprites(
+                camera,
+                at,
+                Vec2::new(w as f32, h as f32),
+                self.game_resolution(),
+            ));
+        }
         // None of it while a game runs. Every piece is built in world space
         // from the *editor* camera - down to the line thickness and the
         // handle size - and then composited through the game camera, so the
@@ -6909,7 +6929,7 @@ impl State {
             }
             overlay.extend(viewport::camera_sprites(
                 &self.project.scene,
-                Vec2::new(w as f32, h as f32),
+                self.game_resolution(),
                 self.camera.zoom,
                 self.selection.primary(),
                 &pal,

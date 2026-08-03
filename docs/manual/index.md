@@ -11,7 +11,7 @@ scripts, and your assets. All of it is meant to be read, diffed and committed -
 there is no binary project format and no database.
 
 ```
-orbit.toml            the manifest: a name, and which scene to open
+orbit.toml            the manifest: a name, a scene to open, a resolution
 scenes/main.ron       a scene: a tree of nodes
 scripts/player.cmt    a script
 assets/sprite.png     art
@@ -35,6 +35,11 @@ Three component kinds exist:
 A camera being a component is the whole reason it is worth having: put one on an
 empty node and the view stays put, put one on the player and the view follows,
 with no code either way.
+
+The rectangle is the project's `resolution` in `orbit.toml` (960x540 by
+default), not the size of the pane you happen to be editing in - so widening a
+pane cannot change what the player can see. While a game runs, whatever the pane
+shows outside that rectangle is covered with black bars.
 
 Every camera draws the rectangle it will frame, so you can aim one without
 pressing Play, and a marker you can click and drag even when there is no sprite
