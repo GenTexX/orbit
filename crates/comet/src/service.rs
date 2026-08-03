@@ -748,6 +748,15 @@ pub fn hover_at(source: &str, schema: &HostSchema, offset: usize) -> Option<Stri
     let (start, end) = word_span(source, offset)?;
     let name = &source[start..end];
 
+    // A name after a dot is a member of whatever is left of it, not a name in
+    // scope - so with a script-state `let x = true;` at the top of the file,
+    // hovering the `x` of `transform.position.x` used to answer `x: bool`.
+    // `definition_at` grew this guard and explains why; hover needs the same
+    // one, and needs it more, because hover is the surface that exists to
+    // teach types.
+    if in_member_position(source, start) {
+        return None;
+    }
     if let Some(function) = script.functions.iter().find(|f| f.name == name) {
         return Some(signature_of(function));
     }
@@ -1466,11 +1475,12 @@ fn visit_lets(block: &Block, offset: usize, out: &mut impl FnMut(&str, Option<&s
                 body,
                 ..
             } => {
-                // The loop variable is always an f32, and it is in scope from
-                // the moment it is written - which is what makes `for i in`
-                // followed by `i` inside the body complete.
+                // `int`, which is what the checker types it and what it
+                // refuses a float range for. This said `f32` and had a comment
+                // asserting it, so hovering `i` in `for i in 0..4` answered
+                // with a type the language does not give it.
                 if (name_span.end as usize) <= offset {
-                    out(name, Some("f32"), *name_span);
+                    out(name, Some("int"), *name_span);
                 }
                 visit_lets(body, offset, out);
             }
@@ -2251,7 +2261,7 @@ func update(dt: f32) {
 
     #[test]
     fn a_loop_variable_resolves_only_inside_its_own_loop() {
-        let source = "func f() {\n    for i in 0.0..3.0 {\n        print(str(i));\n    }\n}";
+        let source = "func f() {\n    for i in 0..3 {\n        print(str(i));\n    }\n}";
         let inside = source.find("str(i)").expect("in the fixture") + 4;
         let found = definition_at(source, inside).expect("resolves");
         assert_eq!(found.kind, DefinitionKind::LoopVar);
@@ -2440,5 +2450,30 @@ func f() {
         let at = source.find("Mood::").unwrap() + "Mood::".len();
         let items = completions_at(source, at);
         assert_eq!(items[1].detail, "(f32)");
+    }
+
+    #[test]
+    fn a_for_counter_hovers_as_the_type_it_actually_has() {
+        // The service typed it `f32` with a comment asserting so, while the
+        // checker types it `int` and refuses a float range - and the service's
+        // own go-to-definition fixture was written against a loop that does not
+        // compile.
+        let source = "func update(dt: f32) { for i in 0..4 { let a = i; } }";
+        let at = source.rfind('i').expect("the use of `i`");
+        assert_eq!(hover_at(source, at), Some("i: int".to_string()));
+    }
+
+    #[test]
+    fn hovering_a_member_does_not_answer_with_something_else_of_that_name() {
+        // With a script-state `x` at the top of the file, hovering the `x` of
+        // `transform.position.x` answered `x: bool`. Hover is the surface that
+        // exists to teach types, so one that is confidently wrong is worse than
+        // one that says nothing.
+        let source = "let x = true;\nfunc update(dt: f32) { transform.position.x = 1.0; }";
+        let at = source.rfind("x =").expect("the member");
+        assert_eq!(hover_at(source, at), None);
+        // The standalone name still answers.
+        let at = source.find('x').expect("the declaration");
+        assert_eq!(hover_at(source, at), Some("x: bool".to_string()));
     }
 }

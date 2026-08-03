@@ -700,6 +700,13 @@ enum Limit {
     /// [`MAX_SCRIPT_MEMORY`] ran out: `memory.grow` was refused, so comet's
     /// allocator trapped rather than hand back a pointer to nothing.
     Memory,
+    /// An array index that is not a position in the array. comet's bounds check
+    /// is an `unreachable` inside `comet_array_at`, so it arrives here wearing
+    /// wasmtime's word for the opcode rather than a sentence.
+    Bounds,
+    /// The wasm stack ran out, which in a language with no other way to recurse
+    /// forever means a function that calls itself.
+    Recursion,
 }
 
 impl Limit {
@@ -711,11 +718,23 @@ impl Limit {
             // `comet_alloc`. The innermost frame is what tells them apart -
             // every other `unreachable` comet emits is a bounds check or a
             // `match` that ran out of arms, and those are the script's.
-            wasmtime::Trap::UnreachableCodeReached => err
-                .downcast_ref::<wasmtime::WasmBacktrace>()
-                .and_then(|backtrace| backtrace.frames().first()?.func_name())
-                .is_some_and(|name| name == "comet_alloc")
-                .then_some(Limit::Memory),
+            // An `unreachable` names its helper: comet emits one for a failed
+            // `memory.grow` and one for a bounds check, and the innermost frame
+            // is what tells them apart. Anything else is the script's own, and
+            // keeps wasmtime's wording.
+            wasmtime::Trap::UnreachableCodeReached => {
+                match err
+                    .downcast_ref::<wasmtime::WasmBacktrace>()
+                    .and_then(|backtrace| backtrace.frames().first()?.func_name())
+                {
+                    Some("comet_alloc") => Some(Limit::Memory),
+                    Some("comet_array_at") => Some(Limit::Bounds),
+                    _ => None,
+                }
+            }
+            // Nothing in comet recurses without a function calling itself, so
+            // "call stack exhausted" has exactly one cause worth naming.
+            wasmtime::Trap::StackOverflow => Some(Limit::Recursion),
             _ => None,
         }
     }
@@ -733,6 +752,13 @@ impl Limit {
                  to in a loop?",
                 MAX_SCRIPT_MEMORY / (1024 * 1024)
             ),
+            Limit::Bounds => "read or wrote past the end of an array - `len(a)` is how \
+                              many there are, and `get(a, i)` is the version that cannot \
+                              trap"
+                .to_string(),
+            Limit::Recursion => "ran out of stack - is a function calling itself with no \
+                                 way to stop?"
+                .to_string(),
         }
     }
 }
@@ -1940,6 +1966,41 @@ mod tests {
         assert!(
             !message.contains("ran out of memory"),
             "an index out of range is not the memory limit: {message}"
+        );
+        // And it is not "wasm trap: unreachable" either. comet's bounds check
+        // is an `unreachable` inside `comet_array_at`, so the frame name is
+        // what turns an opcode into a sentence.
+        assert!(
+            message.contains("past the end of an array"),
+            "it says what happened: {message}"
+        );
+        assert!(
+            message.contains("get(a, i)"),
+            "and what to reach for instead: {message}"
+        );
+    }
+
+    #[test]
+    fn a_function_that_calls_itself_forever_says_so() {
+        // "wasm trap: call stack exhausted" is the message somebody meets in
+        // their first hour, and nothing in comet recurses without a function
+        // calling itself - so it has exactly one cause worth naming.
+        let source = "
+            func down(n: f32) -> f32 { down(n + 1.0) }
+            func update(dt: f32) { transform.position.x = down(0.0); }
+        ";
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate(source, &mut scene, node)
+            .expect("it compiles and starts");
+        let message = script
+            .update(&mut scene, node, 0.016)
+            .expect_err("it runs out of stack")
+            .to_string();
+        assert!(
+            message.contains("ran out of stack") && message.contains("calling itself"),
+            "{message}"
         );
     }
 

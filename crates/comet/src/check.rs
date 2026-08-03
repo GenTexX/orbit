@@ -30,6 +30,8 @@ pub fn check(script: &ast::Script, schema: &HostSchema) -> (TypedScript, Vec<Dia
         enums: Vec::new(),
         constants: std::collections::HashSet::new(),
         called: std::collections::HashSet::new(),
+        calls: Vec::new(),
+        current: 0,
         instances: HashMap::new(),
         building: Vec::new(),
         schema,
@@ -73,6 +75,13 @@ struct Checker<'a> {
     loops: u32,
     /// Which functions something calls, by index.
     called: std::collections::HashSet<usize>,
+    /// Which functions each function calls, so "never called" can mean
+    /// "unreachable from anything the engine starts" rather than "nobody names
+    /// it" - which is a different question, and the wrong one now that the
+    /// engine is what starts things.
+    calls: Vec<std::collections::HashSet<usize>>,
+    /// The function being checked, so a call knows which set to go in.
+    current: usize,
     /// Concrete enums, in the order they were first needed. `Type::Enum`
     /// indexes this, and it is what reaches codegen.
     enums: Vec<TypedEnum>,
@@ -316,7 +325,7 @@ impl Checker<'_> {
                     scrutinee.span,
                     format!(
                         "`match` works on an enum, and this is a {}",
-                        scrutinee.ty.name()
+                        self.name_of(scrutinee.ty)
                     ),
                 );
             }
@@ -1489,7 +1498,7 @@ impl Checker<'_> {
                 };
                 self.error(
                     decl.span,
-                    format!("a `{}` cannot be exported yet - {detail}", ty.name()),
+                    format!("a `{}` cannot be exported yet - {detail}", self.name_of(ty)),
                 );
             }
             if ty == Type::Unit {
@@ -1529,29 +1538,36 @@ impl Checker<'_> {
             });
         }
 
+        self.calls = vec![std::collections::HashSet::new(); script.functions.len()];
         let functions = script
             .functions
             .iter()
             .enumerate()
             .map(|(index, f)| self.function(index, f))
             .collect();
-        // A function nothing calls, and that the engine does not look up
-        // either. Catches a rename whose callers are gone, and a typo that made
-        // a second function instead of calling the first.
+        // A function the engine can never reach. Not "nobody names it": in
+        // `func a() { b(); } func b() { }` with no `update`, nothing names `a`
+        // and something names `b`, and neither can ever run. Reachability from
+        // the hooks is the honest version of the same question, and it is a
+        // fixed point over the call sets already collected above.
+        let reachable = self.reachable_from_hooks(script);
         for (index, f) in script.functions.iter().enumerate() {
-            if f.name.is_empty()
-                || self.called.contains(&index)
-                || HOOKS.iter().any(|hook| hook.name == f.name)
-            {
+            if f.name.is_empty() || reachable.contains(&index) {
                 continue;
             }
+            // A misspelled hook is checked by nothing - `check_hook` only
+            // validates the signature of a name that already is one - so this
+            // is the only place `func updat(dt: f32)` can be caught, and every
+            // other name error in comet already guesses.
+            let hint = match nearest(&f.name, HOOKS.iter().map(|hook| hook.name)) {
+                Some(hook) => format!(" - did you mean `{hook}`, which the engine calls?"),
+                None => {
+                    " - the engine only looks for `update`, `start` and `on_destroy`".to_string()
+                }
+            };
             self.diagnostics.push(Diagnostic::warning(
                 f.name_span,
-                format!(
-                    "`{}` is never called - the engine only looks for `update`, `start` and \
-                     `on_destroy`",
-                    f.name
-                ),
+                format!("`{}` can never run{hint}", f.name),
             ));
         }
 
@@ -1568,7 +1584,29 @@ impl Checker<'_> {
         }
     }
 
+    /// Every function the engine can reach, starting from the hooks it calls.
+    fn reachable_from_hooks(&self, script: &ast::Script) -> std::collections::HashSet<usize> {
+        let mut reached = std::collections::HashSet::new();
+        let mut queue: Vec<usize> = script
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| HOOKS.iter().any(|hook| hook.name == f.name))
+            .map(|(index, _)| index)
+            .collect();
+        while let Some(index) = queue.pop() {
+            if !reached.insert(index) {
+                continue;
+            }
+            if let Some(calls) = self.calls.get(index) {
+                queue.extend(calls.iter().copied());
+            }
+        }
+        reached
+    }
+
     fn function(&mut self, index: usize, f: &ast::Function) -> TypedFn {
+        self.current = index;
         let signature = &self.signatures[index];
         let ret = signature.ret;
         let param_types = signature.params.clone();
@@ -1603,7 +1641,7 @@ impl Checker<'_> {
                 f.body.span,
                 format!(
                     "this function must return `{}`, but some paths reach the end without one",
-                    ret.name()
+                    self.name_of(ret)
                 ),
             );
         }
@@ -1918,8 +1956,8 @@ impl Checker<'_> {
                                 format!(
                                     "`{}=` on {} produces {}, which cannot be stored back",
                                     symbol(op),
-                                    target_ty.name(),
-                                    ty.name()
+                                    self.name_of(target_ty),
+                                    self.name_of(ty)
                                 ),
                             );
                             return TypedStmt::Assign {
@@ -1984,7 +2022,7 @@ impl Checker<'_> {
                         *span,
                         format!(
                             "this function returns `{}`, so `return` needs a value",
-                            ret.name()
+                            self.name_of(ret)
                         ),
                     ),
                 }
@@ -2839,6 +2877,9 @@ impl Checker<'_> {
             return (TypedExprKind::Error, Type::Error);
         };
         self.called.insert(index);
+        if let Some(set) = self.calls.get_mut(self.current) {
+            set.insert(index);
+        }
         let signature = &self.signatures[index];
         let (params, ret) = (signature.params.clone(), signature.ret);
         self.check_args(callee, &mut args, &params, span);
@@ -2959,8 +3000,8 @@ impl Checker<'_> {
                         "cannot apply `{}` to {} and {} - a Vec2 supports `+`, `-`, \
                          unary `-`, and `*` or `/` by a number",
                         symbol(op),
-                        lhs.ty.name(),
-                        rhs.ty.name()
+                        self.name_of(lhs.ty),
+                        self.name_of(rhs.ty)
                     )
                 };
                 self.error(lhs.span.to(rhs.span), message);
@@ -4654,11 +4695,11 @@ mod tests {
     }
 
     #[test]
-    fn a_function_nothing_calls_is_a_warning_unless_the_engine_calls_it() {
+    fn a_function_the_engine_cannot_reach_is_a_warning() {
         assert_eq!(
             warnings("func helper(a: f32) -> f32 { a }\nfunc update(dt: f32) { }"),
             [
-                "`helper` is never called - the engine only looks for `update`, `start` and `on_destroy`"
+                "`helper` can never run - the engine only looks for `update`, `start` and `on_destroy`"
             ]
         );
         // The three the engine looks up are called by it, not by the script.
@@ -4669,6 +4710,36 @@ mod tests {
         // And one that is called is fine wherever the call is.
         check_clean(
             "func update(dt: f32) { print(str(helper(dt))); }\nfunc helper(a: f32) -> f32 { a }",
+        );
+    }
+
+    #[test]
+    fn never_called_means_unreachable_rather_than_unnamed() {
+        // The old rule asked whether anything named a function, which is a
+        // different question and the wrong one now that the engine is what
+        // starts things: here nothing names `a` and something names `b`, and
+        // neither can ever run.
+        let warned = warnings("func a() { b(); }\nfunc b() { }");
+        assert_eq!(warned.len(), 2, "{warned:?}");
+        assert!(warned.iter().any(|w| w.starts_with("`a` can never run")));
+        assert!(warned.iter().any(|w| w.starts_with("`b` can never run")));
+
+        // Reachability is transitive, so a chain from a hook is all fine.
+        check_clean("func update(dt: f32) { a(); }\nfunc a() { b(); }\nfunc b() { }");
+    }
+
+    #[test]
+    fn a_misspelled_hook_is_guessed_at() {
+        // `check_hook` only validates the signature of a name that already is a
+        // hook, so a misspelled one was checked by nothing at all - while every
+        // other name error in comet already says "did you mean".
+        assert_eq!(
+            warnings("func updat(dt: f32) { }"),
+            ["`updat` can never run - did you mean `update`, which the engine calls?"]
+        );
+        assert_eq!(
+            warnings("func on_destory() { }"),
+            ["`on_destory` can never run - did you mean `on_destroy`, which the engine calls?"]
         );
     }
 
