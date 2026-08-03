@@ -162,13 +162,6 @@ now the thinnest part of the project by a wide margin.
   is a direct child of an unmoved root, which is exactly what the demo scene
   is. Either add a world accessor beside the local one or narrow the promise,
   but not neither: this is the class of bug a learner concludes is their own.
-- **The game's screen is whatever the dock left over.** `CameraComponent::view`
-  derives the visible world from the viewport widget's pixel size, re-measured
-  every frame from the dock layout, so dragging a splitter while playing shows
-  the player more of the level. The roadmap's north star is a *one-screen*
-  platformer and "one screen" has no definition anywhere in the codebase. A
-  game resolution plus letterboxing is what makes a layout mean the same thing
-  twice.
 - **There is no second scene, and no way to get to one.** `Runtime` never owns
   a scene - `step` takes one, and instances key on `NodeId`s with nothing
   stamping which scene they came from, so handing `step` a different scene
@@ -454,10 +447,6 @@ first-class feature rather than polish.
   live, and any of them silently selects the wrong node the moment it does. An
   explicit `id: u32` on `Sprite` costs four bytes per sprite and two lines of
   pick.wgsl. Do it before the three, not after.
-- **photon shape primitives**: lines, rects, circles, arcs, polygons. Still the
-  highest-leverage single addition - one change retires the gizmo arrowheads,
-  the rotate feedback arc and a crisper grid, and gives games and debug-draw a
-  real API instead of quad tricks.
 - **World-space text** (photon reusing aurora's glyph atlas machinery) - node
   labels in the viewport, debug overlays, in-game text later.
 - **Seven draw paths, and every new option costs seven edits.** render,
@@ -538,12 +527,6 @@ first-class feature rather than polish.
 - **Persistent instance buffer**: write instances in place rather than
   rebuilding and re-uploading every frame. The `instance_pack` benchmark
   already measures the cost.
-- **Sprite sheet support**: `uv_rect` exists on photon's `Sprite` and is not
-  exposed on `SpriteComponent`. Exposing it is small and unlocks
-  AnimatedSprite. Flipping needs no new photon field at all - the shader
-  interpolates between the uv rect's corners, so an inverted rect already flips
-  the sampling; the gap is entirely above photon.
-
 ## Teaching surface
 
 Orbit's stated differentiator. M5 changed what is possible here: a script now
@@ -742,9 +725,6 @@ missing, with the two structural ones first:
   aurora, met twice over, and two of the four copies are in the crate that
   teaches people how to drive aurora. aurora-wgpu already dev-depends on winit,
   so an optional feature there keeps aurora itself windowing-free.
-- **DPI awareness.** `scale_factor` appears zero times in 61k lines, so the
-  whole editor renders tiny on a hidpi display. Already scheduled as part of
-  the pre-M6 portability block.
 - **An animation story beyond one offset.** `Style::translate` and
   `TabBar::tick` prove the shape; what is missing is anything general - no
   tween or spring type, no way to animate a colour or a size, and every
@@ -814,17 +794,6 @@ image, or hooks `tracing` stays out however reusable it looks. That rules out `f
   component kinds now, and `from_type_name` already builds one from a string.
   It still wants the closed-set `select` control aurora does not have. Worth
   building alongside the fourth component kind rather than before it.
-- **A camera you can see and grab.** M5 made the Camera decide what a player
-  sees, and the viewport draws no sign of it: `gizmo()` returns `None` for a
-  camera-only node and picking goes through `gizmo()`, so a camera cannot be
-  clicked, hovered, outlined or dragged - the only way to move it is to type
-  numbers in the inspector. Nothing draws the rectangle it will show either,
-  though `CameraComponent::view` computes exactly that. It needs a
-  fixed-screen- size icon quad to pick against and a world-space frame; both
-  are quads and tints, the trick the grid and gizmo overlays already use. The
-  same "a node with no extent still needs a handle" machinery covers every
-  future component that is not a rectangle - audio emitters, spawn points,
-  triggers.
 - **Node lock** (excluded from picking and dragging). The visibility eye
   shipped; lock is the remaining half.
 - **Sibling order controls**: explicit move-up/move-down. Drag-to-reorder works
@@ -846,8 +815,6 @@ image, or hooks `tracing` stays out however reusable it looks. That rules out `f
   disagree with the picture and with what the script sees - and wheeling moves
   the zoom readout while the image stays put. Once a readout knows which camera
   it is describing, the same answer drives the zoom control and frame-selected.
-- **Gizmo arrowheads** and **rotate arc feedback** - both want the triangle and
-  arc primitives from photon shapes.
 - **Numeric readout near the cursor while dragging** (the last missing piece of
   snapping - the snap math itself shipped and is tested).
 - **Checkerboard background** option behind the scene, to communicate
@@ -858,39 +825,21 @@ image, or hooks `tracing` stays out however reusable it looks. That rules out `f
 
 ## Editor: shell and workflow
 
-- **Nowhere to put the game.** There is no maximize - no F11, no
-  double-click-a-tab - so a game plays inside whatever slice of the window the
-  Viewport pane occupies, ringed by panels that refuse most clicks while it
-  runs. That was fine when the viewport was a scene editor; M5 changed what it
-  is for half the time. A maximize is a pure `DockNode` operation on a model
-  that is already a testable tree, and `EditorState.dock` is where a maximized
-  state would live. The Code pane wants the same thing for a long editing
-  session.
-- **What the editor forgets between sessions.** `EditorState` persists the
-  dock, the camera, the gizmo mode, pane scrolls, collapsed rows and the
-  explorer's state - but not which script the Code pane had open, not the caret
-  in it, and not the scene selection. M5 sharpened it: the loop is now play,
-  quit or crash, restart, go find your script again. The selection needs the
-  child-index-path trick collapsed rows already use, so the pattern is written
-  and tested. Distinct from "a recovery file is not a save": that is about
-  unsaved *content* after a crash, this is about *where you were* after any
-  exit.
 - **A recovery file is not a save.** The panic hook writes the open buffer and
   the scene to `.orbit/recovered/`, which is a floor rather than a feature:
   nothing offers to restore from it on the next launch, and nothing cleans it
   up.
-- **New/Open project**: still hardwired to `demo_project` via
-  `env!("CARGO_MANIFEST_DIR")` with no argv path. Part of the pre-M6
-  portability block, and a prerequisite for splitting the demo project's three
-  jobs below.
+- **New/Open project**: `atlas <path>` shipped; what is still missing is a
+  dialog for it, a recent-projects list, and creating a project from inside the
+  editor rather than by making the files by hand.
 - **Scene tabs / multiple open scenes.** The dock handles tabs already; what is
   missing is the model for more than one open scene - and the engine-side half
   of that is `Project` being `{ name, scene }` with a const scene path.
 - **Undo-history panel** (the History stack visualized, click to jump).
-- **A keyboard shortcut map**: one place defining all bindings, shown in a help
-  popup. Shortcuts have sprawled far enough that this is overdue - Add Camera
-  (ctrl+shift+K) shipped in M5 with no toolbar button, no menu item and no
-  context-menu entry, so it is discoverable only by reading main.rs.
+- **A shortcut map that is a map.** `shortcuts::SHORTCUTS` and F1 shipped; what
+  it is not is a *binding* table - the handlers still decide, so nothing can be
+  rebound, and the guard that keeps the list honest reads the source with string
+  matching rather than knowing the dispatch.
 - **Directory watching** in the file explorer, so external changes appear
   without pressing Refresh. The mtime poll M5 built for scripts is the
   precedent.
