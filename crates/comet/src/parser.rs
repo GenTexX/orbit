@@ -529,7 +529,20 @@ impl Parser {
         }
 
         let end = self.peek_span();
-        self.expect(&TokenKind::RBrace, "`}` to close this block");
+        // Reported at the `{` that was never closed, not at the token the
+        // parser gave up on. The commonest structural mistake in the language
+        // used to squiggle an innocent later declaration - `block_inner` breaks
+        // at the next `func`, so a missing brace blamed the function after it -
+        // while the opening span was sitting right here as its own argument.
+        if !matches!(self.peek(), TokenKind::RBrace) {
+            self.diagnostics
+                .push(Diagnostic::error(start, "this `{` is never closed"));
+            // Not `expect`, which would report a second time at the wrong
+            // place; the recovery it does is what is wanted, not the message.
+            self.eat(&TokenKind::RBrace);
+        } else {
+            self.expect(&TokenKind::RBrace, "`}` to close this block");
+        }
         Block {
             stmts,
             tail,
@@ -1338,5 +1351,33 @@ mod tests {
         assert_eq!(script.structs.len(), 1, "the struct after the garbage");
         assert_eq!(script.enums.len(), 1, "and the enum");
         assert_eq!(script.state.len(), 1, "and the const");
+    }
+
+    #[test]
+    fn an_unclosed_brace_blames_the_brace() {
+        // The commonest structural mistake in the language, and it used to
+        // squiggle an innocent later declaration: `block_inner` stops at the
+        // next `func`, so a missing `}` blamed the function after it while the
+        // opening span sat right there unused.
+        let source = "func a() {\n    let x = 1.0;\nfunc b() { }";
+        let (_, diagnostics) = parse(source);
+        let first = diagnostics.first().expect("it does not parse");
+        assert_eq!(first.message, "this `{` is never closed");
+        let at = first.span.start as usize;
+        assert_eq!(
+            &source[at..at + 1],
+            "{",
+            "and points at the brace rather than at `func b`"
+        );
+        assert!(
+            at < source.find("func b").expect("the second function"),
+            "which is before the function it used to blame"
+        );
+    }
+
+    #[test]
+    fn a_closed_block_is_still_quiet() {
+        let (_, diagnostics) = parse("func a() {\n    let x = 1.0;\n}\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 }

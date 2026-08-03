@@ -322,6 +322,9 @@ struct State {
     /// The last pointer position that was over the viewport, in world space.
     /// What a script reads while the pointer is somewhere else.
     last_game_cursor: Vec2,
+    /// Unsaved work a previous run wrote out when it died, newest first.
+    /// Emptied as each is dealt with.
+    recovered: Vec<recovery::Recovered>,
     /// The current keyboard modifiers (for the undo/redo shortcuts).
     modifiers: ModifiersState,
     /// The demo texture's natural pixel size (spawned sprites default to it).
@@ -970,6 +973,11 @@ impl State {
         // been recorded into <project>/.orbit/recovered/ rather than taking the
         // session with it.
         recovery::install(&project_dir);
+        // What a previous run left behind, if it died with unsaved work. Read
+        // before the project is opened so the offer can be made against what is
+        // actually on disk, and reported once rather than sitting in a
+        // directory nobody knows to look in.
+        let recovered = recovery::recovered(&project_dir);
         // A project that will not open is not a reason to have no window. It
         // used to be: the error went to the terminal, the event loop exited,
         // and someone who double-clicked the binary saw nothing happen at all -
@@ -1188,6 +1196,7 @@ impl State {
             tooltip_target: None,
             pointer_down: false,
             keys: keys::GameKeys::default(),
+            recovered,
             last_game_cursor: Vec2::ZERO,
             pending_cursor: None,
             tab_bars: Vec::new(),
@@ -4722,6 +4731,39 @@ impl State {
         self.camera.camera(viewport)
     }
 
+    /// Say what a previous run left behind, once, on the first frame that can
+    /// show a dialog.
+    ///
+    /// The panic hook has written the open buffer and the scene to
+    /// `.orbit/recovered/` since M4, and nothing ever mentioned it again - so
+    /// the floor existed and nobody could stand on it: recovering meant knowing
+    /// that directory exists and going to look. This is the half that turns it
+    /// into something a person meets.
+    ///
+    /// It names the files rather than restoring them. Putting a recovered
+    /// buffer back over whatever is open is a decision with a wrong answer, and
+    /// the files are already sitting there in a readable format - so this
+    /// points, and leaves the choice where it belongs. Nothing cleans them up
+    /// yet either; both halves are on the list.
+    fn offer_recovered_work(&mut self) {
+        if self.recovered.is_empty() || self.modal.is_some() {
+            return;
+        }
+        let entries = std::mem::take(&mut self.recovered);
+        let lines: Vec<String> = entries
+            .iter()
+            .map(|entry| format!("{} in {}", entry.summary(), entry.dir.display()))
+            .collect();
+        let what = match entries.len() {
+            1 => "A previous session ended without saving. It left".to_string(),
+            n => format!("{n} previous sessions ended without saving. They left"),
+        };
+        self.open_modal(modal::Modal::report(
+            "Unsaved work was recovered",
+            format!("{what}:\n\n{}", lines.join("\n")),
+        ));
+    }
+
     /// Send a value into a running script instead of into the document.
     ///
     /// Returns whether it was taken. While a game runs, an edit to a script's
@@ -6299,6 +6341,7 @@ impl State {
     fn draw(&mut self) -> Result<()> {
         profiling::scope!("editor_frame");
         let fstart = std::time::Instant::now();
+        self.offer_recovered_work();
         self.flush_pointer();
         // BEFORE anything that can set `dirty`. A rebuild reconstructs the code
         // editor from `self.code.script_text`, so that has to already hold what the
