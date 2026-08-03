@@ -400,6 +400,10 @@ const BUILTINS: &[(&str, &str)] = &[
     ("cos", "func cos(a: f32) -> f32"),
     ("atan2", "func atan2(y: f32, x: f32) -> f32"),
     ("pow", "func pow(a: f32, b: f32) -> f32"),
+    ("random", "func random() -> f32"),
+    // `get` is the array read that cannot trap, and it was missing here long
+    // enough for the demo scripts to teach a name the editor could not complete.
+    ("get", "func get(a: Array<T>, index: int) -> Option<T>"),
 ];
 /// The magic name bound to the owning node's position.
 /// `Vec2`'s whole member set.

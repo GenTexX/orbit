@@ -341,6 +341,9 @@ impl ScriptHost {
             ScriptState {
                 transform: scene.node(node).transform,
                 input: Input::default(),
+                elapsed: 0.0,
+                frame: 0.0,
+                rng: 0x2545_F491,
                 printed: Vec::new(),
                 limits: StoreLimitsBuilder::new()
                     .memory_size(MAX_SCRIPT_MEMORY)
@@ -449,7 +452,13 @@ impl ScriptInstance {
         if self.stopped {
             return Ok(());
         }
-        self.store.data_mut().transform = scene.node(node).transform;
+        let state = self.store.data_mut();
+        state.transform = scene.node(node).transform;
+        // Before the call, so the first frame reads a `dt`'s worth of elapsed
+        // time rather than zero - a script that divides by `time.elapsed` on
+        // frame one should not meet an infinity.
+        state.elapsed += dt;
+        state.frame += 1.0;
         self.arm();
         let result = update.call(&mut self.store, dt);
         // Written back even when the call trapped: whatever the script managed
@@ -662,6 +671,18 @@ struct ScriptState {
     /// Copied in before every call, like the transform. A script reads it and
     /// never writes it.
     input: Input,
+    /// How long this instance has been running, and how many frames it has
+    /// seen. Advanced by the host rather than by the script, so a cooldown does
+    /// not need a hand-rolled accumulator in a state variable.
+    elapsed: f32,
+    frame: f32,
+    /// The seeded generator `random()` draws from.
+    ///
+    /// Per instance and seeded from a fixed constant, which is a teaching
+    /// artifact rather than an oversight: the same script started twice plays
+    /// the same game, so "why did it do something different" has an answer that
+    /// is about the code. A host that wants variety seeds it from the clock.
+    rng: u32,
     printed: Vec<String>,
     /// Read through the store's limiter, so it has to live where the store can
     /// hand out a mutable reference to it.
@@ -722,6 +743,8 @@ enum Property {
     InputDown,
     InputJump,
     InputMouse,
+    TimeElapsed,
+    TimeFrame,
 }
 
 /// Everything a script can reach outside itself, and what each thing is.
@@ -796,6 +819,23 @@ const PROPERTIES: &[(&str, &str, comet::HostType, comet::Access, Property)] = &[
         RO,
         Property::InputMouse,
     ),
+    // The clock, read-only for the same reason input is: the engine is what
+    // knows what time it is. Without these, "three seconds after start" needs a
+    // hand-rolled accumulator in a state variable.
+    (
+        "time",
+        "elapsed",
+        comet::HostType::F32,
+        RO,
+        Property::TimeElapsed,
+    ),
+    (
+        "time",
+        "frame",
+        comet::HostType::F32,
+        RO,
+        Property::TimeFrame,
+    ),
 ];
 
 /// Read a property the script asked for as an `f32`.
@@ -814,6 +854,8 @@ const PROPERTIES: &[(&str, &str, comet::HostType, comet::Access, Property)] = &[
 fn read_f32(state: &ScriptState, property: Property) -> f32 {
     match property {
         Property::Rotation => state.transform.rotation,
+        Property::TimeElapsed => state.elapsed,
+        Property::TimeFrame => state.frame,
         Property::Position
         | Property::Scale
         | Property::InputMouse
@@ -835,7 +877,9 @@ fn write_f32(state: &mut ScriptState, property: Property, value: f32) {
         | Property::InputRight
         | Property::InputUp
         | Property::InputDown
-        | Property::InputJump => {}
+        | Property::InputJump
+        | Property::TimeElapsed
+        | Property::TimeFrame => {}
     }
 }
 
@@ -846,7 +890,12 @@ fn read_bool(state: &ScriptState, property: Property) -> bool {
         Property::InputUp => state.input.up,
         Property::InputDown => state.input.down,
         Property::InputJump => state.input.jump,
-        Property::Position | Property::Rotation | Property::Scale | Property::InputMouse => false,
+        Property::Position
+        | Property::Rotation
+        | Property::Scale
+        | Property::InputMouse
+        | Property::TimeElapsed
+        | Property::TimeFrame => false,
     }
 }
 
@@ -862,7 +911,9 @@ fn write_bool(_state: &mut ScriptState, property: Property, _value: bool) {
         | Property::Position
         | Property::Rotation
         | Property::Scale
-        | Property::InputMouse => {}
+        | Property::InputMouse
+        | Property::TimeElapsed
+        | Property::TimeFrame => {}
     }
 }
 
@@ -876,7 +927,9 @@ fn read_vec2(state: &ScriptState, property: Property) -> Vec2 {
         | Property::InputRight
         | Property::InputUp
         | Property::InputDown
-        | Property::InputJump => Vec2::ZERO,
+        | Property::InputJump
+        | Property::TimeElapsed
+        | Property::TimeFrame => Vec2::ZERO,
     }
 }
 
@@ -890,7 +943,9 @@ fn write_vec2(state: &mut ScriptState, property: Property, value: Vec2) {
         | Property::InputRight
         | Property::InputUp
         | Property::InputDown
-        | Property::InputJump => {}
+        | Property::InputJump
+        | Property::TimeElapsed
+        | Property::TimeFrame => {}
     }
 }
 
@@ -1056,6 +1111,22 @@ fn bind_host(linker: &mut Linker<ScriptState>) -> Result<(), ScriptError> {
                 make_string(&mut c, &text)
             },
         )
+        .map_err(ScriptError::runtime)?;
+    linker
+        .func_wrap(host, "random", |mut c: Caller<'_, ScriptState>| -> f32 {
+            // xorshift32, which is nine lines and good enough for a game jam.
+            // The point is not the quality of the bits, it is that the host
+            // owns the seed: the same script started twice plays the same game,
+            // so a learner chasing "why was it different" is chasing their own
+            // code rather than the weather.
+            let state = c.data_mut();
+            state.rng ^= state.rng << 13;
+            state.rng ^= state.rng >> 17;
+            state.rng ^= state.rng << 5;
+            // 24 bits is every value an f32 can hold exactly, so this is
+            // uniform rather than nearly so.
+            (state.rng >> 8) as f32 / (1u32 << 24) as f32
+        })
         .map_err(ScriptError::runtime)?;
     // The transcendentals. Everything else comet needs from maths is one
     // WebAssembly instruction and never leaves the module.
@@ -2050,5 +2121,80 @@ mod tests {
             .instantiate_with(source, &mut scene, node, &declared)
             .expect("it compiles and starts");
         assert_eq!(script.read_exports(&declared), declared);
+    }
+
+    #[test]
+    fn a_script_can_read_the_clock() {
+        // Before this, "three seconds after start" needed a hand-rolled
+        // accumulator in a state variable - which is the first thing anybody
+        // writes and the first thing they get wrong.
+        let source = "
+            func update(dt: f32) {
+                transform.position.x = time.elapsed;
+                transform.position.y = time.frame;
+            }
+        ";
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate(source, &mut scene, node)
+            .expect("it compiles and starts");
+
+        script.update(&mut scene, node, 0.5).expect("one frame");
+        assert_eq!(
+            position(&scene, node),
+            Vec2::new(0.5, 1.0),
+            "the first frame has already happened, so neither reads zero"
+        );
+        script.update(&mut scene, node, 0.25).expect("another");
+        assert_eq!(position(&scene, node), Vec2::new(0.75, 2.0));
+    }
+
+    #[test]
+    fn the_clock_is_read_only() {
+        let source = "func update(dt: f32) { time.elapsed = 0.0; }";
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let err = host
+            .instantiate(source, &mut scene, node)
+            .expect_err("the engine owns the clock");
+        assert!(err.to_string().contains("read-only"), "{err}");
+    }
+
+    #[test]
+    fn random_is_in_range_varies_and_replays() {
+        let source = "
+            let total = 0.0;
+            func update(dt: f32) {
+                let r = random();
+                if r < 0.0 { transform.position.y = -1.0; }
+                if r > 1.0 { transform.position.y = -1.0; }
+                total += r;
+                transform.position.x = total;
+            }
+        ";
+        let run = || {
+            let mut host = ScriptHost::new().expect("a host");
+            let (mut scene, node) = scene_with_node(Vec2::ZERO);
+            let mut script = host
+                .instantiate(source, &mut scene, node)
+                .expect("it compiles and starts");
+            for _ in 0..64 {
+                script.update(&mut scene, node, 0.016).expect("a frame");
+            }
+            position(&scene, node)
+        };
+        let first = run();
+        assert_eq!(first.y, 0.0, "every draw was inside 0.0 .. 1.0");
+        assert!(
+            first.x > 8.0 && first.x < 56.0,
+            "64 draws averaged somewhere sane: {}",
+            first.x
+        );
+
+        // The same script started again plays the same game. That is the
+        // teaching artifact, not an accident of the generator: a learner asking
+        // why it went differently is asking about their own code.
+        assert_eq!(run(), first, "seeded per instance, so a run replays");
     }
 }

@@ -205,6 +205,9 @@ impl Script {
             )
             .expect("host binding");
         linker
+            .func_wrap(host, "random", |_: Caller<'_, Host>| 0.5f32)
+            .expect("host binding");
+        linker
             .func_wrap(host, "sin", |_: Caller<'_, Host>, x: f32| x.sin())
             .expect("host binding");
         linker

@@ -23,6 +23,7 @@ use crate::tir::*;
 pub fn check(script: &ast::Script, schema: &HostSchema) -> (TypedScript, Vec<Diagnostic>) {
     let mut checker = Checker {
         loops: 0,
+        params: 0,
         templates: Vec::new(),
         structs: Vec::new(),
         arrays: Vec::new(),
@@ -102,6 +103,10 @@ struct Checker<'a> {
     /// One entry per local slot: what a `let` bound, and whether anything has
     /// read it. `None` for parameters and for slots the checker introduced.
     bindings: Vec<Option<Binding>>,
+    /// How many of the current function's slots are its parameters. They come
+    /// first, so a slot below this is one - which is what tells an assignment
+    /// that it is writing into a copy.
+    params: u32,
     ret: Type,
 }
 
@@ -1575,6 +1580,7 @@ impl Checker<'_> {
         // handler takes `dt` whether or not it needs it - and warning about one
         // would train people to ignore warnings.
         self.bindings = f.params.iter().map(|_| None).collect();
+        self.params = f.params.len() as u32;
         for (i, p) in f.params.iter().enumerate() {
             self.scopes[0].insert(p.name.clone(), i as u32);
         }
@@ -2227,6 +2233,26 @@ impl Checker<'_> {
 
         // A local or a piece of state, then the path into it.
         let (is_local, slot, mut ty) = if let Some(slot) = self.lookup_local(name) {
+            // Writing into a field of a parameter changes a copy and nothing
+            // else, because a struct is a value (ADR 0024). It compiles, it
+            // runs, and it does nothing - which is the worst thing a teaching
+            // language can do, so it is at least said out loud. A warning
+            // rather than an error, because the copy may be exactly what was
+            // meant: a scratch value built from an argument.
+            //
+            // Not for `a[i] = v` through a parameter - an array *is* a
+            // reference, so that one really does reach the caller, and it is
+            // handled well above this.
+            if slot < self.params && !path.is_empty() {
+                let span = target.span();
+                self.diagnostics.push(Diagnostic::warning(
+                    span,
+                    format!(
+                        "this changes `{name}`'s copy, not the caller's - return the new \
+                         value instead"
+                    ),
+                ));
+            }
             (true, slot, self.locals[slot as usize])
         } else if let Some(&slot) = self.globals.get(name) {
             if self.constants.contains(name) {
@@ -3110,7 +3136,7 @@ enum Builtin {
 /// builds: the host functions, which live in [`builtin`] and `vec2`.
 const BUILTIN_NAMES: &[&str] = &[
     "print", "str", "vec2", "abs", "sqrt", "floor", "ceil", "min", "max", "sin", "cos", "atan2",
-    "pow", "int", "len", "push", "copy", "get",
+    "random", "pow", "int", "len", "push", "copy", "get",
 ];
 
 /// The candidate closest to `name`, if one is close enough to be worth saying.
@@ -3210,6 +3236,7 @@ fn builtin(name: &str) -> Option<(Builtin, &'static [Type], Type)> {
         "cos" => (Builtin::Host(Host::Cos), &[F32], F32),
         "atan2" => (Builtin::Host(Host::Atan2), &[F32, F32], F32),
         "pow" => (Builtin::Host(Host::Pow), &[F32, F32], F32),
+        "random" => (Builtin::Host(Host::Random), &[], F32),
         _ => return None,
     })
 }
@@ -4851,6 +4878,69 @@ mod tests {
         assert_eq!(
             messages("func update(dt: f32) { if \"a\" == \"b\" { } }"),
             ["`String` values cannot be compared - there is no string comparison yet"]
+        );
+    }
+
+    #[test]
+    fn writing_into_a_parameters_field_says_it_changes_a_copy() {
+        // Structs are values, so this compiles, runs, and does nothing at all.
+        // After the 4.x sweep it was the last silent do-nothing in the
+        // language, and silence is the worst thing a teaching tool can offer.
+        assert_eq!(
+            warnings(
+                "struct Body { hp: f32 }
+                 func hurt(body: Body, amount: f32) { body.hp -= amount; }
+                 func update(dt: f32) { let b = Body { hp: 100.0 }; hurt(b, 10.0); }"
+            ),
+            ["this changes `body`'s copy, not the caller's - return the new value instead"]
+        );
+        // A Vec2 is a value too, and has the same trap.
+        assert_eq!(
+            warnings(
+                "func nudge(v: Vec2) { v.x = 1.0; }
+                 func update(dt: f32) { nudge(vec2(0.0, 0.0)); }"
+            ),
+            ["this changes `v`'s copy, not the caller's - return the new value instead"]
+        );
+    }
+
+    #[test]
+    fn replacing_a_whole_parameter_is_not_the_same_mistake() {
+        // Rebinding the parameter is an ordinary local assignment - nobody
+        // expects that to reach the caller, and warning about it would train
+        // people to ignore warnings.
+        assert!(
+            warnings(
+                "func f(x: f32) -> f32 { x = 2.0; x }
+                 func update(dt: f32) { transform.rotation = f(1.0); }"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn writing_through_a_parameter_array_is_not_warned_about() {
+        // An array is a reference (ADR 0024), so this really does reach the
+        // caller - which is the whole point of the asymmetry the demo scripts
+        // teach.
+        assert!(
+            warnings(
+                "func fill(a: Array<f32>) { a[0] = 1.0; }
+                 func update(dt: f32) { let a = [1.0]; fill(a); }"
+            )
+            .is_empty(),
+            "an array element write is not a copy"
+        );
+    }
+
+    #[test]
+    fn writing_into_a_locals_field_is_fine() {
+        assert!(
+            warnings(
+                "struct Body { hp: f32 }
+                 func update(dt: f32) { let b = Body { hp: 1.0 }; b.hp = 2.0; print(str(b.hp)); }"
+            )
+            .is_empty()
         );
     }
 }

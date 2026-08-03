@@ -162,23 +162,25 @@ const F_POW: u32 = 13;
 /// branch over string literals in every module.
 const F_STR_BOOL: u32 = 14;
 const F_STR_VEC2: u32 = 15;
-const F_ALLOC: u32 = 16;
-const F_RETAIN: u32 = 17;
-const F_RELEASE: u32 = 18;
+/// `random() -> f32`. The host owns the seed, so a run can be replayed.
+const F_RANDOM: u32 = 16;
+const F_ALLOC: u32 = 17;
+const F_RETAIN: u32 = 18;
+const F_RELEASE: u32 = 19;
 /// The array runtime. Two blocks per array - a handle and its elements - so
 /// growing is invisible to every other name for the same array.
-const F_ARRAY_NEW: u32 = 19;
-const F_ARRAY_AT: u32 = 20;
-const F_ARRAY_PUSH: u32 = 21;
-const F_ARRAY_RELEASE: u32 = 22;
-const F_ARRAY_COPY: u32 = 23;
+const F_ARRAY_NEW: u32 = 20;
+const F_ARRAY_AT: u32 = 21;
+const F_ARRAY_PUSH: u32 = 22;
+const F_ARRAY_RELEASE: u32 = 23;
+const F_ARRAY_COPY: u32 = 24;
 /// `comet_heap_used() -> bytes`: what the heap has handed out and not taken
 /// back. Exported so a test has an exact leak oracle rather than watching
 /// `memory.size`, which cannot see a kilobyte leaked inside a 64KB page - the
 /// coarseness that let four ownership bugs ship in 4.5 and 4.6.
-const F_HEAP_USED: u32 = 24;
+const F_HEAP_USED: u32 = 25;
 /// The first script-defined function's index.
-const USER_BASE: u32 = 25;
+const USER_BASE: u32 = 26;
 
 /// Emit a WebAssembly module for `script`.
 ///
@@ -207,6 +209,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     let t_unary = types.get(vec![ValType::F32], vec![ValType::F32]);
     let t_binary = types.get(vec![ValType::F32, ValType::F32], vec![ValType::F32]);
     let t_str_vec2 = types.get(vec![ValType::F32, ValType::F32], vec![ValType::I32]);
+    let t_random = types.get(vec![], vec![ValType::F32]);
     let t_alloc = types.get(vec![ValType::I32], vec![ValType::I32]);
     let t_rc = types.get(vec![ValType::I32], vec![]);
     let t_heap_used = types.get(vec![], vec![ValType::I32]);
@@ -229,6 +232,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     imports.import(HOST_MODULE, "pow", EntityType::Function(t_binary));
     imports.import(HOST_MODULE, "str_bool", EntityType::Function(t_get_bool));
     imports.import(HOST_MODULE, "str_vec2", EntityType::Function(t_str_vec2));
+    imports.import(HOST_MODULE, "random", EntityType::Function(t_random));
 
     let t_array_new = types.get(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
     let t_array_at = types.get(
@@ -357,6 +361,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     names.append(F_POW, "orbit::pow");
     names.append(F_STR_BOOL, "orbit::str_bool");
     names.append(F_STR_VEC2, "orbit::str_vec2");
+    names.append(F_RANDOM, "orbit::random");
     names.append(F_ARRAY_NEW, "comet_array_new");
     names.append(F_ARRAY_AT, "comet_array_at");
     names.append(F_ARRAY_PUSH, "comet_array_push");
@@ -2310,6 +2315,10 @@ impl<'a> FnGen<'a> {
                     self.expr(&args[0]);
                     self.ins().call(F_STR_INT);
                 }
+                // No arguments, so nothing to put on the stack first.
+                Host::Random => {
+                    self.ins().call(F_RANDOM);
+                }
                 Host::StrBool => {
                     self.expr(&args[0]);
                     self.ins().call(F_STR_BOOL);
@@ -3289,6 +3298,7 @@ mod tests {
             "pow",
             "str_bool",
             "str_vec2",
+            "random",
         ]
         .iter()
         .map(|name| (HOST_MODULE.to_string(), name.to_string()))

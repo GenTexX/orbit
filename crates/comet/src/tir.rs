@@ -460,6 +460,10 @@ pub enum Host {
     /// `print("grounded: " + str(grounded))` - has to be one they can write.
     StrBool,
     StrVec2,
+    /// `random() -> f32` in `0.0 .. 1.0`. A host call rather than an emitted
+    /// generator, so the host owns the seed - which is what lets the same run
+    /// be replayed, and what stops every module carrying its own state.
+    Random,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
