@@ -182,7 +182,9 @@ mod tests {
         scene.add_child(root, node);
 
         let renderer = Renderer::headless().expect("headless renderer");
-        let white = renderer.create_texture(&[255, 255, 255, 255], 1, 1);
+        let white = renderer
+            .create_texture(&[255, 255, 255, 255], 1, 1)
+            .expect("a 1x1 texture fits any device");
         let (w, h) = (100u32, 100u32);
         let camera = Camera::new(Vec2::ZERO, Vec2::new(w as f32, h as f32));
         let image = renderer

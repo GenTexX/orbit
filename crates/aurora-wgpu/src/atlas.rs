@@ -25,6 +25,42 @@ pub(crate) struct GlyphEntry {
     pub height: f32,
 }
 
+/// Where the next glyph goes: a row of glyphs at a time, left to right, then
+/// down by the tallest one on the row.
+///
+/// Split out from [`Atlas`] because it is arithmetic and nothing else - the
+/// rest of that type needs a GPU to exist, which is why the one part of it that
+/// can be wrong in an interesting way had no test.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Shelf {
+    x: u32,
+    y: u32,
+    height: u32,
+}
+
+impl Shelf {
+    /// Place a `w` x `h` glyph, or `None` when there is no room left.
+    ///
+    /// `None` rather than a `debug_assert`: past the last shelf the old version
+    /// handed back an origin outside the texture, `write_texture` raised a wgpu
+    /// validation error, and wgpu's default handler turns that into an abort.
+    /// A release build therefore killed the editor when the atlas filled.
+    fn place(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+        if self.x + w + PAD > ATLAS_SIZE {
+            self.x = 0;
+            self.y += self.height + PAD;
+            self.height = 0;
+        }
+        if self.y + h > ATLAS_SIZE {
+            return None;
+        }
+        let at = (self.x, self.y);
+        self.x += w + PAD;
+        self.height = self.height.max(h);
+        Some(at)
+    }
+}
+
 /// A single-channel (coverage) texture holding rasterized glyphs and one white
 /// block, filled by a simple shelf packer.
 pub(crate) struct Atlas {
@@ -32,9 +68,7 @@ pub(crate) struct Atlas {
     pub view: wgpu::TextureView,
     swash: SwashCache,
     glyphs: HashMap<CacheKey, Option<GlyphEntry>>,
-    cursor_x: u32,
-    cursor_y: u32,
-    shelf_height: u32,
+    shelf: Shelf,
     /// UV of the center of the reserved white block, for solid fills.
     pub white_uv: [f32; 2],
 }
@@ -83,9 +117,7 @@ impl Atlas {
             swash: SwashCache::new(),
             glyphs: HashMap::new(),
             // Start packing on a fresh shelf below the white block.
-            cursor_x: 0,
-            cursor_y: WHITE + PAD,
-            shelf_height: 0,
+            shelf: Shelf::default(),
             white_uv: [
                 (WHITE as f32 / 2.0) / ATLAS_SIZE as f32,
                 (WHITE as f32 / 2.0) / ATLAS_SIZE as f32,
@@ -119,9 +151,17 @@ impl Atlas {
             _ => None,
         };
 
-        let entry = extracted.map(|(placement, data)| {
+        let entry = extracted.and_then(|(placement, data)| {
             let (w, h) = (placement.width, placement.height);
-            let (x, y) = self.pack(w, h);
+            // One retry after a reset. A glyph too big for an empty atlas is
+            // the only way to fail twice, and that one is genuinely undrawable.
+            let (x, y) = match self.pack(w, h) {
+                Some(at) => at,
+                None => {
+                    self.reset();
+                    self.pack(w, h)?
+                }
+            };
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.texture,
@@ -142,33 +182,82 @@ impl Atlas {
                 },
             );
             let s = ATLAS_SIZE as f32;
-            GlyphEntry {
+            Some(GlyphEntry {
                 uv_min: [x as f32 / s, y as f32 / s],
                 uv_max: [(x + w) as f32 / s, (y + h) as f32 / s],
                 left: placement.left,
                 top: placement.top,
                 width: w as f32,
                 height: h as f32,
-            }
+            })
         });
 
         self.glyphs.insert(cache_key, entry);
         entry
     }
 
-    /// Shelf packer: place a `w` x `h` glyph and advance the cursor. Assumes the
-    /// atlas is large enough (1024x1024 far exceeds an inspector's glyph set);
-    /// growing or evicting is a later concern.
-    fn pack(&mut self, w: u32, h: u32) -> (u32, u32) {
-        if self.cursor_x + w + PAD > ATLAS_SIZE {
-            self.cursor_x = 0;
-            self.cursor_y += self.shelf_height + PAD;
-            self.shelf_height = 0;
+    /// Shelf packer: place a `w` x `h` glyph and advance the cursor, or `None`
+    /// when the atlas has no room left.
+    ///
+    /// `None` rather than a `debug_assert`: past the last shelf the old version
+    /// handed back an origin outside the texture, `write_texture` raised a wgpu
+    /// validation error, and wgpu's default handler turns that into an abort.
+    /// A release build therefore *killed the editor* when the atlas filled -
+    /// which is reachable, since 1024x1024 is a few thousand glyphs and a large
+    /// font size, several faces, or a script full of unusual characters all
+    /// spend it faster than an inspector does.
+    fn pack(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+        self.shelf.place(w, h)
+    }
+
+    /// Forget every glyph and start packing from the top again.
+    ///
+    /// The blunt survivable answer to a full atlas: the texture keeps whatever
+    /// bytes it had, but nothing refers to them any more, and the glyphs still
+    /// on screen are re-rasterized into the fresh space over the next frames. A
+    /// hitch instead of a crash. An LRU pass or a second page would be better;
+    /// this is what makes the failure recoverable at all. Silent because this
+    /// crate takes no logging dependency - the visible sign is the one hitched
+    /// frame.
+    fn reset(&mut self) {
+        self.glyphs.clear();
+        self.shelf = Shelf::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_shelf_says_so_instead_of_pointing_outside_the_texture() {
+        // The failure this replaces: past the last row the packer returned an
+        // origin beyond the texture, which wgpu rejects and its default error
+        // handler turns into a process abort - so a full glyph atlas took the
+        // editor with it.
+        let mut shelf = Shelf::default();
+        assert_eq!(shelf.place(10, 10), Some((0, 0)));
+        assert_eq!(shelf.place(10, 10), Some((10 + PAD, 0)), "along the row");
+
+        // Fill it. Tall rows so this does not take thousands of iterations.
+        let tall = 256;
+        let mut placed = 2;
+        while shelf.place(ATLAS_SIZE - PAD - 1, tall).is_some() {
+            placed += 1;
+            assert!(placed < 10_000, "it should run out, not go forever");
         }
-        debug_assert!(self.cursor_y + h <= ATLAS_SIZE, "glyph atlas is full");
-        let (x, y) = (self.cursor_x, self.cursor_y);
-        self.cursor_x += w + PAD;
-        self.shelf_height = self.shelf_height.max(h);
-        (x, y)
+        // Everything it did hand out was inside the texture.
+        assert!(shelf.y + tall > ATLAS_SIZE, "it stopped at the bottom edge");
+
+        // And starting again from the top is what makes a full atlas a hitch
+        // rather than a crash.
+        let mut fresh = Shelf::default();
+        assert_eq!(fresh.place(10, 10), Some((0, 0)));
+    }
+
+    #[test]
+    fn a_glyph_taller_than_the_whole_atlas_is_refused_rather_than_placed() {
+        let mut shelf = Shelf::default();
+        assert_eq!(shelf.place(8, ATLAS_SIZE + 1), None);
     }
 }

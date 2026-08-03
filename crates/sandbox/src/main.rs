@@ -143,7 +143,7 @@ impl State {
             .context("decode sprite.png")?
             .to_rgba8();
         let (w, h) = decoded.dimensions();
-        let texture = renderer.create_texture(&decoded.into_raw(), w, h);
+        let texture = renderer.create_texture(&decoded.into_raw(), w, h)?;
 
         let count = std::env::var("ORBIT_SPRITES")
             .ok()

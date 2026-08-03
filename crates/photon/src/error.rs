@@ -27,6 +27,15 @@ pub enum RendererError {
     #[error("this renderer has no window surface")]
     NoSurface,
 
+    /// An image is larger than this device will hold in one texture.
+    ///
+    /// A separate variant rather than a panic because it is a property of the
+    /// *content*, not of the program: someone's PNG is 12000 pixels wide, and a
+    /// caller can put a placeholder in its place. wgpu's default handler turns
+    /// this into an abort, which for an editor means the session.
+    #[error("image is {width}x{height}, larger than this device's limit of {limit}")]
+    TextureTooLarge { width: u32, height: u32, limit: u32 },
+
     /// Acquiring the next surface frame failed unrecoverably.
     #[error("failed to acquire the next surface frame")]
     SurfaceAcquire,

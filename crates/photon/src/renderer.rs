@@ -259,8 +259,32 @@ impl Renderer {
     }
 
     /// Upload an RGBA8 image (row-major, `width * height * 4` bytes) as a texture.
-    pub fn create_texture(&self, rgba: &[u8], width: u32, height: u32) -> Texture {
-        Texture::from_rgba(&self.gpu.device, &self.gpu.queue, rgba, width, height)
+    ///
+    /// Fails rather than aborting when the image is bigger than the device will
+    /// take. wgpu's default error handler panics, and the extent is decided by
+    /// whatever file the user put in their project - so this is content, not a
+    /// programming mistake, and it gets an error a caller can show.
+    pub fn create_texture(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Texture, RendererError> {
+        let limit = self.gpu.device.limits().max_texture_dimension_2d;
+        if width > limit || height > limit {
+            return Err(RendererError::TextureTooLarge {
+                width,
+                height,
+                limit,
+            });
+        }
+        Ok(Texture::from_rgba(
+            &self.gpu.device,
+            &self.gpu.queue,
+            rgba,
+            width,
+            height,
+        ))
     }
 
     /// Resize the window surface. No-op on a headless renderer.
@@ -959,7 +983,7 @@ mod tests {
         // render identically to a self-owned headless renderer.
         let gpu = Gpu::headless().expect("gpu context");
         let shared = Renderer::from_gpu(gpu);
-        let white = shared.create_texture(&[255, 255, 255, 255], 1, 1);
+        let white = shared.create_texture(&[255, 255, 255, 255], 1, 1).unwrap();
         let (w, h) = (64u32, 64u32);
         let camera = Camera::new(Vec2::ZERO, Vec2::new(w as f32, h as f32));
         let sprite = Sprite::new(Vec2::new(10.0, 10.0), Vec2::new(20.0, 20.0));
@@ -981,7 +1005,9 @@ mod tests {
     #[ignore = "requires a GPU adapter; run locally with --ignored"]
     fn render_to_target_draws_into_a_sampleable_texture() {
         let renderer = Renderer::headless().expect("headless renderer");
-        let white = renderer.create_texture(&[255, 255, 255, 255], 1, 1);
+        let white = renderer
+            .create_texture(&[255, 255, 255, 255], 1, 1)
+            .unwrap();
         let camera = Camera::new(Vec2::ZERO, Vec2::new(64.0, 64.0));
         let sprite = Sprite::new(Vec2::new(10.0, 10.0), Vec2::new(20.0, 20.0));
 
@@ -1003,7 +1029,9 @@ mod tests {
     #[ignore = "requires a GPU adapter; run locally with --ignored"]
     fn sprite_lands_in_the_top_left_for_y_down() {
         let renderer = Renderer::headless().expect("headless renderer");
-        let white = renderer.create_texture(&[255, 255, 255, 255], 1, 1);
+        let white = renderer
+            .create_texture(&[255, 255, 255, 255], 1, 1)
+            .unwrap();
         let (w, h) = (200u32, 150u32);
         let camera = Camera::new(Vec2::ZERO, Vec2::new(w as f32, h as f32));
 
@@ -1027,7 +1055,9 @@ mod tests {
     #[ignore = "requires a GPU adapter; run locally with --ignored"]
     fn empty_scene_is_just_the_clear_color() {
         let renderer = Renderer::headless().expect("headless renderer");
-        let texture = renderer.create_texture(&[255, 255, 255, 255], 1, 1);
+        let texture = renderer
+            .create_texture(&[255, 255, 255, 255], 1, 1)
+            .unwrap();
         let camera = Camera::new(Vec2::ZERO, Vec2::new(64.0, 64.0));
 
         let image = renderer
@@ -1047,7 +1077,9 @@ mod tests {
     #[ignore = "requires a GPU adapter; run locally with --ignored"]
     fn pick_finds_the_topmost_sprite_and_misses_empty_space() {
         let renderer = Renderer::headless().expect("headless renderer");
-        let white = renderer.create_texture(&[255, 255, 255, 255], 1, 1);
+        let white = renderer
+            .create_texture(&[255, 255, 255, 255], 1, 1)
+            .unwrap();
         let (w, h) = (100u32, 100u32);
         let camera = Camera::new(Vec2::ZERO, Vec2::new(w as f32, h as f32));
 
@@ -1072,8 +1104,8 @@ mod tests {
     #[ignore = "requires a GPU adapter; run locally with --ignored"]
     fn runs_render_each_group_with_its_own_texture_in_order() {
         let renderer = Renderer::headless().expect("headless renderer");
-        let red = renderer.create_texture(&[255, 0, 0, 255], 1, 1);
-        let green = renderer.create_texture(&[0, 255, 0, 255], 1, 1);
+        let red = renderer.create_texture(&[255, 0, 0, 255], 1, 1).unwrap();
+        let green = renderer.create_texture(&[0, 255, 0, 255], 1, 1).unwrap();
         let (w, h) = (64u32, 64u32);
         let camera = Camera::new(Vec2::ZERO, Vec2::new(w as f32, h as f32));
         let target = renderer.create_scene_target(w, h);
@@ -1112,7 +1144,9 @@ mod tests {
     #[ignore = "requires a GPU adapter; run locally with --ignored"]
     fn pick_ignores_transparent_sprites() {
         let renderer = Renderer::headless().expect("headless renderer");
-        let white = renderer.create_texture(&[255, 255, 255, 255], 1, 1);
+        let white = renderer
+            .create_texture(&[255, 255, 255, 255], 1, 1)
+            .unwrap();
         let camera = Camera::new(Vec2::ZERO, Vec2::new(64.0, 64.0));
 
         // A fully transparent tint: the pick shader discards it, so clicks
@@ -1129,7 +1163,9 @@ mod tests {
     #[ignore = "requires a GPU adapter; run locally with --ignored"]
     fn overlay_draws_over_the_scene_without_clearing_it() {
         let renderer = Renderer::headless().expect("headless renderer");
-        let white = renderer.create_texture(&[255, 255, 255, 255], 1, 1);
+        let white = renderer
+            .create_texture(&[255, 255, 255, 255], 1, 1)
+            .unwrap();
         let (w, h) = (64u32, 64u32);
         let camera = Camera::new(Vec2::ZERO, Vec2::new(w as f32, h as f32));
         let target = renderer.create_scene_target(w, h);

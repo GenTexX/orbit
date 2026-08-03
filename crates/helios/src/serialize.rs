@@ -66,8 +66,17 @@ impl Scene {
     }
 
     /// Rebuild a scene from RON produced by [`to_ron`](Self::to_ron).
+    ///
+    /// The recursion limit is raised because a `NodeDoc` nests structurally:
+    /// `ron`'s default of 128 levels divided by the four serde levels each node
+    /// costs meant a tree deeper than about 30 saved fine and then could not be
+    /// read back - the editor writing a file it refuses to open. Nothing in the
+    /// editor builds trees that deep on its own, but reparenting by hand can,
+    /// and losing a scene to that is not a trade worth keeping.
     pub fn from_ron(text: &str) -> Result<Scene, HeliosError> {
-        let doc: SceneDoc = ron::from_str(text)?;
+        let doc: SceneDoc = ron::Options::default()
+            .with_recursion_limit(1024)
+            .from_str(text)?;
         let mut scene = Scene::new(&doc.root.name);
         let root = scene.root();
         apply_doc(&mut scene, root, &doc.root)?;
@@ -228,6 +237,22 @@ mod tests {
                 ("chases".to_string(), Value::Bool(true)),
             ]
         );
+    }
+
+    #[test]
+    fn a_deep_tree_can_be_read_back_after_it_is_written() {
+        // NodeDoc nests structurally, and ron's default recursion limit of 128
+        // divided by the levels serde spends per node stopped a load at about
+        // 30 deep - so the editor wrote a file it then refused to open, which
+        // is the one failure a save format must not have.
+        let mut scene = Scene::new("root");
+        let mut parent = scene.root();
+        for i in 0..200 {
+            parent = scene.add_child(parent, Node::new(format!("deep{i}")));
+        }
+        let ron = scene.to_ron().expect("it writes");
+        let reloaded = Scene::from_ron(&ron).expect("and reads back");
+        assert_eq!(reloaded.to_ron().unwrap(), ron);
     }
 
     #[test]

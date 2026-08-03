@@ -1174,7 +1174,9 @@ impl State {
         let mut gui = AuroraRenderer::from_gpu(gpu.clone(), surface, (size.width, size.height))
             .context("create GUI renderer")?;
         let engine = PhotonRenderer::from_gpu(gpu);
-        let white = engine.create_texture(&[255, 255, 255, 255], 1, 1);
+        let white = engine
+            .create_texture(&[255, 255, 255, 255], 1, 1)
+            .expect("a 1x1 texture fits any device");
         let textures = TextureCache::new(&engine);
         let icons = Icons::build(&mut gui);
         // Placeholder color-picker gradients (regenerated when it opens).

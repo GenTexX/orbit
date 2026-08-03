@@ -39,7 +39,9 @@ impl TextureCache {
         Self {
             textures: HashMap::new(),
             failed: HashSet::new(),
-            fallback: engine.create_texture(&[255, 0, 255, 255], 1, 1),
+            fallback: engine
+                .create_texture(&[255, 0, 255, 255], 1, 1)
+                .expect("a 1x1 texture fits any device"),
         }
     }
 
@@ -75,7 +77,10 @@ fn load_texture(engine: &Renderer, path: &Path) -> Result<Texture> {
         .with_context(|| format!("decode {}", path.display()))?
         .to_rgba8();
     let (w, h) = rgba.dimensions();
-    Ok(engine.create_texture(&rgba.into_raw(), w, h))
+    // A too-large image comes back as an error here and is reported by
+    // `ensure`, which then leaves the magenta fallback in its place - the
+    // same handling a file that will not decode already gets.
+    Ok(engine.create_texture(&rgba.into_raw(), w, h)?)
 }
 
 #[cfg(test)]
