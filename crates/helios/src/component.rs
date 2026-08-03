@@ -138,10 +138,6 @@ pub struct ScriptComponent {
 }
 
 impl ScriptComponent {
-    /// Bring the stored values into line with what `exports` says the script
-    /// now declares: keep what is still there and still the right type, drop
-    /// what is gone, and add what is new at its default.
-    ///
     /// How the script asked for `field` to be shown.
     pub fn hints_for(&self, field: &str) -> &[comet::Hint] {
         self.hints

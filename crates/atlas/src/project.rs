@@ -113,4 +113,82 @@ mod tests {
             "a second launch must not overwrite the user's edits"
         );
     }
+
+    /// The one project every user opens first, checked end to end.
+    ///
+    /// Nothing loaded it before: the script fixtures were compiled, and the
+    /// scaffold path was exercised in a tempdir, but the committed
+    /// `demo_project/scenes/main.ron` - the file the editor actually opens at
+    /// startup - was read by no test at all. That is where the dropped
+    /// `@export` values were sitting in plain sight.
+    #[test]
+    fn the_committed_demo_project_loads_saves_and_keeps_everything() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("demo_project");
+        let project = helios::Project::load(&dir).expect("the demo project loads");
+
+        // Every asset and script the scene names exists on disk. A dangling
+        // reference shows as a magenta sprite or an empty inspector, which
+        // reads as "the engine is broken" rather than "that file moved".
+        let mut named = Vec::new();
+        let mut stack = vec![project.scene.root()];
+        while let Some(node) = stack.pop() {
+            for component in &project.scene.node(node).components {
+                let reflect = component.as_reflect();
+                for field in reflect.field_names() {
+                    if let Some(helios::Value::Asset(path)) = reflect.get(&field)
+                        && !path.is_empty()
+                    {
+                        named.push(path);
+                    }
+                }
+            }
+            stack.extend(project.scene.children(node));
+        }
+        assert!(!named.is_empty(), "the demo scene references something");
+        for path in &named {
+            assert!(
+                dir.join(path).exists(),
+                "the scene names `{path}`, which is not there"
+            );
+        }
+
+        // Save it somewhere else and read it back byte for byte. This is the
+        // assertion that would have caught the export loss on the day it
+        // landed: the values are in the committed file, and they have to
+        // survive the round trip that the editor performs on every save.
+        let copy = tempfile::tempdir().unwrap();
+        project.save(copy.path()).expect("it saves");
+        let reloaded = helios::Project::load(copy.path()).expect("and loads again");
+        assert_eq!(
+            reloaded.scene.to_ron().unwrap(),
+            project.scene.to_ron().unwrap(),
+            "the demo project survives a save and a load unchanged"
+        );
+
+        // And a script's tuned values are actually there to survive - a fixture
+        // with none would make the assertion above vacuous, which is exactly
+        // how this went unnoticed in helios's own round-trip test.
+        let tuned: Vec<_> = std::iter::successors(Some(vec![project.scene.root()]), |_| None)
+            .flatten()
+            .flat_map(|root| {
+                let mut all = Vec::new();
+                let mut stack = vec![root];
+                while let Some(n) = stack.pop() {
+                    all.push(n);
+                    stack.extend(project.scene.children(n));
+                }
+                all
+            })
+            .flat_map(|n| project.scene.node(n).components.clone())
+            .filter_map(|c| match c {
+                Component::Script(s) => Some(s.exports),
+                _ => None,
+            })
+            .filter(|e| !e.is_empty())
+            .collect();
+        assert!(
+            !tuned.is_empty(),
+            "the demo project has a script with tuned values, so the round trip means something"
+        );
+    }
 }

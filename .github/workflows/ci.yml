@@ -46,6 +46,11 @@ jobs:
       # discovery, so pinning a filename that has drifted (lvp_icd.x86_64.json
       # is not stable across Mesa versions) finds nothing at all rather than
       # falling back. The loader reads /usr/share/vulkan/icd.d itself.
-      - run: cargo test -p photon -- --include-ignored
+      # photon, aether and helios all have GPU tests behind #[ignore]. Only
+      # photon's ran, so aether's headless-context test and helios's - the sole
+      # end-to-end proof that a Node's world transform reaches real pixels -
+      # had never executed in CI at all. atlas is excluded on purpose: its one
+      # ignored test writes an icon preview PNG and is a tool, not a check.
+      - run: cargo test -p photon -p aether -p helios -- --include-ignored
         env:
           WGPU_BACKEND: vulkan
