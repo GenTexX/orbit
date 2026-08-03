@@ -1270,6 +1270,109 @@ impl State {
         }
     }
 
+    /// Follow the running game in the inspector, without rebuilding the shell.
+    ///
+    /// Two things move while a game runs: the node's transform, which scripts
+    /// write through the host schema, and a script's own exported variables,
+    /// which it may assign to. An inspector that showed neither would be a
+    /// panel of numbers that were true when Play was pressed - worse than
+    /// showing nothing, because it looks current.
+    ///
+    /// Only the selected node, and only in place. A rebuild would be a rebuild
+    /// per frame, which drops aurora's retained pointer state; every readout
+    /// here goes through a setter that leaves the layout alone.
+    fn sync_inspector_to_game(&mut self) {
+        if !self.play.is_playing() {
+            return;
+        }
+        let Some(node) = self.selection.primary() else {
+            return;
+        };
+        self.sync_inspector_transform(node);
+        self.sync_live_exports(node);
+    }
+
+    /// Write what each of `node`'s running scripts holds into the inspector's
+    /// rows for it.
+    ///
+    /// The component's own values are untouched: ADR 0022 keeps the component
+    /// the owner, and this is a readout of the module. Which is why Stop puts
+    /// the authored numbers straight back with nothing to undo.
+    fn sync_live_exports(&mut self, node: NodeId) {
+        let scripts: Vec<usize> = self
+            .project
+            .scene
+            .node(node)
+            .components
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c, helios::Component::Script(_)))
+            .map(|(index, _)| index)
+            .collect();
+        for component in scripts {
+            let Some(live) = self.play.live_exports(&self.project.scene, node, component) else {
+                continue;
+            };
+            for (field, value) in live {
+                self.show_field_value(node, component, &field, &value);
+            }
+        }
+    }
+
+    /// Put `value` into whichever inspector row is showing
+    /// `(node, component, field)`, whatever shape that row took.
+    ///
+    /// A row the user is typing in is left alone. Editing is refused while a
+    /// game runs, so nothing typed there can land - but overwriting somebody's
+    /// half-typed text under their caret is rude whatever the reason.
+    fn show_field_value(&mut self, node: NodeId, component: usize, field: &str, value: &Value) {
+        let focused = self.ui.focused();
+        let matches = |&(_, n, c, ref f): &(aurora::WidgetId, NodeId, usize, String)| {
+            n == node && c == component && f == field
+        };
+        if let Some((widget, ..)) = self.rows.field_rows.iter().find(|row| matches(row))
+            && Some(*widget) != focused
+        {
+            let (widget, text) = (*widget, value_to_text(value));
+            self.ui.set_text_input(widget, text);
+        }
+        if let (Some((widget, ..)), Value::F32(v)) = (
+            self.rows.field_sliders.iter().find(|row| matches(row)),
+            value,
+        ) {
+            let (widget, v) = (*widget, *v);
+            self.ui.set_slider_value(widget, v);
+        }
+        if let (Some((widget, ..)), Value::Bool(b)) = (
+            self.rows.field_checkboxes.iter().find(|row| matches(row)),
+            value,
+        ) {
+            let (widget, b) = (*widget, *b);
+            self.ui.set_checked(widget, b);
+        }
+        if let Value::Vec2(v) = value {
+            let target = FieldRef::Component {
+                node,
+                index: component,
+                field: field.to_string(),
+            };
+            let axes: Vec<(aurora::WidgetId, Axis)> = self
+                .rows
+                .vec_inputs
+                .iter()
+                .filter(|(_, f, _)| *f == target)
+                .map(|(widget, _, axis)| (*widget, *axis))
+                .collect();
+            for (widget, axis) in axes {
+                if Some(widget) == focused {
+                    continue;
+                }
+                let text = value_to_text(&Value::F32(crate::ui::axis_of(*v, axis)));
+                self.ui.set_text_input(widget, text);
+            }
+        }
+    }
+
     /// Update one Vec2 field component's inspector input in place (no rebuild) -
     /// used during an inspector label drag-scrub, the same way a viewport drag
     /// updates the transform inputs.
@@ -6222,6 +6325,7 @@ impl State {
         // file - must not hand a game a step it can tunnel through walls with.
         self.play.step(&mut self.project.scene, dt);
         self.drain_script_output();
+        self.sync_inspector_to_game();
         self.tick_tab_bars(dt);
         if let Some(id) = self.rows.carried_tab {
             // The carried tab sits under the pointer at the same point it was

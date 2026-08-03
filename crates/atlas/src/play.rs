@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use helios::Scene;
+use helios::{NodeId, Scene, Value};
 use voyager::Runtime;
 
 /// The editor's play session: a runtime, and the scene as it was before it ran.
@@ -97,6 +97,17 @@ impl Play {
         }
     }
 
+    /// What the script at `(node, component)` currently holds for each of its
+    /// exported variables, or `None` if nothing is running there.
+    pub fn live_exports(
+        &mut self,
+        scene: &Scene,
+        node: NodeId,
+        component: usize,
+    ) -> Option<Vec<(String, Value)>> {
+        self.runtime.as_mut()?.live_exports(scene, node, component)
+    }
+
     /// Take what the running scripts printed, each line tagged with which
     /// script printed it.
     pub fn take_output(&mut self) -> Vec<String> {
@@ -130,7 +141,7 @@ impl Play {
 mod tests {
     use super::*;
 
-    use helios::{Component, Node, NodeId, ScriptComponent};
+    use helios::{Component, Node, ScriptComponent};
 
     /// A project directory holding `move.cmt`, and a scene whose one child node
     /// runs it.
@@ -308,6 +319,58 @@ mod tests {
         let problems = play.take_problems();
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("broken.cmt"), "{problems:?}");
+    }
+
+    #[test]
+    fn the_demo_projects_readonly_export_can_be_watched_while_it_runs() {
+        // `travelled` in tunable.cmt is `@readonly` and the script drives it -
+        // it exists to be watched. Reading it back is what makes the inspector
+        // show the game rather than a snapshot of what it was handed.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("demo_project");
+        let project = helios::Project::load(&dir).expect("the demo project loads");
+        let mut scene = project.scene;
+        let root = scene.root();
+        let (node, component) = scene
+            .children(root)
+            .to_vec()
+            .into_iter()
+            .find_map(|node| {
+                let at = scene.node(node).components.iter().position(
+                    |c| matches!(c, Component::Script(s) if s.source.ends_with("tunable.cmt")),
+                )?;
+                Some((node, at))
+            })
+            .expect("the demo scene runs tunable.cmt");
+
+        let mut play = Play::new(&dir);
+        play.start(&mut scene);
+        for _ in 0..10 {
+            play.step(&mut scene, 0.016);
+        }
+
+        let live = play
+            .live_exports(&scene, node, component)
+            .expect("the script is running");
+        let travelled = live
+            .iter()
+            .find(|(name, _)| name == "travelled")
+            .map(|(_, value)| value.clone())
+            .expect("tunable.cmt exports travelled");
+        assert!(
+            matches!(travelled, helios::Value::F32(x) if x > 0.0),
+            "ten frames of the script's own arithmetic: {travelled:?}"
+        );
+
+        // The component still holds what the scene file said, because a
+        // readout is not ownership (ADR 0022) - which is what lets Stop put the
+        // authored numbers back with nothing to undo.
+        let Some(Component::Script(script)) = scene.node(node).components.get(component) else {
+            panic!("it is a script component");
+        };
+        assert_eq!(
+            script.exports.iter().find(|(n, _)| n == "travelled"),
+            Some(&("travelled".to_string(), helios::Value::F32(0.0)))
+        );
     }
 
     #[test]

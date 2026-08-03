@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use helios::{Component, Input, NodeId, Scene, ScriptError, ScriptHost, ScriptInstance};
+use helios::{Component, Input, NodeId, Scene, ScriptError, ScriptHost, ScriptInstance, Value};
 
 /// One script instance, and the address in the scene it belongs to.
 struct Running {
@@ -168,6 +168,27 @@ impl Runtime {
         lines
     }
 
+    /// What the script at `(node, component)` currently holds for each of its
+    /// exported variables, or `None` if nothing is running there.
+    ///
+    /// A readout of the module, not of the component. The component owns these
+    /// values (ADR 0022) and keeps owning them; this answers the other
+    /// question - what does the game have right now - which stops being the
+    /// same question the moment a script assigns to one of its own exports.
+    pub fn live_exports(
+        &mut self,
+        scene: &Scene,
+        node: NodeId,
+        component: usize,
+    ) -> Option<Vec<(String, Value)>> {
+        let Some(Component::Script(script)) = scene.node(node).components.get(component) else {
+            return None;
+        };
+        let declared = script.exports.clone();
+        let at = self.index_of(node, component)?;
+        Some(self.running[at].script.read_exports(&declared))
+    }
+
     /// Take what has gone wrong since this was last called.
     pub fn take_problems(&mut self) -> Vec<String> {
         std::mem::take(&mut self.problems)
@@ -268,7 +289,7 @@ fn scripts_in_pre_order(scene: &Scene) -> Vec<(NodeId, usize, String)> {
 mod tests {
     use super::*;
 
-    use helios::{Node, ScriptComponent, Value};
+    use helios::{Node, ScriptComponent};
 
     /// A project directory with `script.cmt` in it, plus a scene whose single
     /// child node runs it.
@@ -676,5 +697,49 @@ mod tests {
         runtime.stop(&mut scene);
         assert!(!runtime.is_playing());
         assert!(spoken(&mut runtime).is_empty(), "nothing to tear down");
+    }
+
+    #[test]
+    fn a_running_scripts_own_exports_can_be_read_back_live() {
+        // What makes an inspector useful during a game: a value the script is
+        // driving reads out where it is now, not where it started.
+        let (dir, mut scene, node) = project(
+            "@export let travelled: f32 = 0.0;
+             func update(dt: f32) { travelled = travelled + 1.0; }",
+        );
+        let Some(Component::Script(script)) = scene.node_mut(node).components.get_mut(0) else {
+            panic!("the fixture attaches a script");
+        };
+        script.exports = vec![("travelled".to_string(), Value::F32(0.0))];
+
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        runtime.step(&mut scene, 0.016);
+        runtime.step(&mut scene, 0.016);
+
+        assert_eq!(
+            runtime.live_exports(&scene, node, 0),
+            Some(vec![("travelled".to_string(), Value::F32(2.0))]),
+            "two frames of the script's own arithmetic"
+        );
+        // And the component still owns its copy - the readout did not write
+        // back, which is what keeps ADR 0022 true.
+        let Some(Component::Script(script)) = scene.node(node).components.first() else {
+            panic!("the fixture attaches a script");
+        };
+        assert_eq!(script.exports[0].1, Value::F32(0.0));
+    }
+
+    #[test]
+    fn nothing_running_at_an_address_has_no_live_exports() {
+        let (dir, mut scene, node) = project("func update(dt: f32) { }");
+        let mut runtime = Runtime::new(dir.path()).expect("a runtime");
+        assert_eq!(runtime.live_exports(&scene, node, 0), None);
+        runtime.attach(&mut scene, node, 0).expect("it compiles");
+        assert_eq!(
+            runtime.live_exports(&scene, node, 0),
+            Some(Vec::new()),
+            "a script with no exports has none, which is not the same as none running"
+        );
     }
 }

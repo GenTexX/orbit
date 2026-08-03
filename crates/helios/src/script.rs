@@ -359,6 +359,7 @@ impl ScriptHost {
         scene.node_mut(node).transform = store.data().transform;
         Ok(ScriptInstance {
             store,
+            instance,
             update,
             on_destroy,
             label: scene.node(node).name.clone(),
@@ -372,6 +373,10 @@ impl ScriptHost {
 /// persistent.
 pub struct ScriptInstance {
     store: Store<ScriptState>,
+    /// Kept so exported globals can be read back after `start` - the typed
+    /// entry points above are resolved once, but a global is looked up by name
+    /// whenever somebody asks what the script currently holds.
+    instance: Instance,
     update: Option<TypedFunc<f32, ()>>,
     on_destroy: Option<TypedFunc<(), ()>>,
     /// What this instance's printed output is tagged with.
@@ -486,6 +491,55 @@ impl ScriptInstance {
         let result = on_destroy.call(&mut self.store, ());
         scene.node_mut(node).transform = self.store.data().transform;
         self.settle(result)
+    }
+
+    /// Read back what the running script currently holds for each of
+    /// `declared`, in the same order.
+    ///
+    /// The mirror of `apply_exports`, and it exists for one reason: a script may
+    /// assign to its own exported variable, and a value that changes every frame
+    /// with nowhere to show it is a value nobody can debug. An inspector can
+    /// draw these while a game runs.
+    ///
+    /// A readout, not ownership. ADR 0022 keeps the component the owner of these
+    /// values; this says what the module has right now, which is a different
+    /// question with a different answer the moment a script assigns.
+    ///
+    /// A name the module does not export, or exports at another type, keeps the
+    /// value it was given - the same rule `apply_exports` uses in the other
+    /// direction, and for the same reason: the component and the module are
+    /// reconciled elsewhere, and this is not the place to decide they disagree.
+    pub fn read_exports(&mut self, declared: &[(String, Value)]) -> Vec<(String, Value)> {
+        declared
+            .iter()
+            .map(|(name, value)| (name.clone(), self.read_export(name, value)))
+            .collect()
+    }
+
+    fn read_export(&mut self, name: &str, value: &Value) -> Value {
+        let globals = match value {
+            Value::Vec2(_) => comet::exported_globals(name, comet::Type::Vec2),
+            Value::F32(_) => comet::exported_globals(name, comet::Type::F32),
+            Value::Bool(_) => comet::exported_globals(name, comet::Type::Bool),
+            Value::Int(_) => comet::exported_globals(name, comet::Type::Int),
+            _ => return value.clone(),
+        };
+        let mut read = Vec::with_capacity(globals.len());
+        for global in &globals {
+            let Some(found) = self.instance.get_global(&mut self.store, global) else {
+                return value.clone();
+            };
+            read.push(found.get(&mut self.store));
+        }
+        match (value, read.as_slice()) {
+            (Value::F32(_), [Val::F32(bits)]) => Value::F32(f32::from_bits(*bits)),
+            (Value::Int(_), [Val::I32(v)]) => Value::Int(*v),
+            (Value::Bool(_), [Val::I32(v)]) => Value::Bool(*v != 0),
+            (Value::Vec2(_), [Val::F32(x), Val::F32(y)]) => {
+                Value::Vec2(Vec2::new(f32::from_bits(*x), f32::from_bits(*y)))
+            }
+            _ => value.clone(),
+        }
     }
 
     /// Take the lines this script printed since the last call, leaving it empty.
@@ -1728,5 +1782,70 @@ mod tests {
         assert_eq!(component.get("speed"), Some(Value::F32(5.0)));
         // A stale value of the wrong type is refused rather than written.
         assert!(!component.set("speed", Value::Bool(true)));
+    }
+
+    #[test]
+    fn a_script_that_assigns_to_its_own_export_reads_back_what_it_holds() {
+        // ADR 0022 makes the component the owner of an exported value, so what
+        // the running module holds is a *different* question - and after the
+        // script assigns to it, a different answer. An inspector that showed the
+        // component's copy during a game would be showing a number the game
+        // stopped using on frame one.
+        let source = "
+            @export let speed: f32 = 1.0;
+            @export let steps: int = 0;
+            @export let moving: bool = false;
+            @export let heading: Vec2;
+            func update(dt: f32) {
+                speed = speed * 2.0;
+                steps = steps + 1;
+                moving = true;
+                heading = vec2(3.0, 4.0);
+            }
+        ";
+        let declared = vec![
+            ("speed".to_string(), Value::F32(5.0)),
+            ("steps".to_string(), Value::Int(0)),
+            ("moving".to_string(), Value::Bool(false)),
+            ("heading".to_string(), Value::Vec2(Vec2::ZERO)),
+        ];
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate_with(source, &mut scene, node, &declared)
+            .expect("it compiles and starts");
+
+        assert_eq!(
+            script.read_exports(&declared),
+            declared,
+            "before a frame it still holds what the inspector gave it"
+        );
+
+        script.update(&mut scene, node, 0.016).expect("one frame");
+        assert_eq!(
+            script.read_exports(&declared),
+            vec![
+                ("speed".to_string(), Value::F32(10.0)),
+                ("steps".to_string(), Value::Int(1)),
+                ("moving".to_string(), Value::Bool(true)),
+                ("heading".to_string(), Value::Vec2(Vec2::new(3.0, 4.0))),
+            ],
+            "and afterwards it holds what the script made of it"
+        );
+    }
+
+    #[test]
+    fn reading_back_a_name_the_script_does_not_export_keeps_what_it_was_given() {
+        // The component and the module are reconciled elsewhere. A readout is
+        // not the place to decide they disagree, and inventing a zero here
+        // would look exactly like a script that had set one.
+        let source = "func update(dt: f32) { }";
+        let declared = vec![("ghost".to_string(), Value::F32(7.0))];
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate_with(source, &mut scene, node, &declared)
+            .expect("it compiles and starts");
+        assert_eq!(script.read_exports(&declared), declared);
     }
 }

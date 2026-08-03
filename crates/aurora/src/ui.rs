@@ -447,6 +447,44 @@ impl Ui {
         self.add(WidgetKind::Slider { value, min, max }, style, Some(parent))
     }
 
+    /// Move a slider's handle without a drag - an app showing a value something
+    /// else is driving. Clamped to the slider's own range; a no-op on anything
+    /// that is not a slider, and on a value that is already there.
+    ///
+    /// Like [`set_text_input`](Self::set_text_input), this never invalidates
+    /// layout: a slider's box does not depend on where its handle is, so a
+    /// readout can be refreshed every frame for the cost of a draw.
+    pub fn set_slider_value(&mut self, id: WidgetId, value: f32) {
+        let WidgetKind::Slider {
+            value: current,
+            min,
+            max,
+        } = &mut self.widgets[id].kind
+        else {
+            return;
+        };
+        *current = value.clamp(min.min(*max), min.max(*max));
+    }
+
+    /// Tick or untick a checkbox without a click, for the same reason.
+    pub fn set_checked(&mut self, id: WidgetId, checked: bool) {
+        let WidgetKind::Checkbox {
+            checked: current, ..
+        } = &mut self.widgets[id].kind
+        else {
+            return;
+        };
+        *current = checked;
+    }
+
+    /// A checkbox's current state (false for anything else).
+    pub fn checked(&self, id: WidgetId) -> bool {
+        match self.widgets[id].kind {
+            WidgetKind::Checkbox { checked, .. } => checked,
+            _ => false,
+        }
+    }
+
     /// A slider's current value (0.0 for non-sliders).
     pub fn slider_value(&self, id: WidgetId) -> f32 {
         match self.widgets[id].kind {
@@ -8724,5 +8762,29 @@ three",
         let settled = ui.slider_value(s);
         ui.handle_input(InputEvent::PointerMoved(Vec2::new(90.0, 10.0)));
         assert_eq!(ui.slider_value(s), settled, "released, so it stays put");
+    }
+
+    #[test]
+    fn a_slider_and_a_checkbox_can_be_set_without_being_touched() {
+        // What an app needs to show a value something else is driving - a
+        // running script, a network peer, an animation.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column());
+        let slider = ui.slider(root, 1.0, 0.0, 10.0, Style::new());
+        let check = ui.checkbox(root, false, "on", Style::new());
+
+        ui.set_slider_value(slider, 7.5);
+        assert_eq!(ui.slider_value(slider), 7.5);
+        ui.set_slider_value(slider, 99.0);
+        assert_eq!(ui.slider_value(slider), 10.0, "clamped to its own range");
+
+        ui.set_checked(check, true);
+        assert!(ui.checked(check));
+
+        // And neither setter is confused by the wrong kind of widget.
+        ui.set_slider_value(check, 3.0);
+        ui.set_checked(slider, true);
+        assert_eq!(ui.slider_value(slider), 10.0);
+        assert!(ui.checked(check));
     }
 }
