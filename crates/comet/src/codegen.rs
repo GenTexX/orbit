@@ -152,8 +152,13 @@ const F_ARRAY_AT: u32 = 18;
 const F_ARRAY_PUSH: u32 = 19;
 const F_ARRAY_RELEASE: u32 = 20;
 const F_ARRAY_COPY: u32 = 21;
+/// `comet_heap_used() -> bytes`: what the heap has handed out and not taken
+/// back. Exported so a test has an exact leak oracle rather than watching
+/// `memory.size`, which cannot see a kilobyte leaked inside a 64KB page - the
+/// coarseness that let four ownership bugs ship in 4.5 and 4.6.
+const F_HEAP_USED: u32 = 22;
 /// The first script-defined function's index.
-const USER_BASE: u32 = 22;
+const USER_BASE: u32 = 23;
 
 /// Emit a WebAssembly module for `script`.
 ///
@@ -183,6 +188,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     let t_binary = types.get(vec![ValType::F32, ValType::F32], vec![ValType::F32]);
     let t_alloc = types.get(vec![ValType::I32], vec![ValType::I32]);
     let t_rc = types.get(vec![ValType::I32], vec![]);
+    let t_heap_used = types.get(vec![], vec![ValType::I32]);
     let t_init = types.get(vec![], vec![]);
 
     let mut imports = ImportSection::new();
@@ -216,6 +222,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     functions.function(t_array_new);
     functions.function(t_rc);
     functions.function(t_array_new);
+    functions.function(t_heap_used);
     for f in &script.functions {
         let ty = types.get(
             param_types(f, &script.enums, &script.structs),
@@ -237,6 +244,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     code.function(&emit_array_push());
     code.function(&emit_array_release());
     code.function(&emit_array_copy());
+    code.function(&emit_heap_used(&globals, heap_base));
     for f in &script.functions {
         code.function(&emit_function(f, layouts(script), &globals, &literals));
     }
@@ -270,6 +278,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     exports.export("comet_alloc", ExportKind::Func, F_ALLOC);
     exports.export("comet_retain", ExportKind::Func, F_RETAIN);
     exports.export("comet_release", ExportKind::Func, F_RELEASE);
+    exports.export("comet_heap_used", ExportKind::Func, F_HEAP_USED);
     // An exported variable's globals, so the host can write the inspector's
     // stored value in after instantiation and read it back out. A Vec2 takes
     // two, which is why the naming is derived rather than assumed - see
@@ -328,6 +337,7 @@ pub fn emit(script: &TypedScript) -> Vec<u8> {
     names.append(F_ARRAY_PUSH, "comet_array_push");
     names.append(F_ARRAY_RELEASE, "comet_array_release");
     names.append(F_ARRAY_COPY, "comet_array_copy");
+    names.append(F_HEAP_USED, "comet_heap_used");
     names.append(F_ALLOC, "comet_alloc");
     names.append(F_RETAIN, "comet_retain");
     names.append(F_RELEASE, "comet_release");
@@ -875,6 +885,59 @@ fn emit_array_release() -> Function {
     f
 }
 
+/// Whether a value of this type owns a reference that has to be released.
+///
+/// Free rather than a method because `FnGen::new` needs the same answer before
+/// there is a `self` to ask, and two copies of this predicate is how a struct
+/// holding a `String` came to be released by the general walker and not by the
+/// one that runs when a function returns.
+fn owns_reference(ty: Type, enums: &[TypedEnum], structs: &[TypedStruct]) -> bool {
+    match ty {
+        Type::Str | Type::Array(_) => true,
+        Type::Enum(index) => enums[index as usize].holds_str,
+        Type::Struct(index) => structs[index as usize]
+            .fields
+            .iter()
+            .any(|f| owns_reference(f.ty, enums, structs)),
+        Type::F32 | Type::Int | Type::Bool | Type::Vec2 | Type::Unit | Type::Error => false,
+    }
+}
+
+/// `comet_heap_used() -> bytes handed out and not returned`.
+///
+/// Everything the bump pointer has claimed, less every block sitting on the
+/// free list. Exact, and it costs one walk of a list that is usually short -
+/// which is what makes it usable as a test oracle: a leak of a single 24-byte
+/// block is visible, where `memory.size` only moves once a whole 64KB page has
+/// gone. It is also the number a learner should be able to watch go up when
+/// they forget to let go of something.
+fn emit_heap_used(globals: &Globals, heap_base: u32) -> Function {
+    // 0: used, 1: cur
+    let mut f = Function::new_with_locals_types([ValType::I32; 2]);
+    let mut i = f.instructions();
+    i.global_get(globals.heap_next)
+        .i32_const(heap_base as i32)
+        .i32_sub()
+        .local_set(0);
+    i.global_get(globals.free_head).local_set(1);
+    i.block(BlockType::Empty);
+    i.loop_(BlockType::Empty);
+    i.local_get(1).i32_eqz().br_if(1);
+    i.local_get(0)
+        .local_get(1)
+        .i32_load(mem(OFF_SIZE))
+        .i32_sub()
+        .local_set(0);
+    // The refcount field doubles as the free list's next pointer.
+    i.local_get(1).i32_load(mem(OFF_RC)).local_set(1);
+    i.br(0);
+    i.end();
+    i.end();
+    i.local_get(0);
+    i.end();
+    f
+}
+
 /// `comet_array_copy(handle, width) -> a new array with the same elements`.
 ///
 /// What makes reference semantics workable: `let b = a;` gives two names for
@@ -1091,9 +1154,20 @@ fn block_depth(block: &TypedBlock) -> usize {
 fn stmt_depth(stmt: &TypedStmt) -> usize {
     match stmt {
         TypedStmt::Let { init, .. } => expr_depth(init),
-        // An assignment's depth is its value's, and also its place's: writing
-        // an element parks the handle, the address and the value.
-        TypedStmt::Assign { place, value } => expr_depth(value).max(place_depth(place)),
+        // An assignment's depth is its place's, with the value evaluated
+        // *inside* it rather than beside it. Taking the max of the two was
+        // wrong for `a[i] = v`: `assign` enters a frame for the element and
+        // `store_element` enters a second, and only then is the value
+        // evaluated - so an ordinary expression on the right ran off the end of
+        // the frame table and panicked the compiler with no source location.
+        TypedStmt::Assign { place, value } => match place {
+            Place::Element { array, index, .. } => {
+                2 + expr_depth(array)
+                    .max(expr_depth(index))
+                    .max(expr_depth(value))
+            }
+            other => expr_depth(value).max(place_depth(other)),
+        },
         TypedStmt::If {
             cond,
             then,
@@ -1265,13 +1339,21 @@ impl<'a> FnGen<'a> {
         // Slots whose release does something: a String, or an enum that can
         // hold one. Working this out here rather than at each release site is
         // what keeps the common enum - no payload owning anything - free.
+        // Slots whose release does something. A bare `struct` local is
+        // deliberately *not* here, and that is a known leak rather than an
+        // oversight: releasing one at exit is only correct if reading one
+        // retains, and retaining on read is only correct if a field access
+        // releases the slots it discards - which it cannot do slot by slot,
+        // because a parked struct's slots are split across the frame's i32 and
+        // f32 regions and are not contiguous. The three have to land together.
+        // Until they do, a struct that owns a reference leaks it once per
+        // construction, which is a leak and not a corruption.
         let owned = slot_types
             .iter()
             .enumerate()
             .filter(|(_, ty)| match ty {
-                Type::Str | Type::Array(_) => true,
-                Type::Enum(index) => enums[*index as usize].holds_str,
-                _ => false,
+                Type::Struct(_) => false,
+                other => owns_reference(**other, enums, structs),
             })
             .map(|(slot, _)| slot as u32)
             .collect();
@@ -1399,17 +1481,11 @@ impl<'a> FnGen<'a> {
             let slot = self.owned[i];
             let ty = self.slot_types[slot as usize];
             let base = self.slot_base[slot as usize];
-            match ty {
-                Type::Str => {
-                    self.ins().local_get(base).call(F_RELEASE);
-                }
-                // An array's elements are reachable only through its handle, so
-                // its release is its own - the general one knows nothing about
-                // the second block.
-                Type::Array(index) => self.release_array_slots(base, index),
-                Type::Enum(index) => self.release_enum_slots(base, index),
-                _ => {}
-            }
+            // The one walker, not a second dispatch beside it. The copy that
+            // used to live here listed Str, Array and Enum and ended in a
+            // wildcard, so a struct owning a String was released by every other
+            // path and never by this one - a leak per construction.
+            self.release_slots(base, ty);
         }
     }
 
@@ -1510,17 +1586,63 @@ impl<'a> FnGen<'a> {
         self.leave_frame();
     }
 
+    /// Take a reference to every element of the array whose handle is in wasm
+    /// local `base`. The retain half of `copy`.
+    ///
+    /// `comet_array_copy` cannot do this: it is one runtime function shared by
+    /// every element type and it has no idea whether the words it moved are
+    /// pointers. So the copy used to share one refcount with the original, and
+    /// `release_array_slots` walked the elements of *both* - freeing each
+    /// element twice, which corrupted the free list rather than leaking.
+    fn retain_array_elements(&mut self, base: u32, element: Type) {
+        if !self.owns_reference(element) {
+            return;
+        }
+        let width = val_types(element, self.enums, self.structs).len() as u32;
+        let frame = self.enter_frame();
+        let (at, address) = (frame.i32s[0], frame.i32s[1]);
+        let slots = frame.enum_base;
+
+        self.ins().i32_const(0).local_set(at);
+        self.ins().block(BlockType::Empty);
+        self.ins().loop_(BlockType::Empty);
+        self.ins()
+            .local_get(at)
+            .local_get(base)
+            .i32_load(mem(OFF_ARRAY_LEN))
+            .i32_ge_s()
+            .br_if(1);
+        self.ins()
+            .local_get(base)
+            .i32_load(mem(OFF_ARRAY_DATA))
+            .i32_const(HEADER)
+            .i32_add()
+            .local_get(at)
+            .i32_const(width as i32 * 4)
+            .i32_mul()
+            .i32_add()
+            .local_set(address);
+        for slot in 0..width {
+            self.ins()
+                .local_get(address)
+                .i32_load(mem(u64::from(slot) * 4))
+                .local_set(slots + slot);
+        }
+        self.retain_slots(slots, element);
+        self.ins()
+            .local_get(at)
+            .i32_const(1)
+            .i32_add()
+            .local_set(at);
+        self.ins().br(0);
+        self.ins().end();
+        self.ins().end();
+        self.leave_frame();
+    }
+
     /// Whether releasing a value of this type has anything to do at all.
     fn owns_reference(&self, ty: Type) -> bool {
-        match ty {
-            Type::Str | Type::Array(_) => true,
-            Type::Enum(index) => self.enums[index as usize].holds_str,
-            Type::Struct(index) => self.structs[index as usize]
-                .fields
-                .iter()
-                .any(|f| self.owns_reference(f.ty)),
-            _ => false,
-        }
+        owns_reference(ty, self.enums, self.structs)
     }
 
     fn release_enum_slots(&mut self, base: u32, index: u32) {
@@ -1572,7 +1694,34 @@ impl<'a> FnGen<'a> {
                 }
                 self.leave_frame();
             }
+            // A struct is handled where it is read instead - see
+            // `retain_read`. Its fields keep their own wasm types, so it cannot
+            // be parked in the enum scratch region, which is all i32.
             _ => {}
+        }
+    }
+
+    /// Take a reference to whatever the value starting at wasm local `base`
+    /// owns. The mirror of [`release_slots`](Self::release_slots), and written
+    /// as one so the two cannot drift: a type the release path walks and the
+    /// retain path does not is a value freed while someone still holds it.
+    fn retain_slots(&mut self, base: u32, ty: Type) {
+        match ty {
+            // An array's handle is what is refcounted; its elements belong to
+            // it, so retaining the handle is the whole job.
+            Type::Str | Type::Array(_) => {
+                self.ins().local_get(base).call(F_RETAIN);
+            }
+            Type::Enum(index) => self.retain_enum_slots(base, index),
+            Type::Struct(index) => {
+                let fields = self.structs[index as usize].fields.clone();
+                for field in fields {
+                    if self.owns_reference(field.ty) {
+                        self.retain_slots(base + field.offset, field.ty);
+                    }
+                }
+            }
+            Type::F32 | Type::Int | Type::Bool | Type::Vec2 | Type::Unit | Type::Error => {}
         }
     }
 
@@ -1599,13 +1748,7 @@ impl<'a> FnGen<'a> {
             self.ins().local_get(base).i32_const(tag as i32).i32_eq();
             self.ins().if_(BlockType::Empty);
             for (offset, ty) in owned {
-                match ty {
-                    Type::Str => {
-                        self.ins().local_get(base + offset).call(F_RETAIN);
-                    }
-                    Type::Enum(inner) => self.retain_enum_slots(base + offset, inner),
-                    _ => {}
-                }
+                self.retain_slots(base + offset, ty);
             }
             self.ins().end();
         }
@@ -1843,7 +1986,7 @@ impl<'a> FnGen<'a> {
                 self.ins().call(F_ARRAY_AT).local_set(at);
                 self.ins().local_get(handle).call(F_ARRAY_RELEASE);
                 self.ins().local_get(at);
-                self.store_element(value, *ty, width);
+                self.store_element(value, *ty, width, true);
                 self.leave_frame();
             }
 
@@ -2059,7 +2202,7 @@ impl<'a> FnGen<'a> {
                     self.ins().i32_const(at as i32);
                     self.ins().i32_const(width as i32);
                     self.ins().call(F_ARRAY_AT);
-                    self.store_element(element, element_ty, width);
+                    self.store_element(element, element_ty, width, false);
                 }
                 self.ins().local_get(handle);
                 self.leave_frame();
@@ -2092,20 +2235,29 @@ impl<'a> FnGen<'a> {
                         self.ins().i32_const(width as i32);
                         self.ins().call(F_ARRAY_PUSH);
                         let value = value.as_deref().expect("push checked its arity");
-                        self.store_element(value, *element, width);
+                        self.store_element(value, *element, width, false);
                         self.ins().local_get(handle).call(F_ARRAY_RELEASE);
                         self.leave_frame();
                     }
                     ArrayOp::Copy => {
-                        let handle = self.scratch().i32s[0];
+                        // Its own level, because retaining the elements below
+                        // takes one too - `scratch` and `enter_frame` name the
+                        // same locals, so sharing would have the retain loop's
+                        // counter and the handle be the same wasm local. The
+                        // two levels ArrayOp reserves are exactly these.
+                        let frame = self.enter_frame();
+                        let (handle, fresh) = (frame.i32s[0], frame.i32s[1]);
                         self.expr(array);
                         self.ins().local_tee(handle);
                         self.ins().i32_const(width as i32);
                         self.ins().call(F_ARRAY_COPY);
-                        let fresh = self.scratch().i32s[1];
                         self.ins().local_set(fresh);
+                        // The copy is a second owner of every element, and the
+                        // memcpy inside comet_array_copy cannot know that.
+                        self.retain_array_elements(fresh, *element);
                         self.ins().local_get(handle).call(F_ARRAY_RELEASE);
                         self.ins().local_get(fresh);
+                        self.leave_frame();
                     }
                 }
             }
@@ -2149,6 +2301,11 @@ impl<'a> FnGen<'a> {
                     self.ins().local_get(at).i32_load(mem(u64::from(slot) * 4));
                     self.ins().local_set(res + 1 + slot);
                 }
+                // The Option is a second owner of the element, exactly as `a[i]`
+                // is (see `Index` below, which retains). Without this it held a
+                // reference nobody took, so dropping the Option freed a block
+                // the array still pointed at.
+                self.retain_slots(res + 1, *element);
                 self.ins().else_();
                 self.ins().i32_const(*none as i32).local_set(res);
                 self.ins().end();
@@ -2256,7 +2413,7 @@ impl<'a> FnGen<'a> {
     /// Elements are stored as `i32` words with floats reinterpreted, the same
     /// packing an enum payload uses - so one addressing rule covers every
     /// element type.
-    fn store_element(&mut self, value: &TypedExpr, ty: Type, width: u32) {
+    fn store_element(&mut self, value: &TypedExpr, ty: Type, width: u32, overwrite: bool) {
         let frame = self.enter_frame();
         let (address, slots) = (frame.i32s[1], frame.enum_base);
         self.ins().local_set(address);
@@ -2264,6 +2421,22 @@ impl<'a> FnGen<'a> {
         self.pack(ty);
         for slot in (0..width).rev() {
             self.ins().local_set(slots + slot);
+        }
+        // What was in the element owned whatever it pointed at, and storing
+        // over it was the only place in the language that dropped a reference
+        // without releasing it - `Place::Local` and `store_global` both release
+        // the old value first. Read out and released after the new value is
+        // parked, so `a[i] = a[i]` cannot free it in between. Not on the push
+        // path: there the slots are fresh and hold nothing.
+        if overwrite && self.owns_reference(ty) {
+            let old = frame.result_base;
+            for slot in 0..width {
+                self.ins()
+                    .local_get(address)
+                    .i32_load(mem(u64::from(slot) * 4))
+                    .local_set(old + slot);
+            }
+            self.release_slots(old, ty);
         }
         for slot in 0..width {
             self.ins().local_get(address);
@@ -2595,6 +2768,26 @@ mod tests {
             .expect("fixture should compile clean");
         wasmparser::validate(&bytes).expect("emitted module must validate");
         bytes
+    }
+
+    #[test]
+    fn an_ordinary_expression_can_go_on_the_right_of_an_element_assignment() {
+        // stmt_depth took the max of the value's frame depth and the place's,
+        // but emission nests them: `assign` enters a frame for the element and
+        // `store_element` enters a second, and only then evaluates the value.
+        // Anything needing a frame of its own ran off the end of the table and
+        // panicked the compiler - no diagnostic, no source location.
+        for body in [
+            "a[0] = a[0] + a[1];",
+            "a[0] = b[c[0]];",
+            "a[0] = (a[0] + a[0]) * dt;",
+            "a[0] = dt % (dt % 2.0);",
+        ] {
+            compile_valid(&format!(
+                "func update(dt: f32) {{ let a = [1.0, 2.0]; let b = [3.0, 4.0]; \
+                 let c = [0, 1]; {body} }}"
+            ));
+        }
     }
 
     #[test]

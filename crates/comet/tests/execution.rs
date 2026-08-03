@@ -256,6 +256,16 @@ impl Script {
         self.call::<i32, ()>("comet_release", ptr);
     }
 
+    /// Bytes the heap has handed out and not taken back.
+    ///
+    /// The oracle every ownership test should use. `memory_bytes` only moves
+    /// when a whole 64KB page is claimed, so it cannot see a block-per-call
+    /// leak until thousands of calls have run - and it cannot see a double
+    /// free at all. This is exact.
+    fn heap_used(&mut self) -> i32 {
+        self.call::<(), i32>("comet_heap_used", ())
+    }
+
     fn memory_bytes(&mut self) -> usize {
         let memory = self.memory();
         memory.data(&self.store).len()
@@ -1999,4 +2009,132 @@ fn a_string_inside_a_place_reaches_the_data_segment() {
     );
     script.update(0.0);
     assert_eq!(script.printed(), ["choosing", "5"]);
+}
+
+// --- ownership across every container (4.5 and 4.6) ---
+//
+// These use `heap_used`, not `memory_bytes`. The difference is the whole
+// reason four of these bugs shipped: a leak of one block per call is invisible
+// in `memory.size` until a 64KB page fills, and a double free is invisible in
+// it forever.
+
+/// Run `update` `rounds` times and return how many heap bytes were still out
+/// after, measured from a settled state rather than from the first call - the
+/// first round allocates the things the script keeps.
+fn heap_after(script: &mut Script, rounds: usize) -> (i32, i32) {
+    script.update(0.016);
+    script.update(0.016);
+    let settled = script.heap_used();
+    for _ in 0..rounds {
+        script.update(0.016);
+    }
+    (settled, script.heap_used())
+}
+
+/// Known defect, kept as its reproduction: a struct that owns a reference
+/// leaks it once per construction.
+///
+/// Ignored rather than deleted or "fixed" halfway. Releasing a struct local at
+/// function exit is only correct if reading one retains, and retaining on read
+/// is only correct if a field access releases the slots it discards - and it
+/// cannot do that slot by slot, because a parked struct's slots are split
+/// across the frame's i32 and f32 regions and are not contiguous. Landing one
+/// or two of the three turns a leak into a double free, which is strictly
+/// worse. See the codegen comment on FnGen's `owned` set.
+#[test]
+#[ignore = "struct ownership needs retain, release and discard to land together"]
+fn a_struct_that_owns_a_string_releases_it() {
+    // FnGen's `owned` set had no Struct arm, so a struct local holding a String
+    // was never walked on the way out and leaked one block per construction.
+    let mut script = Script::new(
+        "struct Named { label: String, value: f32 }\n\
+         func make(v: f32) -> f32 { let n = Named { label: str(v), value: v }; n.value }\n\
+         func update(dt: f32) { let total = make(dt) + make(dt + 1.0); }",
+    );
+    let (settled, after) = heap_after(&mut script, 500);
+    assert_eq!(
+        after, settled,
+        "500 rounds of two structs each leaked nothing"
+    );
+}
+
+#[test]
+fn copying_an_array_of_strings_does_not_free_them_twice() {
+    // emit_array_copy memcpy'd the element words without retaining them, so one
+    // refcount had two owners and release_array_slots walked both. The symptom
+    // was not a leak but a corrupted free list, and then a trap inside
+    // comet_alloc a few frames later.
+    let mut script = Script::new(
+        "func churn(n: f32) { let a: Array<String> = []; push(a, str(n)); \
+         push(a, str(n + 1.0)); let b = copy(a); print(b[0] + \"/\" + b[1]); }\n\
+         func update(dt: f32) { churn(dt); }",
+    );
+    let (settled, after) = heap_after(&mut script, 200);
+    assert_eq!(
+        after, settled,
+        "200 copies leaked nothing and freed nothing twice"
+    );
+    assert!(script.printed().len() > 100, "and it kept running");
+}
+
+#[test]
+fn get_hands_back_something_it_owns() {
+    // ArrayGet copied the element's slots into the Option with no retain, where
+    // Index retains - so the Option was a second reference nobody took, and
+    // dropping it freed a block the array still pointed at.
+    let mut script = Script::new(
+        "let words: Array<String> = [];\n\
+         func update(dt: f32) { push(words, \"w\" + str(dt)); \
+         let found = get(words, 0); \
+         let shown = match found { None => \"none\", Some(w) => w }; print(shown); }",
+    );
+    for _ in 0..40 {
+        script.update(0.016);
+    }
+    // Every line is the first word pushed, unchanged: a use-after-free showed
+    // up as later lines reading whatever the allocator handed out next.
+    let printed = script.printed();
+    let first = printed[0].to_string();
+    assert!(
+        printed.iter().all(|line| *line == first),
+        "the element survived being looked at: {printed:?}"
+    );
+}
+
+#[test]
+fn overwriting_an_array_element_releases_what_was_there() {
+    // Place::Element released the handle and stored over the old slots without
+    // reading them, unlike Place::Local and store_global which both release the
+    // previous value first.
+    let mut script = Script::new(
+        "let a: Array<String> = [];\n\
+         func update(dt: f32) { if len(a) == 0 { push(a, \"seed\"); } a[0] = str(dt) + \"x\"; }",
+    );
+    let (settled, after) = heap_after(&mut script, 500);
+    assert_eq!(after, settled, "500 overwrites leaked nothing");
+}
+
+#[test]
+fn an_enum_payload_that_owns_something_is_released_whatever_it_is() {
+    // owns_str counted Str and other enums but not Array or Struct, so
+    // holds_str was false and every release path skipped the payload.
+    let mut script = Script::new(
+        "enum Bag { Empty, Items(Array<f32>) }\n\
+         func fill(n: f32) -> f32 { let b = Bag::Items([n, n + 1.0, n + 2.0]); \
+         match b { Empty => 0.0, Items(xs) => xs[1] } }\n\
+         func update(dt: f32) { let got = fill(dt); }",
+    );
+    let (settled, after) = heap_after(&mut script, 500);
+    assert_eq!(after, settled, "500 arrays inside an enum leaked nothing");
+
+    // And the struct payload case, which is the same gate.
+    let mut script = Script::new(
+        "struct Label { text: String }\n\
+         enum Tag { None, Named(Label) }\n\
+         func make(n: f32) -> f32 { let t = Tag::Named(Label { text: str(n) }); \
+         match t { None => 0.0, Named(l) => 1.0 } }\n\
+         func update(dt: f32) { let got = make(dt); }",
+    );
+    let (settled, after) = heap_after(&mut script, 500);
+    assert_eq!(after, settled, "500 structs inside an enum leaked nothing");
 }

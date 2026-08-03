@@ -452,9 +452,16 @@ impl Checker<'_> {
     /// Whether releasing a value of this type has anything to do.
     fn owns_str(&self, ty: Type) -> bool {
         match ty {
-            Type::Str => true,
+            // An array is a reference whatever it holds, so an enum carrying
+            // one has something to release even when the elements are floats.
+            Type::Str | Type::Array(_) => true,
             Type::Enum(index) => self.enums[index as usize].holds_str,
-            _ => false,
+            Type::Struct(index) => self.structs[index as usize]
+                .fields
+                .clone()
+                .iter()
+                .any(|f| self.owns_str(f.ty)),
+            Type::F32 | Type::Int | Type::Bool | Type::Vec2 | Type::Unit | Type::Error => false,
         }
     }
 
