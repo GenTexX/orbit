@@ -807,6 +807,14 @@ impl Ui {
     /// of a widget - there is one of each, belonging to whatever is focused - so
     /// without this, clicking into the find bar loses the range you were about
     /// to replace, which is exactly when you want to keep seeing it.
+    /// Give up keyboard focus, so keys go wherever unfocused keys go.
+    ///
+    /// The public half of [`focus`](Self::focus), which an app needs when
+    /// something other than a widget wants the keyboard - a running game, say.
+    pub fn blur(&mut self) {
+        self.set_focused(None);
+    }
+
     fn set_focused(&mut self, id: Option<WidgetId>) {
         if self.focused == id {
             self.focused = id;

@@ -315,6 +315,9 @@ struct State {
     /// The keyboard as the running game sees it. Fed from winit directly,
     /// because aurora's input model has no key release to route this through.
     keys: keys::GameKeys,
+    /// The last pointer position that was over the viewport, in world space.
+    /// What a script reads while the pointer is somewhere else.
+    last_game_cursor: Vec2,
     /// The current keyboard modifiers (for the undo/redo shortcuts).
     modifiers: ModifiersState,
     /// The demo texture's natural pixel size (spawned sprites default to it).
@@ -1181,6 +1184,7 @@ impl State {
             tooltip_target: None,
             pointer_down: false,
             keys: keys::GameKeys::default(),
+            last_game_cursor: Vec2::ZERO,
             pending_cursor: None,
             tab_bars: Vec::new(),
             carrying: None,
@@ -1223,6 +1227,13 @@ impl State {
     fn play_cursor_world(&self) -> Option<Vec2> {
         let rect = self.viewport_rect()?;
         if rect.size.x <= 0.0 || rect.size.y <= 0.0 {
+            return None;
+        }
+        // Only while the pointer is actually over the game. It used to be fed
+        // in unconditionally, so moving the mouse to the Inspector sailed a
+        // mouse-following script off the level - and there was not even a
+        // stale-but-sane last position, because the value kept tracking.
+        if !self.over_viewport() {
             return None;
         }
         let camera = self.scene_camera(rect.size);
@@ -1448,13 +1459,13 @@ impl State {
         if self.ui.hit_test(self.cursor) != self.rows.viewport {
             return;
         }
-        // Grabbing a gizmo or picking a sprite both start an edit, so both are
-        // refused while a game is running. Panning and zooming are not edits and
-        // are deliberately still allowed: watching the game from somewhere else
-        // is exactly what you want to do while it runs.
-        if self.scene_edits_blocked() {
-            return;
-        }
+        // A gizmo grab and a drag are edits and stay refused. A *pick* is not:
+        // it changes the selection, which the scene tree can already do during
+        // Play without complaint - so the rule was never "no selecting", it was
+        // "not in the pane where the game is". That matters because the live
+        // inspector readout follows the primary selection, and the natural
+        // gesture for re-aiming it was the one being refused.
+        let playing = self.play.is_playing();
         // Interacting with the viewport moves keyboard focus off the explorer.
         self.explorer_focused = false;
         let Some(world) = self.cursor_world() else {
@@ -1464,7 +1475,8 @@ impl State {
 
         // Gizmo handles first: they float outside the sprite, so they must win
         // over picking (which only sees sprite pixels).
-        if let Some(sel) = self.selection.primary()
+        if !playing
+            && let Some(sel) = self.selection.primary()
             && let Some(g) = viewport::gizmo(scene, sel, self.camera.zoom)
             && let Some(hit) = viewport::hit_gizmo(&g, world, self.gizmo_mode)
         {
@@ -1531,18 +1543,23 @@ impl State {
             Some(mut node) => {
                 // Alt-drag duplicates: leave the original in place and drag a
                 // fresh copy (which starts exactly on top of it).
-                if self.modifiers.alt_key()
+                if !playing
+                    && self.modifiers.alt_key()
                     && let Some(copy) =
                         actions::duplicate_node(&mut self.project.scene, &mut self.history, node)
                 {
                     node = copy;
                 }
                 self.selection.select_one(node);
-                self.drag = Some(Drag::Move {
-                    node,
-                    original: self.project.scene.node(node).transform,
-                    grab_world: world,
-                });
+                // Selecting is allowed while a game runs; moving what was
+                // selected is not.
+                if !playing {
+                    self.drag = Some(Drag::Move {
+                        node,
+                        original: self.project.scene.node(node).transform,
+                        grab_world: world,
+                    });
+                }
                 self.dirty = true;
             }
             None => {
@@ -3321,6 +3338,14 @@ impl State {
             // with your hands already on the keyboard, and having it do nothing
             // because a text field somewhere still has focus is the kind of
             // thing that gets blamed on the game.
+            // Shift restarts: stop and start in one press and one rebuild. It
+            // is the most frequent action in any edit-run loop and used to cost
+            // two of each, and it is the only escape hatch a trapped script has
+            // short of stopping the whole session.
+            NamedKey::F5 if self.modifiers.shift_key() => {
+                self.restart_play();
+                true
+            }
             NamedKey::F5 => {
                 self.toggle_play();
                 true
@@ -4628,11 +4653,33 @@ impl State {
             self.end_slider_drag();
             self.close_color_picker();
             self.reparent = None;
+            // The game gets the keyboard. A script only sees a key when nothing
+            // is focused, so the natural loop - edit a script, ctrl+S, F5 -
+            // started a game that ignored WASD; worse, pressing W to walk typed
+            // a `w` into the script that was running.
+            self.ui.blur();
             self.play.start(&mut self.project.scene);
             self.note("playing");
         }
         // The mode changes what the shell draws and what the inspector shows,
         // so this one is a rebuild rather than a redraw.
+        self.dirty = true;
+    }
+
+    /// Stop and start in one press.
+    ///
+    /// Two F5s do the same thing and cost two full shell rebuilds; this costs
+    /// one. It is also what a trapped script needs, since an instance that has
+    /// latched itself off is only replaced by a fresh session or a reload.
+    fn restart_play(&mut self) {
+        if !self.play.is_playing() {
+            self.toggle_play();
+            return;
+        }
+        self.play.stop(&mut self.project.scene);
+        self.ui.blur();
+        self.play.start(&mut self.project.scene);
+        self.note("restarted");
         self.dirty = true;
     }
 
@@ -6050,7 +6097,13 @@ impl State {
 
     /// Refresh the status bar readouts in place (no shell rebuild).
     fn update_status_bar(&mut self) {
-        let cursor = match (self.over_viewport(), self.cursor_world()) {
+        // Through the same camera the script is handed, so the number on screen
+        // and the number `input.mouse` reports are the same number.
+        let world = match self.play.is_playing() {
+            true => self.play_cursor_world(),
+            false => self.cursor_world(),
+        };
+        let cursor = match (self.over_viewport(), world) {
             (true, Some(w)) => format!("x {:.0}, y {:.0}", w.x, w.y),
             _ => "x -, y -".to_string(),
         };
@@ -6109,7 +6162,14 @@ impl State {
                 }
             }
         };
-        let zoom = format!("zoom {:.0}%", self.camera.zoom * 100.0);
+        // The camera the viewport is actually drawn with. During Play that is
+        // the scene's, so reading the editor's here made both numbers disagree
+        // with the picture - and wheeling over the viewport moved the readout
+        // while the image stayed put.
+        let zoom = match (self.play.is_playing(), self.project.scene.active_camera()) {
+            (true, Some((camera, _))) => format!("zoom {:.0}%", camera.zoom * 100.0),
+            _ => format!("zoom {:.0}%", self.camera.zoom * 100.0),
+        };
         let fps = format!("{:.0} fps", self.last_fps);
         let modified = if self.is_modified() {
             "unsaved changes"
@@ -6478,8 +6538,13 @@ impl State {
         // The keyboard as of this instant, and the pointer through whatever
         // camera the viewport is being drawn with - so a script comparing the
         // mouse against its own position is comparing two points in one space.
-        let mouse = self.play_cursor_world().unwrap_or_default();
-        self.play.set_input(self.keys.input(mouse));
+        // Held rather than zeroed when the pointer leaves: a script that
+        // follows the mouse should stop following it, not be yanked to the
+        // world origin.
+        if let Some(world) = self.play_cursor_world() {
+            self.last_game_cursor = world;
+        }
+        self.play.set_input(self.keys.input(self.last_game_cursor));
         self.poll_scripts();
         self.play.step(&mut self.project.scene, dt);
         self.drain_script_output();
@@ -6569,48 +6634,58 @@ impl State {
         // with the tintable white texture: the grid+axes first (furthest back),
         // then the axis guide line, then the selection outline and gizmo handles.
         let mut overlay = Vec::new();
-        if self.show_grid || self.show_axes {
-            overlay.extend(viewport::grid_sprites(
-                &self.camera,
-                Vec2::new(w as f32, h as f32),
-                self.show_grid,
-                self.show_axes,
-                &pal,
-            ));
-        }
-        if let Some(drag) = &self.drag
-            && let Some(guide) = viewport::axis_guide_sprite(
-                drag,
-                &self.project.scene,
-                &self.camera,
-                Vec2::new(w as f32, h as f32),
-                &pal,
-            )
-        {
-            overlay.push(guide);
-        }
-        if let Some(sel) = self.selection.primary()
-            && let Some(g) = viewport::gizmo(&self.project.scene, sel, self.camera.zoom)
-        {
-            overlay.extend(viewport::gizmo_sprites(
-                &g,
-                self.camera.zoom,
-                self.gizmo_mode,
-                &pal,
-            ));
-        }
-        // A script being dragged over the viewport lands on one node, not on the
-        // viewport at large, so it outlines that node rather than letting the
-        // whole pane light up (which is what aurora's drop highlight would do,
-        // and why the viewport turns script drags down).
-        if let Some(node) = self.script_drop_node()
-            && let Some(g) = viewport::gizmo(&self.project.scene, node, self.camera.zoom)
-        {
-            overlay.extend(viewport::outline_sprites(
-                &g,
-                self.camera.zoom,
-                pal.rotate_handle,
-            ));
+        // None of it while a game runs. Every piece is built in world space
+        // from the *editor* camera - down to the line thickness and the
+        // handle size - and then composited through the game camera, so the
+        // moment a scene has a Camera the two disagree: a finite patch of
+        // grid at the wrong thickness, floating over the game, sized for a
+        // zoom nobody is using. Play is supposed to show what a player would
+        // see, and the frame around the viewport is what says which mode
+        // this is.
+        if !self.play.is_playing() {
+            if self.show_grid || self.show_axes {
+                overlay.extend(viewport::grid_sprites(
+                    &self.camera,
+                    Vec2::new(w as f32, h as f32),
+                    self.show_grid,
+                    self.show_axes,
+                    &pal,
+                ));
+            }
+            if let Some(drag) = &self.drag
+                && let Some(guide) = viewport::axis_guide_sprite(
+                    drag,
+                    &self.project.scene,
+                    &self.camera,
+                    Vec2::new(w as f32, h as f32),
+                    &pal,
+                )
+            {
+                overlay.push(guide);
+            }
+            if let Some(sel) = self.selection.primary()
+                && let Some(g) = viewport::gizmo(&self.project.scene, sel, self.camera.zoom)
+            {
+                overlay.extend(viewport::gizmo_sprites(
+                    &g,
+                    self.camera.zoom,
+                    self.gizmo_mode,
+                    &pal,
+                ));
+            }
+            // A script being dragged over the viewport lands on one node, not on the
+            // viewport at large, so it outlines that node rather than letting the
+            // whole pane light up (which is what aurora's drop highlight would do,
+            // and why the viewport turns script drags down).
+            if let Some(node) = self.script_drop_node()
+                && let Some(g) = viewport::gizmo(&self.project.scene, node, self.camera.zoom)
+            {
+                overlay.extend(viewport::outline_sprites(
+                    &g,
+                    self.camera.zoom,
+                    pal.rotate_handle,
+                ));
+            }
         }
         if !overlay.is_empty() {
             self.engine
