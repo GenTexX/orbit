@@ -338,6 +338,9 @@ pub struct EditorRows {
     /// A submitted field row commits its current text to
     /// `(node, component index, field name)`.
     pub field_rows: Vec<(WidgetId, NodeId, usize, String)>,
+    /// Boolean fields, shown as a checkbox. Separate from `field_rows` because
+    /// a checkbox reports a toggle rather than text to parse.
+    pub field_checkboxes: Vec<(WidgetId, NodeId, usize, String)>,
     /// Exported values shown as a slider, because the script asked with
     /// `@range`. Separate from `field_rows` because a slider reports a value
     /// rather than text.
@@ -2107,6 +2110,32 @@ fn build_inspector(
                         ui, card, field, &path, asset_kind, node, i, icons, explorer, thumbnails,
                         theme, rows,
                     );
+                }
+                // A checkbox, not a text box you have to type `true` into.
+                // `ui.checkbox` is used two hundred lines away for exactly this
+                // shape of value; the inspector simply never reached for it.
+                Value::Bool(on) => {
+                    let hints: &[comet::Hint] = match component {
+                        helios::Component::Script(script) => script.hints_for(field),
+                        _ => &[],
+                    };
+                    let row = ui.panel(card, Style::new().row().gap(6.0).align_center());
+                    ui.label(
+                        row,
+                        field,
+                        Style::new().width(70.0).foreground(theme.aurora.heading),
+                    );
+                    let check = ui.checkbox(
+                        row,
+                        on,
+                        "",
+                        Style::new()
+                            .grow(1.0)
+                            .foreground(theme.aurora.heading)
+                            .enabled(!hints.contains(&comet::Hint::Readonly)),
+                    );
+                    rows.field_checkboxes
+                        .push((check, node, i, field.to_string()));
                 }
                 _ => {
                     // What the script asked for, if it is a Script component
@@ -4423,6 +4452,38 @@ mod tests {
         assert!(
             rows.asset_fields.iter().any(|(_, _, _, f)| f == "source"),
             "and the path is still the asset field it was"
+        );
+    }
+
+    #[test]
+    fn a_boolean_export_is_a_checkbox_not_a_box_you_type_true_into() {
+        let mut scene = Scene::new("root");
+        let node = scene.add_child(scene.root(), Node::new("Thing"));
+        scene
+            .node_mut(node)
+            .components
+            .push(Component::Script(helios::ScriptComponent {
+                source: "s.cmt".into(),
+                exports: vec![
+                    ("chases".into(), Value::Bool(true)),
+                    ("speed".into(), Value::F32(1.0)),
+                ],
+                hints: Vec::new(),
+            }));
+        let rows = laid_out_inspector(&scene, node);
+        assert!(
+            rows.field_checkboxes
+                .iter()
+                .any(|(_, _, _, f)| f == "chases"),
+            "the bool got a checkbox"
+        );
+        assert!(
+            !rows.field_rows.iter().any(|(_, _, _, f)| f == "chases"),
+            "and not a text box as well"
+        );
+        assert!(
+            rows.field_rows.iter().any(|(_, _, _, f)| f == "speed"),
+            "the number still has its field"
         );
     }
 

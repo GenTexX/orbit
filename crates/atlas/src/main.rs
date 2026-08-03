@@ -6451,6 +6451,28 @@ impl State {
                         find.set_replacement(text);
                     }
                 }
+                // A boolean inspector field. Commits straight through the
+                // history: a checkbox has no half-typed state to protect, so
+                // there is nothing to defer to a focus-out.
+                AuroraEvent::Toggled { id, checked }
+                    if self.rows.field_checkboxes.iter().any(|(w, ..)| *w == id) =>
+                {
+                    if let Some((_, node, component, field)) = self
+                        .rows
+                        .field_checkboxes
+                        .iter()
+                        .find(|(w, ..)| *w == id)
+                        .map(|(w, n, c, f)| (*w, *n, *c, f.clone()))
+                    {
+                        self.history.set_field(
+                            &mut self.project.scene,
+                            node,
+                            component,
+                            &field,
+                            Value::Bool(checked),
+                        );
+                    }
+                }
                 AuroraEvent::Toggled { id, checked } if Some(id) == self.rows.find.match_case => {
                     if let Some(find) = &mut self.find {
                         find.set_match_case(checked, &self.script_text);
