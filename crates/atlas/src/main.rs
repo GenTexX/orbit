@@ -1237,7 +1237,7 @@ impl State {
             return None;
         }
         let camera = self.scene_camera(rect.size);
-        Some(camera.position + (self.cursor - rect.pos) * camera.viewport / rect.size)
+        Some(camera.screen_to_world(self.cursor - rect.pos, rect.size))
     }
 
     /// Apply the newest pointer position reported since the last call, if any.

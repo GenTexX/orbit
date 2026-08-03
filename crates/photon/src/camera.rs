@@ -54,6 +54,32 @@ impl Camera {
             Vec4::new(tx, ty, tz, 1.0),
         )
     }
+
+    /// A pixel in a `target`-sized render target to the world point under it.
+    ///
+    /// The other direction of the same mapping, and it lives here for the
+    /// reason renderer.md gives for the projection: one place. It had already
+    /// been written twice elsewhere - once in the editor on its own pan/zoom
+    /// pair, and once inline against a real `Camera` - and the second copy is
+    /// this method, signature and all.
+    ///
+    /// `target` matters and is easy to forget: the render target and the widget
+    /// showing it need not be the same size, so the pixel has to be scaled by
+    /// the ratio rather than added to the position directly.
+    pub fn screen_to_world(&self, pixel: Vec2, target: Vec2) -> Vec2 {
+        if target.x <= 0.0 || target.y <= 0.0 {
+            return self.position;
+        }
+        self.position + pixel * self.viewport / target
+    }
+
+    /// The inverse of [`screen_to_world`](Self::screen_to_world).
+    pub fn world_to_screen(&self, world: Vec2, target: Vec2) -> Vec2 {
+        if self.viewport.x <= 0.0 || self.viewport.y <= 0.0 {
+            return Vec2::ZERO;
+        }
+        (world - self.position) * target / self.viewport
+    }
 }
 
 #[cfg(test)]
@@ -115,6 +141,48 @@ mod tests {
             "upper.y = {}, lower.y = {}",
             upper.y,
             lower.y
+        );
+    }
+
+    #[test]
+    fn screen_to_world_round_trips_through_world_to_screen() {
+        // Both directions of one mapping, so a drift in either shows up here
+        // rather than as a cursor that is off by a scale factor.
+        let camera = Camera::new(Vec2::new(100.0, -50.0), Vec2::new(400.0, 300.0));
+        let target = Vec2::new(800.0, 600.0);
+        for pixel in [Vec2::ZERO, Vec2::new(800.0, 600.0), Vec2::new(123.0, 456.0)] {
+            let world = camera.screen_to_world(pixel, target);
+            let back = camera.world_to_screen(world, target);
+            assert!(
+                (back - pixel).length() < EPS,
+                "{pixel} -> {world} -> {back}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_top_left_pixel_is_the_cameras_position() {
+        let camera = Camera::new(Vec2::new(7.0, 9.0), Vec2::new(400.0, 300.0));
+        let at = camera.screen_to_world(Vec2::ZERO, Vec2::new(800.0, 600.0));
+        assert!((at - Vec2::new(7.0, 9.0)).length() < EPS, "{at}");
+    }
+
+    #[test]
+    fn a_render_target_larger_than_the_widget_still_maps_correctly() {
+        // The half that is easy to forget: the target and the widget showing it
+        // need not agree, so a pixel is scaled by the ratio rather than added
+        // to the position.
+        let camera = Camera::new(Vec2::ZERO, Vec2::new(400.0, 300.0));
+        let at = camera.screen_to_world(Vec2::new(400.0, 300.0), Vec2::new(800.0, 600.0));
+        assert!((at - Vec2::new(200.0, 150.0)).length() < EPS, "{at}");
+    }
+
+    #[test]
+    fn a_degenerate_target_answers_rather_than_dividing_by_zero() {
+        let camera = Camera::new(Vec2::new(1.0, 2.0), Vec2::new(400.0, 300.0));
+        assert_eq!(
+            camera.screen_to_world(Vec2::ONE, Vec2::ZERO),
+            camera.position
         );
     }
 }

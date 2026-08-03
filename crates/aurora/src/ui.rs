@@ -655,6 +655,27 @@ impl Ui {
         self.widgets[id].translate
     }
 
+    /// A widget's children, in the order they were added.
+    ///
+    /// The one accessor that lets anything outside this crate walk the tree it
+    /// just built. Without it a layout debug overlay has nothing to outline, a
+    /// widget gallery has nothing to enumerate, and a UI regression net has
+    /// nothing to compare - three things blocked on five lines.
+    pub fn children(&self, id: WidgetId) -> &[WidgetId] {
+        &self.widgets[id].children
+    }
+
+    /// Every widget in the arena, in creation order, starting at the root.
+    pub fn walk(&self, root: WidgetId) -> Vec<WidgetId> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            out.push(id);
+            stack.extend(self.children(id).iter().rev().copied());
+        }
+        out
+    }
+
     /// A widget's background color (mostly for tests and introspection).
     pub fn background(&self, id: WidgetId) -> Color {
         self.widgets[id].background
@@ -8794,5 +8815,24 @@ three",
         ui.set_checked(slider, true);
         assert_eq!(ui.slider_value(slider), 10.0);
         assert!(ui.checked(check));
+    }
+
+    #[test]
+    fn the_tree_can_be_walked_from_outside() {
+        // Five lines that unblock three separate things: a layout debug
+        // overlay, a widget gallery, and a golden-draw-list regression net all
+        // need to enumerate what was built.
+        let mut ui = Ui::new();
+        let root = ui.root_panel(Style::new().column());
+        let a = ui.panel(root, Style::new().row());
+        let b = ui.label(root, "b", Style::new());
+        let a1 = ui.label(a, "a1", Style::new());
+
+        assert_eq!(ui.children(root), &[a, b]);
+        assert_eq!(ui.children(a), &[a1]);
+        assert!(ui.children(b).is_empty());
+        // Depth first, children in order, so a walk reads the way the tree was
+        // written.
+        assert_eq!(ui.walk(root), vec![root, a, a1, b]);
     }
 }

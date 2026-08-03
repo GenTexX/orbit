@@ -7,18 +7,32 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Three platforms, because portability that is not built is not portable.
+    # One thing was already broken on Windows and nobody could have found out:
+    # spectrum's settings path reads XDG_CONFIG_HOME else HOME, both normally
+    # unset there, so `save` returned Ok having written nothing and the editor
+    # ran on defaults forever. The GPU tests stay ignored here, so no leg needs
+    # a driver.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # Formatting and lints are platform-independent, so they run once.
       - run: cargo fmt --all --check
+        if: matrix.os == 'ubuntu-latest'
       - run: cargo clippy --workspace --all-targets -- -D warnings
+        if: matrix.os == 'ubuntu-latest'
       - run: cargo test --workspace
       # Compile-check the benchmarks so they cannot rot silently.
       - run: cargo bench --workspace --no-run
+        if: matrix.os == 'ubuntu-latest'
 
   # Runs the GPU render tests (normally #[ignore]d) on Mesa lavapipe, a software
   # Vulkan implementation, so they gate CI without needing a physical GPU.

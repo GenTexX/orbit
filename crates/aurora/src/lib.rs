@@ -5,6 +5,7 @@ mod draw;
 mod error;
 mod event;
 pub mod find;
+pub mod golden;
 mod input;
 pub mod list;
 pub mod picker;
