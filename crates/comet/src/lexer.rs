@@ -203,7 +203,12 @@ impl<'src> Lexer<'src> {
         let mut value = String::new();
         loop {
             match self.peek() {
-                None => {
+                // A newline ends it too, not only EOF. A string has no line
+                // continuation, so one unmatched quote used to turn the whole
+                // rest of the file into a single Str token - the parser saw no
+                // code below it, and one missing quote reported as "everything
+                // after this line does not exist".
+                None | Some(b'\n') => {
                     self.diagnostics.push(Diagnostic::error(
                         Span::new(start as u32, self.pos as u32),
                         "unterminated string literal",

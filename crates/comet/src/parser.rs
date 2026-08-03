@@ -168,6 +168,23 @@ impl Parser {
         while !self.at_end() {
             // Annotations attach to whatever declaration follows them.
             let annotations = self.annotations();
+            // Only a declaration takes annotations. Everything else used to
+            // drop the vector on the floor, so `@export func update(...)` -
+            // which is the obvious wrong guess for a beginner - did nothing at
+            // all and said nothing, the exact failure mode ADR 0022 chose `@`
+            // over a doc-comment convention to avoid.
+            if !matches!(self.peek(), TokenKind::Let | TokenKind::Const) {
+                for annotation in &annotations {
+                    self.error(
+                        annotation.span,
+                        format!(
+                            "`@{}` can only go on a `let` or a `const` - it describes a value \
+                             the inspector owns",
+                            annotation.name
+                        ),
+                    );
+                }
+            }
             match self.peek() {
                 TokenKind::Enum => {
                     if let Some(e) = self.enum_decl() {
@@ -202,10 +219,19 @@ impl Parser {
     /// Skip forward to the next thing that can start a top-level item, so one
     /// piece of garbage costs one diagnostic rather than one per token after it.
     fn recover_to_top_level(&mut self) {
+        // Every keyword `script` starts a declaration with. Listing only
+        // Func, Let and At meant recovering from one bad line swallowed the
+        // next `enum`, `struct` or `const` whole, so one syntax error hid an
+        // entire type declaration and every use of it became "cannot find".
         while !self.at_end()
             && !matches!(
                 self.peek(),
-                TokenKind::Func | TokenKind::Let | TokenKind::At
+                TokenKind::Func
+                    | TokenKind::Let
+                    | TokenKind::At
+                    | TokenKind::Enum
+                    | TokenKind::Struct
+                    | TokenKind::Const
             )
         {
             self.advance();
@@ -1239,5 +1265,32 @@ mod tests {
          }";
         let (_, diagnostics) = parse(source);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn an_annotation_only_belongs_on_a_declaration() {
+        // It used to be parsed and then dropped on the floor, so `@export` on a
+        // function did nothing and said nothing - the failure mode ADR 0022
+        // chose `@` over a doc-comment convention specifically to avoid.
+        let (_, diagnostics) = parse("@export func update(dt: f32) { }");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("can only go on a `let`")),
+            "{diagnostics:?}"
+        );
+        // On a `let` it is still accepted in silence.
+        let (_, diagnostics) = parse("@export let speed: f32;");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn recovery_stops_at_every_kind_of_declaration() {
+        // It stopped only at func/let/@, so one bad line swallowed the next
+        // enum, struct or const whole and every use of it read "cannot find".
+        let (script, _) = parse("%%%\nstruct Enemy { hp: f32 }\nconst G = 9.8;\nenum S { A }");
+        assert_eq!(script.structs.len(), 1, "the struct after the garbage");
+        assert_eq!(script.enums.len(), 1, "and the enum");
+        assert_eq!(script.state.len(), 1, "and the const");
     }
 }

@@ -748,7 +748,11 @@ impl Checker<'_> {
         let name = if args.is_empty() {
             decl.name.clone()
         } else {
-            let listed: Vec<&str> = args.iter().map(|t| t.name()).collect();
+            // `name_of`, not `Type::name`: the latter answers "enum" or
+            // "struct" for anything a script declared, because only the checker
+            // holds the table - so every message mentioning `Option<Enemy>`
+            // used to read `Option<struct>`.
+            let listed: Vec<String> = args.iter().map(|t| self.name_of(*t)).collect();
             format!("{}<{}>", decl.name, listed.join(", "))
         };
         // Settled here rather than only at the end: whether an enum owns
@@ -3052,7 +3056,7 @@ fn builtin(name: &str) -> Option<(Builtin, &'static [Type], Type)> {
 }
 
 fn is_host_name(name: &str) -> bool {
-    builtin(name).is_some() || matches!(name, "vec2" | "int" | "len" | "push" | "copy")
+    builtin(name).is_some() || matches!(name, "vec2" | "int" | "len" | "push" | "copy" | "get")
 }
 
 /// Names the compiled module already uses for something. Every script function
@@ -4335,6 +4339,28 @@ mod tests {
         // Written the way it has to be written, it is still accepted.
         check_clean("func f(c: bool) -> f32 { if c { return 1.0; } else { return 2.0; } }");
         check_clean("func f(c: bool) -> f32 { if c { return 1.0; } 2.0 }");
+    }
+
+    #[test]
+    fn the_checker_says_something_where_it_used_to_say_nothing() {
+        // `get` is provided by the engine, and `call` intercepts it before the
+        // user-function lookup - so defining one was accepted and unreachable.
+        assert!(
+            messages("func get(a: f32) -> f32 { a }")
+                .iter()
+                .any(|m| m.contains("get")),
+        );
+
+        // A generic's arguments were named by Type::name, which answers
+        // "struct" for anything a script declared.
+        let named = messages(
+            "struct Enemy { hp: f32 }\nlet x: Option<Enemy>;\n\
+             func f(o: Option<Enemy>) -> f32 { match o { None => 0.0, Some(e) => e.hp } }",
+        );
+        assert!(
+            !named.iter().any(|m| m.contains("Option<struct>")),
+            "no message calls it Option<struct>: {named:?}"
+        );
     }
 
     #[test]

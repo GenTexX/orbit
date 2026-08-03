@@ -348,7 +348,18 @@ fn in_comment_or_string(source: &str, offset: usize) -> bool {
         let inside = offset > start && offset < end;
         match token.kind {
             TokenKind::Comment => offset > start && offset <= end,
-            TokenKind::Str(_) => inside,
+            TokenKind::Str(_) => {
+                // A closed string ends with its quote, so a caret just past it
+                // is code again. An unterminated one ends at the newline or at
+                // EOF, and a caret sitting there is still inside a string being
+                // typed - `print("le` is exactly when the list must stay shut.
+                let closed = end > start + 1 && source.as_bytes().get(end - 1) == Some(&b'"');
+                if closed {
+                    inside
+                } else {
+                    offset > start && offset <= end
+                }
+            }
             _ => false,
         }
     })
