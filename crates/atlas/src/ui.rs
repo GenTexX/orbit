@@ -2140,7 +2140,7 @@ fn build_inspector(
                             .push((slider, node, i, field.to_string()));
                         continue;
                     }
-                    let numeric = matches!(value, Value::F32(_));
+                    let numeric = matches!(value, Value::F32(_) | Value::Int(_));
                     let multiline = hints.contains(&comet::Hint::Multiline);
                     let shape = FieldShape {
                         multiline,
@@ -3144,6 +3144,7 @@ fn record_entry(
 pub fn value_to_text(value: &Value) -> String {
     match value {
         Value::F32(x) => x.to_string(),
+        Value::Int(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Str(s) => s.clone(),
         Value::Vec2(v) => format!("{}, {}", v.x, v.y),
@@ -3158,6 +3159,9 @@ pub fn value_to_text(value: &Value) -> String {
 pub fn parse_value(text: &str, like: &Value) -> Option<Value> {
     match like {
         Value::F32(_) => text.trim().parse().ok().map(Value::F32),
+        // A whole number only: `3.5` typed into an int field is refused rather
+        // than truncated, so the value shown is always the value that runs.
+        Value::Int(_) => text.trim().parse().ok().map(Value::Int),
         Value::Bool(_) => text.trim().parse().ok().map(Value::Bool),
         Value::Str(_) => Some(Value::Str(text.to_string())),
         Value::Asset(_) => Some(Value::Asset(text.to_string())),

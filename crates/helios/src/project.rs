@@ -23,6 +23,34 @@ pub struct Manifest {
     pub main_scene: String,
 }
 
+/// Write `bytes` to `path` without ever leaving it half-written: a temp sibling
+/// is written and flushed first, then renamed over the target.
+///
+/// `std::fs::write` truncates the file before it writes, so a crash or a full
+/// disk mid-save leaves an empty or partial file and the original is gone. The
+/// temp name starts with a dot so a file explorer that hides dotfiles does not
+/// flicker it into the list.
+///
+/// Here rather than in the editor because the thing most worth not losing - the
+/// scene - is written from here, and M6's package writer will want it too.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp = path.with_file_name(format!(".{name}.tmp"));
+    {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&temp);
+            Err(err)
+        }
+    }
+}
+
 /// An open project: its name and its loaded scene. A project is a directory of
 /// text files (ADR 0009); M3 holds a single scene.
 #[derive(Debug, Clone)]
@@ -42,6 +70,10 @@ impl Project {
 
     /// Write the project to `dir`: the manifest and the scene file, creating the
     /// directory (and the scene's parent) as needed.
+    ///
+    /// Both go through [`write_atomic`], so an interrupted save leaves the
+    /// previous good file rather than a truncated one. The scene is the least
+    /// replaceable thing in a project and it used to get the weakest treatment.
     pub fn save(&self, dir: impl AsRef<Path>) -> Result<(), HeliosError> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir).map_err(|e| HeliosError::io("creating", dir, e))?;
@@ -53,14 +85,14 @@ impl Project {
         let manifest_text =
             toml::to_string_pretty(&manifest).map_err(|e| HeliosError::Manifest(e.to_string()))?;
         let manifest_path = dir.join(MANIFEST);
-        fs::write(&manifest_path, manifest_text)
+        write_atomic(&manifest_path, manifest_text.as_bytes())
             .map_err(|e| HeliosError::io("writing", &manifest_path, e))?;
 
         let scene_path = dir.join(MAIN_SCENE);
         if let Some(parent) = scene_path.parent() {
             fs::create_dir_all(parent).map_err(|e| HeliosError::io("creating", parent, e))?;
         }
-        fs::write(&scene_path, self.scene.to_ron()?)
+        write_atomic(&scene_path, self.scene.to_ron()?.as_bytes())
             .map_err(|e| HeliosError::io("writing", &scene_path, e))?;
         Ok(())
     }
@@ -114,6 +146,38 @@ mod tests {
         assert_eq!(
             loaded.scene.to_ron().unwrap(),
             project.scene.to_ron().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_previous_file_whole() {
+        // The point of writing through a temp sibling: `fs::write` truncates
+        // first, so an interrupted save used to leave an empty scene and take
+        // the only good copy with it. Simulated by making the rename fail - the
+        // target is a directory, which cannot be replaced by a file.
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("scene.ron");
+        fs::write(&good, "the previous good scene").unwrap();
+        assert!(write_atomic(&good, b"a new scene").is_ok());
+        assert_eq!(fs::read_to_string(&good).unwrap(), "a new scene");
+
+        let blocked = dir.path().join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        assert!(
+            write_atomic(&blocked, b"cannot land").is_err(),
+            "renaming a file over a directory must fail"
+        );
+        assert!(blocked.is_dir(), "and must leave what was there alone");
+        // No litter either: the temp sibling is cleaned up when the rename fails.
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
         );
     }
 }

@@ -13,6 +13,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     F32(f32),
+    /// A whole number: comet's `int`, and a payload-free enum's tag.
+    ///
+    /// Added because pretending it was an `f32` was not free. atlas mapped
+    /// comet's `Int` onto `F32`, and the script host then derived the wasm type
+    /// from the `Value` it happened to hold - so it wrote an f32 into the
+    /// module's i32 global, wasmtime refused it, and the error was discarded.
+    /// An `@export let lives: int;` tuned to 5 in the inspector ran at 0. Two
+    /// layers each working around a missing variant, which is exactly what a
+    /// closed set is meant to prevent (ADR 0016).
+    Int(i32),
     Bool(bool),
     Str(String),
     Vec2(Vec2),

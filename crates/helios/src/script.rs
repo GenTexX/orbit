@@ -374,18 +374,30 @@ fn apply_exports(store: &mut Store<ScriptState>, instance: &Instance, exports: &
             Value::Vec2(_) => comet::exported_globals(name, comet::Type::Vec2),
             Value::F32(_) => comet::exported_globals(name, comet::Type::F32),
             Value::Bool(_) => comet::exported_globals(name, comet::Type::Bool),
+            // comet's `Int` and a payload-free enum's tag are both one i32
+            // global, and `exported_globals` names them the same way, so one
+            // arm covers both.
+            Value::Int(_) => comet::exported_globals(name, comet::Type::Int),
             _ => continue,
         };
         let wasm: Vec<Val> = match value {
             Value::F32(v) => vec![Val::F32(v.to_bits())],
+            Value::Int(v) => vec![Val::I32(*v)],
             Value::Bool(v) => vec![Val::I32(i32::from(*v))],
             Value::Vec2(v) => vec![Val::F32(v.x.to_bits()), Val::F32(v.y.to_bits())],
             _ => continue,
         };
         for (name, value) in globals.iter().zip(wasm) {
-            if let Some(global) = instance.get_global(&mut *store, name) {
-                let _ = global.set(&mut *store, value);
-            }
+            let Some(global) = instance.get_global(&mut *store, name) else {
+                continue;
+            };
+            // A failure here is a real disagreement between the component and
+            // the module - the value's type is not the global's - and used to
+            // be thrown away with `let _`, which is how an exported int came to
+            // be editable, saved, and silently inert. helios takes no logging
+            // dependency (that is the editor's), so it is dropped deliberately
+            // and named rather than swallowed anonymously.
+            let _mismatch = global.set(&mut *store, value);
         }
     }
 }
@@ -1192,6 +1204,48 @@ mod tests {
         b.update(&mut scene, slow, 1.0).expect("one frame");
         assert_eq!(position(&scene, fast).x, 100.0);
         assert_eq!(position(&scene, slow).x, 10.0);
+    }
+
+    #[test]
+    fn an_exported_int_reaches_the_module_it_was_tuned_for() {
+        // It did not. `Value` had no Int, so atlas stored an exported int as an
+        // F32 and `apply_exports` derived the wasm type from what the component
+        // happened to hold - writing an f32 into the module's i32 global.
+        // wasmtime refused it and the error was thrown away, so the field was
+        // editable, saved, and completely inert: the script ran at the default.
+        let source = "
+            @export let steps: int;
+            func update(dt: f32) { transform.position.x += steps; }
+        ";
+        let mut host = ScriptHost::new().expect("a host");
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate_with(source, &mut scene, node, &[("steps".into(), Value::Int(7))])
+            .expect("it compiles");
+        script.update(&mut scene, node, 1.0).expect("one frame");
+        assert_eq!(position(&scene, node).x, 7.0, "the tuned value ran");
+
+        // And the f32 path still works beside it, from the same table.
+        let source = "
+            @export let steps: int;
+            @export let speed: f32;
+            func update(dt: f32) { transform.position.x += steps; \
+             transform.position.y += speed; }
+        ";
+        let (mut scene, node) = scene_with_node(Vec2::ZERO);
+        let mut script = host
+            .instantiate_with(
+                source,
+                &mut scene,
+                node,
+                &[
+                    ("steps".into(), Value::Int(3)),
+                    ("speed".into(), Value::F32(1.5)),
+                ],
+            )
+            .expect("it compiles");
+        script.update(&mut scene, node, 1.0).expect("one frame");
+        assert_eq!(position(&scene, node), Vec2::new(3.0, 1.5));
     }
 
     #[test]

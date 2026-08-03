@@ -670,29 +670,13 @@ impl TextEncoding {
     }
 }
 
-/// Write `bytes` to `path` without ever leaving it half-written: a temp sibling
-/// is written and flushed first, then renamed over the target.
+/// Write `bytes` to `path` without ever leaving it half-written.
 ///
-/// `std::fs::write` truncates the file before it writes, so a crash or a full
-/// disk mid-save leaves an empty or partial script and the original is gone. The
-/// temp name starts with a dot so the file explorer, which hides dotfiles, does
-/// not flicker it into the list.
+/// helios's, not a second copy: the scene goes through the same call, and
+/// "saving must not be able to destroy what it is replacing" is a property of
+/// writing a project rather than of this editor.
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temp = path.with_file_name(format!(".{name}.tmp"));
-    {
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    match std::fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = std::fs::remove_file(&temp);
-            Err(err)
-        }
-    }
+    helios::write_atomic(path, bytes)
 }
 
 /// What a find-bar button does.
@@ -733,15 +717,13 @@ fn completion_colors(
 fn default_for(ty: comet::Type) -> Option<helios::Value> {
     Some(match ty {
         comet::Type::F32 => helios::Value::F32(0.0),
-        // The inspector has no int field yet, so an exported int is shown and
-        // stored as an f32. Narrowing back happens at the wasm boundary.
-        comet::Type::Int => helios::Value::F32(0.0),
+        comet::Type::Int => helios::Value::Int(0),
         comet::Type::Bool => helios::Value::Bool(false),
         comet::Type::Vec2 => helios::Value::Vec2(Vec2::ZERO),
-        // A payload-free enum is stored as its tag. The inspector has no
-        // dropdown yet, so it shows as a number - provisional, and the same
-        // wart as an exported int.
-        comet::Type::Enum(_) => helios::Value::F32(0.0),
+        // A payload-free enum is stored as its tag, which is a whole number.
+        // The inspector has no dropdown yet, so it shows as one - the display
+        // is provisional, but the value that reaches the module is now exact.
+        comet::Type::Enum(_) => helios::Value::Int(0),
         _ => return None,
     })
 }

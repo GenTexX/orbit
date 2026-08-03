@@ -21,7 +21,7 @@ mod transform;
 pub use command::{Edit, History};
 pub use component::{Component, ScriptComponent, SpriteComponent};
 pub use error::HeliosError;
-pub use project::{Manifest, Project};
+pub use project::{Manifest, Project, write_atomic};
 pub use reflect::{Reflect, Value};
 pub use render::SpriteDraw;
 pub use scene::{Node, NodeId, Scene};
