@@ -2469,6 +2469,13 @@ fn add_asset_field(
         Style::new().width(70.0).foreground(theme.aurora.heading),
     );
 
+    // Whether the file is actually there. A path that was renamed, moved to the
+    // trash, or never created looked exactly like a working one - and at Play
+    // time that reads as "the engine is broken" rather than "that file moved".
+    // An empty path is not missing; it is a component with nothing chosen yet,
+    // which is what Add Script leaves behind.
+    let missing = !path.is_empty() && !explorer.resolve_relative(path).exists();
+
     // A preview: the asset's decoded thumbnail if we have it, else a file icon.
     match thumbnails.get(&explorer.resolve_relative(path)) {
         Some(handle) => {
@@ -2489,17 +2496,27 @@ fn add_asset_field(
     }
 
     // The editable path (commits through the same field_rows path as any field).
+    // Drawn in the error colour when the file is not there, which is the same
+    // colour the Code pane squiggles a mistake in - one vocabulary for "this
+    // does not resolve".
     let input = ui.text_input(
         row,
         path.to_string(),
         Style::new()
             .grow(1.0)
             .padding(4.0)
-            .foreground(theme.aurora.heading)
+            .foreground(if missing {
+                theme.code_error
+            } else {
+                theme.aurora.heading
+            })
             .corner_radius(theme.aurora.control_radius),
     );
     rows.field_rows
         .push((input, node, component, field.to_string()));
+    if missing {
+        ui.label(row, "missing", Style::new().foreground(theme.code_error));
+    }
 
     // Browse (opens the image chooser) and Clear (empties the field).
     let browse = asset_icon_button(ui, row, icons, Icon::Load, "...", theme);
@@ -3359,6 +3376,21 @@ mod tests {
         build_modal(&mut ui, modal, None, &thumbnails, &theme, &mut rows);
         ui.layout(Vec2::new(1000.0, 700.0)).unwrap();
         rows
+    }
+
+    #[test]
+    fn saving_over_a_project_that_would_not_open_has_to_be_asked_for() {
+        // A project that will not load no longer exits with no window: an empty
+        // scene stands in. That stand-in must not be writable over the file it
+        // is standing in for by reflex, so the save asks - and the middle
+        // answer, which everywhere else means "discard and go ahead", must not
+        // go ahead here.
+        let rows = laid_out_modal(&Modal::confirm(
+            "This project did not open. Save anyway?",
+            crate::modal::Pending::SaveOverBrokenProject,
+        ));
+        assert_eq!(rows.modal_buttons.len(), 3, "the confirm shape is shared");
+        assert!(rows.modal_close.is_some(), "and Escape backs out");
     }
 
     #[test]
@@ -4561,6 +4593,63 @@ mod tests {
             rows.asset_fields.iter().any(|(_, _, _, f)| f == "source"),
             "and the path is still the asset field it was"
         );
+    }
+
+    #[test]
+    fn an_asset_field_says_when_the_file_is_not_there() {
+        // A Script or Sprite pointing at a file that was renamed, trashed, or
+        // never created looked exactly like a working one. At Play time that
+        // reads as "the engine is broken" rather than "that file moved".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        std::fs::write(
+            dir.path().join("scripts/there.cmt"),
+            "func update(dt: f32) {}",
+        )
+        .unwrap();
+
+        let laid_out = |source: &str| {
+            let mut scene = Scene::new("root");
+            let node = scene.add_child(scene.root(), Node::new("Thing"));
+            scene
+                .node_mut(node)
+                .components
+                .push(Component::Script(helios::ScriptComponent {
+                    source: source.to_string(),
+                    ..Default::default()
+                }));
+            let theme = EditorTheme::default();
+            let mut ui = Ui::new();
+            ui.set_theme(theme.aurora);
+            let root = ui.root_panel(Style::new().fill());
+            let mut rows = EditorRows::default();
+            build_inspector(
+                &mut ui,
+                root,
+                &scene,
+                Some(node),
+                None,
+                &InspectorView::default(),
+                &FileExplorer::new(dir.path()),
+                &Thumbnails::new(),
+                &theme,
+                &mut rows,
+            );
+            ui.layout(Vec2::new(400.0, 700.0)).unwrap();
+            let (input, ..) = *rows
+                .field_rows
+                .iter()
+                .find(|(_, _, _, f)| f == "source")
+                .expect("the source row");
+            ui.foreground_of(input)
+        };
+
+        let theme = EditorTheme::default();
+        assert_eq!(laid_out("scripts/there.cmt"), theme.aurora.heading);
+        assert_eq!(laid_out("scripts/gone.cmt"), theme.code_error);
+        // An empty path is a component with nothing chosen yet, not a broken
+        // one - that is what Add Script leaves behind.
+        assert_eq!(laid_out(""), theme.aurora.heading);
     }
 
     #[test]

@@ -324,6 +324,10 @@ struct State {
     /// The history revision the recovery snapshot was taken at, so a `Scene`
     /// clone happens once per edit rather than once per frame.
     recorded_revision: u64,
+    /// Why the project did not open, when it did not. While this is set the
+    /// scene in memory is a stand-in, so saving over the real file has to be
+    /// asked for rather than assumed.
+    load_failed: Option<String>,
     /// The window title currently applied (set only on change, like the cursor).
     applied_title: String,
     /// The shared log ring shown in the Console pane (written by the tracing
@@ -952,6 +956,18 @@ impl ApplicationHandler for App {
                 // showed a script's path and none of its fields until the
                 // script was next saved.
                 state.reconcile_script_exports();
+                // Say so, in the window, rather than in a terminal nobody is
+                // reading. The same failure through Load has always opened a
+                // modal; only the startup path exited silently.
+                if let Some(why) = state.load_failed.clone() {
+                    state.open_modal(modal::Modal::report(
+                        "Could not open the project",
+                        format!(
+                            "{why} - the scene here is an empty stand-in, and saving will \
+                             ask before it replaces the file on disk"
+                        ),
+                    ));
+                }
                 state.window.request_redraw();
                 self.state = Some(state);
             }
@@ -1190,7 +1206,22 @@ impl State {
         // been recorded into <project>/.orbit/recovered/ rather than taking the
         // session with it.
         recovery::install(&project_dir);
-        let project = project::open_or_create(&project_dir)?;
+        // A project that will not open is not a reason to have no window. It
+        // used to be: the error went to the terminal, the event loop exited,
+        // and someone who double-clicked the binary saw nothing happen at all -
+        // while the very same failure through Load opens a modal that says what
+        // went wrong. An empty scene stands in, and `load_failed` makes sure
+        // saving cannot quietly replace the file that did not load with it.
+        let (project, load_failed) = match project::open_or_create(&project_dir) {
+            Ok(project) => (project, None),
+            Err(err) => {
+                tracing::error!("could not open the project: {err:#}");
+                (
+                    helios::Project::new("Untitled", helios::Scene::new("Root")),
+                    Some(format!("{err:#}")),
+                )
+            }
+        };
         // Decode the demo sprite once for its natural pixel size (the default
         // size for newly spawned sprites); its pixels load through the cache.
         // Missing or unreadable (e.g. deleted through the file explorer) falls
@@ -1317,6 +1348,7 @@ impl State {
             applied_cursor: aurora::CursorHint::Default,
             saved_revision: 0,
             recorded_revision: 0,
+            load_failed,
             applied_title: WINDOW_TITLE.to_string(),
             logs,
             last_log_gen: 0,
@@ -2062,6 +2094,19 @@ impl State {
                 }
             }
             ModalAction::DiscardAndProceed => {
+                // "Save anyway?" has no discard: the two answers are write it
+                // or do not, and doing nothing is what closing means. Without
+                // this the middle button would write the stand-in scene over
+                // the project it is standing in for, which is the one outcome
+                // the question exists to prevent.
+                if matches!(
+                    self.modal.as_ref().map(|m| &m.body),
+                    Some(modal::ModalBody::Confirm(c))
+                        if c.pending == modal::Pending::SaveOverBrokenProject
+                ) {
+                    self.close_modal();
+                    return;
+                }
                 self.script_modified = false;
                 self.proceed_with_pending();
             }
@@ -2079,6 +2124,10 @@ impl State {
             modal::Pending::Quit => self.quit_requested = true,
             modal::Pending::OpenScript(path) => self.open_script_file(&path),
             modal::Pending::ReloadProject => self.load_project(),
+            modal::Pending::SaveOverBrokenProject => {
+                self.load_failed = None;
+                self.save_project();
+            }
         }
     }
 
@@ -3680,6 +3729,19 @@ impl State {
     }
 
     fn save_project(&mut self) {
+        // The scene in memory is a stand-in for one that would not load, so
+        // writing it out would replace the real file with an empty room. Ask
+        // first; the answer is the user's, and it is not the obvious one.
+        if let Some(why) = self.load_failed.clone() {
+            self.open_modal(modal::Modal::confirm(
+                format!(
+                    "This project did not open ({why}), so the scene here is an empty \
+                     stand-in. Saving replaces the file on disk with it. Save anyway?"
+                ),
+                modal::Pending::SaveOverBrokenProject,
+            ));
+            return;
+        }
         match self.project.save(&self.project_dir) {
             Ok(()) => {
                 self.saved_revision = self.history.revision();

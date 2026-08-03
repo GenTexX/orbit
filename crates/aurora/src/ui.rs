@@ -2904,6 +2904,11 @@ impl Ui {
         Some((view_h, content_h))
     }
 
+    /// A widget's text colour, as resolved from its style.
+    pub fn foreground_of(&self, id: WidgetId) -> Color {
+        self.widgets[id].foreground
+    }
+
     #[doc(hidden)]
     pub fn text_area_extent_for_test(&self, id: WidgetId) -> Option<(f32, f32)> {
         self.text_area_extent(id)

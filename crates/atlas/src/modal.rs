@@ -55,6 +55,8 @@ pub enum Pending {
     OpenScript(std::path::PathBuf),
     /// Reload the project from disk, discarding the scene and the undo stack.
     ReloadProject,
+    /// Write the stand-in scene over a project that would not load.
+    SaveOverBrokenProject,
 }
 
 /// Which reflected component field an asset chooser writes to.
